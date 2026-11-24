@@ -28,6 +28,7 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary.
+- `evals/`: harness evals that run headless Claude Code (need a signed-in `claude`; not run in CI).
 - `docs/`: the design and operator docs, routed from `docs/index.md`.
 
 ## Rules

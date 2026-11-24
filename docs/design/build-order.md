@@ -35,4 +35,6 @@ step's exit test passes.
 
 ## Status
 
-Step 1 is in progress: the event log and Ahjo environments exist; the exit test is next.
+Step 1 is done. Its exit test is `evals/step1-exit.sh`: headless Claude Code, in a fresh environment and guided only by
+`CLAUDE.md`, builds Paja and runs fmt, clippy and the tests. It passed on 2026-11-24. It needs a signed-in `claude`, so
+it runs on the owner's machine, not in CI. Step 2 is next.
