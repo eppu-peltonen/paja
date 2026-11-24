@@ -50,9 +50,18 @@ current state by replaying it, and every write holds the home lock. See `crates/
 A write cut off by a crash leaves bytes after the last newline. Those were never acknowledged, so the next append
 cuts them off and keeps them in `events.jsonl.torn`; a bad line that ends in a newline is an error, never repaired.
 
+## Work queue
+
+Jono's items are GitHub issues labelled `paja`. `paja work sync` reads the open ones with `gh` and appends
+`work.imported`, `work.changed`, `work.closed` and `work.reopened` events. Whether an issue is open is kept apart from
+the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
+survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the oldest
+open, queued item and marks it active under the home lock, so two runs never share one. A sync that reads its full limit
+of issues refuses to close anything rather than drop work it could not see.
+
 ## MCP server
 
-`paja mcp` serves the core as MCP tools over stdio (`env_create`, `env_list`, `env_show`, `env_remove`, `log`), built on
+`paja mcp` serves the core as MCP tools over stdio (`env_*`, `work_*` and `log`), built on
 the official Rust MCP SDK. Claude Code starts it from the project directory, so a tool's `repo` defaults to there. Each
 tool returns the JSON the matching `paja --json` command prints, and a failure is a tool error whose text is
 `{"error": "..."}`.

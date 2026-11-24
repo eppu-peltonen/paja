@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use crate::ahjo::{self, CreateOptions};
 use crate::home::Home;
+use crate::jono;
 
 #[derive(Clone)]
 pub struct PajaMcp {
@@ -48,6 +49,28 @@ pub struct RemoveArgs {
     /// Discard uncommitted changes in the worktree.
     #[serde(default)]
     force: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RepoArgs {
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct NumberArgs {
+    /// The GitHub issue number.
+    number: u64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SetArgs {
+    /// The GitHub issue number.
+    number: u64,
+    /// queued, active, landed or escalated.
+    status: String,
+    /// Why, for example the question an escalation asks.
+    note: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -123,6 +146,61 @@ impl PajaMcp {
         .await
     }
 
+    #[tool(
+        description = "Jono: import open GitHub issues labelled paja into the work queue (uses gh)."
+    )]
+    async fn work_sync(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let repo = std::path::absolute(PathBuf::from(args.repo.unwrap_or_else(|| ".".into())))?;
+            Ok(serde_json::to_value(jono::sync(&home, &repo)?)?)
+        })
+        .await
+    }
+
+    #[tool(description = "Jono: list work items, oldest first.")]
+    async fn work_list(&self) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || Ok(serde_json::to_value(jono::list(&home)?)?)).await
+    }
+
+    #[tool(description = "Jono: show one work item by its issue number.")]
+    async fn work_show(&self, Parameters(args): Parameters<NumberArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || Ok(serde_json::to_value(jono::get(&home, args.number)?)?)).await
+    }
+
+    #[tool(description = "Jono: the next item to work on (the oldest queued one), or null.")]
+    async fn work_next(&self) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || Ok(serde_json::to_value(jono::next(&home)?)?)).await
+    }
+
+    #[tool(
+        description = "Jono: take the next item and mark it active in one step, so two runs never share one. Null when nothing is queued."
+    )]
+    async fn work_claim(&self) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || Ok(serde_json::to_value(jono::claim(&home)?)?)).await
+    }
+
+    #[tool(
+        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note."
+    )]
+    async fn work_set(&self, Parameters(args): Parameters<SetArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let status = jono::parse_status(&args.status)?;
+            Ok(serde_json::to_value(jono::set_status(
+                &home,
+                args.number,
+                status,
+                args.note.as_deref(),
+            )?)?)
+        })
+        .await
+    }
+
     #[tool(description = "Show the event log, oldest first.")]
     async fn log(&self, Parameters(args): Parameters<LogArgs>) -> Result<String, String> {
         let home = self.home.clone();
@@ -136,7 +214,7 @@ impl ServerHandler for PajaMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("paja", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Paja's core: Ahjo environments (env_*) and the event log (log). \
+                "Paja's core: Ahjo environments (env_*), Jono's work queue (work_*) and the event log (log). \
                  Every result is the JSON that `paja --json` prints.",
             )
     }
