@@ -21,4 +21,15 @@ Design: [Paja: a software factory for new and existing projects](https://claude.
 
 ## Status
 
-Step 1 of the build order: the seed, written by hand.
+Step 1 of the build order: the seed, written by hand. Today Paja has the event log and Ahjo environments:
+
+```sh
+cargo install --path crates/paja
+paja env create fix-login        # isolated worktree on branch paja/fix-login with its own ports
+paja env list
+paja --json env show fix-login   # every command speaks JSON
+paja env remove fix-login        # the branch is kept
+paja log                         # the append-only event log
+```
+
+State lives in `$PAJA_HOME` (default `~/.paja`). See [CLAUDE.md](CLAUDE.md) for how to work on Paja.
