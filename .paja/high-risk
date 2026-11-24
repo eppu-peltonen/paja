@@ -1,0 +1,8 @@
+# Path prefixes that make a change high risk: two independent reviewers must agree.
+# Read from main, never from the branch under review.
+crates/paja/src/events.rs
+crates/paja/src/mestari.rs
+.paja/
+evals/
+CLAUDE.md
+.github/

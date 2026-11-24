@@ -1,0 +1,5 @@
+# Vasara's checks for Paja: one shell command per line. Mestari reads this file from main,
+# never from the branch under review.
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test

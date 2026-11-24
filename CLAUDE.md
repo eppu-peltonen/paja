@@ -27,6 +27,9 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 - `crates/paja/src/home.rs`: the state directory (`$PAJA_HOME`, default `~/.paja`) and its lock.
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
 - `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues labelled `paja` (`gh`, or `$PAJA_GH`).
+- `crates/paja/src/mestari.rs`: `paja run`, the build, check, review and land loop for one work item.
+- `.paja/checks`, `.paja/high-risk`: Vasara's check commands and the high-risk path prefixes. `paja run` reads both
+  from `main`, never from the branch under review.
 - `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary.
@@ -40,8 +43,9 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
   readable.
 - **Every write holds the home lock** (`Home::lock`), so sequence numbers and port blocks are never handed out twice.
 - **Every command supports `--json`** and prints exactly one JSON value on stdout, errors as `{"error": "..."}`.
-  Agents and Paja Desk depend on this. The one exception is `paja mcp`, whose stdout is the MCP protocol; each of its
-  tools returns the same JSON as the matching command.
+  Agents and Paja Desk depend on this. Two exceptions: `paja mcp`, whose stdout is the MCP protocol (each tool
+  returns the same JSON as the matching command), and `paja run --every`, which prints one JSON value per line, one
+  per item, for as long as it runs.
 - **The CLI and the MCP server are two doors to one core.** New behaviour goes in the library modules and is exposed
   through both, with the same JSON shape.
 - **Errors say what to do.** Include the path, name or command involved and the fix when there is one.
