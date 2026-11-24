@@ -56,8 +56,8 @@ impl Bounds {
 const PROGRAMS: &[&str] = &[
     "cargo", "rustc", "rustfmt", "git", "ls", "cat", "head", "tail", "wc", "grep", "rg", "find",
     "sort", "uniq", "diff", "echo", "printf", "pwd", "true", "false", "test", "[", "mkdir",
-    "touch", "cp", "mv", "rm", "sed", "tr", "cut", "basename", "dirname", "which", "date",
-    "mktemp", "cd", "sleep",
+    "touch", "cp", "mv", "rm", "tr", "cut", "basename", "dirname", "which", "date", "mktemp", "cd",
+    "sleep",
 ];
 
 /// The git subcommands an agent may use: local work on its own branch.
@@ -216,7 +216,13 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
 }
 
 fn check_program(program: &str, args: &[String], here: &Path, b: &Bounds) -> Option<String> {
-    let operands = || args.iter().filter(|a| !a.starts_with('-'));
+    // Paths the program will act on: plain operands and the values of `--opt=value`.
+    let operands = || {
+        args.iter().filter_map(|a| match a.strip_prefix("--") {
+            Some(opt) => opt.split_once('=').map(|(_, value)| value),
+            None => (!a.starts_with('-')).then_some(a.as_str()),
+        })
+    };
     for arg in operands() {
         if in_factory_home(&normalize(&here.join(arg)), b) {
             return Some(format!(
@@ -226,6 +232,15 @@ fn check_program(program: &str, args: &[String], here: &Path, b: &Bounds) -> Opt
     }
     match program {
         "git" => {
+            if let Some(opt) = args.iter().find(|a| {
+                ["-C", "--git-dir", "--work-tree", "--namespace"]
+                    .iter()
+                    .any(|o| a.as_str() == *o || a.starts_with(&format!("{o}=")))
+            }) {
+                return Some(format!(
+                    "`git {opt}` points git elsewhere; agents only use git in their own worktree"
+                ));
+            }
             let sub = git_subcommand(args);
             if !sub.is_some_and(|s| GIT_SUBCOMMANDS.contains(&s)) {
                 return Some(format!(
@@ -264,12 +279,12 @@ fn check_program(program: &str, args: &[String], here: &Path, b: &Bounds) -> Opt
         {
             return Some("`find` may only list files, not run, write or delete them".into());
         }
-        "sed"
+        "sort"
             if args
                 .iter()
-                .any(|a| a.starts_with("-i") || a == "--in-place") =>
+                .any(|a| a.starts_with("-o") || a.starts_with("--output")) =>
         {
-            return Some("change files with the Edit tool, not `sed -i`".into());
+            return Some("`sort` may only print; write files with the Write tool".into());
         }
         "cd" => match args.first() {
             Some(target) if !target.starts_with('-') => {
@@ -333,10 +348,7 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
     for arg in args {
         if skip {
             skip = false;
-        } else if matches!(
-            arg.as_str(),
-            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
-        ) {
+        } else if matches!(arg.as_str(), "-c") {
             skip = true;
         } else if !arg.starts_with('-') {
             return Some(arg);
@@ -532,7 +544,7 @@ mod tests {
             "git status",
             "git stash push",
             "git diff main...HEAD",
-            "git -C . log --oneline -3",
+            "git -c core.pager=cat log --oneline -3",
             "rm -rf target/debug",
             "ls src && cat Cargo.toml | head -5",
             "PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo",
@@ -605,6 +617,13 @@ mod tests {
             "find . -delete",
             "find . -exec rm {} ;",
             "sed -i s/a/b/ src/x.rs",
+            "sed -n 'w /tmp/x' src/x.rs",
+            "sort -o /tmp/x src/x.rs",
+            "git -C /other/repo add -A",
+            "git --work-tree=/elsewhere restore .",
+            "cp --target-directory=/tmp/x src/a.rs",
+            "mv --target-directory=/outside f",
+            "cat --x=../../events.jsonl",
             "sudo ls",
             "python3 -c 'import os'",
             "xargs rm",

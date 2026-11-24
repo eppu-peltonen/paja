@@ -85,12 +85,13 @@ The bounds are passed in rather than read from the tool call, because the report
 
 - **Shell commands** are split into simple commands at `;`, `&&`, `||`, `|`, `&`, subshells and substitutions (also
   inside double quotes), with quotes and backslashes removed. Each must start with a program on an allowlist, named
-  without a path: cargo, local git, and plain file and text tools. Shells, interpreters, `env`, `xargs` and network
-  tools are not on it. Git is limited to local subcommands (add, commit, status, diff, log, show, stash and the like);
-  cargo can't publish or install; `find` can't run or delete; `sed -i` is out. Setting `PATH`, `GIT_*`, `LD_*` or
-  `RUSTC_WRAPPER` is blocked.
+  without a path: cargo, local git, and plain file and text tools. Shells, interpreters, `sed`, `env`, `xargs` and
+  network tools are not on it. Git is limited to local subcommands (add, commit, status, diff, log, show, stash and
+  the like) and can't be pointed elsewhere with `-C`, `--git-dir` or `--work-tree`; cargo can't publish or install;
+  `find` can't run, write or delete; `sort -o` is out. Setting `PATH`, `GIT_*`, `LD_*` or `RUSTC_WRAPPER` is blocked.
 - **Writes** stay in the environment: file edits, `rm`, `cp`, `mv`, `mkdir`, `touch`, `cd` and output redirections
-  must resolve inside the root, and a path the shell would expand first (`~`, `$`, globs) is blocked.
+  must resolve inside the root (`--opt=value` paths included), and a path the shell would expand first (`~`, `$`,
+  globs) is blocked.
 - **Reads** may look outside the worktree, but nothing may touch credential paths (`~/.ssh`, `~/.config/gh` and the
   like) or the factory home outside the environment, including via `Glob` patterns and `Grep` globs.
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
