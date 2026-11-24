@@ -65,10 +65,13 @@ of issues refuses to close anything rather than drop work it could not see.
 environment `work-<issue>` from `main` (resuming the branch an earlier run kept). Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
-2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder.
-3. A fresh reviewer agent with read-only tools reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it
-   is on `main`, and answers `land`, `changes` or `escalate`. A change touching a prefix in `.paja/high-risk` (read
-   from `main`) gets two reviewers, who must agree; a split is escalated.
+2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
+   check run that changed the worktree or its commits, which are put back first.
+3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
+   answers `land`, `changes` or `escalate`. It may read, run cargo and use read-only git, and changes nothing. A change
+   touching a path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
+   An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also at any depth, in
+   any letter case.
 
 On `land`, Mestari pushes the branch, opens a pull request, waits for CI with `gh pr checks --watch`, squash-merges it
 and marks the item landed. On `escalate`, three failed rounds, a red CI or an error it can't fix, it comments on the
@@ -100,8 +103,9 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   checkout shares. Its revisions and paths must stay inside the worktree. `cargo fmt` takes options only with
   `--check`, since `--all` and `-p` can reach path dependencies outside the worktree.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
-  and never into a `.git`, `.cargo`, `.github` or `.claude` directory or a `rust-toolchain` file at any depth, in any
-  letter case (reading them is fine). `git rm` takes plain files only, and `git commit` needs `-m`.
+  and never into a `.git`, `.cargo`, `.github` or `.claude` directory, a `rust-toolchain` file or a rustfmt or clippy
+  configuration file at any depth, in any letter case (reading them is fine). A file tool path may not hold `..`. `git
+  rm` takes plain files only, and `git commit` needs `-m`.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks

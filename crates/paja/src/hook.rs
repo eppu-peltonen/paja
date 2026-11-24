@@ -255,6 +255,11 @@ const SECRET_PATHS: &[&str] = &[
 const HARMLESS_TOOLS: &[&str] = &[
     "TodoWrite",
     "TodoRead",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
+    "ToolSearch",
     "Task",
     "Agent",
     "ExitPlanMode",
@@ -274,6 +279,16 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             if path.starts_with('~') {
                 return Ok(Some(format!(
                     "`{path}` starts with `~`; give an absolute path or one inside the worktree"
+                )));
+            }
+            // Claude Code drops `..` as text, but the kernel follows a symlink before it, so
+            // the two can disagree about where such a path lands.
+            if Path::new(path)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                return Ok(Some(format!(
+                    "`{path}` holds `..`; give the path without it"
                 )));
             }
             if touches_secret(path) {
@@ -444,6 +459,21 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
         return Some(format!(
             "{} is cargo or toolchain configuration, which could change how cargo runs; agents \
              never change it",
+            full.display()
+        ));
+    }
+    if [
+        "rustfmt.toml",
+        ".rustfmt.toml",
+        "clippy.toml",
+        ".clippy.toml",
+    ]
+    .iter()
+    .any(|name| named(name))
+    {
+        return Some(format!(
+            "{} configures the format and lint checks that judge the change; agents never \
+             change it",
             full.display()
         ));
     }
@@ -660,6 +690,14 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
     let Some((program, args)) = words[start..].split_first() else {
         return Some(format!("an empty command; {SHAPE}"));
     };
+    // Cargo and git act on the directory they run in, which must be the worktree.
+    if matches!(*program, "cargo" | "git") && !here.starts_with(&b.root) {
+        return Some(format!(
+            "the shell is in {}, outside the worktree; start with `cd {} &&`",
+            here.display(),
+            b.root.display()
+        ));
+    }
     match *program {
         "cargo" => check_cargo(args, b.read_only),
         "git" => check_git(args, here, b),
@@ -1211,6 +1249,22 @@ mod tests {
         );
         assert!(decide("Glob", json!({"pattern": "**/.ssh/*"})).is_some());
         assert!(decide("Write", json!({"file_path": "rust-toolchain.toml"})).is_some());
+        assert!(decide("Write", json!({"file_path": "rustfmt.toml"})).is_some());
+        assert!(decide("Write", json!({"file_path": "crates/x/.clippy.toml"})).is_some());
+        assert!(decide("Write", json!({"file_path": format!("{ROOT}/src/../x.rs")})).is_some());
+        assert_eq!(decide("TaskCreate", json!({"subject": "x"})), None);
+        let elsewhere = HookInput {
+            tool_name: "Bash".into(),
+            tool_input: json!({"command": "git add -A"}),
+            cwd: "/h/other".into(),
+        };
+        assert!(check(&elsewhere, &bounds()).unwrap().is_some());
+        let back = HookInput {
+            tool_name: "Bash".into(),
+            tool_input: json!({"command": format!("cd {ROOT} && git add -A")}),
+            cwd: "/h/other".into(),
+        };
+        assert_eq!(check(&back, &bounds()).unwrap(), None);
         assert!(decide("Edit", json!({"file_path": "crates/x/Rust-Toolchain"})).is_some());
         assert_eq!(bash("cargo test --features serde/derive"), None);
         assert_eq!(bash("cargo test --features=serde/derive"), None);

@@ -147,7 +147,25 @@ fn run_item(
             record_round(home, item, round, "no_change", &feedback)?;
             continue;
         }
-        if let Some(failure) = run_checks(&env.path, &checks)? {
+        let checked = git(&env.path, &["rev-parse", "HEAD"])?;
+        let mut failed = run_checks(&env.path, &checks)?;
+        // The checks run the branch's code, which could change the tree or even commit. Put it
+        // back, and fail the round, so nothing lands that the checks didn't judge.
+        let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
+            || !git(&env.path, &["status", "--porcelain"])?.is_empty();
+        if moved {
+            git(
+                &env.path,
+                &["checkout", "-q", "-f", "-B", env.branch.as_str(), &checked],
+            )?;
+            git(&env.path, &["clean", "-q", "-f", "-d"])?;
+            failed.get_or_insert_with(|| {
+                "Running the checks changed the worktree or its commits; the change was put \
+                 back. Tests and builds must not write to the source tree or commit."
+                    .into()
+            });
+        }
+        if let Some(failure) = failed {
             feedback =
                 format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
             record_round(home, item, round, "checks_failed", &failure)?;
@@ -255,6 +273,11 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
         "Bash(git diff*)",
         "Bash(git show*)",
         "Bash(git log*)",
+        "Bash(tail *)",
+        "Bash(head *)",
+        "Bash(grep *)",
+        "Bash(wc *)",
+        "Bash(pwd)",
     ];
     claude(home, env, base, &prompt, &tools, None, false).map(|_| ())
 }
@@ -292,6 +315,11 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Bash(git status*)",
         "Bash(git diff*)",
         "Bash(git log*)",
+        "Bash(tail *)",
+        "Bash(head *)",
+        "Bash(grep *)",
+        "Bash(wc *)",
+        "Bash(pwd)",
         "Bash(git show*)",
     ];
     let before = git(&env.path, &["rev-parse", "HEAD"])?;

@@ -13,3 +13,7 @@ CLAUDE.md
 .claude/
 .cargo/
 rust-toolchain
+rustfmt.toml
+.rustfmt.toml
+clippy.toml
+.clippy.toml
