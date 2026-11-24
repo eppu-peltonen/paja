@@ -30,7 +30,7 @@ enum Command {
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
     /// stdout carries the MCP protocol, so this is the one command that never prints a
-    /// result of its own; startup errors still follow --json.
+    /// result of its own; its errors go to stderr.
     Mcp,
     /// Show the event log, newest last.
     Log {
