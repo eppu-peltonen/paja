@@ -174,6 +174,9 @@ const DIFF_FLAGS: &[&str] = &[
     "-n",
 ];
 
+/// Words that make `cargo run -- ...` change the repository or reach GitHub and Claude.
+const RUN_DENIED: &[&str] = &["create", "remove", "sync", "claim", "set", "run", "mcp"];
+
 /// Variables an agent may set in front of a command.
 const ALLOWED_VARIABLES: &[&str] = &["RUST_BACKTRACE", "RUST_LOG"];
 
@@ -210,10 +213,17 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
         if input.tool_name == "Bash" || (input.tool_name == "Grep" && key == "pattern") {
             continue;
         }
-        if let Some(path) = t[key].as_str().filter(|p| p.starts_with('~')) {
-            return Ok(Some(format!(
-                "`{path}` starts with `~`; give an absolute path or one inside the worktree"
-            )));
+        if let Some(path) = t[key].as_str() {
+            if path.starts_with('~') {
+                return Ok(Some(format!(
+                    "`{path}` starts with `~`; give an absolute path or one inside the worktree"
+                )));
+            }
+            if touches_secret(path) {
+                return Ok(Some(format!(
+                    "`{path}` names a credential path; agents never touch those"
+                )));
+            }
         }
     }
     match input.tool_name.as_str() {
@@ -221,6 +231,11 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             let command = t["command"]
                 .as_str()
                 .context("a Bash call without a command")?;
+            if t["run_in_background"] == Value::Bool(true) {
+                return Ok(Some(
+                    "agents run commands in the foreground, so their output comes back".into(),
+                ));
+            }
             Ok(check_command(command, &cwd, bounds))
         }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
@@ -247,7 +262,10 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 "pattern"
             };
             if let Some(pattern) = t[key].as_str() {
-                if pattern.starts_with('/') || pattern.split('/').any(|part| part == "..") {
+                if pattern.starts_with('/')
+                    || pattern.contains("..")
+                    || pattern.contains(['{', '}'])
+                {
                     return Ok(Some(format!(
                         "the pattern `{pattern}` reaches outside the worktree; search relative to it"
                     )));
@@ -556,6 +574,8 @@ fn check_cargo(args: &[&str]) -> Option<String> {
             },
             "fmt" => *arg == "--check",
             // `cargo run -- --json work list`: the worktree's own binary, with plain words.
+            // Commands that change the repository or reach GitHub are left to the smoke tests.
+            "run" if RUN_DENIED.contains(arg) => false,
             "run" => is_name(arg) || arg.starts_with("--") && is_name(&arg[2..]),
             _ => false,
         };
@@ -684,13 +704,32 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
+/// Whether `text` names a credential path as whole path components, so `.ssh/id_rsa` matches
+/// and `my.sshconfig.txt` does not.
 fn touches_secret(text: &str) -> bool {
-    SECRET_PATHS.iter().any(|secret| text.contains(secret))
+    let path: String = text
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() || "'\"=:;|&<>()`$".contains(c) {
+                '/'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let path = format!("/{path}/");
+    SECRET_PATHS.iter().any(|secret| {
+        path.contains(&format!("/{secret}/")) || path.contains(&format!("/{secret}."))
+    })
 }
 
 /// Resolve symlinks in the part of `path` that exists, and `.` and `..` everywhere, so a link
 /// can't lead out of the worktree and paths that don't exist yet still work.
 fn resolve(path: &Path) -> PathBuf {
+    resolve_within(path, 40)
+}
+
+fn resolve_within(path: &Path, depth: u32) -> PathBuf {
     // Walk one component at a time, as the kernel does: a `..` after a symlink leaves the
     // link's target, not the link.
     let mut out = PathBuf::new();
@@ -707,6 +746,15 @@ fn resolve(path: &Path) -> PathBuf {
                 out.push(other);
                 if let Ok(real) = out.canonicalize() {
                     out = real;
+                } else if let Ok(target) = std::fs::read_link(&out) {
+                    // A link to something that doesn't exist yet: writing through it creates
+                    // its target, so judge the target. Too many links means a loop; treat it as
+                    // somewhere no rule allows.
+                    if depth == 0 {
+                        return PathBuf::from("/");
+                    }
+                    out.pop();
+                    out = resolve_within(&out.join(target), depth - 1);
                 }
             }
         }
@@ -769,7 +817,7 @@ mod tests {
             "git show HEAD:crates/paja/src/lib.rs",
             "pwd",
             "RUST_BACKTRACE=1 cargo test smoke",
-            "cargo run -q -- --json env create demo",
+            "cargo run -q -- --json work list",
             "cd /h/.paja/envs/work-1 && cargo test",
             "cargo test 2>&1|tail -n 20",
             "cargo test | wc -l",
@@ -888,6 +936,8 @@ mod tests {
             "rm -rf target/debug",
             "ls src",
             "cd ./crates/paja && cargo test",
+            "cargo run -q -- --json env create demo",
+            "cargo run -q -- run",
         ] {
             assert!(bash(bad).is_some(), "{bad} should be blocked");
         }
@@ -906,6 +956,14 @@ mod tests {
         assert!(decide("Write", json!({"file_path": ".cargo/config.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "crates/x/.cargo/config.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "sub/.git/config"})).is_some());
+        assert!(decide("Glob", json!({"pattern": "{..,x}/../.ssh/*"})).is_some());
+        assert!(decide("Glob", json!({"pattern": "**/.ssh/*"})).is_some());
+        assert!(decide(
+            "Bash",
+            json!({"command": "cargo test", "run_in_background": true})
+        )
+        .is_some());
+        assert_eq!(bash("git commit -m 'read my.sshconfig.txt'"), None);
         assert!(decide("Read", json!({"file_path": "~/.paja/events.jsonl"})).is_some());
         assert!(decide("Write", json!({"file_path": "~/.bashrc"})).is_some());
         assert!(decide("Read", json!({"file_path": "/proc/self/environ"})).is_some());
@@ -939,6 +997,9 @@ mod tests {
         assert!(call("Write", "link/x").is_some());
         // `link/..` is the link target's parent, outside the worktree.
         assert!(call("Write", "link/../x").is_some());
+        // A link to a file that doesn't exist yet would create it outside.
+        std::os::unix::fs::symlink(outside.join("new"), root.join("dangling")).unwrap();
+        assert!(call("Write", "dangling").is_some());
         assert_eq!(call("Write", "src/new/x.rs"), None);
         std::fs::remove_dir_all(&tmp).unwrap();
     }

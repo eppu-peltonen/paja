@@ -256,7 +256,7 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
         "Bash(git diff*)",
         "Bash(git log*)",
     ];
-    claude(home, env, &prompt, &tools, None).map(|_| ())
+    claude(home, env, base, &prompt, &tools, None).map(|_| ())
 }
 
 fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
@@ -291,7 +291,7 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Bash(git log*)",
         "Bash(git show*)",
     ];
-    let out = claude(home, env, &prompt, &tools, Some(&schema))?;
+    let out = claude(home, env, base, &prompt, &tools, Some(&schema))?;
     let structured = out
         .get("structured_output")
         .cloned()
@@ -312,6 +312,7 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
 fn claude(
     home: &Home,
     env: &Env,
+    base: &str,
     prompt: &str,
     tools: &[&str],
     schema: Option<&Value>,
@@ -319,6 +320,10 @@ fn claude(
     let program = claude_program();
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let settings = hook_settings(&env.path, home.root())?;
+    let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
+        Some(text) => format!("The project's CLAUDE.md, as it is on main:\n\n{text}"),
+        None => String::new(),
+    };
     let scratch = tempfile_dir(&env.path)?;
     let mut cmd = Command::new(&program);
     cmd.current_dir(&env.path)
@@ -332,8 +337,11 @@ fn claude(
             "acceptEdits",
         ])
         // No settings files at all, only the deny-list hook: neither the owner's settings nor
-        // a settings file on the branch can loosen or switch it off. CLAUDE.md still loads.
+        // a settings file on the branch can loosen or switch it off.
         .args(["--setting-sources", "", "--settings", &settings])
+        // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
+        // main: the branch under review can't rewrite the rules its agents follow.
+        .args(["--append-system-prompt", &harness])
         // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
         .arg("--strict-mcp-config")
         .arg("--allowedTools")
@@ -365,6 +373,14 @@ fn claude(
 /// agent never starts under a hook that doesn't.
 fn hook_settings(root: &Path, home: &Path) -> Result<String> {
     let exe = std::env::current_exe().context("finding the paja binary for the deny-list hook")?;
+    // After a rebuild the running binary's path is gone (Linux shows it as "... (deleted)").
+    if !exe.exists() {
+        bail!(
+            "the paja binary {} was replaced while `paja run` was running; restart `paja run` so \
+             agents get the new deny-list hook",
+            exe.display()
+        );
+    }
     let args = [
         "hook".into(),
         "--root".into(),

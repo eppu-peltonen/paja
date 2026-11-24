@@ -81,8 +81,9 @@ issue with the question and marks the item escalated; the branch keeps the work.
 Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config` and settings that send each tool
 call to `paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file
 and no MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it
-off; `CLAUDE.md` still loads. The bounds are passed in rather than read from the tool call, because the reported `cwd`
-moves when the agent runs `cd`.
+off. Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the
+branch under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read
+from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
   tools included, is blocked.
@@ -101,7 +102,8 @@ moves when the agent runs `cd`.
 - **Reads** of single files may look outside the worktree, but not into hidden directories other than dependency
   sources (`.cargo/registry`, `.cargo/git`, `.rustup`), never into `/proc`, `/sys` or `/dev`, and never into the
   factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree. A file tool path may
-  not start with `~`, and nothing may name a credential path (`.ssh`, `.config/gh` and the like).
+  not start with `~`, a search pattern may not hold `..` or braces, and no tool may name a credential path (`.ssh`,
+  `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
 
 It fails closed: unreadable input, missing bounds and a crash all block, and the hook command ends in `|| exit 2` so a

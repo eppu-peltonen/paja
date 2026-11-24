@@ -793,6 +793,8 @@ fn run_builds_reviews_and_lands_an_issue() {
     // settings files that could switch the hook off.
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
     assert!(args.contains("--setting-sources  --settings"), "{args}");
+    // CLAUDE.md doesn't load without setting sources, so main's copy comes with the prompt.
+    assert!(args.contains("--append-system-prompt"), "{args}");
     assert!(
         args.contains("PreToolUse") && args.contains("hook --root") && args.contains("work-5"),
         "{args}"
