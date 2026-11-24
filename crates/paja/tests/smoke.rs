@@ -18,9 +18,15 @@ fn git(dir: &Path, args: &[&str]) {
 
 /// Run `paja --json <args>` and parse its stdout. Returns (success, json).
 fn paja(home: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
+    paja_with(home, cwd, args, &[])
+}
+
+/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
+fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(cwd)
         .env("PAJA_HOME", home)
+        .envs(vars.iter().copied())
         .arg("--json")
         .args(args)
         .output()
@@ -460,7 +466,17 @@ fn the_mcp_server_serves_the_same_core() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    for want in ["env_create", "env_list", "env_show", "env_remove", "log"] {
+    for want in [
+        "env_create",
+        "env_list",
+        "env_show",
+        "env_remove",
+        "log",
+        "work_sync",
+        "work_list",
+        "work_show",
+        "work_next",
+    ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
 
@@ -520,4 +536,93 @@ fn the_mcp_server_serves_the_same_core() {
 
     drop(stdin);
     assert!(child.wait().unwrap().success());
+}
+
+/// A fake `gh` that prints the issues in `issues.json` next to it, and logs its arguments.
+fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(dir.join("issues.json"), issues).unwrap();
+    let script = dir.join("gh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {log}\ncat {issues}\n",
+            log = dir.join("gh.log").display(),
+            issues = dir.join("issues.json").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[test]
+fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = fake_gh(
+        tmp.path(),
+        r#"[{"number": 7, "title": "Later", "body": "", "url": "https://example.com/7"},
+            {"number": 3, "title": "Add a plugin", "body": "Ship it.", "url": "https://example.com/3"}]"#,
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["imported"], serde_json::json!([7, 3]));
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("--label paja") && log.contains("--state open"),
+        "{log}"
+    );
+
+    let (ok, next) = paja(&home, &repo, &["work", "next"]);
+    assert!(ok);
+    assert_eq!(next["number"], 3);
+    assert_eq!(next["status"], "queued");
+    let (ok, shown) = paja(&home, &repo, &["work", "show", "3"]);
+    assert!(ok);
+    assert_eq!(shown["body"], "Ship it.");
+
+    // Issue 3 is closed upstream: the next sync closes it, and 7 is next.
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        r#"[{"number": 7, "title": "Later", "body": "", "url": "https://example.com/7"}]"#,
+    )
+    .unwrap();
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok);
+    assert_eq!(report["closed"], serde_json::json!([3]));
+    let (_, next) = paja(&home, &repo, &["work", "next"]);
+    assert_eq!(next["number"], 7);
+
+    let (ok, missing) = paja(&home, &repo, &["work", "show", "99"]);
+    assert!(!ok);
+    assert!(
+        missing["error"]
+            .as_str()
+            .unwrap()
+            .contains("paja work sync"),
+        "{missing}"
+    );
+}
+
+#[test]
+fn work_sync_says_what_to_do_when_gh_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let missing = tmp.path().join("no-such-gh");
+    let (ok, err) = paja_with(
+        &home,
+        &repo,
+        &["work", "sync"],
+        &[("PAJA_GH", missing.as_path())],
+    );
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("gh auth login"),
+        "{err}"
+    );
 }

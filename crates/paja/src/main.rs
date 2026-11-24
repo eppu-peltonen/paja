@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use paja::ahjo::{self, CreateOptions, Env};
 use paja::home::Home;
+use paja::jono;
 
 /// Paja: a software factory. Every command takes --json for machine-readable output.
 #[derive(Parser)]
@@ -27,6 +28,11 @@ enum Command {
         #[command(subcommand)]
         command: EnvCommand,
     },
+    /// Jono: the work queue, imported from GitHub issues labelled `paja`.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
     /// stdout carries the MCP protocol, so this is the one command that never prints a
@@ -38,6 +44,22 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+}
+
+#[derive(Subcommand)]
+enum WorkCommand {
+    /// Import open issues labelled `paja` from the checkout's GitHub repository (uses `gh`).
+    Sync {
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// List work items, oldest first.
+    List,
+    /// Show one work item by its issue number.
+    Show { number: u64 },
+    /// The next item to work on: the oldest queued one, or null.
+    Next,
 }
 
 #[derive(Subcommand)]
@@ -166,6 +188,44 @@ fn run(cli: &Cli) -> Result<()> {
                 );
             }
         },
+        Command::Work { command } => match command {
+            WorkCommand::Sync { repo } => {
+                let report = jono::sync(&home, repo)?;
+                emit(cli, serde_json::to_value(&report)?, || {
+                    format!(
+                        "imported {:?}, changed {:?}, closed {:?}, reopened {:?}",
+                        report.imported, report.changed, report.closed, report.reopened
+                    )
+                });
+            }
+            WorkCommand::List => {
+                let items = jono::list(&home)?;
+                emit(cli, serde_json::to_value(&items)?, || {
+                    if items.is_empty() {
+                        "no work items; run `paja work sync`".to_string()
+                    } else {
+                        items
+                            .iter()
+                            .map(describe_item)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                });
+            }
+            WorkCommand::Show { number } => {
+                let item = jono::get(&home, *number)?;
+                emit(cli, serde_json::to_value(&item)?, || {
+                    format!("{}\n  {}\n\n{}", describe_item(&item), item.url, item.body)
+                });
+            }
+            WorkCommand::Next => {
+                let item = jono::next(&home)?;
+                emit(cli, serde_json::to_value(&item)?, || {
+                    item.as_ref()
+                        .map_or("nothing queued".to_string(), describe_item)
+                });
+            }
+        },
         Command::Log { limit } => {
             let events = home.events().tail(*limit)?;
             emit(cli, serde_json::to_value(&events)?, || {
@@ -189,6 +249,10 @@ fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
             println!("{text}");
         }
     }
+}
+
+fn describe_item(item: &jono::WorkItem) -> String {
+    format!("#{}\t{:?}\t{}", item.number, item.status, item.title)
 }
 
 fn describe(env: &Env) -> String {

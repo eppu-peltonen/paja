@@ -3,4 +3,5 @@
 pub mod ahjo;
 pub mod events;
 pub mod home;
+pub mod jono;
 pub mod mcp;
