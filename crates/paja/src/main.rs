@@ -27,6 +27,11 @@ enum Command {
         #[command(subcommand)]
         command: EnvCommand,
     },
+    /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
+    ///
+    /// stdout carries the MCP protocol, so this is the one command that never prints a
+    /// result of its own; its errors go to stderr.
+    Mcp,
     /// Show the event log, newest last.
     Log {
         /// Only the last N events.
@@ -106,6 +111,14 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<()> {
     let home = Home::from_env()?;
     match &cli.command {
+        Command::Mcp => {
+            // Once the session is up, stdout is the protocol: report a later failure on
+            // stderr so it can't be read as a frame.
+            if let Err(err) = paja::mcp::serve(home) {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+        }
         Command::Env { command } => match command {
             EnvCommand::Create { name, repo, base } => {
                 let env = ahjo::create(
@@ -148,17 +161,13 @@ fn run(cli: &Cli) -> Result<()> {
                 let env = ahjo::remove(&home, name, *force)?;
                 emit(
                     cli,
-                    json!({ "removed": env.name, "branch_kept": env.branch }),
+                    serde_json::to_value(ahjo::RemoveReport::from(&env))?,
                     || format!("removed {} (branch {} kept)", env.name, env.branch),
                 );
             }
         },
         Command::Log { limit } => {
-            let mut events = home.events().read_all()?;
-            if let Some(limit) = limit {
-                let skip = events.len().saturating_sub(*limit);
-                events.drain(..skip);
-            }
+            let events = home.events().tail(*limit)?;
             emit(cli, serde_json::to_value(&events)?, || {
                 events
                     .iter()

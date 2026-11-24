@@ -50,6 +50,13 @@ current state by replaying it, and every write holds the home lock. See `crates/
 A write cut off by a crash leaves bytes after the last newline. Those were never acknowledged, so the next append
 cuts them off and keeps them in `events.jsonl.torn`; a bad line that ends in a newline is an error, never repaired.
 
+## MCP server
+
+`paja mcp` serves the core as MCP tools over stdio (`env_create`, `env_list`, `env_show`, `env_remove`, `log`), built on
+the official Rust MCP SDK. Claude Code starts it from the project directory, so a tool's `repo` defaults to there. Each
+tool returns the JSON the matching `paja --json` command prints, and a failure is a tool error whose text is
+`{"error": "..."}`.
+
 ## CLI output
 
 Under `--json` every command prints exactly one JSON value on stdout. Failures, usage errors included, carry an

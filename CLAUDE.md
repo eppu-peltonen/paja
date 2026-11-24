@@ -26,6 +26,7 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 - `crates/paja/src/events.rs`: the append-only event log, the core's only source of truth.
 - `crates/paja/src/home.rs`: the state directory (`$PAJA_HOME`, default `~/.paja`) and its lock.
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
+- `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary.
 - `evals/`: harness evals that run headless Claude Code (need a signed-in `claude`; not run in CI).
@@ -38,7 +39,10 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
   readable.
 - **Every write holds the home lock** (`Home::lock`), so sequence numbers and port blocks are never handed out twice.
 - **Every command supports `--json`** and prints exactly one JSON value on stdout, errors as `{"error": "..."}`.
-  Agents and Paja Desk depend on this.
+  Agents and Paja Desk depend on this. The one exception is `paja mcp`, whose stdout is the MCP protocol; each of its
+  tools returns the same JSON as the matching command.
+- **The CLI and the MCP server are two doors to one core.** New behaviour goes in the library modules and is exposed
+  through both, with the same JSON shape.
 - **Errors say what to do.** Include the path, name or command involved and the fix when there is one.
 - **Test behaviour end to end.** New CLI behaviour gets a case in `tests/smoke.rs` that runs the real binary.
 - **Checks stay out of reach of the change they judge.** A change that fixes a failing test must not edit that test;

@@ -70,6 +70,16 @@ impl EventLog {
         Ok(events)
     }
 
+    /// The last `limit` events (all of them when `limit` is None), oldest first.
+    pub fn tail(&self, limit: Option<usize>) -> Result<Vec<Event>> {
+        let mut events = self.read_all()?;
+        if let Some(limit) = limit {
+            let skip = events.len().saturating_sub(limit);
+            events.drain(..skip);
+        }
+        Ok(events)
+    }
+
     /// Append one event. Requires the home lock so sequence numbers stay unique.
     pub fn append(&self, _lock: &HomeLock, kind: &str, data: Value) -> Result<Event> {
         self.repair_tail()?;
