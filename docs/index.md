@@ -11,5 +11,4 @@ owns it. Instructions for agents working on Paja's own code live in [`../CLAUDE.
 | [`design/landing.md`](./design/landing.md) | You need to know who decides whether a change lands, the risk tiers, and when a person is asked |
 | [`design/build-order.md`](./design/build-order.md) | You want to know what gets built next and the exit test for each step |
 | [`design/decisions.md`](./design/decisions.md) | You need a settled decision (language, work source, where workers run, budget) and why |
-| [`design/lineage.md`](./design/lineage.md) | You want to know which public projects shaped each idea |
 | [`glossary.md`](./glossary.md) | You met a Finnish part name and want its meaning |
