@@ -624,8 +624,9 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
         .as_ref()
         .filter(|(root, exe)| root == home.root() && exe.exists())
     {
-        // Keep this run's copy fresh so another run's cleanup leaves it alone.
-        if let Ok(file) = std::fs::File::options().write(true).open(exe) {
+        // Keep this run's copy fresh so another run's cleanup leaves it alone. Opened read-only:
+        // the copy may be running, and a running binary can't be opened for writing.
+        if let Ok(file) = std::fs::File::open(exe) {
             let _ = file.set_modified(std::time::SystemTime::now());
         }
         return Ok(exe.clone());
@@ -679,7 +680,7 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
             })?;
     }
     // A copy keeps the source's age on some systems; make it new so cleanup leaves it be.
-    if let Ok(file) = std::fs::File::options().write(true).open(&exe) {
+    if let Ok(file) = std::fs::File::open(&exe) {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
     *copied = Some((home.root().to_path_buf(), exe.clone()));

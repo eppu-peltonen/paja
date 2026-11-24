@@ -45,6 +45,9 @@ pub struct Bounds {
     pub home: PathBuf,
     /// A reviewer: it reads the change and changes nothing, not even inside the worktree.
     pub read_only: bool,
+    /// Dependency sources and the toolchain, readable although they sit outside the worktree:
+    /// `$CARGO_HOME/registry`, `$CARGO_HOME/git` and `$RUSTUP_HOME`.
+    pub deps: Vec<PathBuf>,
 }
 
 impl Bounds {
@@ -55,10 +58,32 @@ impl Bounds {
                 root: resolve(&root),
                 home: resolve(&home),
                 read_only: false,
+                deps: dependency_roots(),
             }),
             _ => bail!("`paja hook` needs absolute --root and --home paths; Mestari passes both"),
         }
     }
+}
+
+/// Where cargo and rustup keep sources, from the hook's own environment (which the agent
+/// cannot change), with their usual defaults under `$HOME`.
+fn dependency_roots() -> Vec<PathBuf> {
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let home = var("HOME");
+    let cargo = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+    let rustup = var("RUSTUP_HOME").or_else(|| home.as_ref().map(|h| h.join(".rustup")));
+    let mut roots: Vec<PathBuf> = cargo
+        .iter()
+        .flat_map(|c| [c.join("registry"), c.join("git")])
+        .chain(rustup)
+        .map(|p| resolve(&p))
+        .collect();
+    roots.dedup();
+    roots
 }
 
 /// How long the hook may take before it blocks. Mestari gives Claude Code a longer timeout.
@@ -223,10 +248,6 @@ const SECRET_PATHS: &[&str] = &[
     ".docker",
 ];
 
-/// Hidden directories outside the worktree that are still worth reading: dependency
-/// sources and the toolchain.
-const READABLE_HIDDEN: &[&str] = &[".cargo/registry", ".cargo/git", ".rustup"];
-
 /// Tools that touch nothing outside the session. Any tool not named here or handled in
 /// [`check`], MCP tools included, is blocked.
 /// `StructuredOutput` is how Claude Code returns a `--json-schema` result, such as a verdict.
@@ -314,7 +335,7 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 };
                 let literal = pattern
                     .split('/')
-                    .take_while(|part| !part.contains(['*', '?', '[']))
+                    .take_while(|part| !part.contains(['*', '?', '[', '{']))
                     .fold(start, |path, part| path.join(part));
                 if let Some(reason) = within_root("search", &base.join(literal), bounds) {
                     return Ok(Some(reason));
@@ -331,6 +352,14 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                     )));
                 }
             }
+            // A wildcard can walk into a symlink the literal prefix never names.
+            if let Some(link) = link_out(&resolve(&base), bounds, 0) {
+                return Ok(Some(format!(
+                    "{} is a symlink out of the worktree, and searches here could follow it; \
+                     search a directory without it, or Read files by path",
+                    link.display()
+                )));
+            }
             Ok(None)
         }
         "WebFetch" | "WebSearch" => Ok(Some("no network access from agents".into())),
@@ -340,6 +369,30 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
              local git"
         ))),
     }
+}
+
+/// The first symlink under `dir` that leads out of the worktree, if any. Build output and
+/// git's own directory are skipped: agents don't search them, and they are large.
+fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
+    if depth > 32 {
+        return Some(dir.to_path_buf());
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            if !resolve(&path).starts_with(&b.root) {
+                return Some(path);
+            }
+        } else if kind.is_dir() && !matches!(entry.file_name().to_str(), Some(".git" | "target")) {
+            if let Some(found) = link_out(&path, b, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// `path` must be inside the worktree, and not git's link to the repository.
@@ -419,29 +472,21 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
         ));
     }
     let text = full.to_string_lossy();
-    let parts: Vec<String> = full
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    // Where a dependency root (`.cargo/registry`, `.rustup`, ...) starts in the path, if any.
-    let dependency = (0..parts.len()).find(|&n| {
-        READABLE_HIDDEN.iter().any(|dir| {
-            dir.split('/')
-                .enumerate()
-                .all(|(k, want)| parts.get(n + k).map(String::as_str) == Some(want))
-        })
-    });
-    // Hidden directories before it hold credentials and settings; inside it, a crate's own
-    // hidden files are fine.
-    let hidden_ok = parts
-        .iter()
-        .enumerate()
-        .all(|(n, part)| !part.starts_with('.') || dependency.is_some_and(|start| n >= start));
-    let dependency = dependency.is_some();
-    if touches_secret(&text) || !hidden_ok || !(dependency || full.starts_with("/usr")) {
+    // Inside a dependency root, a crate's own hidden files are fine; anywhere else, hidden
+    // directories hold credentials and settings.
+    let readable = if let Some(dep) = b.deps.iter().find(|d| full.starts_with(d)) {
+        !touches_secret(&full.strip_prefix(dep).unwrap_or(&full).to_string_lossy())
+    } else {
+        full.starts_with("/usr")
+            && !touches_secret(&text)
+            && !full
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+    };
+    if !readable {
         return Some(format!(
             "{} is outside the worktree; agents read only the worktree, /usr and dependency \
-             sources (~/.cargo/registry, ~/.cargo/git, ~/.rustup)",
+             sources ($CARGO_HOME/registry, $CARGO_HOME/git, $RUSTUP_HOME)",
             full.display()
         ));
     }
@@ -603,7 +648,7 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
         return Some(format!("an empty command; {SHAPE}"));
     };
     match *program {
-        "cargo" => check_cargo(args),
+        "cargo" => check_cargo(args, b.read_only),
         "git" => check_git(args, here, b),
         "pwd" if args.is_empty() => None,
         // Only into the worktree's root, and only as a step of its own, so a failed `cd`
@@ -623,13 +668,17 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
     }
 }
 
-fn check_cargo(args: &[&str]) -> Option<String> {
+fn check_cargo(args: &[&str], read_only: bool) -> Option<String> {
     let sub = args.first().copied().unwrap_or("");
     if !CARGO_SUBCOMMANDS.contains(&sub) {
         return Some(format!(
             "`cargo {sub}` is not allowed; agents use cargo {}",
             CARGO_SUBCOMMANDS.join(", ")
         ));
+    }
+    // `cargo fmt` rewrites sources unless it only checks them; a reviewer changes nothing.
+    if read_only && sub == "fmt" && !args.contains(&"--check") {
+        return Some("reviewers change nothing: use `cargo fmt --all --check`".into());
     }
     let rest = &args[1..];
     let split = rest.iter().position(|a| *a == "--").unwrap_or(rest.len());
@@ -908,7 +957,12 @@ mod tests {
     const ROOT: &str = "/h/.paja/envs/work-1";
 
     fn bounds() -> Bounds {
-        Bounds::new(Some(ROOT.into()), Some("/h/.paja".into())).unwrap()
+        Bounds {
+            deps: ["/h/.cargo/registry", "/h/.cargo/git", "/h/.rustup"]
+                .map(PathBuf::from)
+                .to_vec(),
+            ..Bounds::new(Some(ROOT.into()), Some("/h/.paja".into())).unwrap()
+        }
     }
 
     fn decide(tool: &str, input: Value) -> Option<String> {
@@ -1115,6 +1169,10 @@ mod tests {
             None
         );
         assert!(decide("Glob", json!({"pattern": "**/.ssh/*"})).is_some());
+        // `-e` would take the pattern and leave the last word to be read as a file.
+        assert!(bash("cargo test 2>&1 | grep -ve -qqq src/lib.rs").is_some());
+        assert!(bash("cargo test 2>&1 | grep -e x src/lib.rs").is_some());
+        assert!(decide("Read", json!({"file_path": "/opt/.cargo/registry/x"})).is_some());
         assert!(decide(
             "Bash",
             json!({"command": "cargo test", "run_in_background": true})
@@ -1165,6 +1223,21 @@ mod tests {
             cwd: root.clone(),
         };
         assert!(check(&glob, &b).unwrap().is_some());
+        // Wildcards and braces can name the link without spelling it out.
+        for pattern in ["l[i]nk/**", "{link,x}/*", "**/*.rs"] {
+            let glob = HookInput {
+                tool_name: "Glob".into(),
+                tool_input: json!({ "pattern": pattern }),
+                cwd: root.clone(),
+            };
+            assert!(check(&glob, &b).unwrap().is_some(), "{pattern}");
+        }
+        let grep = HookInput {
+            tool_name: "Grep".into(),
+            tool_input: json!({"pattern": "x", "glob": "*"}),
+            cwd: root.clone(),
+        };
+        assert!(check(&grep, &b).unwrap().is_some());
         assert_eq!(call("Write", "src/new/x.rs"), None);
         std::fs::remove_dir_all(&tmp).unwrap();
     }
@@ -1208,6 +1281,12 @@ mod tests {
             None
         );
         assert_eq!(call("Read", json!({"file_path": "src/lib.rs"})), None);
+        assert!(call("Bash", json!({"command": "cargo fmt --all"})).is_some());
+        assert_eq!(
+            call("Bash", json!({"command": "cargo fmt --all --check"})),
+            None
+        );
+        assert_eq!(call("Bash", json!({"command": "cargo test"})), None);
     }
 
     #[test]
