@@ -9,8 +9,8 @@ step's exit test passes.
    - *Exit:* Claude Code, inside a fresh environment, can build Paja and run its tests with one command each.
 2. **Interface and plugin, still by hand.** Wrap the core in the CLI and MCP server and ship the Claude Code plugin.
    Every action writes to the event log, and per-chunk metrics are recorded from the start. Before step 3 lets agents
-   run unattended, add the deny-list hook that blocks when it errors, and give Paja its own GitHub App identity, so the
-   first unattended run is already fail-closed and acts under Paja's name.
+   run unattended, add the deny-list hook that blocks when it errors, so the first unattended run is already
+   fail-closed.
    - *Exit:* from a Claude Code session you can create a work item, start an environment and see status without
      leaving the chat.
 3. **First loop: Paja starts building Paja.** Jono with its diff-size budget, and a Mestari graph (plan, build, verify
@@ -23,7 +23,7 @@ step's exit test passes.
    Add revert on a red `main`, the learn step, and the Posti digest of questions and proposed rules.
    - *Exit:* a week of Paja changes landing unattended, every revert explained.
 5. **Safety and limits.** Sandbox each environment on the host and fail closed (no run if the sandbox can't start),
-   scoped short-lived tokens minted from Paja's GitHub App, and pacing that keeps runs inside the account's usage
+   a fine-grained GitHub token limited to the repository being worked on, and pacing that keeps runs inside the account's usage
    limits.
    - *Exit:* a deliberate prompt-injection test cannot reach a secret or push outside its branch.
 6. **Paja Desk, built by Paja.** Write its specs and let the queue build it on the HTTP API.
