@@ -715,7 +715,9 @@ impl Factory {
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
                  \"pr view\") exit 1 ;;\n\
-                 \"pr create\") echo https://example.com/pull/1 ;;\n\
+                 \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
+                 echo https://example.com/pull/1 ;;\n\
+                 \"issue comment\") if [ -f {d}/gh-down ]; then exit 1; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -847,4 +849,22 @@ fn run_checks_come_from_main_not_the_branch() {
         "{report}"
     );
     assert!(!f.gh_log().contains("pr merge"));
+}
+
+#[test]
+fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("gh-down"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert_eq!(report["rounds"], 1);
+    assert!(
+        report["question"].as_str().unwrap().contains("HTTP 502"),
+        "{report}"
+    );
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "never left active");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]), "the worktree is freed");
 }

@@ -43,9 +43,10 @@ enum Command {
         /// Any path inside the repository's checkout (default: current directory).
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// Keep going: after each item take the next, and when the queue is empty check
-        /// again every this many minutes. Prints one JSON value per item.
-        #[arg(long, value_name = "MINUTES")]
+        /// Keep going: after each item take the next, and when the queue is empty or a run
+        /// fails, check again every this many minutes. Prints one JSON value per line, one
+        /// per item.
+        #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
         every: Option<u64>,
     },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
@@ -214,25 +215,31 @@ fn run(cli: &Cli) -> Result<()> {
             }
         },
         Command::Run { repo, every } => loop {
-            let report = mestari::run_once(&home, mestari::RunOptions { repo })?;
-            let idle = matches!(report, mestari::RunReport::Idle);
-            emit(cli, serde_json::to_value(&report)?, || match &report {
-                mestari::RunReport::Idle => "nothing queued".to_string(),
-                mestari::RunReport::Landed { number, pr, rounds } => {
-                    format!("#{number} landed in {rounds} round(s): {pr}")
+            let outcome = mestari::run_once(&home, mestari::RunOptions { repo });
+            let Some(minutes) = every else {
+                let report = outcome?;
+                emit(cli, serde_json::to_value(&report)?, || {
+                    describe_run(&report)
+                });
+                break;
+            };
+            // A long-running loop reports an error and carries on; it must not stop the factory.
+            let idle = match outcome {
+                Ok(report) => {
+                    emit(cli, serde_json::to_value(&report)?, || {
+                        describe_run(&report)
+                    });
+                    matches!(report, mestari::RunReport::Idle)
                 }
-                mestari::RunReport::Escalated {
-                    number, question, ..
-                } => {
-                    format!("#{number} escalated:\n{question}")
+                Err(err) => {
+                    emit(cli, json!({ "error": format!("{err:#}") }), || {
+                        format!("error: {err:#}")
+                    });
+                    true
                 }
-            });
-            match every {
-                None => break,
-                Some(minutes) if idle => {
-                    std::thread::sleep(std::time::Duration::from_secs(minutes * 60))
-                }
-                Some(_) => {}
+            };
+            if idle {
+                std::thread::sleep(std::time::Duration::from_secs(minutes.saturating_mul(60)));
             }
         },
         Command::Work { command } => match command {
@@ -311,6 +318,18 @@ fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
         if !text.is_empty() {
             println!("{text}");
         }
+    }
+}
+
+fn describe_run(report: &mestari::RunReport) -> String {
+    match report {
+        mestari::RunReport::Idle => "nothing queued".to_string(),
+        mestari::RunReport::Landed { number, pr, rounds } => {
+            format!("#{number} landed in {rounds} round(s): {pr}")
+        }
+        mestari::RunReport::Escalated {
+            number, question, ..
+        } => format!("#{number} escalated:\n{question}"),
     }
 }
 

@@ -83,7 +83,8 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         return Ok(RunReport::Idle);
     };
     // Anything that goes wrong from here is reported on the issue, not lost.
-    match run_item(home, &repo, &base, &item) {
+    let mut rounds = 0;
+    match run_item(home, &repo, &base, &item, &mut rounds) {
         Ok(report) => Ok(report),
         Err(err) => {
             let question = format!(
@@ -91,17 +92,31 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                  Fix the cause, then set the item back to queued with `paja work set {} queued`.",
                 item.number
             );
-            escalate(home, &repo, &item, &question, 0)?;
+            // Park the item first, so it never stays active if GitHub is the thing failing.
+            jono::set_status(home, item.number, Status::Escalated, Some(&question))?;
+            record(
+                home,
+                EV_ESCALATED,
+                json!({ "number": item.number, "rounds": rounds }),
+            )?;
+            let _ = comment(&repo, &item, &question);
+            let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
                 number: item.number,
                 question,
-                rounds: 0,
+                rounds,
             })
         }
     }
 }
 
-fn run_item(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<RunReport> {
+fn run_item(
+    home: &Home,
+    repo: &Path,
+    base: &str,
+    item: &WorkItem,
+    rounds: &mut u32,
+) -> Result<RunReport> {
     let checks = read_from_base(repo, base, CHECKS_FILE)?.with_context(|| {
         format!("{CHECKS_FILE} is missing on main; add the check commands there")
     })?;
@@ -116,6 +131,7 @@ fn run_item(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<Run
 
     let mut feedback = String::new();
     for round in 1..=MAX_ROUNDS {
+        *rounds = round;
         build(&env, item, base, &feedback)?;
         commit_leftovers(&env, item)?;
         if git(
@@ -133,9 +149,15 @@ fn run_item(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<Run
             record_round(home, item, round, "checks_failed", &failure)?;
             continue;
         }
+        // --no-renames lists both sides of a rename, so moving a high-risk file keeps it high risk.
         let changed = git(
             &env.path,
-            &["diff", "--name-only", &format!("{base}...HEAD")],
+            &[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                &format!("{base}...HEAD"),
+            ],
         )?;
         let risky = changed.lines().any(|path| {
             high_risk
@@ -269,7 +291,16 @@ fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
         .get("structured_output")
         .cloned()
         .context("the reviewer returned no verdict")?;
-    serde_json::from_value(structured).context("the reviewer's verdict has the wrong shape")
+    let mut review: Review =
+        serde_json::from_value(structured).context("the reviewer's verdict has the wrong shape")?;
+    // A verdict without its details still has to give the builder or the person something.
+    if review.comments.trim().is_empty() {
+        review.comments = review.summary.clone();
+    }
+    if review.question.trim().is_empty() {
+        review.question = review.summary.clone();
+    }
+    Ok(review)
 }
 
 /// Run headless Claude Code in the environment and return its JSON result.
@@ -381,9 +412,18 @@ fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Re
          reviewer agent approved it.",
         item.number
     );
+    // Reuse this branch's pull request only while it is still open.
     let pr = match run_gh(
         repo,
-        &["pr", "view", branch, "--json", "url", "--jq", ".url"],
+        &[
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "url,state",
+            "--jq",
+            "select(.state == \"OPEN\") | .url",
+        ],
     ) {
         Ok(url) if !url.is_empty() => url,
         _ => run_gh(
@@ -395,19 +435,22 @@ fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Re
         )?,
     };
     // CI must be green before landing; a red CI is a failed check, not a merge.
-    if let Err(err) = run_gh(repo, &["pr", "checks", &pr, "--watch", "--fail-fast"]) {
-        let question = format!("CI failed on {pr}, so Paja did not land it:\n\n{err:#}");
+    if let Err(err) = wait_for_ci(repo, &pr) {
+        let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
         return escalated(home, repo, env, item, &question, rounds);
     }
+    // Free the worktree first: gh deletes the local branch too, which git refuses while a
+    // worktree has it checked out.
+    ahjo::remove(home, &env.name, true)?;
     run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
         .with_context(|| format!("{gh} pr merge {pr}"))?;
-    jono::set_status(home, item.number, Status::Landed, Some(&pr))?;
-    record(
+    // Merged: from here nothing may turn this into an escalation.
+    let _ = jono::set_status(home, item.number, Status::Landed, Some(&pr));
+    let _ = record(
         home,
         EV_LANDED,
         json!({ "number": item.number, "pr": pr, "rounds": rounds }),
-    )?;
-    ahjo::remove(home, &env.name, true)?;
+    );
     Ok(RunReport::Landed {
         number: item.number,
         pr,
@@ -423,9 +466,9 @@ fn escalated(
     question: &str,
     rounds: u32,
 ) -> Result<RunReport> {
-    escalate(home, repo, item, question, rounds)?;
     // The branch keeps the work; the worktree and its ports are freed.
-    ahjo::remove(home, &env.name, true)?;
+    let _ = ahjo::remove(home, &env.name, true);
+    escalate(home, repo, item, question, rounds)?;
     Ok(RunReport::Escalated {
         number: item.number,
         question: question.to_string(),
@@ -435,6 +478,18 @@ fn escalated(
 
 /// Ask the person on the issue, and park the item until they answer.
 fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u32) -> Result<()> {
+    // Park the item first, so it never stays active if the comment fails.
+    jono::set_status(home, item.number, Status::Escalated, Some(question))?;
+    record(
+        home,
+        EV_ESCALATED,
+        json!({ "number": item.number, "rounds": rounds }),
+    )?;
+    comment(repo, item, question)
+}
+
+/// Ask the person on the issue.
+fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
     let body = format!(
         "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer here, then run \
          `paja work set {} queued` to try again.",
@@ -450,13 +505,26 @@ fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u
             &body,
         ],
     )?;
-    jono::set_status(home, item.number, Status::Escalated, Some(question))?;
-    record(
-        home,
-        EV_ESCALATED,
-        json!({ "number": item.number, "rounds": rounds }),
-    )?;
     Ok(())
+}
+
+/// Wait until GitHub has registered checks on the pull request, then until they finish.
+/// A pull request that gets no checks at all is not treated as green.
+fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
+    const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    loop {
+        match run_gh(repo, &["pr", "checks", pr, "--watch", "--fail-fast"]) {
+            Ok(_) => return Ok(()),
+            Err(err) if format!("{err:#}").contains("no checks reported") => {
+                if start.elapsed() > APPEAR {
+                    bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn record(home: &Home, kind: &str, data: Value) -> Result<()> {
