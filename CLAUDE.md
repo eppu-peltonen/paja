@@ -44,9 +44,9 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
   readable.
 - **Every write holds the home lock** (`Home::lock`), so sequence numbers and port blocks are never handed out twice.
 - **Every command supports `--json`** and prints exactly one JSON value on stdout, errors as `{"error": "..."}`.
-  Agents and Paja Desk depend on this. Two exceptions: `paja mcp`, whose stdout is the MCP protocol (each tool
-  returns the same JSON as the matching command), and `paja run --every`, which prints one JSON value per line, one
-  per item, for as long as it runs.
+  Agents and Paja Desk depend on this. Three exceptions: `paja mcp`, whose stdout is the MCP protocol (each tool
+  returns the same JSON as the matching command); `paja run --every`, which prints one JSON value per line, one per
+  item, for as long as it runs; and `paja hook`, which Claude Code reads by exit code and stderr only.
 - **The CLI and the MCP server are two doors to one core.** New behaviour goes in the library modules and is exposed
   through both, with the same JSON shape.
 - **Errors say what to do.** Include the path, name or command involved and the fix when there is one.

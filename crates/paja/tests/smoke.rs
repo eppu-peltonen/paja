@@ -789,14 +789,12 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]));
-    // Every agent runs under the deny-list hook, with project settings only.
+    // Every agent runs under the deny-list hook, bounded to its environment, and with no
+    // settings files that could switch the hook off.
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert!(args.contains("--setting-sources  --settings"), "{args}");
     assert!(
-        args.contains("--setting-sources project --settings"),
-        "{args}"
-    );
-    assert!(
-        args.contains("PreToolUse") && args.contains("hook"),
+        args.contains("PreToolUse") && args.contains("hook --root") && args.contains("work-5"),
         "{args}"
     );
     // Agents never see the factory's own PAJA_HOME.
@@ -895,10 +893,15 @@ fn an_empty_checks_file_is_an_error_not_a_pass() {
 
 /// Run `paja hook` with a tool call on stdin; returns its exit code and stderr.
 fn hook(input: &str) -> (Option<i32>, String) {
+    hook_with(&["--root", "/w/env", "--home", "/w/home"], input)
+}
+
+fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
     use std::io::Write;
     use std::process::Stdio;
     let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
         .arg("hook")
+        .args(args)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -932,4 +935,19 @@ fn the_deny_list_hook_blocks_and_fails_closed() {
     let (code, why) = hook("not json");
     assert_eq!(code, Some(2));
     assert!(why.contains("fails closed"), "{why}");
+    // So does a hook started without its bounds.
+    let (code, why) = hook_with(&[], &call("cargo test"));
+    assert_eq!(code, Some(2));
+    assert!(why.contains("--root"), "{why}");
+    // The factory's own state is off limits, the environment inside it is not.
+    let read = |path: &str| {
+        serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": path}, "cwd": "/w/home/envs/a"})
+            .to_string()
+    };
+    let inside = ["--root", "/w/home/envs/a", "--home", "/w/home"];
+    assert_eq!(hook_with(&inside, &read("/w/home/events.jsonl")).0, Some(2));
+    assert_eq!(
+        hook_with(&inside, &read("/w/home/envs/a/src/lib.rs")).0,
+        Some(0)
+    );
 }

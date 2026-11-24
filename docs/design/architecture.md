@@ -78,13 +78,26 @@ issue with the question and marks the item escalated; the branch keeps the work.
 
 ## The deny-list hook
 
-Every agent Mestari starts runs with `--setting-sources project` and settings that send each tool call to `paja hook`
-as a Claude Code `PreToolUse` hook, so neither the owner's settings nor the branch's can loosen it. The hook blocks
-pushing, GitHub and network commands, `sudo`, switching branches or rewriting history, publishing or installing, changes
-to `PAJA_HOME`, anything touching credential paths (`~/.ssh`, `~/.config/gh` and the like), writes outside the
-environment's worktree, and `rm` outside it. It splits commands at `;`, `&&`, `|` and substitutions so a denied command
-can't hide behind another. It fails closed: unreadable input blocks too, and before each agent Mestari checks that the
-hook blocks a `git push`, refusing to start the agent if it doesn't.
+Every agent Mestari starts runs with `--setting-sources ""` and settings that send each tool call to
+`paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file is loaded,
+so neither the owner's settings nor a file on the branch can loosen the hook or switch it off; `CLAUDE.md` still loads.
+The bounds are passed in rather than read from the tool call, because the reported `cwd` moves when the agent runs `cd`.
+
+- **Shell commands** are split into simple commands at `;`, `&&`, `||`, `|`, `&`, subshells and substitutions (also
+  inside double quotes), with quotes and backslashes removed. Each must start with a program on an allowlist, named
+  without a path: cargo, local git, and plain file and text tools. Shells, interpreters, `env`, `xargs` and network
+  tools are not on it. Git is limited to local subcommands (add, commit, status, diff, log, show, stash and the like);
+  cargo can't publish or install; `find` can't run or delete; `sed -i` is out. Setting `PATH`, `GIT_*`, `LD_*` or
+  `RUSTC_WRAPPER` is blocked.
+- **Writes** stay in the environment: file edits, `rm`, `cp`, `mv`, `mkdir`, `touch`, `cd` and output redirections
+  must resolve inside the root, and a path the shell would expand first (`~`, `$`, globs) is blocked.
+- **Reads** may look outside the worktree, but nothing may touch credential paths (`~/.ssh`, `~/.config/gh` and the
+  like) or the factory home outside the environment, including via `Glob` patterns and `Grep` globs.
+- **Network tools** (`WebFetch`, `WebSearch`) are blocked.
+
+It fails closed: unreadable input, missing bounds and a crash all block. Before each agent Mestari checks that the
+hook blocks a `git push` with the deny-list's message and allows `cargo test`, and refuses to start the agent if
+not. The hook is a guardrail, not a sandbox: code the agent writes still runs under `cargo test`.
 
 ## MCP server
 

@@ -50,9 +50,17 @@ enum Command {
         every: Option<u64>,
     },
     /// The deny-list hook Mestari runs agents under (Claude Code `PreToolUse`). Reads the
-    /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow.
+    /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow. Prints no
+    /// JSON: Claude Code reads only its exit code and stderr.
     #[command(hide = true)]
-    Hook,
+    Hook {
+        /// The agent's environment: the only place it may change files.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// The factory's home, which agents never touch.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
     /// stdout carries the MCP protocol, so this is the one command that never prints a
@@ -147,8 +155,8 @@ fn main() -> ExitCode {
             return code;
         }
     };
-    if matches!(cli.command, Command::Hook) {
-        return run_hook();
+    if let Command::Hook { root, home } = &cli.command {
+        return run_hook(root.clone(), home.clone());
     }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -164,12 +172,18 @@ fn main() -> ExitCode {
 }
 
 /// Fail closed: anything but a clear "allowed" blocks the call.
-fn run_hook() -> ExitCode {
+fn run_hook(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
+    // A panic would exit 101, which Claude Code treats as "allow"; block instead.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("Blocked: Paja's deny-list hook crashed ({info}), so it fails closed");
+        std::process::exit(2);
+    }));
     let decision = (|| -> Result<Option<String>> {
+        let bounds = paja::hook::Bounds::new(root, home)?;
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
         let input: paja::hook::HookInput = serde_json::from_str(&input)?;
-        paja::hook::check(&input)
+        paja::hook::check(&input, &bounds)
     })();
     match decision {
         Ok(None) => ExitCode::SUCCESS,
@@ -189,7 +203,7 @@ fn run_hook() -> ExitCode {
 fn run(cli: &Cli) -> Result<()> {
     let home = Home::from_env()?;
     match &cli.command {
-        Command::Hook => unreachable!("handled before the home is opened"),
+        Command::Hook { .. } => unreachable!("handled before the home is opened"),
         Command::Mcp => {
             // Once the session is up, stdout is the protocol: report a later failure on
             // stderr so it can't be read as a frame.

@@ -136,7 +136,7 @@ fn run_item(
     let mut feedback = String::new();
     for round in 1..=MAX_ROUNDS {
         *rounds = round;
-        build(&env, item, base, &feedback)?;
+        build(home, &env, item, base, &feedback)?;
         commit_leftovers(&env, item)?;
         if git(
             &env.path,
@@ -170,7 +170,7 @@ fn run_item(
         });
         let reviewers = if risky { 2 } else { 1 };
         let reviews = (0..reviewers)
-            .map(|_| review(&env, item, base))
+            .map(|_| review(home, &env, item, base))
             .collect::<Result<Vec<_>>>()?;
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
         record_round(home, item, round, &verdicts.join(","), &summaries(&reviews))?;
@@ -227,7 +227,7 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
     )
 }
 
-fn build(env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<()> {
+fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<()> {
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
@@ -255,10 +255,10 @@ fn build(env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<()> {
         "Bash(git diff*)",
         "Bash(git log*)",
     ];
-    claude(env, &prompt, &tools, None).map(|_| ())
+    claude(home, env, &prompt, &tools, None).map(|_| ())
 }
 
-fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
+fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
     let prompt = format!(
         "You are an independent reviewer for Paja. You did not write this change. Read it cold \
          and decide whether it lands.\n\nThe change is `git diff {base}...HEAD`. Judge it against \
@@ -290,7 +290,7 @@ fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
         "Bash(git log*)",
         "Bash(git show*)",
     ];
-    let out = claude(env, &prompt, &tools, Some(&schema))?;
+    let out = claude(home, env, &prompt, &tools, Some(&schema))?;
     let structured = out
         .get("structured_output")
         .cloned()
@@ -308,11 +308,17 @@ fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
 }
 
 /// Run headless Claude Code in the environment and return its JSON result.
-fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Result<Value> {
+fn claude(
+    home: &Home,
+    env: &Env,
+    prompt: &str,
+    tools: &[&str],
+    schema: Option<&Value>,
+) -> Result<Value> {
     let program = claude_program();
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let scratch = tempfile_dir(&env.path)?;
-    let settings = hook_settings()?;
+    let settings = hook_settings(&env.path, home.root())?;
     let mut cmd = Command::new(&program);
     cmd.current_dir(&env.path)
         .env("PAJA_HOME", &scratch)
@@ -324,9 +330,9 @@ fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Re
             "--permission-mode",
             "acceptEdits",
         ])
-        // Project settings only, plus the deny-list hook: the owner's own settings and any
-        // settings on the branch can't loosen it.
-        .args(["--setting-sources", "project", "--settings", &settings])
+        // No settings files at all, only the deny-list hook: neither the owner's settings nor
+        // a settings file on the branch can loosen or switch it off. CLAUDE.md still loads.
+        .args(["--setting-sources", "", "--settings", &settings])
         .arg("--allowedTools")
         .args(tools);
     if let Some(schema) = schema {
@@ -351,32 +357,35 @@ fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Re
     Ok(value)
 }
 
-/// Claude Code settings that run every tool call through `paja hook`. Before handing them
-/// out, check that the hook really blocks; an agent never starts under a hook that doesn't.
-fn hook_settings() -> Result<String> {
+/// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
+/// Before handing them out, check that the hook really blocks a push and allows a build; an
+/// agent never starts under a hook that doesn't.
+fn hook_settings(root: &Path, home: &Path) -> Result<String> {
     let exe = std::env::current_exe().context("finding the paja binary for the deny-list hook")?;
-    let mut test = Command::new(&exe)
-        .arg("hook")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("starting the deny-list hook {}", exe.display()))?;
-    std::io::Write::write_all(
-        test.stdin.as_mut().context("the hook's stdin")?,
-        crate::hook::self_test_input().as_bytes(),
-    )?;
-    drop(test.stdin.take());
-    if test.wait()?.code() != Some(2) {
+    let args = [
+        "hook".into(),
+        "--root".into(),
+        root.as_os_str().to_owned(),
+        "--home".into(),
+        home.as_os_str().to_owned(),
+    ];
+    let (push, build) = crate::hook::self_test_inputs(root);
+    let (code, stderr) = run_hook_once(&exe, &args, &push)?;
+    let blocked = code == Some(2) && stderr.contains("Blocked by Paja's deny-list");
+    let (code, _) = run_hook_once(&exe, &args, &build)?;
+    if !blocked || code != Some(0) {
         bail!(
-            "the deny-list hook {} did not block a `git push` in its self-test, so no agent will \
-             start; rebuild paja from main",
+            "the deny-list hook {} failed its self-test (it must block `git push` and allow \
+             `cargo test`), so no agent will start; rebuild paja from main",
             exe.display()
         );
     }
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     let command = format!(
-        "'{}' hook",
-        exe.display().to_string().replace('\'', r"'\''")
+        "{} hook --root {} --home {}",
+        quote(&exe.to_string_lossy()),
+        quote(&root.to_string_lossy()),
+        quote(&home.to_string_lossy())
     );
     Ok(json!({
         "hooks": {
@@ -384,6 +393,30 @@ fn hook_settings() -> Result<String> {
         }
     })
     .to_string())
+}
+
+fn run_hook_once(
+    exe: &Path,
+    args: &[std::ffi::OsString],
+    input: &str,
+) -> Result<(Option<i32>, String)> {
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting the deny-list hook {}", exe.display()))?;
+    std::io::Write::write_all(
+        child.stdin.as_mut().context("the hook's stdin")?,
+        input.as_bytes(),
+    )?;
+    drop(child.stdin.take());
+    let out = child.wait_with_output()?;
+    Ok((
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }
 
 fn tempfile_dir(near: &Path) -> Result<PathBuf> {
