@@ -12,6 +12,9 @@ use serde_json::json;
 use crate::events::Event;
 use crate::home::Home;
 
+/// Most issues one sync reads. A sync that hits it refuses to close anything.
+pub const FETCH_LIMIT: usize = 1000;
+
 /// The label that puts an issue in Jono.
 pub const LABEL: &str = "paja";
 
@@ -33,8 +36,17 @@ pub enum Status {
     Landed,
     /// Waiting on a person's answer on the issue.
     Escalated,
-    /// Closed on GitHub, or no longer labelled.
-    Closed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Queued => "queued",
+            Status::Active => "active",
+            Status::Landed => "landed",
+            Status::Escalated => "escalated",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +56,9 @@ pub struct WorkItem {
     pub title: String,
     pub body: String,
     pub url: String,
+    /// Whether the issue is open and labelled `paja`. A closed issue keeps its status, so an
+    /// escalation's question or a landing survives the issue closing and reopening.
+    pub open: bool,
     pub status: Status,
     /// Why the status last changed, for example the escalation question.
     #[serde(default)]
@@ -97,6 +112,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                         title: issue.title,
                         body: issue.body,
                         url: issue.url,
+                        open: true,
                         status: Status::Queued,
                         note: None,
                     },
@@ -115,12 +131,12 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                 let n: Number =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
                 if let Some(item) = items.get_mut(&n.number) {
-                    item.status = if event.kind == EV_CLOSED {
-                        Status::Closed
-                    } else {
-                        Status::Queued
-                    };
-                    item.note = None;
+                    item.open = event.kind == EV_REOPENED;
+                    // A landed issue opened again (say after a revert) needs work again.
+                    if item.open && item.status == Status::Landed {
+                        item.status = Status::Queued;
+                        item.note = None;
+                    }
                 }
             }
             EV_STATUS => {
@@ -151,11 +167,38 @@ pub fn get(home: &Home, number: u64) -> Result<WorkItem> {
         })
 }
 
-/// The next item to work on: the oldest queued issue. None when the queue is empty.
+fn is_ready(item: &WorkItem) -> bool {
+    item.open && item.status == Status::Queued
+}
+
+/// The next item to work on: the oldest open, queued issue. None when the queue is empty.
 pub fn next(home: &Home) -> Result<Option<WorkItem>> {
-    Ok(list(home)?
-        .into_iter()
-        .find(|item| item.status == Status::Queued))
+    Ok(list(home)?.into_iter().find(is_ready))
+}
+
+/// Take the next item and mark it active in one step under the home lock, so two runs
+/// never pick up the same item.
+pub fn claim(home: &Home) -> Result<Option<WorkItem>> {
+    let lock = home.lock()?;
+    let log = home.events();
+    let Some(mut item) = replay(&log.read_all()?)?.into_values().find(is_ready) else {
+        return Ok(None);
+    };
+    log.append(
+        &lock,
+        EV_STATUS,
+        json!({ "number": item.number, "status": Status::Active, "note": null }),
+    )?;
+    item.status = Status::Active;
+    item.note = None;
+    Ok(Some(item))
+}
+
+/// Read a status name as the CLI and MCP tools take it.
+pub fn parse_status(name: &str) -> Result<Status> {
+    serde_json::from_value(json!(name)).map_err(|_| {
+        anyhow::anyhow!("unknown status {name:?}; use queued, active, landed or escalated")
+    })
 }
 
 /// Record a status change, for example when a run picks an item up or escalates it.
@@ -182,6 +225,12 @@ pub fn set_status(
 
 /// Import the open issues labelled `paja` from the GitHub repository of the checkout at `repo`.
 pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
+    if !repo.is_dir() {
+        bail!(
+            "{} is not a directory; pass --repo with a path inside the checkout",
+            repo.display()
+        );
+    }
     let issues = fetch_issues(repo)?;
     apply(home, &issues)
 }
@@ -200,7 +249,7 @@ pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
                 report.imported.push(issue.number);
             }
             Some(item) => {
-                if item.status == Status::Closed {
+                if !item.open {
                     log.append(&lock, EV_REOPENED, json!({ "number": issue.number }))?;
                     report.reopened.push(issue.number);
                 }
@@ -212,9 +261,8 @@ pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
         }
     }
     for item in items.values() {
-        // Landed items stay landed; anything else no longer open is closed.
         let still_open = open.iter().any(|issue| issue.number == item.number);
-        if !still_open && !matches!(item.status, Status::Closed | Status::Landed) {
+        if item.open && !still_open {
             log.append(&lock, EV_CLOSED, json!({ "number": item.number }))?;
             report.closed.push(item.number);
         }
@@ -239,7 +287,7 @@ fn fetch_issues(repo: &Path) -> Result<Vec<Issue>> {
             "--state",
             "open",
             "--limit",
-            "500",
+            &FETCH_LIMIT.to_string(),
             "--json",
             "number,title,body,url",
         ])
@@ -254,9 +302,17 @@ fn fetch_issues(repo: &Path) -> Result<Vec<Issue>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    serde_json::from_slice(&output.stdout).with_context(|| {
+    let issues: Vec<Issue> = serde_json::from_slice(&output.stdout).with_context(|| {
         format!("`{gh} issue list` printed something that is not a list of issues")
-    })
+    })?;
+    if issues.len() >= FETCH_LIMIT {
+        // A full page may be cut short, and closing what is missing would drop real work.
+        bail!(
+            "{FETCH_LIMIT} or more open issues are labelled `{LABEL}`, more than one sync reads; \
+             close or unlabel some, then rerun"
+        );
+    }
+    Ok(issues)
 }
 
 #[cfg(test)]
@@ -287,25 +343,46 @@ mod tests {
 
         let second = apply(&home, &[issue(2, "b2")]).unwrap();
         assert_eq!((second.changed, second.closed), (vec![2], vec![1]));
-        assert_eq!(get(&home, 1).unwrap().status, Status::Closed);
+        assert!(!get(&home, 1).unwrap().open);
+        assert_eq!(next(&home).unwrap().unwrap().number, 2);
         assert_eq!(get(&home, 2).unwrap().title, "b2");
 
         let third = apply(&home, &[issue(1, "a"), issue(2, "b2")]).unwrap();
         assert_eq!(third.reopened, vec![1]);
-        assert_eq!(get(&home, 1).unwrap().status, Status::Queued);
+        assert!(get(&home, 1).unwrap().open);
+        assert_eq!(next(&home).unwrap().unwrap().number, 1);
     }
 
     #[test]
-    fn landed_items_stay_landed_and_status_is_replayed() {
+    fn status_survives_close_and_reopen_but_a_reopened_landing_is_requeued() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path()).unwrap();
         apply(&home, &[issue(1, "a"), issue(2, "b")]).unwrap();
         set_status(&home, 1, Status::Landed, None).unwrap();
         set_status(&home, 2, Status::Escalated, Some("which API?")).unwrap();
         assert!(next(&home).unwrap().is_none());
+
         apply(&home, &[]).unwrap();
-        assert_eq!(get(&home, 1).unwrap().status, Status::Landed);
-        assert_eq!(get(&home, 2).unwrap().status, Status::Closed);
+        apply(&home, &[issue(1, "a"), issue(2, "b")]).unwrap();
+        let escalated = get(&home, 2).unwrap();
+        assert_eq!(escalated.status, Status::Escalated);
+        assert_eq!(escalated.note.as_deref(), Some("which API?"));
+        assert_eq!(
+            get(&home, 1).unwrap().status,
+            Status::Queued,
+            "reverted work is queued"
+        );
         assert!(format!("{:#}", get(&home, 9).unwrap_err()).contains("paja work sync"));
+    }
+
+    #[test]
+    fn claim_hands_each_item_out_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        apply(&home, &[issue(1, "a"), issue(2, "b")]).unwrap();
+        assert_eq!(claim(&home).unwrap().unwrap().number, 1);
+        assert_eq!(claim(&home).unwrap().unwrap().number, 2);
+        assert!(claim(&home).unwrap().is_none());
+        assert_eq!(get(&home, 1).unwrap().status, Status::Active);
     }
 }

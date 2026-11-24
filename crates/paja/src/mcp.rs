@@ -64,6 +64,16 @@ pub struct NumberArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct SetArgs {
+    /// The GitHub issue number.
+    number: u64,
+    /// queued, active, landed or escalated.
+    status: String,
+    /// Why, for example the question an escalation asks.
+    note: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
     /// Only the last N events.
     limit: Option<usize>,
@@ -164,6 +174,31 @@ impl PajaMcp {
     async fn work_next(&self) -> Result<String, String> {
         let home = self.home.clone();
         call(move || Ok(serde_json::to_value(jono::next(&home)?)?)).await
+    }
+
+    #[tool(
+        description = "Jono: take the next item and mark it active in one step, so two runs never share one. Null when nothing is queued."
+    )]
+    async fn work_claim(&self) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || Ok(serde_json::to_value(jono::claim(&home)?)?)).await
+    }
+
+    #[tool(
+        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note."
+    )]
+    async fn work_set(&self, Parameters(args): Parameters<SetArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let status = jono::parse_status(&args.status)?;
+            Ok(serde_json::to_value(jono::set_status(
+                &home,
+                args.number,
+                status,
+                args.note.as_deref(),
+            )?)?)
+        })
+        .await
     }
 
     #[tool(description = "Show the event log, oldest first.")]

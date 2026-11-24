@@ -476,6 +476,8 @@ fn the_mcp_server_serves_the_same_core() {
         "work_list",
         "work_show",
         "work_next",
+        "work_claim",
+        "work_set",
     ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
@@ -523,6 +525,19 @@ fn the_mcp_server_serves_the_same_core() {
     assert!(
         err["error"].as_str().unwrap().contains("already exists"),
         "{err}"
+    );
+    // Jono over MCP: nothing imported yet, so next is null and show says how to import.
+    let (ok, next) = call(&mut request, "work_next", serde_json::json!({}));
+    assert!(ok);
+    assert!(next.is_null(), "{next}");
+    let (ok, missing) = call(&mut request, "work_show", serde_json::json!({"number": 1}));
+    assert!(!ok);
+    assert!(
+        missing["error"]
+            .as_str()
+            .unwrap()
+            .contains("paja work sync"),
+        "{missing}"
     );
     let (ok, removed) = call(
         &mut request,
@@ -584,8 +599,31 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     let (ok, shown) = paja(&home, &repo, &["work", "show", "3"]);
     assert!(ok);
     assert_eq!(shown["body"], "Ship it.");
+    let (ok, listed) = paja(&home, &repo, &["work", "list"]);
+    assert!(ok);
+    assert_eq!(listed.as_array().unwrap().len(), 2);
 
-    // Issue 3 is closed upstream: the next sync closes it, and 7 is next.
+    // Claim hands out 3 and marks it active; an escalation keeps its question.
+    let (ok, claimed) = paja(&home, &repo, &["work", "claim"]);
+    assert!(ok);
+    assert_eq!(claimed["number"], 3);
+    assert_eq!(claimed["status"], "active");
+    let (ok, esc) = paja(
+        &home,
+        &repo,
+        &["work", "set", "3", "escalated", "--note", "Which API?"],
+    );
+    assert!(ok, "{esc}");
+    assert_eq!(esc["note"], "Which API?");
+    let (ok, bad) = paja(&home, &repo, &["work", "set", "3", "done"]);
+    assert!(!ok);
+    assert!(
+        bad["error"].as_str().unwrap().contains("queued, active"),
+        "{bad}"
+    );
+    paja(&home, &repo, &["work", "set", "3", "queued"]);
+
+    // Issue 3 is closed upstream: the next sync marks it closed, and 7 is next.
     std::fs::write(
         tmp.path().join("issues.json"),
         r#"[{"number": 7, "title": "Later", "body": "", "url": "https://example.com/7"}]"#,

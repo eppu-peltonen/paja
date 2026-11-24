@@ -58,8 +58,18 @@ enum WorkCommand {
     List,
     /// Show one work item by its issue number.
     Show { number: u64 },
-    /// The next item to work on: the oldest queued one, or null.
+    /// The next item to work on: the oldest open, queued one, or null.
     Next,
+    /// Take the next item and mark it active in one step, so two runs never share one.
+    Claim,
+    /// Set an item's status: queued, active, landed or escalated.
+    Set {
+        number: u64,
+        status: String,
+        /// Why, for example the question an escalation asks.
+        #[arg(long)]
+        note: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -218,6 +228,22 @@ fn run(cli: &Cli) -> Result<()> {
                     format!("{}\n  {}\n\n{}", describe_item(&item), item.url, item.body)
                 });
             }
+            WorkCommand::Claim => {
+                let item = jono::claim(&home)?;
+                emit(cli, serde_json::to_value(&item)?, || {
+                    item.as_ref()
+                        .map_or("nothing queued".to_string(), describe_item)
+                });
+            }
+            WorkCommand::Set {
+                number,
+                status,
+                note,
+            } => {
+                let status = jono::parse_status(status)?;
+                let item = jono::set_status(&home, *number, status, note.as_deref())?;
+                emit(cli, serde_json::to_value(&item)?, || describe_item(&item));
+            }
             WorkCommand::Next => {
                 let item = jono::next(&home)?;
                 emit(cli, serde_json::to_value(&item)?, || {
@@ -252,7 +278,17 @@ fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
 }
 
 fn describe_item(item: &jono::WorkItem) -> String {
-    format!("#{}\t{:?}\t{}", item.number, item.status, item.title)
+    let mut line = format!(
+        "#{}\t{}{}\t{}",
+        item.number,
+        item.status.as_str(),
+        if item.open { "" } else { " (issue closed)" },
+        item.title
+    );
+    if let Some(note) = &item.note {
+        line.push_str(&format!("\n  note: {note}"));
+    }
+    line
 }
 
 fn describe(env: &Env) -> String {

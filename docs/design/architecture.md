@@ -53,9 +53,11 @@ cuts them off and keeps them in `events.jsonl.torn`; a bad line that ends in a n
 ## Work queue
 
 Jono's items are GitHub issues labelled `paja`. `paja work sync` reads the open ones with `gh` and appends
-`work.imported`, `work.changed`, `work.closed` and `work.reopened` events; runs append `work.status` as an item moves
-through `queued`, `active`, `landed` and `escalated`. `paja work next` is the oldest queued item. A landed item stays
-landed when its issue closes.
+`work.imported`, `work.changed`, `work.closed` and `work.reopened` events. Whether an issue is open is kept apart from
+the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
+survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the oldest
+open, queued item and marks it active under the home lock, so two runs never share one. A sync that reads its full limit
+of issues refuses to close anything rather than drop work it could not see.
 
 ## MCP server
 
