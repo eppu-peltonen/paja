@@ -45,6 +45,8 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
   Vasara's rules and scenarios are read from `main`, never from the branch under review.
 - **Small changes.** One concern per pull request.
 - **This repository is public.** Never commit secrets, private links, personal details or internal hostnames.
+- **Docs describe Paja, nothing else.** `docs/` and other Markdown cover only how the system works and what agents
+  need to work in it. Leave out references to other projects, research, and notes on inspiration or lineage.
 
 ## How changes land
 
