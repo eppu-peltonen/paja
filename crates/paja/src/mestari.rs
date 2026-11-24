@@ -372,15 +372,40 @@ fn claude(
 /// Before handing them out, check that the hook really blocks a push and allows a build; an
 /// agent never starts under a hook that doesn't.
 fn hook_settings(root: &Path, home: &Path) -> Result<String> {
-    let exe = std::env::current_exe().context("finding the paja binary for the deny-list hook")?;
+    let running =
+        std::env::current_exe().context("finding the paja binary for the deny-list hook")?;
     // After a rebuild the running binary's path is gone (Linux shows it as "... (deleted)").
-    if !exe.exists() {
+    if !running.exists() {
         bail!(
             "the paja binary {} was replaced while `paja run` was running; restart `paja run` so \
              agents get the new deny-list hook",
-            exe.display()
+            running.display()
         );
     }
+    // Run the hook from a copy in the factory home, so an agent's own `cargo build` can't
+    // replace the binary that judges it.
+    let dir = home.join("hook");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Copied once per `paja run`, so a reused process id never picks up an old copy.
+    static COPIED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let exe = match COPIED.get() {
+        Some(exe) => exe.clone(),
+        None => {
+            let exe = dir.join(format!(
+                "paja-{}-{}",
+                std::process::id(),
+                crate::events::now_ms()
+            ));
+            std::fs::copy(&running, &exe).with_context(|| {
+                format!(
+                    "copying {} to {} for the deny-list hook",
+                    running.display(),
+                    exe.display()
+                )
+            })?;
+            COPIED.get_or_init(|| exe).clone()
+        }
+    };
     let args = [
         "hook".into(),
         "--root".into(),
@@ -408,9 +433,14 @@ fn hook_settings(root: &Path, home: &Path) -> Result<String> {
         quote(&root.to_string_lossy()),
         quote(&home.to_string_lossy())
     );
+    // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
+    let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
     Ok(json!({
         "hooks": {
-            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{"type": "command", "command": command, "timeout": timeout}]
+            }]
         }
     })
     .to_string())
@@ -438,6 +468,20 @@ fn run_hook_once(
         }
     }
     drop(child.stdin.take());
+    // The hook blocks itself after its deadline; anything longer is a hung binary.
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(crate::hook::HOOK_DEADLINE_SECS + 10);
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            bail!(
+                "the deny-list hook {} hung in its self-test, so no agent will start; rebuild \
+                 paja from main",
+                exe.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let out = child.wait_with_output()?;
     Ok((
         out.status.code(),

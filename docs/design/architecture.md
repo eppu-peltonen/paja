@@ -88,7 +88,7 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
   tools included, is blocked.
 - **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
-  `cd` to the worktree's root as a step of its own, then `cargo` and local `git` commands joined by `&&`, each
+  `cd` to the worktree's root as a step of its own, then `cargo`, local `git` and `pwd` commands joined by `&&`, each
   optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading `~`
   or `=`, redirections other than `2>&1`, or other separators outside single quotes. Only `RUST_BACKTRACE` and
   `RUST_LOG` may be set in front of a command.
@@ -98,18 +98,21 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   (so no `-C` or `-c`) and is one of add, commit, status, diff, show, log and rm; not `stash`, whose refs every
   checkout shares. Its revisions and paths must stay inside the worktree.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
-  and never into a `.git` or `.cargo` directory at any depth.
-- **Reads** of single files may look outside the worktree, but not into hidden directories other than dependency
-  sources (`.cargo/registry`, `.cargo/git`, `.rustup`), never into `/proc`, `/sys` or `/dev`, and never into the
-  factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree. A file tool path may
+  and never into a `.git` or `.cargo` directory at any depth, in any letter case.
+- **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`.cargo/registry`,
+  `.cargo/git`, `.rustup`); never `/proc`, `/sys`, `/dev`, other hidden directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree. A file tool path may
   not start with `~`, a search pattern may not hold `..` or braces, and no tool may name a credential path (`.ssh`,
   `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
 
-It fails closed: unreadable input, missing bounds and a crash all block, and the hook command ends in `|| exit 2` so a
-binary that can't start or is killed blocks too. Before each agent Mestari checks that the hook blocks a `git push`
+It fails closed: unreadable input, missing bounds, a crash and running past its own 20-second deadline all block, and
+the hook command ends in `|| exit 2` so a binary that can't start or is killed blocks too. Claude Code's own hook
+timeout is set well above that deadline. The hook runs from a copy of the paja binary in the factory home, so an
+agent's `cargo build` can't replace the binary that judges it. Before each agent Mestari checks that the hook blocks a `git push`
 with the deny-list's message and allows `cargo test`, and refuses to start the agent if not. The hook is a guardrail,
-not a sandbox: code the agent writes still runs under `cargo test`.
+not a sandbox: code the agent writes still runs under `cargo test`. Because no settings file loads, agents
+authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
+`apiKeyHelper` or provider settings.
 
 ## MCP server
 

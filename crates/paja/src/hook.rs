@@ -58,10 +58,19 @@ impl Bounds {
     }
 }
 
+/// How long the hook may take before it blocks. Mestari gives Claude Code a longer timeout.
+pub const HOOK_DEADLINE_SECS: u64 = 20;
+
 /// `paja hook`: read one tool call on stdin and answer with an exit code Claude Code
 /// understands. 0 allows; 2 blocks, with the reason on stderr. Anything but a clear "allow"
 /// blocks, a panic included.
 pub fn run(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
+    // A hook that runs past Claude Code's timeout counts as "allow"; block well before it.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(HOOK_DEADLINE_SECS));
+        eprintln!("Blocked: Paja's deny-list hook took too long to decide, so it fails closed");
+        std::process::exit(2);
+    });
     // A panic would exit 101, which Claude Code treats as "allow"; block instead.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("Blocked: Paja's deny-list hook crashed ({info}), so it fails closed");
@@ -83,7 +92,9 @@ pub fn run(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
         }
         Err(err) => {
             eprintln!(
-                "Blocked: Paja's deny-list hook couldn't decide ({err:#}), so it fails closed"
+                "Blocked: Paja's deny-list hook couldn't decide ({err:#}), so it fails closed. \
+                 This is a hook setup problem, not the agent's: rebuild paja from main and \
+                 restart `paja run`"
             );
             ExitCode::from(2)
         }
@@ -294,13 +305,19 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     }
     // Git and cargo read configuration from these at any depth.
     let inner = full.strip_prefix(&b.root).unwrap_or(&full);
-    if inner.components().any(|c| c.as_os_str() == ".git") {
+    // Compared without case, for case-insensitive filesystems such as macOS's default.
+    let named = |name: &str| {
+        inner
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(name))
+    };
+    if named(".git") {
         return Some(format!(
             "{} is git's own data or link to the repository; agents never change it",
             full.display()
         ));
     }
-    if inner.components().any(|c| c.as_os_str() == ".cargo") {
+    if named(".cargo") {
         return Some(format!(
             "{} is cargo configuration, which could change how cargo runs; agents never change it",
             full.display()
@@ -345,9 +362,15 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
                     && want.all(|next| parts.get(n + 1).map(String::as_str) == Some(next))
             })
     });
-    if touches_secret(&text) || !hidden_ok {
+    // Outside the worktree, only the toolchain and dependency sources.
+    let dependency = parts
+        .windows(2)
+        .any(|w| w[0] == ".cargo" && (w[1] == "registry" || w[1] == "git"))
+        || parts.iter().any(|p| p == ".rustup");
+    if touches_secret(&text) || !hidden_ok || !(dependency || full.starts_with("/usr")) {
         return Some(format!(
-            "{} is in a hidden directory outside the worktree; agents don't read those",
+            "{} is outside the worktree; agents read only the worktree, /usr and dependency \
+             sources (~/.cargo/registry, ~/.cargo/git, ~/.rustup)",
             full.display()
         ));
     }
@@ -540,7 +563,8 @@ fn check_cargo(args: &[&str]) -> Option<String> {
             CARGO_NAME_FLAGS.contains(&flag) && is_name(value)
         } else {
             // A test name filter, or a binary's arguments for `cargo run`.
-            matches!(sub, "test" | "run") && is_name(arg)
+            // A test name filter. `cargo run` takes the binary's arguments only after `--`.
+            sub == "test" && is_name(arg)
         };
         if !ok {
             return Some(format!(
@@ -956,6 +980,11 @@ mod tests {
         assert!(decide("Write", json!({"file_path": ".cargo/config.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "crates/x/.cargo/config.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "sub/.git/config"})).is_some());
+        assert!(decide("Write", json!({"file_path": ".GIT"})).is_some());
+        assert!(decide("Write", json!({"file_path": ".Cargo/config.toml"})).is_some());
+        assert!(decide("Read", json!({"file_path": "/etc/passwd"})).is_some());
+        assert!(decide("Read", json!({"file_path": "/var/run/secrets/token"})).is_some());
+        assert!(bash("cargo run -q env create demo").is_some());
         assert!(decide("Glob", json!({"pattern": "{..,x}/../.ssh/*"})).is_some());
         assert!(decide("Glob", json!({"pattern": "**/.ssh/*"})).is_some());
         assert!(decide(
@@ -980,6 +1009,7 @@ mod tests {
     #[test]
     fn symlinks_cannot_lead_out_of_the_worktree() {
         let tmp = std::env::temp_dir().join(format!("paja-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
         let root = tmp.join("home/envs/a");
         let outside = tmp.join("outside");
         std::fs::create_dir_all(&root).unwrap();
