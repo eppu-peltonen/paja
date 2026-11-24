@@ -4,6 +4,8 @@ Settled decisions, newest first within each date. Change one only by adding a ne
 
 ## 2026-11-24
 
+- **No separate GitHub identity.** Commits and pull requests go out under the owner's account. Unattended runs use a
+  fine-grained token limited to the repository being worked on, so an agent can't reach anything else.
 - **Nobody reviews pull requests.** Agents review and land code; high-risk changes pass a stricter automated gate
   instead of a person. See [landing.md](./landing.md).
 - **Paja's first target is Paja itself.** The factory builds the factory; other projects come in step 7.
