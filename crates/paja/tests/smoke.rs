@@ -730,11 +730,12 @@ impl Factory {
                  *--json-schema*) v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\"}}}}\" ;;\n\
                  *) echo built >> feature.txt\n\
+                 stamp=$(echo \"$*\" | sed -n \"s/.*--stamp '\\([^']*\\)'.*/\\1/p\")\n\
+                 if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
-                 if [ -f {d}/unhooked ]; then echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 5}}'\n\
-                 else echo '{{\"is_error\": false, \"result\": \"done\"}}'; fi ;;\nesac\n"
+                 echo '{{\"is_error\": false, \"result\": \"done\"}}' ;;\nesac\n"
             ),
         );
         Factory {
@@ -896,6 +897,18 @@ fn work_from_an_agent_the_hook_never_saw_does_not_land() {
         "{report}"
     );
     assert!(!f.gh_log().contains("pr create"));
+    // Its commits are gone from the branch, so a later run can't resume them.
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&f.repo)
+        .args(["log", "--oneline", "paja/work-5"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&log.stdout).contains("built"),
+        "{}",
+        String::from_utf8_lossy(&log.stdout)
+    );
 }
 
 #[test]

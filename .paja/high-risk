@@ -3,6 +3,7 @@
 crates/paja/src/events.rs
 crates/paja/src/mestari.rs
 crates/paja/src/hook.rs
+crates/paja/src/main.rs
 .paja/
 evals/
 CLAUDE.md

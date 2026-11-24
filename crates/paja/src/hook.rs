@@ -397,24 +397,25 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
         ));
     }
     let text = full.to_string_lossy();
-    // Every hidden directory on the way must be one of the dependency roots.
     let parts: Vec<String> = full
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    let hidden_ok = parts.iter().enumerate().all(|(n, part)| {
-        !part.starts_with('.')
-            || READABLE_HIDDEN.iter().any(|dir| {
-                let mut want = dir.split('/');
-                want.next() == Some(part.as_str())
-                    && want.all(|next| parts.get(n + 1).map(String::as_str) == Some(next))
-            })
+    // Where a dependency root (`.cargo/registry`, `.rustup`, ...) starts in the path, if any.
+    let dependency = (0..parts.len()).find(|&n| {
+        READABLE_HIDDEN.iter().any(|dir| {
+            dir.split('/')
+                .enumerate()
+                .all(|(k, want)| parts.get(n + k).map(String::as_str) == Some(want))
+        })
     });
-    // Outside the worktree, only the toolchain and dependency sources.
-    let dependency = parts
-        .windows(2)
-        .any(|w| w[0] == ".cargo" && (w[1] == "registry" || w[1] == "git"))
-        || parts.iter().any(|p| p == ".rustup");
+    // Hidden directories before it hold credentials and settings; inside it, a crate's own
+    // hidden files are fine.
+    let hidden_ok = parts
+        .iter()
+        .enumerate()
+        .all(|(n, part)| !part.starts_with('.') || dependency.is_some_and(|start| n >= start));
+    let dependency = dependency.is_some();
     if touches_secret(&text) || !hidden_ok || !(dependency || full.starts_with("/usr")) {
         return Some(format!(
             "{} is outside the worktree; agents read only the worktree, /usr and dependency \
@@ -1056,6 +1057,13 @@ mod tests {
         assert!(bash("git log -").is_some());
         assert!(decide("Write", json!({"file_path": ".Cargo/config.toml"})).is_some());
         assert!(decide("Read", json!({"file_path": "/etc/passwd"})).is_some());
+        assert_eq!(
+            decide(
+                "Read",
+                json!({"file_path": "/h/.cargo/registry/src/i/serde-1.0/.cargo_vcs_info.json"})
+            ),
+            None
+        );
         assert!(decide("Read", json!({"file_path": "/var/run/secrets/token"})).is_some());
         assert!(bash("cargo run -q env create demo").is_some());
         assert!(decide("Glob", json!({"pattern": "{..,x}/../.ssh/*"})).is_some());

@@ -354,25 +354,35 @@ fn claude(
     let _ = std::fs::remove_dir_all(&scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
-    // A session that took more than one turn used tools, so the hook must have run. If it
-    // didn't, something (such as an administrator's policy) switched it off and nothing the
-    // agent did can be trusted: throw it away, so a later run can't resume and land it. When
-    // the output can't be read, any change to the worktree counts as such a run.
-    let parsed: Option<Value> = output
+    // A session that took more than one turn, or changed the worktree, used tools, so the hook
+    // must have run. If it didn't, something (such as an administrator's policy) switched it
+    // off and nothing the agent did can be trusted: throw it away, so a later run can't resume
+    // and land it.
+    let turns = output
         .as_ref()
         .ok()
-        .and_then(|o| serde_json::from_slice(&o.stdout).ok());
-    let unhooked = !hooked
-        && match &parsed {
-            Some(value) => value["num_turns"].as_u64().unwrap_or(0) > 1,
-            None => output.is_ok() && changed_since(&env.path, before.as_deref()),
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .and_then(|value| value["num_turns"].as_u64())
+        .unwrap_or(0);
+    if !hooked && output.is_ok() && (turns > 1 || changed_since(&env.path, before.as_deref())) {
+        let fate = match before.as_deref() {
+            Some(before) => match discard(env, before) {
+                Ok(()) => "was discarded".to_string(),
+                Err(err) => format!(
+                    "could not be discarded ({err:#}); delete the branch {} before running it again",
+                    env.branch
+                ),
+            },
+            None => format!(
+                "is still on the branch {} (its starting commit was unknown); check or delete it \
+                 before running it again",
+                env.branch
+            ),
         };
-    if unhooked {
-        discard(env, before.as_deref().unwrap_or(base));
         bail!(
-            "Claude Code never called Paja's deny-list hook during the agent's run in {}, so \
-             its work is not trusted and was discarded; check for settings that disable hooks \
-             (such as `disableAllHooks` in managed settings) and run again",
+            "Claude Code never called Paja's deny-list hook during the agent's run in {}, so its \
+             work is not trusted and {fate}; check for settings that disable hooks (such as \
+             `disableAllHooks` in managed settings) and run again",
             env.path.display()
         );
     }
@@ -418,24 +428,22 @@ fn changed_since(repo: &Path, before: Option<&str>) -> bool {
 
 /// Put the environment's own branch back at `to` and drop every file made since, ignored
 /// ones included, even if the agent switched branches.
-fn discard(env: &Env, to: &str) {
-    let ok = |args: &[&str]| {
-        Command::new("git")
+fn discard(env: &Env, to: &str) -> Result<()> {
+    for args in [
+        &["checkout", "-q", "-f", "-B", &env.branch, to][..],
+        &["clean", "-q", "-f", "-d", "-x"],
+    ] {
+        let status = Command::new("git")
             .arg("-C")
             .arg(&env.path)
             .args(args)
             .status()
-            .is_ok_and(|s| s.success())
-    };
-    let reset = ok(&["checkout", "-q", "-f", "-B", &env.branch, to])
-        && ok(&["clean", "-q", "-f", "-d", "-x"]);
-    if !reset {
-        eprintln!(
-            "warning: couldn't reset {} to {to}; delete the branch {} before running it again",
-            env.path.display(),
-            env.branch
-        );
+            .context("running git")?;
+        if !status.success() {
+            bail!("`git {}` failed in {}", args.join(" "), env.path.display());
+        }
     }
+    Ok(())
 }
 
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
@@ -463,7 +471,12 @@ fn hook_settings(root: &Path, home: &Home) -> Result<(String, PathBuf)> {
         );
     }
     // The self-test leaves no stamp: the hook only gets `--stamp` from Claude Code.
-    let stamp = exe.with_extension(format!("stamp-{}", crate::events::now_ms()));
+    // Outside the factory home, so writing it needs no home lock.
+    let stamp = std::env::temp_dir().join(format!(
+        "paja-stamp-{}-{}",
+        std::process::id(),
+        crate::events::now_ms()
+    ));
     let _ = std::fs::remove_file(&stamp);
     let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails

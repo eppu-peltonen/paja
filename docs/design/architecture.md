@@ -112,8 +112,10 @@ the hook command ends in `|| exit 2` so a binary that can't start or is killed b
 timeout is set well above that deadline. The hook runs from a copy of the paja binary in the factory home, so an
 agent's `cargo build` can't replace the binary that judges it. Managed settings still load, so Mestari refuses to
 start agents when they set `disableAllHooks` or `allowManagedHooksOnly`. Policy can arrive in other ways too, so the
-hook also touches a stamp file on every call: an agent run that took tool turns, or failed, without one is rejected,
-and everything it did to the worktree is discarded. Before each agent Mestari checks that the hook blocks a `git push`
+hook also touches a stamp file on every call: an agent run that took more than one turn or changed the worktree
+without one is rejected, and its branch is reset to where the run started. Only the two managed-settings file
+locations are checked up front. The stamp catches a hook that was silently dropped, not an agent that forges it while
+hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook blocks a `git push`
 with the deny-list's message and allows `cargo test`, and refuses to start the agent if not. The hook is a guardrail,
 not a sandbox: code the agent writes still runs under `cargo test`. Because no settings file loads, agents
 authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
