@@ -365,6 +365,15 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             Ok(None)
         }
         "WebFetch" | "WebSearch" => Ok(Some("no network access from agents".into())),
+        // A subagent's own calls come through this hook, but a worktree of its own is made by
+        // Claude Code, in the shared repository, with no call to judge.
+        "Task" | "Agent" if !t["isolation"].is_null() || t["run_in_background"] == true => {
+            Ok(Some(
+                "subagents run in this worktree, in the foreground: leave out `isolation` and \
+             `run_in_background`"
+                    .into(),
+            ))
+        }
         name if HARMLESS_TOOLS.contains(&name) => Ok(None),
         name => Ok(Some(format!(
             "agents don't use the `{name}` tool; Mestari's agents use the file tools, cargo and \
@@ -1233,6 +1242,9 @@ mod tests {
         assert!(decide("WebFetch", json!({"url": "https://example.com"})).is_some());
         assert!(decide("mcp__github__merge_pull_request", json!({})).is_some());
         assert_eq!(decide("TodoWrite", json!({"todos": []})), None);
+        assert_eq!(decide("Agent", json!({"prompt": "look"})), None);
+        assert!(decide("Agent", json!({"prompt": "x", "isolation": "worktree"})).is_some());
+        assert!(decide("Task", json!({"prompt": "x", "run_in_background": true})).is_some());
         assert_eq!(decide("StructuredOutput", json!({"verdict": "land"})), None);
     }
 

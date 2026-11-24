@@ -86,7 +86,8 @@ branch under review can't rewrite the rules its builder and reviewers follow. Th
 from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
-  tools included, is blocked.
+  tools included, is blocked. Subagents run in the same worktree in the foreground, under the same hook; one with
+  `isolation` or `run_in_background` is blocked, since Claude Code would make its worktree without a call to judge.
 - **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
   `cd` to the worktree's root as a step of its own, then `cargo`, local `git` and `pwd` commands joined by `&&`, each
   optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading `~`
@@ -123,13 +124,14 @@ refuses to start the agent if not. The hook is a guardrail, not a sandbox: code 
 test`. Mestari takes away the easy ways that code could reach GitHub: agents run without GitHub or registry tokens, the
 SSH agent or askpass programs, with gh's login, git's global and system configuration and every credential helper
 switched off, and with the owner's commit name, email and global ignore file passed in instead. Vasara's checks run the
-same branch code, so they run with the same environment and a throwaway `HOME` as well. Agents keep the owner's `HOME`,
-which Claude Code needs to sign in, so code they run can still read credential files there (such as `.netrc`), and a
-token written into the remote's URL is not covered: closing those is the sandbox's job. Reviewers run the hook with
-`--read-only`: no file edits, no `cargo fmt` without `--check` and no git command that changes the branch; after the
-review, the branch and worktree are put back where it started, whatever the code its builds ran did. Because no settings
-file loads, agents authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not
-through `apiKeyHelper` or provider settings.
+same branch code, so they run with the same environment and a throwaway `HOME` as well (cargo keeps its real
+`CARGO_HOME`, so its registry token stays reachable). Agents keep the owner's `HOME`, which Claude Code needs to sign
+in, so code they run can still read credential files there (such as `.netrc`), and a token written into the remote's URL
+is not covered: closing those is the sandbox's job. Reviewers run the hook with `--read-only`: no file edits, no `cargo
+fmt` without `--check` and no git command that changes the branch; after the review, the branch and worktree are put
+back where it started, whatever the code its builds ran did. Because no settings file loads, agents authenticate the way
+`claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider
+settings.
 
 ## MCP server
 

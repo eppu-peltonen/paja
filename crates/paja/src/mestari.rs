@@ -163,11 +163,7 @@ fn run_item(
                 &format!("{base}...HEAD"),
             ],
         )?;
-        let risky = changed.lines().any(|path| {
-            high_risk
-                .iter()
-                .any(|prefix| path.starts_with(prefix.as_str()))
-        });
+        let risky = changed.lines().any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
         let reviews = (0..reviewers)
             .map(|_| review(home, &env, item, base))
@@ -868,28 +864,49 @@ fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&st
         .envs(git_identity);
 }
 
+/// Whether a changed path is high risk: it starts with one of `prefixes`, or, for a prefix
+/// that is a single name (`.cargo/`, `CLAUDE.md`), any directory or file in it starts with
+/// that name, in any letter case, since nested configuration counts as much as the top level.
+fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        let name = prefix.trim_end_matches('/').to_lowercase();
+        path.starts_with(prefix.as_str())
+            || !name.contains('/')
+                && path
+                    .split('/')
+                    .any(|part| part.to_lowercase().starts_with(&name))
+    })
+}
+
 /// Run each check in the environment. Returns the first failure's command and output. The
 /// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     let home_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_default();
-    let toolchain = (
-        std::env::var_os("CARGO_HOME").map_or(home_dir.join(".cargo"), PathBuf::from),
-        std::env::var_os("RUSTUP_HOME").map_or(home_dir.join(".rustup"), PathBuf::from),
-    );
+        .filter(|h| h.is_absolute());
+    let dir_of = |var: &str, default: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .or_else(|| home_dir.as_ref().map(|h| h.join(default)))
+    };
+    let cargo_home = dir_of("CARGO_HOME", ".cargo");
+    let rustup_home = dir_of("RUSTUP_HOME", ".rustup");
     let scratch = tempfile_dir(dir)?;
     let result = (|| {
         for check in checks {
             let mut cmd = Command::new("sh");
             cmd.args(["-c", check]).current_dir(dir);
             without_credentials(&mut cmd, &scratch, git_identity(dir));
-            // The checks don't need the owner's home either, and it holds credential files
-            // (`.netrc`, cargo's `credentials.toml`) that git and cargo read on their own.
-            // Cargo and rustup keep their real directories.
-            cmd.env("HOME", &scratch)
-                .env("CARGO_HOME", &toolchain.0)
-                .env("RUSTUP_HOME", &toolchain.1);
+            // The checks don't need the owner's home either, and it holds credential files,
+            // such as the `.netrc` git reads on its own. Cargo and rustup keep their real
+            // directories, so cargo's own `credentials.toml` stays reachable.
+            cmd.env("HOME", &scratch);
+            if let Some(dir) = &cargo_home {
+                cmd.env("CARGO_HOME", dir);
+            }
+            if let Some(dir) = &rustup_home {
+                cmd.env("RUSTUP_HOME", dir);
+            }
             let output = cmd
                 .stdin(std::process::Stdio::null())
                 .output()
@@ -1161,6 +1178,24 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nested_configuration_is_high_risk() {
+        let prefixes: Vec<String> = [".cargo/", "CLAUDE.md", "crates/paja/src/hook.rs"]
+            .map(String::from)
+            .to_vec();
+        assert!(super::is_high_risk(
+            "crates/x/.Cargo/config.toml",
+            &prefixes
+        ));
+        assert!(super::is_high_risk("docs/CLAUDE.md", &prefixes));
+        assert!(super::is_high_risk("crates/paja/src/hook.rs", &prefixes));
+        assert!(!super::is_high_risk("crates/paja/src/jono.rs", &prefixes));
+        assert!(!super::is_high_risk(
+            "other/crates/paja/src/hook.rs",
+            &prefixes
+        ));
+    }
+
     use super::*;
 
     #[test]
