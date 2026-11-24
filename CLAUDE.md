@@ -1,8 +1,9 @@
 # Paja
 
 Paja is a software factory that builds itself. This file is the harness (Kaava) for agents working on Paja's own code.
-Design: https://claude.ai/artifact/MATj1wWDEtX7Lqt77yrXd6. The README names the parts (Jono, Kaava, Posti, Mestari,
-Ahjo, Vasara, Paja Desk); use those names in code, docs and commit messages.
+The design is in `docs/` (start at `docs/index.md`); `docs/glossary.md` names the parts (Jono, Kaava, Posti, Mestari,
+Ahjo, Vasara, Paja Desk). Use those names in code, docs and commit messages. When a change alters the design, update
+the matching file in `docs/design/` in the same pull request.
 
 ## Commands
 
@@ -27,6 +28,7 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary.
+- `docs/`: the design and operator docs, routed from `docs/index.md`.
 
 ## Rules
 
@@ -41,6 +43,7 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 - **Checks stay out of reach of the change they judge.** A change that fixes a failing test must not edit that test;
   Vasara's rules and scenarios are read from `main`, never from the branch under review.
 - **Small changes.** One concern per pull request.
+- **This repository is public.** Never commit secrets, private links, personal details or internal hostnames.
 
 ## How changes land
 
@@ -54,6 +57,7 @@ code.
   handling, the deny-list hook, landing and revert logic, Vasara's rules, the harness evals, or the event log's
   format (`events.rs`). Automation decides the tier from the files a change touches.
 - **Escalate, don't wait.** If reviewers disagree, a check can't decide, or a change would weaken a check, the
-  question goes to Posti (today: the project thread) as an intent decision, with options and a recommendation.
+  question goes to Posti (until Posti exists: a comment on the issue or pull request) as an intent decision, with
+  options and a recommendation. Details: `docs/design/landing.md`.
 - **Until Paja's own reviewer runs (build step 3)**, Claude does the review and landing for these hand-built seed
   pull requests under the same rules.

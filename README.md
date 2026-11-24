@@ -4,7 +4,8 @@ Paja (Finnish: *workshop, forge*) is a software factory: a headless core that ta
 Claude Code agents on it in isolated environments, verifies the result, and lands it. It works for new projects and
 existing ones alike, and it is built by itself.
 
-Design: [Paja: a software factory for new and existing projects](https://claude.ai/artifact/MATj1wWDEtX7Lqt77yrXd6)
+The design lives in [`docs/`](docs/index.md): start with the [overview](docs/design/overview.md) and the
+[architecture](docs/design/architecture.md).
 
 ## Parts
 
@@ -12,8 +13,8 @@ Design: [Paja: a software factory for new and existing projects](https://claude.
 | --- | --- | --- |
 | Paja | workshop, forge | The whole factory and its headless core |
 | Jono | queue | Work queue and scheduler, fed by GitHub issues labelled `paja` |
-| Kaava | pattern, formula | Specs and the harness agents work from |
-| Posti | mail | Inbox for agent questions and approvals |
+| Kaava | pattern, formula | Specs, scenarios, harness evals and the harness agents work from |
+| Posti | mail | Inbox for agent questions and escalations |
 | Mestari | master craftsman | Orchestrator that runs workflow graphs |
 | Ahjo | forge hearth | Isolated environments where the work runs |
 | Vasara | hammer | Verifier |
