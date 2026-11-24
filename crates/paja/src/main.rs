@@ -259,6 +259,9 @@ fn run(cli: &Cli) -> Result<()> {
                     });
                     matches!(report, mestari::RunReport::Idle)
                 }
+                // Except when git's configuration was tampered with: then running git again is
+                // the danger, so the loop stops for a person.
+                Err(err) if mestari::is_tampered(&err) => return Err(err),
                 Err(err) => {
                     emit(cli, json!({ "error": format!("{err:#}") }), || {
                         format!("error: {err:#}")

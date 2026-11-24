@@ -896,16 +896,23 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
 fn checks_that_change_git_configuration_stop_the_run() {
     // Branch code run by the checks could plant a credential helper for Mestari's own git.
     let f = Factory::new("git config paja.planted yes\n", "land");
-    let (_, report) = f.run();
-    assert_eq!(report["outcome"], "escalated", "{report}");
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
     assert!(
-        report["question"]
+        report["error"]
             .as_str()
             .unwrap()
             .contains("git's configuration, hooks or attributes"),
         "{report}"
     );
     assert!(!f.gh_log().contains("pr create"));
+    // The item is parked and the person told, but Paja runs no more git there, not even to
+    // remove the environment.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated");
+    assert!(f.gh_log().contains("issue comment"), "{}", f.gh_log());
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
 }
 
 #[test]

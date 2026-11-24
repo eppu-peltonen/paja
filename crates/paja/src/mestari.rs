@@ -100,6 +100,10 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 json!({ "number": item.number, "rounds": rounds }),
             )?;
             let _ = comment(&repo, &item, &question);
+            if is_tampered(&err) {
+                // Removing the environment runs git; stop instead, loop included.
+                return Err(err);
+            }
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
                 number: item.number,
@@ -329,7 +333,6 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Bash(git show*)",
     ];
     let before = git(&env.path, &["rev-parse", "HEAD"])?;
-    // `claude` already checks git's configuration once the reviewer is done.
     let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
     // A reviewer changes nothing, but the code its builds and tests run can (a lockfile, even
     // a commit). Put the branch back where the review started, so none of it lands unread.
@@ -340,6 +343,7 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
     )
     .and_then(|_| git(&env.path, &["clean", "-q", "-f", "-d"]));
     let out = match (out, reset) {
+        (Err(err), _) if is_tampered(&err) => return Err(err),
         (Err(err), Err(reset)) => {
             return Err(err.context(format!("and resetting the worktree failed too: {reset:#}")))
         }
@@ -380,9 +384,10 @@ fn claude(
         None => String::new(),
     };
     let git_identity = git_identity(&env.path);
+    let guard = GitGuard::new(&env.path)?;
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let scratch = tempfile_dir(&env.path)?;
-    let (settings, stamp) = match hook_settings(&env.path, home, read_only) {
+    let (settings, stamp, exe) = match hook_settings(&env.path, home, read_only) {
         Ok(made) => made,
         Err(err) => {
             let _ = std::fs::remove_dir_all(&scratch);
@@ -415,15 +420,16 @@ fn claude(
     }
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
-    let guard = GitGuard::new(&env.path)?;
     let output = cmd.stdin(std::process::Stdio::null()).output();
     let _ = std::fs::remove_dir_all(&scratch);
-    guard.check("the agent")?;
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
     if let Some(dir) = stamp.parent() {
         let _ = std::fs::remove_dir(dir);
     }
+    guard.check("the agent")?;
+    // Code the agent ran could also have swapped the hook's copy during the session.
+    let hooked = hooked && hook_copy_intact(&exe);
     // A session that took more than one turn, or changed the worktree, used tools, so the hook
     // must have run. If it didn't, something (such as an administrator's policy) switched it
     // off and nothing the agent did can be trusted: throw it away, so a later run can't resume
@@ -453,10 +459,12 @@ fn claude(
             ),
         };
         bail!(
-            "Claude Code never called Paja's deny-list hook during the agent's run in {}, so its \
-             work is not trusted and {fate}; check for settings that disable hooks (such as \
-             `disableAllHooks` in managed settings) and run again",
-            env.path.display()
+            "Claude Code never called Paja's deny-list hook during the agent's run in {}, or the \
+             hook's copy {} changed during it, so its work is not trusted and {fate}; check for \
+             settings that disable hooks (such as `disableAllHooks` in managed settings) and run \
+             again",
+            env.path.display(),
+            exe.display()
         );
     }
     let output =
@@ -563,7 +571,7 @@ fn discard(env: &Env, to: &str) -> Result<()> {
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
 /// Before handing them out, check that the hook really blocks a push and allows a build; an
 /// agent never starts under a hook that doesn't.
-fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf)> {
+fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
     let mut args: Vec<std::ffi::OsString> = vec![
@@ -628,7 +636,7 @@ fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, P
         }
     })
     .to_string();
-    Ok((settings, stamp))
+    Ok((settings, stamp, exe))
 }
 
 /// Managed (administrator) settings load whatever `--setting-sources` says, and two of their
@@ -690,6 +698,17 @@ fn refuse_hook_policies() -> Result<()> {
 /// binary that is running (on Linux even if the file on disk has been rebuilt since; elsewhere
 /// it is the file on disk when the run first needs it); copies other runs
 /// left behind are removed once they are a day old.
+/// This paja's own bytes, read once per process: what the hook copy must match, whatever later
+/// happens to the file.
+static RUNNING: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Whether the hook's copy still matches this paja byte for byte.
+fn hook_copy_intact(exe: &Path) -> bool {
+    RUNNING
+        .get()
+        .is_some_and(|bytes| std::fs::read(exe).ok().as_deref() == Some(bytes.as_slice()))
+}
+
 fn hook_binary(home: &Home) -> Result<PathBuf> {
     let _lock = home.lock()?;
     let dir = home.root().join("hook");
@@ -713,8 +732,6 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
         p if p.exists() => p.to_path_buf(),
         _ => std::env::current_exe().context("finding the paja binary for the deny-list hook")?,
     };
-    // Read once per process: what this paja is, whatever later happens to the file.
-    static RUNNING: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = match RUNNING.get() {
         Some(bytes) => bytes,
         None => {
@@ -730,7 +747,7 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
     let exe = dir.join(format!("paja-{}-{digest:016x}", bytes.len()));
     // The copy sits in the factory home, which code an agent runs could reach. Use it only
     // while it still matches this paja byte for byte; otherwise copy again.
-    if std::fs::read(&exe).ok().as_deref() != Some(bytes.as_slice()) {
+    if !hook_copy_intact(&exe) {
         // Write under a temporary name and rename, so no run ever sees half a binary.
         let partial = dir.join(format!(
             "partial-{}-{}",
@@ -912,7 +929,7 @@ fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&st
 fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|prefix| {
         let name = prefix.trim_end_matches('/').to_lowercase();
-        path.starts_with(prefix.as_str())
+        path.to_lowercase().starts_with(&prefix.to_lowercase())
             || !name.contains('/')
                 && path
                     .split('/')
@@ -1204,14 +1221,7 @@ fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
 /// hooks or a file-system monitor for it to run, so those are always off; [`GitGuard`] catches
 /// the rest of a planted configuration.
 fn git_command() -> Command {
-    let mut cmd = Command::new("git");
-    cmd.args([
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-    ]);
-    cmd
+    ahjo::git_command()
 }
 
 /// A snapshot of the git configuration, hooks and attributes a worktree's git reads, all of
@@ -1219,6 +1229,24 @@ fn git_command() -> Command {
 /// checks or a reviewer's build runs could change them to make Mestari's own git run a program
 /// with Mestari's credentials (a credential helper, a filter). Mestari takes the snapshot before
 /// such code runs and checks it before it runs git there again.
+/// The error a [`GitGuard`] raises. Nothing may run git in that repository afterwards, not
+/// even to clean up, until a person has looked.
+#[derive(Debug)]
+pub struct Tampered(String);
+
+impl std::fmt::Display for Tampered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Tampered {}
+
+/// Whether `err` is, or was caused by, a [`Tampered`] repository.
+pub fn is_tampered(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<Tampered>())
+}
+
 struct GitGuard {
     files: Vec<PathBuf>,
     hooks: PathBuf,
@@ -1237,6 +1265,20 @@ impl GitGuard {
         };
         let (own, common) = (dir("--absolute-git-dir")?, dir("--git-common-dir")?);
         let hooks = common.join("hooks");
+        // The owner's global configuration, which Mestari's own git reads.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".config")));
+        let global: Vec<PathBuf> = home
+            .iter()
+            .map(|h| h.join(".gitconfig"))
+            .chain(
+                xdg.iter()
+                    .flat_map(|x| [x.join("git/config"), x.join("git/attributes")]),
+            )
+            .chain(std::env::var_os("GIT_CONFIG_GLOBAL").map(PathBuf::from))
+            .collect();
         let mut guard = GitGuard {
             files: vec![
                 common.join("config"),
@@ -1247,6 +1289,7 @@ impl GitGuard {
             hooks,
             snapshot: Vec::new(),
         };
+        guard.files.extend(global);
         guard.snapshot = guard.read();
         Ok(guard)
     }
@@ -1271,13 +1314,15 @@ impl GitGuard {
     /// Fails, before Mestari runs git again, when anything changed since the snapshot.
     fn check(&self, what: &str) -> Result<()> {
         if self.read() != self.snapshot {
-            bail!(
-                "git's configuration, hooks or attributes outside the worktree ({} and {}) \
-                 changed while {what} ran, so Mestari stopped before running git there again; \
-                 a person must check those files and restore them",
+            return Err(Tampered(format!(
+                "git's configuration, hooks or attributes ({}, {} or the owner's global git \
+                 configuration) changed while {what} ran, so Paja stopped before running git \
+                 there again; a person must check and restore those files before running Paja \
+                 again",
                 self.files[0].display(),
                 self.hooks.display()
-            );
+            ))
+            .into());
         }
         Ok(())
     }
