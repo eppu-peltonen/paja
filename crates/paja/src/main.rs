@@ -65,18 +65,20 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => {
             use clap::error::ErrorKind;
-            let wants_json = std::env::args().any(|a| a == "--json");
-            let is_info = matches!(
-                err.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            );
-            if wants_json && !is_info {
-                // Agents parse stdout, so even a usage error must be one JSON value there.
-                let message = err.render().to_string();
-                println!("{}", json!({ "error": message.trim() }));
-                return ExitCode::from(2);
+            if !std::env::args_os().any(|a| a == "--json") {
+                err.exit();
             }
-            err.exit();
+            // Agents parse stdout, so help, version and usage errors are one JSON value too.
+            let text = err.render().to_string();
+            let (key, code) = match err.kind() {
+                ErrorKind::DisplayHelp => ("help", ExitCode::SUCCESS),
+                // `paja` with no subcommand: help text, but still a usage error.
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => ("help", ExitCode::from(2)),
+                ErrorKind::DisplayVersion => ("version", ExitCode::SUCCESS),
+                _ => ("error", ExitCode::from(2)),
+            };
+            println!("{}", json!({ key: text.trim() }));
+            return code;
         }
     };
     match run(&cli) {

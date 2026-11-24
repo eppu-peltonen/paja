@@ -120,13 +120,15 @@ impl EventLog {
             .with_context(|| format!("opening {}", self.path.display()))?;
         if serde_json::from_str::<Event>(torn).is_ok() {
             let mut file = file;
-            file.seek(SeekFrom::End(0))?;
-            file.write_all(b"\n")?;
-            file.sync_data()?;
+            let ctx = || format!("repairing the last line of {}", self.path.display());
+            file.seek(SeekFrom::End(0)).with_context(ctx)?;
+            file.write_all(b"\n").with_context(ctx)?;
+            file.sync_data().with_context(ctx)?;
         } else {
             file.set_len(complete.len() as u64)
                 .with_context(|| format!("dropping torn write in {}", self.path.display()))?;
-            file.sync_data()?;
+            file.sync_data()
+                .with_context(|| format!("syncing {}", self.path.display()))?;
         }
         Ok(())
     }

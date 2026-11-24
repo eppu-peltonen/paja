@@ -201,3 +201,84 @@ fn usage_errors_are_json_too() {
     assert!(!ok);
     assert!(err["error"].as_str().unwrap().contains("NAME"), "{err}");
 }
+
+#[test]
+fn show_and_log_limit_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    paja(&home, &repo, &["env", "create", "one"]);
+    paja(&home, &repo, &["env", "create", "two"]);
+
+    let (ok, shown) = paja(&home, &repo, &["env", "show", "two"]);
+    assert!(ok, "{shown}");
+    assert_eq!(shown["name"], "two");
+    let (ok, missing) = paja(&home, &repo, &["env", "show", "nope"]);
+    assert!(!ok);
+    assert!(missing["error"].as_str().unwrap().contains("paja env list"));
+
+    let (_, log) = paja(&home, &repo, &["log", "--limit", "1"]);
+    let log = log.as_array().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0]["seq"], 2);
+}
+
+#[test]
+fn help_and_version_are_json_under_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ok, version) = paja(tmp.path(), tmp.path(), &["--version"]);
+    assert!(ok);
+    assert!(version["version"].as_str().unwrap().contains("paja"));
+    let (ok, help) = paja(tmp.path(), tmp.path(), &["--help"]);
+    assert!(ok);
+    assert!(help["help"].as_str().unwrap().contains("env"));
+}
+
+#[test]
+fn works_inside_a_submodule() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (lib, app, home) = (
+        tmp.path().join("lib"),
+        tmp.path().join("app"),
+        tmp.path().join("home"),
+    );
+    init_repo(&lib);
+    init_repo(&app);
+    git(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    let sub = app.join("lib");
+    let (ok, env) = paja(&home, &sub, &["env", "create", "sub-env"]);
+    assert!(ok, "{env}");
+    assert_eq!(
+        Path::new(env["repo"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        sub.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn force_removes_a_directory_git_no_longer_knows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let (_, env) = paja(&home, &repo, &["env", "create", "lost"]);
+    let path = Path::new(env["path"].as_str().unwrap()).to_path_buf();
+    // Re-create the repo at the same path: git forgets the worktree, the directory stays.
+    std::fs::remove_dir_all(&repo).unwrap();
+    init_repo(&repo);
+
+    let (ok, removed) = paja(&home, &repo, &["env", "remove", "lost", "--force"]);
+    assert!(ok, "{removed}");
+    assert!(!path.exists());
+}

@@ -71,7 +71,7 @@ pub fn list(home: &Home) -> Result<Vec<Env>> {
 pub fn get(home: &Home, name: &str) -> Result<Env> {
     replay(&home.events().read_all()?)?
         .remove(name)
-        .with_context(|| format!("no environment named {name:?}"))
+        .with_context(|| format!("no environment named {name:?}; run `paja env list` to see them"))
 }
 
 pub struct CreateOptions<'a> {
@@ -129,10 +129,11 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
             path.display()
         );
     }
-    std::fs::create_dir_all(home.envs_dir())?;
+    std::fs::create_dir_all(home.envs_dir())
+        .with_context(|| format!("creating {}", home.envs_dir().display()))?;
     let path_str = path
         .to_str()
-        .context("environment path is not UTF-8")?
+        .with_context(|| format!("environment path {} is not UTF-8", path.display()))?
         .to_string();
 
     let add: Vec<&str> = if resume {
@@ -156,6 +157,17 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
         .map_err(anyhow::Error::from)
         .and_then(|data| log.append(&lock, EV_CREATED, data));
     if let Err(err) = recorded {
+        // If the event made it into the log (say, only the sync failed), the environment is
+        // real and must be kept; undoing the worktree would leave the log pointing at nothing.
+        let landed = log.read_all().ok().is_some_and(|events| {
+            replay(&events).is_ok_and(|envs| envs.get(&env.name) == Some(&env))
+        });
+        if landed {
+            return Err(err.context(format!(
+                "environment {:?} was recorded, but the log could not be synced to disk",
+                opts.name
+            )));
+        }
         // Without its event the worktree would be an orphan that blocks the name; undo it.
         let _ = git(&env.repo, &["worktree", "remove", "--force", &path_str]);
         if !resume {
@@ -174,10 +186,13 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
-    let env = replay(&log.read_all()?)?
-        .remove(name)
-        .with_context(|| format!("no environment named {name:?}"))?;
-    let path = env.path.to_str().context("environment path is not UTF-8")?;
+    let env = replay(&log.read_all()?)?.remove(name).with_context(|| {
+        format!("no environment named {name:?}; run `paja env list` to see them")
+    })?;
+    let path = env
+        .path
+        .to_str()
+        .with_context(|| format!("environment path {} is not UTF-8", env.path.display()))?;
 
     if !env.repo.exists() {
         // git can't run against a repository that is gone; only the directory is left.
@@ -197,16 +212,34 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
             args.push("--force");
         }
         args.push(path);
-        git(&env.repo, &args).with_context(|| {
+        let removed = git(&env.repo, &args);
+        if removed.is_err() && force {
+            // git no longer knows this directory as a worktree (re-cloned repo, lost
+            // metadata); with --force, delete it directly and let git forget the rest.
+            std::fs::remove_dir_all(&env.path).with_context(|| format!("deleting {path}"))?;
+            git(&env.repo, &["worktree", "prune"]).with_context(|| {
+                format!(
+                    "pruning worktrees of {} after deleting {path}",
+                    env.repo.display()
+                )
+            })?;
+        } else {
+            removed.with_context(|| {
             if force {
                 format!("removing worktree {path}")
             } else {
                 format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
             }
         })?;
+        }
     } else {
         // The directory is already gone; let git forget about it too.
-        git(&env.repo, &["worktree", "prune"])?;
+        git(&env.repo, &["worktree", "prune"]).with_context(|| {
+            format!(
+                "pruning worktrees of {} for environment {name:?}",
+                env.repo.display()
+            )
+        })?;
     }
 
     log.append(
@@ -217,22 +250,45 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     Ok(env)
 }
 
-/// The main repository's top level for any path inside it, even from inside a worktree
-/// (an agent creating an environment from within its own environment).
+/// The main repository's top level for any path inside it, even from inside a linked
+/// worktree (an agent creating an environment from within its own environment) or a
+/// submodule. git lists the main worktree first.
 fn main_repo(path: &Path) -> Result<PathBuf> {
-    let common = PathBuf::from(git(
+    let dirs = git(
         path,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?);
-    if common.file_name().is_some_and(|n| n == ".git") {
-        if let Some(top) = common.parent() {
-            return Ok(top.to_path_buf());
-        }
-    }
-    bail!(
-        "{} is not inside a repository with a working tree (bare repositories aren't supported)",
-        path.display()
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+            "--show-toplevel",
+        ],
     )
+    .with_context(|| {
+        format!(
+            "{} is not inside a git checkout with a working tree",
+            path.display()
+        )
+    })?;
+    let mut lines = dirs.lines();
+    let (git_dir, common_dir, top) = (lines.next(), lines.next(), lines.next());
+    let top = top.with_context(|| {
+        format!(
+            "{} is in a bare repository; run paja from a checkout",
+            path.display()
+        )
+    })?;
+    if git_dir == common_dir {
+        // Already the main checkout (this also covers submodules).
+        return Ok(PathBuf::from(top));
+    }
+    // A linked worktree: git lists the main worktree first.
+    let list = git(path, &["worktree", "list", "--porcelain"])?;
+    list.lines()
+        .next()
+        .and_then(|l| l.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .with_context(|| format!("can't find the main checkout for {}", path.display()))
 }
 
 fn free_port_block(envs: &BTreeMap<String, Env>) -> Result<u16> {
