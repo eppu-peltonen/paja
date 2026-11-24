@@ -484,7 +484,14 @@ fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u
         EV_ESCALATED,
         json!({ "number": item.number, "rounds": rounds }),
     )?;
-    comment(repo, item, question)
+    // The item is parked either way; a failed comment must not escalate it a second time.
+    if let Err(err) = comment(repo, item, question) {
+        eprintln!(
+            "warning: couldn't comment on issue #{}: {err:#}",
+            item.number
+        );
+    }
+    Ok(())
 }
 
 /// Ask the person on the issue.
