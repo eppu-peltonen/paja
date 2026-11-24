@@ -324,11 +324,10 @@ fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Re
     if let Some(schema) = schema {
         cmd.args(["--json-schema", &schema.to_string()]);
     }
-    let output = cmd
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("running `{program}` (install Claude Code and sign in)"))?;
+    let output = cmd.stdin(std::process::Stdio::null()).output();
     let _ = std::fs::remove_dir_all(&scratch);
+    let output =
+        output.with_context(|| format!("running `{program}` (install Claude Code and sign in)"))?;
     if !output.status.success() {
         bail!(
             "`{program} -p` failed in {}: {}",
@@ -556,12 +555,28 @@ fn summaries(reviews: &[Review]) -> String {
         .join("\n")
 }
 
-/// Read a file as it is on the base commit, or None if it isn't there.
+/// Read a file as it is on the base commit, or None if it isn't there. Any other git failure
+/// is an error: a check file that can't be read must never count as an empty one.
 fn read_from_base(repo: &Path, base: &str, path: &str) -> Result<Option<String>> {
-    match git(repo, &["show", &format!("{base}:{path}")]) {
-        Ok(text) => Ok(Some(text)),
-        Err(_) => Ok(None),
+    let spec = format!("{base}:{path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &spec])
+        .output()
+        .context("running git (is it installed?)")?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
     }
+    let err = String::from_utf8_lossy(&output.stderr);
+    if err.contains("does not exist in") || err.contains("exists on disk, but not in") {
+        return Ok(None);
+    }
+    bail!(
+        "git show {spec} failed in {}: {}",
+        repo.display(),
+        err.trim()
+    )
 }
 
 /// Non-empty lines that are not `#` comments.
