@@ -59,32 +59,48 @@ def run(cmd, cwd, env=None, timeout=CHECK_TIMEOUT):
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
+        try:
+            proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass  # a child escaped the group and holds the pipes; give up on its output
         raise
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
-ALIASES = {"t": "test"}
+ALIASES = {"t": "test", "b": "build", "c": "check"}
+# cargo's global flags that take a separate value.
+VALUE_FLAGS = {"--manifest-path", "-C", "--config", "--color", "-Z"}
 
 
-def is_check(args, check):
-    """Whether a cargo argument list runs `check`, wherever global flags put it."""
-    before = args[: args.index("--")] if "--" in args else args
-    return any(ALIASES.get(a, a) == check for a in before)
+def subcommand(args):
+    """The cargo subcommand: the first argument that is not a toolchain or global flag."""
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in VALUE_FLAGS:
+            skip = True
+        elif not arg.startswith(("-", "+")):
+            return ALIASES.get(arg, arg)
+    return None
 
 
 def rewrites(args):
     """Whether a cargo run edits source instead of checking it."""
-    before = args[: args.index("--")] if "--" in args else args
-    if "fix" in before or "--fix" in before:
+    sub = subcommand(args)
+    own = args[: args.index("--")] if "--" in args else args
+    if sub == "fix" or (sub == "clippy" and "--fix" in own):
         return True
-    return is_check(args, "fmt") and "--check" not in before
+    # `--check` may go to cargo fmt or, after `--`, to rustfmt; both only check.
+    return sub == "fmt" and "--check" not in args
 
 
 def judge(invocations):
+    """Each check must have run, passed on its first run, and never rewritten files. A build
+    is covered by clippy and test, which both compile Paja first."""
     steps = {}
     for check in CHECKS:
-        runs = [i for i in invocations if is_check(i["args"], check)]
+        runs = [i for i in invocations if subcommand(i["args"]) == check]
         first = runs[0] if runs else None
         rewrote = any(rewrites(i["args"]) for i in runs)
         steps[check] = {
@@ -122,8 +138,10 @@ def main():
     paja = [os.path.join(scratch, "target", "debug", "paja"), "--json"]
     try:
         added = run(["git", "worktree", "add", "-q", "--detach", src, base], repo)
-        built = run(["cargo", "build", "-q", "--target-dir", os.path.join(scratch, "target")], src,
-                    env) if added.returncode == 0 else added
+        if added.returncode != 0:
+            done({"error": f"`git worktree add {src} {base}` failed in {repo}: "
+                           f"{added.stderr.strip()}"}, False)
+        built = run(["cargo", "build", "-q", "--target-dir", os.path.join(scratch, "target")], src, env)
         if built.returncode != 0:
             done({"error": f"building paja from {base} failed: {built.stderr.strip()[-500:]}"}, False)
         created = run(paja + ["env", "create", name, "--repo", repo, "--base", base], repo, env)
@@ -163,29 +181,48 @@ def main():
                         invocations.append(json.loads(line))
                     except json.JSONDecodeError:
                         invocations.append({"args": ["<unreadable log line>"], "code": -1})
+        if not os.path.exists(log):
+            done({"error": "the cargo shim logged nothing, so Claude's cargo calls bypassed it "
+                           "(a shell profile may put ~/.cargo/bin back first on PATH); fix PATH "
+                           "for non-interactive shells, then rerun",
+                  "claude_said": claude.stdout[-1500:]}, False)
         steps = judge(invocations)
+        rewrote_anywhere = [" ".join(i["args"]) for i in invocations if rewrites(i["args"])]
         # The checks must pass on origin/main as it is, so Claude must leave no edits behind.
         changed = run(["git", "status", "--porcelain"], path).stdout.strip()
-        recheck = {" ".join(c): run(c, path, env).returncode == 0 for c in RECHECK}
-        ok = (all(s["first_passed"] for s in steps.values()) and all(recheck.values())
-              and not changed)
+        recheck = {}
+        for c in RECHECK:
+            try:
+                recheck[" ".join(c)] = run(c, path, env).returncode == 0
+            except subprocess.TimeoutExpired:
+                recheck[" ".join(c)] = f"timed out after {CHECK_TIMEOUT}s"
+        ok = (all(s["first_passed"] for s in steps.values())
+              and all(v is True for v in recheck.values())
+              and not changed and not rewrote_anywhere)
         try:
             said = json.loads(claude.stdout).get("result", "")
         except (json.JSONDecodeError, AttributeError):
             said = claude.stdout
         done({"passed": ok, "base": base, "steps": steps, "recheck": recheck,
-              "changed_files": changed.splitlines(),
+              "changed_files": changed.splitlines(), "rewriting_runs": rewrote_anywhere,
               "cargo": [" ".join(i["args"]) + f" -> {i['code']}" for i in invocations],
               "claude_said": said[-1500:]}, ok)
     finally:
-        try:
-            run(paja + ["env", "remove", name, "--force"], repo, env)
-            run(["git", "worktree", "remove", "--force", src], repo)
-            run(["git", "worktree", "prune"], repo)
-            run(["git", "branch", "-D", f"paja/{name}"], repo)
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
-
+        # Cleanup never raises, so it can't hide the verdict or print a second value.
+        cleanup = []
+        if os.path.exists(paja[0]):
+            cleanup.append(paja + ["env", "remove", name, "--force"])
+        cleanup += [
+            ["git", "worktree", "remove", "--force", src],
+            ["git", "worktree", "prune"],
+            ["git", "branch", "-D", f"paja/{name}"],
+        ]
+        for cmd in cleanup:
+            try:
+                run(cmd, repo, env)
+            except Exception:
+                pass
+        shutil.rmtree(scratch, ignore_errors=True)
 
 if __name__ == "__main__":
     try:
