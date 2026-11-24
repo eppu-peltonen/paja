@@ -87,22 +87,21 @@ moves when the agent runs `cd`.
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
   tools included, is blocked.
 - **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
-  leading `cd` into the worktree (an absolute path, or one starting with `./` or `../`, as a step of its own), then
-  `cargo`, local `git`, `ls`, `rm` or `pwd` commands joined by `&&`, each optionally piped into `head`, `tail`, `grep`
-  or `wc` with no file arguments. No `$`, backticks, globs, `~`, redirections other than `2>&1`, or other separators
-  outside single quotes. Only `RUST_BACKTRACE` and `RUST_LOG` may be set in front of a command.
-- **Cargo** is limited to build, check, test, fmt, clippy, run, doc, tree and metadata, with no `--config`, `-Z` or
-  other output directories.
-- **Git**'s subcommand must come first (so no `-C` or `-c`) and be a local one: add, commit, status, diff, log, show
-  and the like, but not `stash`, whose refs every checkout shares. Options that run programs or reach other files
-  (`--output`, `--ext-diff`, `-O`, `-F`, `--no-index`) are blocked.
-- **Writes** stay in the environment: file edits and the paths given to `git` (as operands or path options), `ls` and
-  `rm` must resolve inside the root, with symlinks followed, and never at its `.git` link or `.cargo` configuration.
-  `rm` can't remove the root itself.
+  `cd` to the worktree's root as a step of its own, then `cargo` and local `git` commands joined by `&&`, each
+  optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading `~`
+  or `=`, redirections other than `2>&1`, or other separators outside single quotes. Only `RUST_BACKTRACE` and
+  `RUST_LOG` may be set in front of a command.
+- **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
+  option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
+  clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
+  (so no `-C` or `-c`) and is one of add, commit, status, diff, show, log and rm; not `stash`, whose refs every
+  checkout shares. Its revisions and paths must stay inside the worktree.
+- **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
+  and never into a `.git` or `.cargo` directory at any depth.
 - **Reads** of single files may look outside the worktree, but not into hidden directories other than dependency
   sources (`.cargo/registry`, `.cargo/git`, `.rustup`), never into `/proc`, `/sys` or `/dev`, and never into the
-  factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree. Nothing may name a
-  credential path (`.ssh`, `.config/gh` and the like).
+  factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree. A file tool path may
+  not start with `~`, and nothing may name a credential path (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
 
 It fails closed: unreadable input, missing bounds and a crash all block, and the hook command ends in `|| exit 2` so a

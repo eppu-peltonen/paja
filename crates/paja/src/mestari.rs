@@ -412,10 +412,15 @@ fn run_hook_once(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("starting the deny-list hook {}", exe.display()))?;
-    std::io::Write::write_all(
+    // A hook that exits without reading its input is judged by its exit code, not the pipe.
+    if let Err(err) = std::io::Write::write_all(
         child.stdin.as_mut().context("the hook's stdin")?,
         input.as_bytes(),
-    )?;
+    ) {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(err.into());
+        }
+    }
     drop(child.stdin.take());
     let out = child.wait_with_output()?;
     Ok((

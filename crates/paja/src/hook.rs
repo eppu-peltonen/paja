@@ -7,10 +7,11 @@
 //! the agent runs `cd`.
 //!
 //! Shell commands are not parsed in general, since a shell has too many ways to hide a denied
-//! command. Instead a command must have one of a few plain shapes: an optional `cd` into the
-//! worktree, then `cargo`, local `git`, `ls`, `rm` or `pwd` commands joined by `&&`, each
-//! optionally piped into `head`, `tail`, `grep` or `wc`. No expansions, no redirections other
-//! than `2>&1`, and no other separators. Agents read and change files with the file tools.
+//! command. Instead a command must have one plain shape: an optional `cd` to the worktree's
+//! root, then `cargo` and local `git` commands joined by `&&`, each optionally piped into
+//! `head`, `tail`, `grep` or `wc`. Every flag must be one Paja lists for that subcommand. No
+//! expansions, no redirections other than `2>&1`, and no other separators. Agents read and
+//! change files with the file tools.
 //!
 //! It is a guardrail, not a sandbox: code the agent writes still runs under `cargo test`.
 //!
@@ -67,9 +68,10 @@ pub fn run(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
         std::process::exit(2);
     }));
     let decision = (|| -> Result<Option<String>> {
-        let bounds = Bounds::new(root, home)?;
+        // Read the call first, so the caller's write never meets a closed pipe.
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        let bounds = Bounds::new(root, home)?;
         let input: HookInput = serde_json::from_str(&input)?;
         check(&input, &bounds)
     })();
@@ -88,58 +90,89 @@ pub fn run(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// Cargo subcommands an agent may run. The subcommand must come first.
-const CARGO_SUBCOMMANDS: &[&str] = &[
-    "build", "check", "test", "fmt", "clippy", "run", "doc", "tree", "metadata",
+/// Cargo subcommands an agent may run, and the flags each accepts. The subcommand comes
+/// first, and every word must be one Paja knows, so no option can load other configuration,
+/// run another program or write elsewhere.
+const CARGO_SUBCOMMANDS: &[&str] = &["build", "check", "test", "fmt", "clippy", "run", "doc"];
+
+/// Cargo flags that take no value.
+const CARGO_FLAGS: &[&str] = &[
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+    "--all",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--lib",
+    "--bins",
+    "--tests",
+    "--benches",
+    "--examples",
+    "--doc",
+    "--release",
+    "--locked",
+    "--offline",
+    "--frozen",
+    "--no-fail-fast",
+    "--no-deps",
+    "--check",
 ];
 
-/// Cargo options that load other configuration or write elsewhere.
-const CARGO_DENIED_OPTIONS: &[&str] = &[
-    "--config",
-    "-Z",
-    "--target-dir",
-    "--manifest-path",
-    "--artifact-dir",
-    "--out-dir",
-    "-C",
+/// Cargo flags whose value is a package, target, feature or job count.
+const CARGO_NAME_FLAGS: &[&str] = &[
+    "-p",
+    "--package",
+    "--test",
+    "--bin",
+    "--example",
+    "--features",
+    "-j",
+    "--jobs",
 ];
 
-/// Git subcommands an agent may run: local work on its own branch. The subcommand must come
-/// first, so no global option can point git elsewhere or set configuration.
-const GIT_SUBCOMMANDS: &[&str] = &[
-    "add",
-    "commit",
-    "status",
-    "diff",
-    "log",
-    "show",
-    "rev-parse",
-    "ls-files",
-    "blame",
-    "rm",
-    "mv",
-    "restore",
+/// Flags the test harness accepts after `--`.
+const TEST_HARNESS_FLAGS: &[&str] = &[
+    "--nocapture",
+    "--exact",
+    "--ignored",
+    "--include-ignored",
+    "--show-output",
+    "-q",
+    "--quiet",
 ];
 
-/// Git options that run programs, read or write files outside the repository, or compare
-/// arbitrary files.
-const GIT_DENIED_OPTIONS: &[&str] = &[
-    "--output",
-    "--ext-diff",
-    "--textconv",
-    "-O",
-    "--open-files-in-pager",
-    "--exec",
-    "-F",
-    "--file",
-    "-t",
-    "--template",
-    "--pathspec-from-file",
-    "--no-index",
+/// Git subcommands an agent may run, local work on its own branch, and the flags each
+/// accepts. The subcommand comes first, so no global option can point git elsewhere or set
+/// configuration; `stash` is out because its refs are shared with every checkout.
+const GIT_FLAGS: &[(&str, &[&str])] = &[
+    ("add", &["-A", "--all", "-u", "--update", "-v"]),
+    ("commit", &["-a", "--all", "-q", "--quiet"]),
+    (
+        "status",
+        &["-s", "--short", "--porcelain", "-b", "--branch"],
+    ),
+    ("diff", DIFF_FLAGS),
+    ("show", DIFF_FLAGS),
+    ("log", DIFF_FLAGS),
+    ("rm", &["-r", "-q", "--cached", "-f"]),
 ];
 
-/// Git options whose value is a path.
-const GIT_PATH_OPTIONS: &[&str] = &["--contents", "--ignore-revs-file", "--orderfile"];
+const DIFF_FLAGS: &[&str] = &[
+    "--stat",
+    "--shortstat",
+    "--name-only",
+    "--name-status",
+    "--oneline",
+    "--cached",
+    "--staged",
+    "-p",
+    "--patch",
+    "--no-patch",
+    "--no-color",
+    "-n",
+];
 
 /// Variables an agent may set in front of a command.
 const ALLOWED_VARIABLES: &[&str] = &["RUST_BACKTRACE", "RUST_LOG"];
@@ -172,6 +205,17 @@ const HARMLESS_TOOLS: &[&str] = &["TodoWrite", "TodoRead", "Task", "Agent", "Exi
 pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
     let cwd = resolve(&input.cwd);
     let t = &input.tool_input;
+    // File tools expand `~` themselves, so a path starting with it can't be judged here.
+    for key in ["file_path", "notebook_path", "path", "pattern", "glob"] {
+        if input.tool_name == "Bash" || (input.tool_name == "Grep" && key == "pattern") {
+            continue;
+        }
+        if let Some(path) = t[key].as_str().filter(|p| p.starts_with('~')) {
+            return Ok(Some(format!(
+                "`{path}` starts with `~`; give an absolute path or one inside the worktree"
+            )));
+        }
+    }
     match input.tool_name.as_str() {
         "Bash" => {
             let command = t["command"]
@@ -230,13 +274,15 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
             full.display()
         ));
     }
-    if full.starts_with(b.root.join(".git")) {
+    // Git and cargo read configuration from these at any depth.
+    let inner = full.strip_prefix(&b.root).unwrap_or(&full);
+    if inner.components().any(|c| c.as_os_str() == ".git") {
         return Some(format!(
-            "{} is git's own link to the repository; agents never change it",
+            "{} is git's own data or link to the repository; agents never change it",
             full.display()
         ));
     }
-    if full.starts_with(b.root.join(".cargo")) {
+    if inner.components().any(|c| c.as_os_str() == ".cargo") {
         return Some(format!(
             "{} is cargo configuration, which could change how cargo runs; agents never change it",
             full.display()
@@ -376,7 +422,7 @@ fn next_is(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, rest: &str) -> 
     }
 }
 
-const SHAPE: &str = "agents run `cargo`, local `git`, `ls`, `rm` and `pwd`, joined by `&&` and \
+const SHAPE: &str = "agents run `cargo` and local `git` with plain flags, joined by `&&` and \
      optionally piped into `head`, `tail`, `grep` or `wc`; use the file tools for everything else";
 
 fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
@@ -432,99 +478,138 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
         return Some(format!("an empty command; {SHAPE}"));
     };
     match *program {
-        "cargo" => {
-            let sub = args.first().copied().unwrap_or("");
-            if !CARGO_SUBCOMMANDS.contains(&sub) {
-                return Some(format!(
-                    "`cargo {sub}` is not allowed; agents use cargo {}",
-                    CARGO_SUBCOMMANDS.join(", ")
-                ));
+        "cargo" => check_cargo(args),
+        "git" => check_git(args, here, b),
+        "pwd" if args.is_empty() => None,
+        // Only into the worktree's root, and only as a step of its own, so a failed `cd`
+        // stops the rest.
+        "cd" if first => match args {
+            [target] if target.starts_with('/') && resolve(Path::new(target)) == b.root => {
+                *here = b.root.clone();
+                None
             }
-            let own: Vec<&str> = args.iter().take_while(|a| **a != "--").copied().collect();
-            if let Some(opt) = denied_option(&own, CARGO_DENIED_OPTIONS) {
-                return Some(format!("`cargo {sub} {opt}` is not allowed for agents"));
-            }
+            _ => Some(format!(
+                "`cd` only goes to the worktree's root, {}",
+                b.root.display()
+            )),
+        },
+        "cd" => Some("`cd` may only be the first step of a command, on its own".into()),
+        other => Some(format!("`{other}` is not allowed; {SHAPE}")),
+    }
+}
+
+fn check_cargo(args: &[&str]) -> Option<String> {
+    let sub = args.first().copied().unwrap_or("");
+    if !CARGO_SUBCOMMANDS.contains(&sub) {
+        return Some(format!(
+            "`cargo {sub}` is not allowed; agents use cargo {}",
+            CARGO_SUBCOMMANDS.join(", ")
+        ));
+    }
+    let rest = &args[1..];
+    let split = rest.iter().position(|a| *a == "--").unwrap_or(rest.len());
+    let (own, after) = (&rest[..split], rest.get(split + 1..).unwrap_or(&[]));
+    let mut value_next = false;
+    for arg in own {
+        let ok = if std::mem::take(&mut value_next) {
+            is_name(arg)
+        } else if CARGO_FLAGS.contains(arg) {
+            true
+        } else if CARGO_NAME_FLAGS.contains(arg) {
+            value_next = true;
+            true
+        } else if let Some((flag, value)) = arg.split_once('=') {
+            CARGO_NAME_FLAGS.contains(&flag) && is_name(value)
+        } else {
+            // A test name filter, or a binary's arguments for `cargo run`.
+            matches!(sub, "test" | "run") && is_name(arg)
+        };
+        if !ok {
+            return Some(format!(
+                "`cargo {sub} {arg}` is not allowed: agents use plain cargo flags ({})",
+                CARGO_FLAGS.join(" ")
+            ));
         }
-        "git" => {
-            let sub = args.first().copied().unwrap_or("");
-            if !GIT_SUBCOMMANDS.contains(&sub) {
-                return Some(format!(
-                    "`git {sub}` is not allowed: agents only use local git on their own branch \
-                     ({})",
-                    GIT_SUBCOMMANDS.join(", ")
-                ));
+    }
+    if value_next {
+        return Some(format!("`cargo {sub}`: a flag is missing its value"));
+    }
+    // After `--`, the words go to the program cargo starts.
+    let mut lint_next = false;
+    for arg in after {
+        let ok = match sub {
+            "test" => {
+                TEST_HARNESS_FLAGS.contains(arg)
+                    || arg
+                        .strip_prefix("--test-threads=")
+                        .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+                    || is_name(arg)
             }
-            // A commit message is not an option or a path; leave it out of both checks.
-            let takes_message = sub == "commit";
-            let mut rest = Vec::new();
-            let mut message = false;
-            for arg in &args[1..] {
-                if std::mem::take(&mut message) {
-                    continue;
+            "clippy" if std::mem::take(&mut lint_next) => is_name(arg),
+            "clippy" => match arg.get(..2) {
+                Some("-D" | "-W" | "-A") if arg.len() == 2 => {
+                    lint_next = true;
+                    true
                 }
-                if takes_message && matches!(*arg, "-m" | "--message") {
-                    message = true;
-                } else if !(takes_message
-                    && (arg.starts_with("-m") || arg.starts_with("--message=")))
-                {
-                    rest.push(*arg);
-                }
-            }
-            if let Some(opt) = denied_option(&rest, GIT_DENIED_OPTIONS) {
-                return Some(format!("`git {sub} {opt}` is not allowed for agents"));
-            }
-            // Every path git is given, as an operand or the value of an option that takes a
-            // path, stays in the worktree. `rev:path` names a file in a revision.
-            let paths: Vec<&str> = rest
-                .iter()
-                .filter_map(|arg| match arg.split_once('=') {
-                    Some((opt, value)) if GIT_PATH_OPTIONS.contains(&opt) => Some(value),
-                    _ if GIT_PATH_OPTIONS.contains(arg) => None,
-                    _ => (!arg.starts_with('-') && !is_revision_path(arg)).then_some(*arg),
-                })
-                .collect();
-            if let Some(opt) = rest.iter().find(|a| GIT_PATH_OPTIONS.contains(a)) {
+                Some("-D" | "-W" | "-A") => is_name(&arg[2..]),
+                _ => false,
+            },
+            "fmt" => *arg == "--check",
+            // `cargo run -- --json work list`: the worktree's own binary, with plain words.
+            "run" => is_name(arg) || arg.starts_with("--") && is_name(&arg[2..]),
+            _ => false,
+        };
+        if !ok {
+            return Some(format!(
+                "`cargo {sub} -- {arg}` is not allowed for agents; pass plain names and flags"
+            ));
+        }
+    }
+    None
+}
+
+fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
+    let sub = args.first().copied().unwrap_or("");
+    let Some((_, flags)) = GIT_FLAGS.iter().find(|(name, _)| *name == sub) else {
+        let names: Vec<&str> = GIT_FLAGS.iter().map(|(name, _)| *name).collect();
+        return Some(format!(
+            "`git {sub}` is not allowed: agents only use local git on their own branch ({})",
+            names.join(", ")
+        ));
+    };
+    let mut paths_only = false;
+    let mut skip_next = false;
+    for arg in &args[1..] {
+        if std::mem::take(&mut skip_next) {
+            continue;
+        }
+        if !paths_only && sub == "commit" && matches!(*arg, "-m" | "--message") {
+            // A commit message is free text, neither a flag nor a path.
+            skip_next = true;
+        } else if !paths_only && *arg == "--" {
+            paths_only = true;
+        } else if !paths_only && arg.starts_with('-') {
+            let count = arg[1..].chars().all(|c| c.is_ascii_digit());
+            if !flags.contains(arg) && !(count && DIFF_FLAGS == *flags) {
                 return Some(format!(
-                    "write `{opt}=<path>` so the path can be checked against the worktree"
+                    "`git {sub} {arg}` is not allowed: agents use {}",
+                    flags.join(" ")
                 ));
             }
-            if let Some(reason) = operands_inside(&paths, here, b, "use git") {
+        } else if !is_plain(arg) {
+            return Some(format!(
+                "`git {sub} {arg}`: name revisions and paths plainly"
+            ));
+        } else if paths_only || !is_revision_path(arg) {
+            // A revision such as `main...HEAD` stays inside the root as a path too; anything
+            // that leaves it is a path outside the worktree.
+            if let Some(reason) = inside_root("use git", &here.join(arg), b) {
                 return Some(reason);
             }
         }
-        "ls" | "rm" => {
-            if let Some(reason) = operands_inside(args, here, b, "use ls and rm") {
-                return Some(reason);
-            }
-            if *program == "rm"
-                && args
-                    .iter()
-                    .any(|a| !a.starts_with('-') && resolve(&here.join(a)) == b.root)
-            {
-                return Some("agents don't remove their whole worktree".into());
-            }
-        }
-        "pwd" => {}
-        // Only as the first step, so a failed `cd` stops the rest.
-        // A bare relative name could follow CDPATH and `-` goes back to OLDPWD, so neither
-        // is allowed.
-        "cd" if first => {
-            let [target] = args else {
-                return Some("`cd` takes one directory inside the worktree".into());
-            };
-            if !(target.starts_with('/') || target.starts_with("./") || target.starts_with("../")) {
-                return Some(format!(
-                    "`cd {target}`: give an absolute path or one starting with `./`"
-                ));
-            }
-            let to = resolve(&here.join(target));
-            if let Some(reason) = inside_root("cd", &to, b) {
-                return Some(reason);
-            }
-            *here = to;
-        }
-        "cd" => return Some("`cd` may only be the first step of a command, on its own".into()),
-        other => return Some(format!("`{other}` is not allowed; {SHAPE}")),
+    }
+    if skip_next {
+        return Some("`git commit -m` needs a message".into());
     }
     None
 }
@@ -568,31 +653,29 @@ fn check_pipe_target(words: &[&str]) -> Option<String> {
     (!ok).then(|| format!("`{program}` may only filter the pipe, not read files; {SHAPE}"))
 }
 
-/// The first argument that is one of `denied`, sets it with `=`, or (for a short option)
-/// has its value attached.
-fn denied_option<'a>(args: &[&'a str], denied: &[&str]) -> Option<&'a str> {
-    args.iter().copied().find(|arg| {
-        denied.iter().any(|opt| {
-            *arg == *opt
-                || arg.starts_with(&format!("{opt}="))
-                || (opt.len() == 2 && arg.starts_with(opt))
-        })
-    })
-}
-
 /// `HEAD:src/lib.rs` or `main:x` names a file in a revision, not on disk.
 fn is_revision_path(arg: &str) -> bool {
     arg.split_once(':')
         .is_some_and(|(rev, _)| !rev.is_empty() && !rev.contains('/'))
 }
 
-fn operands_inside(args: &[&str], here: &Path, b: &Bounds, what: &str) -> Option<String> {
-    for arg in args.iter().filter(|a| !a.starts_with('-')) {
-        if let Some(reason) = inside_root(what, &here.join(arg), b) {
-            return Some(reason);
-        }
-    }
-    None
+/// A package, target, test filter or lint name: nothing a shell or a program would read as a
+/// path or an option.
+fn is_name(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-:,".contains(c))
+}
+
+/// A revision or a path, with nothing a shell would expand (`~` or `=` at the start).
+fn is_plain(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with(['-', '~', '='])
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:,+@^~".contains(c))
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -681,20 +764,14 @@ mod tests {
             "git commit -m '/etc parsing'",
             "git status",
             "git commit -m '-Fix parsing'",
-            "git log --grep=/api --author=/x/",
             "git diff main...HEAD",
             "git log --oneline -3 | head -3",
             "git show HEAD:crates/paja/src/lib.rs",
-            "rm -rf target/debug",
-            "ls src",
             "pwd",
             "RUST_BACKTRACE=1 cargo test smoke",
             "cargo run -q -- --json env create demo",
             "cd /h/.paja/envs/work-1 && cargo test",
-            "cd ./crates/paja && cargo test",
             "cargo test 2>&1|tail -n 20",
-            "git log -m --oneline -3",
-            "git log --format=%H -1",
             "cargo test | wc -l",
         ] {
             assert_eq!(bash(ok), None, "{ok}");
@@ -801,6 +878,16 @@ mod tests {
             "git stash clear",
             "git stash pop",
             "git blame --contents /h/.paja/events.jsonl src/lib.rs",
+            "git commit -aF/proc/self/environ",
+            "git commit --fil=/h/.paja/events.jsonl",
+            "git add --pathspec-from=/etc/x",
+            "cargo fmt -- /h/other/src/main.rs",
+            "git rm -r -- -/../..",
+            "git log =cargo",
+            "git log --format=%H",
+            "rm -rf target/debug",
+            "ls src",
+            "cd ./crates/paja && cargo test",
         ] {
             assert!(bash(bad).is_some(), "{bad} should be blocked");
         }
@@ -817,6 +904,10 @@ mod tests {
         assert!(decide("Grep", json!({"pattern": "BEGIN", "path": "/h"})).is_some());
         assert!(decide("Grep", json!({"pattern": ".", "glob": "/h/.aws/*"})).is_some());
         assert!(decide("Write", json!({"file_path": ".cargo/config.toml"})).is_some());
+        assert!(decide("Write", json!({"file_path": "crates/x/.cargo/config.toml"})).is_some());
+        assert!(decide("Write", json!({"file_path": "sub/.git/config"})).is_some());
+        assert!(decide("Read", json!({"file_path": "~/.paja/events.jsonl"})).is_some());
+        assert!(decide("Write", json!({"file_path": "~/.bashrc"})).is_some());
         assert!(decide("Read", json!({"file_path": "/proc/self/environ"})).is_some());
         assert!(decide(
             "Read",
