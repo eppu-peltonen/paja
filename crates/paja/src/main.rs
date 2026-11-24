@@ -63,6 +63,9 @@ enum Command {
         /// A file the hook touches on every call, so Mestari can tell it really ran.
         #[arg(long)]
         stamp: Option<PathBuf>,
+        /// For reviewers: block every change, inside the worktree too.
+        #[arg(long)]
+        read_only: bool,
     },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
@@ -158,8 +161,14 @@ fn main() -> ExitCode {
             return code;
         }
     };
-    if let Command::Hook { root, home, stamp } = &cli.command {
-        return paja::hook::run(root.clone(), home.clone(), stamp.clone());
+    if let Command::Hook {
+        root,
+        home,
+        stamp,
+        read_only,
+    } = &cli.command
+    {
+        return paja::hook::run(root.clone(), home.clone(), stamp.clone(), *read_only);
     }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,

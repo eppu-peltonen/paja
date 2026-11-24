@@ -43,6 +43,8 @@ pub struct Bounds {
     pub root: PathBuf,
     /// The factory's state directory. Agents never touch it, apart from `root` inside it.
     pub home: PathBuf,
+    /// A reviewer: it reads the change and changes nothing, not even inside the worktree.
+    pub read_only: bool,
 }
 
 impl Bounds {
@@ -52,6 +54,7 @@ impl Bounds {
             (Some(root), Some(home)) if root.is_absolute() && home.is_absolute() => Ok(Bounds {
                 root: resolve(&root),
                 home: resolve(&home),
+                read_only: false,
             }),
             _ => bail!("`paja hook` needs absolute --root and --home paths; Mestari passes both"),
         }
@@ -64,7 +67,12 @@ pub const HOOK_DEADLINE_SECS: u64 = 20;
 /// `paja hook`: read one tool call on stdin and answer with an exit code Claude Code
 /// understands. 0 allows; 2 blocks, with the reason on stderr. Anything but a clear "allow"
 /// blocks, a panic included.
-pub fn run(root: Option<PathBuf>, home: Option<PathBuf>, stamp: Option<PathBuf>) -> ExitCode {
+pub fn run(
+    root: Option<PathBuf>,
+    home: Option<PathBuf>,
+    stamp: Option<PathBuf>,
+    read_only: bool,
+) -> ExitCode {
     // Proof for Mestari that Claude Code called the hook at all.
     if let Some(stamp) = &stamp {
         let _ = std::fs::write(stamp, b"");
@@ -84,7 +92,10 @@ pub fn run(root: Option<PathBuf>, home: Option<PathBuf>, stamp: Option<PathBuf>)
         // Read the call first, so the caller's write never meets a closed pipe.
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-        let bounds = Bounds::new(root, home)?;
+        let bounds = Bounds {
+            read_only,
+            ..Bounds::new(root, home)?
+        };
         let input: HookInput = serde_json::from_str(&input)?;
         check(&input, &bounds)
     })();
@@ -262,6 +273,11 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             }
             Ok(check_command(command, &cwd, bounds))
         }
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" if bounds.read_only => Ok(Some(
+            "reviewers read the change and leave it as it is; say what should change in the \
+             verdict"
+                .into(),
+        )),
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             let Some(path) = ["file_path", "notebook_path"]
                 .iter()
@@ -526,13 +542,22 @@ const SHAPE: &str = "agents run `cargo` and local `git` with plain flags, joined
      optionally piped into `head`, `tail`, `grep` or `wc`; use the file tools for everything else";
 
 fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
-    if touches_secret(command) {
-        return Some("that command names credentials; agents never touch them".into());
-    }
     let tokens = match tokenize(command) {
         Ok(tokens) => tokens,
         Err(what) => return Some(format!("the command has {what}; {SHAPE}")),
     };
+    // Every word but a commit message may not name a credential path.
+    let mut message = false;
+    for token in &tokens {
+        let Token::Word(word) = token else { continue };
+        if std::mem::take(&mut message) {
+            continue;
+        }
+        message = matches!(word.as_str(), "-m" | "--message");
+        if touches_secret(word) {
+            return Some("that command names credentials; agents never touch them".into());
+        }
+    }
     // `&&` steps, each a pipeline of simple commands.
     let mut here = cwd.to_path_buf();
     for (i, step) in tokens.split(|t| *t == Token::And).enumerate() {
@@ -684,6 +709,11 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
             names.join(", ")
         ));
     };
+    if b.read_only && !matches!(sub, "diff" | "show" | "log" | "status") {
+        return Some(format!(
+            "`git {sub}` changes the branch; reviewers only read it (diff, show, log, status)"
+        ));
+    }
     let mut paths_only = false;
     let mut skip_next = false;
     let mut message = false;
@@ -1059,6 +1089,7 @@ mod tests {
         assert!(decide("Write", json!({"file_path": "sub/.git/config"})).is_some());
         assert!(decide("Write", json!({"file_path": ".GIT"})).is_some());
         assert!(decide("Write", json!({"file_path": ".claude/settings.json"})).is_some());
+        assert_eq!(bash("git commit -m 'ignore .docker/ in packaging'"), None);
         assert!(decide("Write", json!({"file_path": ".github/workflows/x.yml"})).is_some());
         assert!(bash("git rm -r -f x:/../.cargo").is_some());
         assert!(bash("git log -").is_some());
@@ -1153,6 +1184,30 @@ mod tests {
             cwd: "/h".into(),
         };
         assert!(check(&input, &bounds()).unwrap().is_some());
+    }
+
+    #[test]
+    fn reviewers_only_read() {
+        let b = Bounds {
+            read_only: true,
+            ..bounds()
+        };
+        let call = |tool: &str, input: Value| {
+            let input = HookInput {
+                tool_name: tool.into(),
+                tool_input: input,
+                cwd: ROOT.into(),
+            };
+            check(&input, &b).unwrap()
+        };
+        assert!(call("Edit", json!({"file_path": "src/lib.rs"})).is_some());
+        assert!(call("Bash", json!({"command": "git add -A"})).is_some());
+        assert!(call("Bash", json!({"command": "git commit -m x"})).is_some());
+        assert_eq!(
+            call("Bash", json!({"command": "git diff main...HEAD"})),
+            None
+        );
+        assert_eq!(call("Read", json!({"file_path": "src/lib.rs"})), None);
     }
 
     #[test]

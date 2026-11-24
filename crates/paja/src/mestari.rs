@@ -256,7 +256,7 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
         "Bash(git diff*)",
         "Bash(git log*)",
     ];
-    claude(home, env, base, &prompt, &tools, None).map(|_| ())
+    claude(home, env, base, &prompt, &tools, None, false).map(|_| ())
 }
 
 fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
@@ -291,7 +291,7 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Bash(git log*)",
         "Bash(git show*)",
     ];
-    let out = claude(home, env, base, &prompt, &tools, Some(&schema))?;
+    let out = claude(home, env, base, &prompt, &tools, Some(&schema), true)?;
     let structured = out
         .get("structured_output")
         .cloned()
@@ -316,24 +316,42 @@ fn claude(
     prompt: &str,
     tools: &[&str],
     schema: Option<&Value>,
+    read_only: bool,
 ) -> Result<Value> {
     let program = claude_program();
-    let (settings, stamp) = hook_settings(&env.path, home)?;
     let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
         Some(text) => format!("The project's CLAUDE.md, as it is on main:\n\n{text}"),
         None => String::new(),
     };
+    let git_identity = git_identity(&env.path);
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let scratch = tempfile_dir(&env.path)?;
+    let (settings, stamp) = match hook_settings(&env.path, home, read_only) {
+        Ok(made) => made,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Err(err);
+        }
+    };
     let mut cmd = Command::new(&program);
     cmd.current_dir(&env.path)
         .env("PAJA_HOME", &scratch)
-        // GitHub stays Mestari's: agents and the code they run never see its tokens.
+        // GitHub stays Mestari's. Take away the easy ways the agent, or code it runs, could
+        // reach it: tokens, the SSH agent, gh's stored login and git's credential helpers.
+        // Determined code run by `cargo test` is the sandbox's job.
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")
         .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env_remove("PAJA_GH")
+        .env_remove("SSH_AUTH_SOCK")
+        .env("GH_CONFIG_DIR", &scratch)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "false")
+        // Without the global config, commits still need the owner's name and email.
+        .envs(git_identity)
         .args([
             "-p",
             prompt,
@@ -416,6 +434,31 @@ fn claude(
     Ok(value)
 }
 
+/// The owner's commit name and email, which agents' commits use while git's global
+/// configuration is hidden from them.
+fn git_identity(repo: &Path) -> Vec<(&'static str, String)> {
+    let get = |key: &str| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", key])
+            .output()
+            .ok()?;
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !value.is_empty()).then_some(value)
+    };
+    let mut vars = Vec::new();
+    if let Some(name) = get("user.name") {
+        vars.push(("GIT_AUTHOR_NAME", name.clone()));
+        vars.push(("GIT_COMMITTER_NAME", name));
+    }
+    if let Some(email) = get("user.email") {
+        vars.push(("GIT_AUTHOR_EMAIL", email.clone()));
+        vars.push(("GIT_COMMITTER_EMAIL", email));
+    }
+    vars
+}
+
 fn git_head(repo: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -469,7 +512,7 @@ fn discard(env: &Env, to: &str) -> Result<()> {
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
 /// Before handing them out, check that the hook really blocks a push and allows a build; an
 /// agent never starts under a hook that doesn't.
-fn hook_settings(root: &Path, home: &Home) -> Result<(String, PathBuf)> {
+fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
     let args = [
@@ -512,11 +555,12 @@ fn hook_settings(root: &Path, home: &Home) -> Result<(String, PathBuf)> {
     // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails
     // in any other way must block too.
     let command = format!(
-        "{} hook --root {} --home {} --stamp {} || exit 2",
+        "{} hook --root {} --home {} --stamp {}{} || exit 2",
         quote(&exe.to_string_lossy()),
         quote(&root.to_string_lossy()),
         quote(&home.root().to_string_lossy()),
-        quote(&stamp.to_string_lossy())
+        quote(&stamp.to_string_lossy()),
+        if read_only { " --read-only" } else { "" }
     );
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
@@ -539,8 +583,17 @@ fn refuse_hook_policies() -> Result<()> {
         "/etc/claude-code/managed-settings.json",
         "/Library/Application Support/ClaudeCode/managed-settings.json",
     ] {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "reading Claude Code's managed settings {path}, which could switch off \
+                         Paja's deny-list hook; make it readable or run Paja elsewhere"
+                    )
+                })
+            }
         };
         let settings: Value = serde_json::from_str(&text)
             .with_context(|| format!("reading Claude Code's managed settings {path}"))?;
@@ -598,18 +651,33 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
         p if p.exists() => p.to_path_buf(),
         _ => std::env::current_exe().context("finding the paja binary for the deny-list hook")?,
     };
-    let exe = dir.join(format!(
-        "paja-{}-{}",
-        std::process::id(),
-        crate::events::now_ms()
-    ));
-    std::fs::copy(&running, &exe).with_context(|| {
-        format!(
-            "copying {} to {} for the deny-list hook; if paja was rebuilt, restart `paja run`",
-            running.display(),
-            exe.display()
-        )
-    })?;
+    // One copy per build of paja, shared by every run of it, so copies don't pile up.
+    let meta = std::fs::metadata(&running)
+        .with_context(|| format!("reading {} for the deny-list hook", running.display()))?;
+    let built = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let exe = dir.join(format!("paja-{}-{built}", meta.len()));
+    if !exe.exists() {
+        // Copy under a temporary name and rename, so no run ever sees half a binary.
+        let partial = dir.join(format!(
+            "partial-{}-{}",
+            std::process::id(),
+            crate::events::now_ms()
+        ));
+        std::fs::copy(&running, &partial)
+            .and_then(|_| std::fs::rename(&partial, &exe))
+            .with_context(|| {
+                format!(
+                    "copying {} to {} for the deny-list hook; if paja was rebuilt, restart `paja \
+                     run`",
+                    running.display(),
+                    exe.display()
+                )
+            })?;
+    }
     // A copy keeps the source's age on some systems; make it new so cleanup leaves it be.
     if let Ok(file) = std::fs::File::options().write(true).open(&exe) {
         let _ = file.set_modified(std::time::SystemTime::now());

@@ -797,6 +797,11 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert!(args.contains("--setting-sources  --settings"), "{args}");
     // CLAUDE.md doesn't load without setting sources, so main's copy comes with the prompt.
     assert!(args.contains("--append-system-prompt"), "{args}");
+    // Reviewers run read-only under the hook; builders don't.
+    let reviewer = args.lines().find(|l| l.contains("--json-schema")).unwrap();
+    let builder = args.lines().find(|l| !l.contains("--json-schema")).unwrap();
+    assert!(reviewer.contains("--read-only"), "{reviewer}");
+    assert!(!builder.contains("--read-only"), "{builder}");
     assert!(
         args.contains("PreToolUse") && args.contains("hook --root") && args.contains("work-5"),
         "{args}"
