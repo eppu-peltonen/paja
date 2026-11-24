@@ -35,7 +35,8 @@ step's exit test passes.
 
 ## Status
 
-Step 1 is done. Its exit test is `evals/step1-exit.py`: headless Claude Code, in a fresh environment made from `main`
-and guided only by `CLAUDE.md`, builds Paja and runs fmt, clippy and the tests, each passing on its first command. The
-verdict comes from the transcript and a re-run of the checks, never from the model's own report. It passed on
-2026-11-24. It needs a signed-in `claude`, so it runs on the owner's machine, not in CI. Step 2 is next.
+Step 1 is done. Its exit test is `evals/step1-exit.py`: headless Claude Code, in a fresh environment made from
+`origin/main` and guided only by `CLAUDE.md`, must run fmt, clippy and the tests, each passing on its first command. The
+verdict comes from a log of the cargo processes Claude really started and a re-run of the checks, never from the model's
+own report. It needs a signed-in `claude`, so it runs on the owner's machine, not in CI; its latest passing output is
+in the pull request that added it. Step 2 is next.
