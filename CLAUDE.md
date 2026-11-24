@@ -38,9 +38,12 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
   Agents and Paja Desk depend on this.
 - **Errors say what to do.** Include the path, name or command involved and the fix when there is one.
 - **Test behaviour end to end.** New CLI behaviour gets a case in `tests/smoke.rs` that runs the real binary.
+- **Checks stay out of reach of the change they judge.** A change that fixes a failing test must not edit that test;
+  Vasara's rules and scenarios are read from `main`, never from the branch under review.
 - **Small changes.** One concern per pull request.
 
 ## Risk tiers
 
 These areas always wait for a human before landing, even when checks pass: sandbox and secrets handling, the deny-list
-hook, landing and revert logic, and the event log's format (`events.rs`). Everything else may land on green.
+hook, landing and revert logic, Vasara's rules and the harness evals, and the event log's format (`events.rs`).
+Everything else may land on green.
