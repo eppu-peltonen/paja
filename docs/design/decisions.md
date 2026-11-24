@@ -4,6 +4,9 @@ Settled decisions, newest first within each date. Change one only by adding a ne
 
 ## 2026-11-24
 
+- **Self-hosting first.** Steps 2 and 3 are cut to the smallest loop that can build Paja (issue import, build, review,
+  land, deny-list hook); everything else is built by that loop. This replaces the earlier step 2 (interface and plugin
+  by hand).
 - **No separate GitHub identity.** Commits and pull requests go out under the owner's account. Unattended runs use a
   fine-grained token limited to the repository being worked on, so an agent can't reach anything else.
 - **Nobody reviews pull requests.** Agents review and land code; high-risk changes pass a stricter automated gate
