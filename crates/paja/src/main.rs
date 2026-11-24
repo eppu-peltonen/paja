@@ -156,7 +156,7 @@ fn main() -> ExitCode {
         }
     };
     if let Command::Hook { root, home } = &cli.command {
-        return run_hook(root.clone(), home.clone());
+        return paja::hook::run(root.clone(), home.clone());
     }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -167,35 +167,6 @@ fn main() -> ExitCode {
                 eprintln!("error: {err:#}");
             }
             ExitCode::FAILURE
-        }
-    }
-}
-
-/// Fail closed: anything but a clear "allowed" blocks the call.
-fn run_hook(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
-    // A panic would exit 101, which Claude Code treats as "allow"; block instead.
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("Blocked: Paja's deny-list hook crashed ({info}), so it fails closed");
-        std::process::exit(2);
-    }));
-    let decision = (|| -> Result<Option<String>> {
-        let bounds = paja::hook::Bounds::new(root, home)?;
-        let mut input = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-        let input: paja::hook::HookInput = serde_json::from_str(&input)?;
-        paja::hook::check(&input, &bounds)
-    })();
-    match decision {
-        Ok(None) => ExitCode::SUCCESS,
-        Ok(Some(reason)) => {
-            eprintln!("Blocked by Paja's deny-list: {reason}");
-            ExitCode::from(2)
-        }
-        Err(err) => {
-            eprintln!(
-                "Blocked: Paja's deny-list hook couldn't decide ({err:#}), so it fails closed"
-            );
-            ExitCode::from(2)
         }
     }
 }

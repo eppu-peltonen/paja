@@ -83,17 +83,19 @@ Every agent Mestari starts runs with `--setting-sources ""` and settings that se
 so neither the owner's settings nor a file on the branch can loosen the hook or switch it off; `CLAUDE.md` still loads.
 The bounds are passed in rather than read from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
-- **Shell commands** are split into simple commands at `;`, `&&`, `||`, `|`, `&`, subshells and substitutions (also
-  inside double quotes), with quotes and backslashes removed. Each must start with a program on an allowlist, named
-  without a path: cargo, local git, and plain file and text tools. Shells, interpreters, `sed`, `env`, `xargs` and
-  network tools are not on it. Git is limited to local subcommands (add, commit, status, diff, log, show, stash and
-  the like) and can't be pointed elsewhere with `-C`, `--git-dir` or `--work-tree`; cargo can't publish or install;
-  `find` can't run, write or delete; `sort -o` is out. Setting `PATH`, `GIT_*`, `LD_*` or `RUSTC_WRAPPER` is blocked.
-- **Writes** stay in the environment: file edits, `rm`, `cp`, `mv`, `mkdir`, `touch`, `cd` and output redirections
-  must resolve inside the root (`--opt=value` paths included), and a path the shell would expand first (`~`, `$`,
-  globs) is blocked.
-- **Reads** may look outside the worktree, but nothing may touch credential paths (`~/.ssh`, `~/.config/gh` and the
-  like) or the factory home outside the environment, including via `Glob` patterns and `Grep` globs.
+- **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
+  leading `cd` into the worktree, then `cargo`, local `git`, `ls`, `rm` or `pwd` commands joined by `&&`, each
+  optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, `~`,
+  redirections other than `2>&1`, or other separators outside single quotes. Cargo is limited to build, check, test,
+  fmt, clippy, run, doc, tree and metadata, with no `--config`, `-Z` or other output directories. Git's subcommand
+  must come first (so no `-C` or `-c`) and be a local one (add, commit, status, diff, log, show, stash and the like),
+  without options that run programs or reach other files (`--output`, `--ext-diff`, `-O`, `-F`, `--no-index`). Only
+  `RUST_BACKTRACE` and `RUST_LOG` may be set in front of a command.
+- **Writes** stay in the environment: file edits and the paths given to `git`, `ls` and `rm` must resolve inside the
+  root, never at its `.git` link, and `rm` can't remove the root itself.
+- **Reads** of single files may look outside the worktree, but not into hidden directories other than dependency
+  sources (`.cargo/registry`, `.rustup`) and never into the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so
+  they stay inside the worktree. Nothing may name a credential path (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
 
 It fails closed: unreadable input, missing bounds and a crash all block. Before each agent Mestari checks that the

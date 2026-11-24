@@ -4,17 +4,22 @@
 //!
 //! Mestari passes the environment's root and the factory's home explicitly
 //! (`paja hook --root <env> --home <home>`), because the `cwd` Claude Code reports moves when
-//! the agent runs `cd`. Shell commands are judged against an allowlist of programs, one simple
-//! command at a time, because a shell has too many ways to hide a denied one.
+//! the agent runs `cd`.
+//!
+//! Shell commands are not parsed in general, since a shell has too many ways to hide a denied
+//! command. Instead a command must have one of a few plain shapes: an optional `cd` into the
+//! worktree, then `cargo`, local `git`, `ls`, `rm` or `pwd` commands joined by `&&`, each
+//! optionally piped into `head`, `tail`, `grep` or `wc`. No expansions, no redirections other
+//! than `2>&1`, and no other separators. Agents read and change files with the file tools.
 //!
 //! It is a guardrail, not a sandbox: code the agent writes still runs under `cargo test`.
-//! Containing that is the sandbox's job.
 //!
-//! It fails closed. `paja hook` exits 2 (block) when a rule matches and also when anything goes
+//! It fails closed. [`run`] exits 2 (block) when a rule matches and also when anything goes
 //! wrong while deciding, including a panic. Mestari runs a self-test before each agent and
 //! refuses to start one unless the hook both blocks a push and allows a build.
 
 use std::path::{Component, Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -52,15 +57,55 @@ impl Bounds {
     }
 }
 
-/// Programs an agent may run. Anything else is blocked, including shells and interpreters.
-const PROGRAMS: &[&str] = &[
-    "cargo", "rustc", "rustfmt", "git", "ls", "cat", "head", "tail", "wc", "grep", "rg", "find",
-    "sort", "uniq", "diff", "echo", "printf", "pwd", "true", "false", "test", "[", "mkdir",
-    "touch", "cp", "mv", "rm", "tr", "cut", "basename", "dirname", "which", "date", "mktemp", "cd",
-    "sleep",
+/// `paja hook`: read one tool call on stdin and answer with an exit code Claude Code
+/// understands. 0 allows; 2 blocks, with the reason on stderr. Anything but a clear "allow"
+/// blocks, a panic included.
+pub fn run(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
+    // A panic would exit 101, which Claude Code treats as "allow"; block instead.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("Blocked: Paja's deny-list hook crashed ({info}), so it fails closed");
+        std::process::exit(2);
+    }));
+    let decision = (|| -> Result<Option<String>> {
+        let bounds = Bounds::new(root, home)?;
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        let input: HookInput = serde_json::from_str(&input)?;
+        check(&input, &bounds)
+    })();
+    match decision {
+        Ok(None) => ExitCode::SUCCESS,
+        Ok(Some(reason)) => {
+            eprintln!("Blocked by Paja's deny-list: {reason}");
+            ExitCode::from(2)
+        }
+        Err(err) => {
+            eprintln!(
+                "Blocked: Paja's deny-list hook couldn't decide ({err:#}), so it fails closed"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Cargo subcommands an agent may run. The subcommand must come first.
+const CARGO_SUBCOMMANDS: &[&str] = &[
+    "build", "check", "test", "fmt", "clippy", "run", "doc", "tree", "metadata",
 ];
 
-/// The git subcommands an agent may use: local work on its own branch.
+/// Cargo options that load other configuration or write elsewhere.
+const CARGO_DENIED_OPTIONS: &[&str] = &[
+    "--config",
+    "-Z",
+    "--target-dir",
+    "--manifest-path",
+    "--artifact-dir",
+    "--out-dir",
+    "-C",
+];
+
+/// Git subcommands an agent may run: local work on its own branch. The subcommand must come
+/// first, so no global option can point git elsewhere or set configuration.
 const GIT_SUBCOMMANDS: &[&str] = &[
     "add",
     "commit",
@@ -71,24 +116,36 @@ const GIT_SUBCOMMANDS: &[&str] = &[
     "rev-parse",
     "ls-files",
     "blame",
-    "grep",
-    "mv",
     "rm",
+    "mv",
     "restore",
     "stash",
 ];
 
-/// Cargo subcommands that reach a registry or install tools.
-const CARGO_DENIED: &[&str] = &["publish", "install", "login", "logout", "owner", "yank"];
+/// Git options that run programs, read or write files outside the repository, or compare
+/// arbitrary files.
+const GIT_DENIED_OPTIONS: &[&str] = &[
+    "--output",
+    "--ext-diff",
+    "--textconv",
+    "-O",
+    "--open-files-in-pager",
+    "--exec",
+    "-F",
+    "--file",
+    "-t",
+    "--template",
+    "--pathspec-from-file",
+    "--no-index",
+];
 
-/// Programs whose path arguments are changed, so each must stay inside the root.
-const WRITERS: &[&str] = &["mkdir", "touch", "cp", "mv", "rm"];
+/// Variables an agent may set in front of a command.
+const ALLOWED_VARIABLES: &[&str] = &["RUST_BACKTRACE", "RUST_LOG"];
 
-/// Variables that change which program runs or what it loads.
-const DENIED_VARIABLES: &[&str] = &["PATH", "BASH_ENV", "ENV", "RUSTC", "RUSTC_WRAPPER"];
-const DENIED_VARIABLE_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_"];
+/// Programs that may read a pipe, with no file operands.
+const PIPE_TARGETS: &[&str] = &["head", "tail", "grep", "wc"];
 
-/// Places that hold credentials. Any tool touching them is blocked.
+/// Places that hold credentials. Any tool naming them is blocked.
 const SECRET_PATHS: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -97,10 +154,13 @@ const SECRET_PATHS: &[&str] = &[
     ".netrc",
     ".git-credentials",
     ".cargo/credentials",
-    ".cargo/credentials.toml",
     ".npmrc",
-    ".docker/config.json",
+    ".docker",
 ];
+
+/// Hidden directories outside the worktree that are still worth reading: dependency
+/// sources and the toolchain.
+const READABLE_HIDDEN: &[&str] = &[".cargo/registry", ".cargo/git", ".rustup"];
 
 /// Decide one tool call. `Ok(None)` allows it, `Ok(Some(reason))` blocks it.
 pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
@@ -118,16 +178,29 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 .iter()
                 .find_map(|key| t[*key].as_str())
                 .context("a file edit without a path")?;
-            Ok(check_write(path, &cwd, bounds))
+            Ok(inside_root("change files", &cwd.join(path), bounds))
         }
-        "Read" | "Glob" | "Grep" | "LS" => {
-            for key in ["file_path", "path", "pattern", "glob"] {
-                if let Some(value) = t[key].as_str() {
-                    // A Grep pattern is a regex, not a path: only look for secrets in it.
-                    let is_path = key != "pattern" || input.tool_name == "Glob";
-                    if let Some(reason) = check_read(value, &cwd, bounds, is_path) {
-                        return Ok(Some(reason));
-                    }
+        "Read" => {
+            let path = t["file_path"].as_str().context("a Read without a path")?;
+            Ok(check_read(&cwd.join(path), bounds))
+        }
+        // Searches recurse, so they stay inside the worktree.
+        "Glob" | "Grep" | "LS" => {
+            let base = t["path"].as_str().map_or(cwd.clone(), |p| cwd.join(p));
+            if let Some(reason) = inside_root("search", &base, bounds) {
+                return Ok(Some(reason));
+            }
+            // Grep's pattern is a regex; Glob's pattern and Grep's glob are paths.
+            let key = if input.tool_name == "Grep" {
+                "glob"
+            } else {
+                "pattern"
+            };
+            if let Some(pattern) = t[key].as_str() {
+                if pattern.starts_with('/') || pattern.split('/').any(|part| part == "..") {
+                    return Ok(Some(format!(
+                        "the pattern `{pattern}` reaches outside the worktree; search relative to it"
+                    )));
                 }
             }
             Ok(None)
@@ -138,220 +211,313 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
     }
 }
 
-/// Reads may look outside the worktree, but never at credentials or the factory's state.
-fn check_read(value: &str, cwd: &Path, b: &Bounds, is_path: bool) -> Option<String> {
-    if touches_secret(value) {
-        return Some(format!("{value} holds credentials; agents never touch it"));
-    }
-    if is_path {
-        let full = normalize(&cwd.join(value));
-        if in_factory_home(&full, b) {
-            return Some(format!(
-                "{} is the factory's own state; agents never touch it",
-                full.display()
-            ));
-        }
-    }
-    None
-}
-
-fn check_write(path: &str, cwd: &Path, b: &Bounds) -> Option<String> {
-    if let Some(reason) = check_read(path, cwd, b, true) {
-        return Some(reason);
-    }
-    let full = normalize(&cwd.join(path));
+/// `path` must be inside the worktree, and not git's link to the repository.
+fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
+    let full = normalize(path);
     if !full.starts_with(&b.root) {
         return Some(format!(
-            "{} is outside this environment ({}); agents only change files in their own worktree",
-            full.display(),
-            b.root.display()
+            "agents {what} only inside their own worktree ({}), not {}",
+            b.root.display(),
+            full.display()
+        ));
+    }
+    if full.starts_with(b.root.join(".git")) {
+        return Some(format!(
+            "{} is git's own link to the repository; agents never change it",
+            full.display()
         ));
     }
     None
 }
 
-fn in_factory_home(path: &Path, b: &Bounds) -> bool {
-    path.starts_with(&b.home) && !path.starts_with(&b.root)
+/// Reads may look at plain files outside the worktree, but not into hidden directories
+/// (where credentials live) other than dependency sources, and never at the factory's state.
+fn check_read(path: &Path, b: &Bounds) -> Option<String> {
+    let full = normalize(path);
+    if full.starts_with(&b.root) {
+        return None;
+    }
+    if full.starts_with(&b.home) {
+        return Some(format!(
+            "{} is the factory's own state; agents never touch it",
+            full.display()
+        ));
+    }
+    let text = full.to_string_lossy();
+    let hidden = full
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+    let allowed = READABLE_HIDDEN
+        .iter()
+        .any(|dir| text.contains(&format!("/{dir}/")));
+    if touches_secret(&text) || (hidden && !allowed) {
+        return Some(format!(
+            "{} is in a hidden directory outside the worktree; agents don't read those",
+            full.display()
+        ));
+    }
+    None
 }
+
+/// One piece of a command line.
+#[derive(Debug, PartialEq)]
+enum Token {
+    Word(String),
+    And,
+    Pipe,
+    StderrToStdout,
+}
+
+/// Split a command into words and the few operators allowed. Anything the shell would
+/// expand or treat specially, outside single quotes, is an error.
+fn tokenize(command: &str) -> Result<Vec<Token>, String> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = command.chars().peekable();
+    let flush = |word: &mut String, in_word: &mut bool, tokens: &mut Vec<Token>| {
+        if *in_word {
+            tokens.push(Token::Word(std::mem::take(word)));
+            *in_word = false;
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => word.push(c),
+                        None => return Err("an unclosed quote".into()),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some(c @ ('$' | '`' | '\\' | '!')) => {
+                            return Err(format!("`{c}` inside double quotes (use single quotes)"));
+                        }
+                        Some(c) => word.push(c),
+                        None => return Err("an unclosed quote".into()),
+                    }
+                }
+            }
+            ' ' | '\t' => flush(&mut word, &mut in_word, &mut tokens),
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                flush(&mut word, &mut in_word, &mut tokens);
+                tokens.push(Token::And);
+            }
+            '|' if chars.peek() != Some(&'|') => {
+                flush(&mut word, &mut in_word, &mut tokens);
+                tokens.push(Token::Pipe);
+            }
+            '2' if !in_word && next_is(&mut chars, ">&1") => {
+                tokens.push(Token::StderrToStdout);
+            }
+            c if c.is_ascii_alphanumeric() || "-_./=:,+@%^".contains(c) => {
+                in_word = true;
+                word.push(c);
+            }
+            '\n' => return Err("a newline".into()),
+            c => return Err(format!("`{c}` outside quotes")),
+        }
+    }
+    flush(&mut word, &mut in_word, &mut tokens);
+    Ok(tokens)
+}
+
+/// Consume `rest` from `chars` if it comes next and ends the word.
+fn next_is(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, rest: &str) -> bool {
+    let ahead: String = chars.clone().take(rest.len() + 1).collect();
+    let ends = ahead.len() == rest.len() || ahead.ends_with([' ', '\t']);
+    if ahead.starts_with(rest) && ends {
+        for _ in 0..rest.len() {
+            chars.next();
+        }
+        true
+    } else {
+        false
+    }
+}
+
+const SHAPE: &str = "agents run `cargo`, local `git`, `ls`, `rm` and `pwd`, joined by `&&` and \
+     optionally piped into `head`, `tail`, `grep` or `wc`; use the file tools for everything else";
 
 fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
     if touches_secret(command) {
-        return Some("that command touches credentials; agents never do".into());
+        return Some("that command names credentials; agents never touch them".into());
     }
-    let home = b.home.to_string_lossy();
-    if command.contains(home.as_ref()) || command.contains("~/.paja") {
-        return Some("that command names the factory's own state; agents never touch it".into());
-    }
-    // A `cd` earlier in the command moves where later parts run, so track it.
+    let tokens = match tokenize(command) {
+        Ok(tokens) => tokens,
+        Err(what) => return Some(format!("the command has {what}; {SHAPE}")),
+    };
+    // `&&` steps, each a pipeline of simple commands.
     let mut here = cwd.to_path_buf();
-    for segment in segments(command) {
-        let words = words(&segment);
-        let Some(start) = words.iter().position(|w| !is_assignment(w)) else {
-            continue;
-        };
-        if let Some(var) = words[..start].iter().find_map(|w| denied_variable(w)) {
-            return Some(format!(
-                "agents don't set {var}; it changes which program runs"
-            ));
-        }
-        let program = words[start].as_str();
-        let args = &words[start + 1..];
-        if !PROGRAMS.contains(&program) {
-            return Some(format!(
-                "`{program}` is not on the agents' allowlist; use the file tools, cargo and \
-                 local git (run programs by name, not by path)"
-            ));
-        }
-        if let Some(reason) = check_program(program, args, &here, b) {
-            return Some(reason);
-        }
-        if let Some(reason) = check_redirects(&segment, &here, b) {
-            return Some(reason);
-        }
-        if program == "cd" {
-            here = normalize(&here.join(&args[0]));
+    for (i, step) in tokens.split(|t| *t == Token::And).enumerate() {
+        for (j, stage) in step.split(|t| *t == Token::Pipe).enumerate() {
+            let mut words: Vec<&str> = Vec::new();
+            for (k, token) in stage.iter().enumerate() {
+                match token {
+                    Token::Word(w) => words.push(w),
+                    Token::StderrToStdout if k == stage.len() - 1 => {}
+                    _ => return Some(format!("a misplaced operator; {SHAPE}")),
+                }
+            }
+            let reason = if j == 0 {
+                check_simple(&words, i == 0, &mut here, b)
+            } else {
+                check_pipe_target(&words)
+            };
+            if reason.is_some() {
+                return reason;
+            }
         }
     }
     None
 }
 
-fn check_program(program: &str, args: &[String], here: &Path, b: &Bounds) -> Option<String> {
-    // Paths the program will act on: plain operands and the values of `--opt=value`.
-    let operands = || {
-        args.iter().filter_map(|a| match a.strip_prefix("--") {
-            Some(opt) => opt.split_once('=').map(|(_, value)| value),
-            None => (!a.starts_with('-')).then_some(a.as_str()),
-        })
-    };
-    for arg in operands() {
-        if in_factory_home(&normalize(&here.join(arg)), b) {
+fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> Option<String> {
+    let start = words
+        .iter()
+        .position(|w| !is_assignment(w))
+        .unwrap_or(words.len());
+    for assignment in &words[..start] {
+        let name = assignment.split_once('=').map_or("", |(n, _)| n);
+        if !ALLOWED_VARIABLES.contains(&name) {
             return Some(format!(
-                "`{program} {arg}` reaches the factory's own state; agents never touch it"
+                "agents don't set {name} (PAJA_HOME is already a throwaway home); {SHAPE}"
             ));
         }
     }
-    match program {
-        "git" => {
-            if let Some(opt) = args.iter().find(|a| {
-                ["-C", "--git-dir", "--work-tree", "--namespace"]
-                    .iter()
-                    .any(|o| a.as_str() == *o || a.starts_with(&format!("{o}=")))
-            }) {
-                return Some(format!(
-                    "`git {opt}` points git elsewhere; agents only use git in their own worktree"
-                ));
-            }
-            let sub = git_subcommand(args);
-            if !sub.is_some_and(|s| GIT_SUBCOMMANDS.contains(&s)) {
-                return Some(format!(
-                    "`git {}` is not allowed: agents only use local git on their own branch \
-                     (add, commit, status, diff, log, show, stash)",
-                    sub.unwrap_or("")
-                ));
-            }
-        }
+    let Some((program, args)) = words[start..].split_first() else {
+        return Some(format!("an empty command; {SHAPE}"));
+    };
+    match *program {
         "cargo" => {
-            if let Some(sub) = args
-                .iter()
-                .find(|a| !a.starts_with('-') && !a.starts_with('+'))
-                .filter(|s| CARGO_DENIED.contains(&s.as_str()))
-            {
+            let sub = args.first().copied().unwrap_or("");
+            if !CARGO_SUBCOMMANDS.contains(&sub) {
                 return Some(format!(
-                    "`cargo {sub}` is not allowed: agents don't publish or install"
+                    "`cargo {sub}` is not allowed; agents use cargo {}",
+                    CARGO_SUBCOMMANDS.join(", ")
                 ));
             }
-        }
-        "find"
-            if args.iter().any(|a| {
-                matches!(
-                    a.as_str(),
-                    "-exec"
-                        | "-execdir"
-                        | "-ok"
-                        | "-okdir"
-                        | "-delete"
-                        | "-fprint"
-                        | "-fprintf"
-                        | "-fprint0"
-                        | "-fls"
-                )
-            }) =>
-        {
-            return Some("`find` may only list files, not run, write or delete them".into());
-        }
-        "sort"
-            if args
-                .iter()
-                .any(|a| a.starts_with("-o") || a.starts_with("--output")) =>
-        {
-            return Some("`sort` may only print; write files with the Write tool".into());
-        }
-        "cd" => match args.first() {
-            Some(target) if !target.starts_with('-') => {
-                return confined("cd", target, here, b);
+            let own: Vec<&str> = args.iter().take_while(|a| **a != "--").copied().collect();
+            if let Some(opt) = denied_option(&own, CARGO_DENIED_OPTIONS) {
+                return Some(format!("`cargo {sub} {opt}` is not allowed for agents"));
             }
-            _ => return Some("`cd` needs a plain directory inside the worktree".into()),
-        },
-        _ => {}
-    }
-    if WRITERS.contains(&program) {
-        for target in operands() {
-            if let Some(reason) = confined(program, target, here, b) {
+        }
+        "git" => {
+            let sub = args.first().copied().unwrap_or("");
+            if !GIT_SUBCOMMANDS.contains(&sub) {
+                return Some(format!(
+                    "`git {sub}` is not allowed: agents only use local git on their own branch \
+                     ({})",
+                    GIT_SUBCOMMANDS.join(", ")
+                ));
+            }
+            if let Some(opt) = denied_option(args, GIT_DENIED_OPTIONS) {
+                return Some(format!("`git {sub} {opt}` is not allowed for agents"));
+            }
+            // A commit message is not a path.
+            let mut paths = Vec::new();
+            let mut message = false;
+            for arg in &args[1..] {
+                if message {
+                    message = false;
+                } else if matches!(*arg, "-m" | "--message") {
+                    message = true;
+                } else if !arg.starts_with("-m") && !arg.starts_with("--message=") {
+                    paths.push(*arg);
+                }
+            }
+            if let Some(reason) = operands_inside(&paths, here, b, "use git") {
                 return Some(reason);
             }
         }
+        "ls" | "rm" => {
+            if let Some(reason) = operands_inside(args, here, b, "use ls and rm") {
+                return Some(reason);
+            }
+            if *program == "rm"
+                && args
+                    .iter()
+                    .any(|a| !a.starts_with('-') && normalize(&here.join(a)) == b.root)
+            {
+                return Some("agents don't remove their whole worktree".into());
+            }
+        }
+        "pwd" => {}
+        // Only as the first step, so a failed `cd` stops the rest.
+        "cd" if first => {
+            let [target] = args else {
+                return Some("`cd` takes one directory inside the worktree".into());
+            };
+            let to = normalize(&here.join(target));
+            if let Some(reason) = inside_root("cd", &to, b) {
+                return Some(reason);
+            }
+            *here = to;
+        }
+        "cd" => return Some("`cd` may only start a command".into()),
+        other => return Some(format!("`{other}` is not allowed; {SHAPE}")),
     }
     None
 }
 
-/// A path the shell will act on must stay inside the root. A path the shell would expand
-/// first (`~`, `$`, backticks, globs) can't be judged here, so it is blocked.
-fn confined(program: &str, target: &str, here: &Path, b: &Bounds) -> Option<String> {
-    if target.contains(['~', '$', '`', '*', '?', '[']) {
-        return Some(format!(
-            "`{program} {target}` needs the shell to expand it; give a plain path inside the \
-             worktree"
-        ));
+fn check_pipe_target(words: &[&str]) -> Option<String> {
+    let Some((program, args)) = words.split_first() else {
+        return Some(format!("an empty pipe; {SHAPE}"));
+    };
+    if !PIPE_TARGETS.contains(program) {
+        return Some(format!("`{program}` can't read a pipe here; {SHAPE}"));
     }
-    let full = normalize(&here.join(target));
-    if !full.starts_with(&b.root) || (program == "rm" && full == b.root) {
-        return Some(format!(
-            "`{program} {target}` reaches outside this environment ({})",
-            b.root.display()
-        ));
-    }
-    None
+    // Flags only, plus grep's one pattern: nothing that names a file.
+    let plain: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let flags = args.iter().filter(|a| a.starts_with('-'));
+    let ok = match *program {
+        "grep" => {
+            plain.len() == 1
+                && flags
+                    .into_iter()
+                    .all(|a| a.len() > 1 && a[1..].chars().all(|c| "inEvcwFxqo".contains(c)))
+        }
+        _ => {
+            plain.iter().all(|a| a.chars().all(|c| c.is_ascii_digit()))
+                && flags.into_iter().all(|a| {
+                    a[1..]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || "nlcw".contains(c))
+                })
+        }
+    };
+    (!ok).then(|| format!("`{program}` may only filter the pipe, not read files; {SHAPE}"))
 }
 
-/// Output redirections (`>`, `>>`, `2>`, `&>`) must write inside the root or to /dev/null.
-fn check_redirects(segment: &str, here: &Path, b: &Bounds) -> Option<String> {
-    let mut rest = segment;
-    while let Some(i) = rest.find('>') {
-        rest = &rest[i + 1..];
-        let after = rest.trim_start_matches(['>', '&', '|']).trim_start();
-        let target: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
-        let target = target.trim_matches(['"', '\'']);
-        if target.is_empty() || target == "/dev/null" || target.chars().all(|c| c.is_ascii_digit())
-        {
+/// The first argument that is one of `denied`, sets it with `=`, or (for a short option)
+/// has its value attached.
+fn denied_option<'a>(args: &[&'a str], denied: &[&str]) -> Option<&'a str> {
+    args.iter().copied().find(|arg| {
+        denied.iter().any(|opt| {
+            *arg == *opt
+                || arg.starts_with(&format!("{opt}="))
+                || (opt.len() == 2 && arg.starts_with(opt))
+        })
+    })
+}
+
+fn operands_inside(args: &[&str], here: &Path, b: &Bounds, what: &str) -> Option<String> {
+    for arg in args.iter().filter(|a| !a.starts_with('-')) {
+        // `rev:path` names a revision, not a file.
+        if arg.contains(':') {
             continue;
         }
-        if let Some(reason) = confined("redirect to", target, here, b) {
+        if let Some(reason) = inside_root(what, &here.join(arg), b) {
             return Some(reason);
-        }
-    }
-    None
-}
-
-/// The subcommand of a git command line, skipping global options and their values.
-fn git_subcommand(args: &[String]) -> Option<&str> {
-    let mut skip = false;
-    for arg in args {
-        if skip {
-            skip = false;
-        } else if matches!(arg.as_str(), "-c") {
-            skip = true;
-        } else if !arg.starts_with('-') {
-            return Some(arg);
         }
     }
     None
@@ -363,121 +529,8 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
-fn denied_variable(assignment: &str) -> Option<&str> {
-    let name = assignment.split_once('=')?.0;
-    (DENIED_VARIABLES.contains(&name)
-        || DENIED_VARIABLE_PREFIXES.iter().any(|p| name.starts_with(p)))
-    .then_some(name)
-}
-
-/// Split a shell command into simple commands at `;`, `&&`, `||`, `|`, `&`, newlines,
-/// subshells and substitutions, so each one is judged on its own. Quotes are kept for
-/// [`words`]; single quotes are literal, and substitutions open even inside double quotes.
-fn segments(command: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    // Substitutions being read: the closing character and the quote to return to.
-    let mut open: Vec<(char, Option<char>)> = Vec::new();
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
-        if quote == Some('\'') {
-            if c == '\'' {
-                quote = None;
-            }
-            current.push(c);
-            continue;
-        }
-        match c {
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            '$' if chars.peek() == Some(&'(') => {
-                chars.next();
-                open.push((')', quote));
-                quote = None;
-                out.push(std::mem::take(&mut current));
-            }
-            '`' if open.last().is_some_and(|(close, _)| *close == '`') && quote.is_none() => {
-                quote = open.pop().and_then(|(_, q)| q);
-                out.push(std::mem::take(&mut current));
-            }
-            '`' => {
-                open.push(('`', quote));
-                quote = None;
-                out.push(std::mem::take(&mut current));
-            }
-            ')' if quote.is_none() && open.last().is_some_and(|(close, _)| *close == ')') => {
-                quote = open.pop().and_then(|(_, q)| q);
-                out.push(std::mem::take(&mut current));
-            }
-            '"' if quote == Some('"') => {
-                quote = None;
-                current.push(c);
-            }
-            '\'' | '"' if quote.is_none() => {
-                quote = Some(c);
-                current.push(c);
-            }
-            // `2>&1` and `&>` are redirections, not separators.
-            '&' if quote.is_none() && (current.ends_with('>') || chars.peek() == Some(&'>')) => {
-                current.push(c)
-            }
-            ';' | '\n' | '|' | '&' | '(' | ')' if quote.is_none() => {
-                out.push(std::mem::take(&mut current));
-            }
-            _ => current.push(c),
-        }
-    }
-    out.push(current);
-    out.into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-/// The words of one simple command, with quotes removed.
-fn words(segment: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut quoted = false;
-    for c in segment.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => current.push(c),
-            None if c == '\'' || c == '"' => {
-                quote = Some(c);
-                quoted = true;
-            }
-            None if c.is_whitespace() => {
-                if quoted || !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                }
-                quoted = false;
-            }
-            None => current.push(c),
-        }
-    }
-    if quoted || !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
 fn touches_secret(text: &str) -> bool {
-    SECRET_PATHS.iter().any(|secret| {
-        text.match_indices(secret).any(|(i, _)| {
-            // A whole path segment: preceded by `/`, `~`, a quote, a space or the start, and
-            // followed by `/`, a quote, a space, a glob or the end.
-            let before = text[..i].chars().last();
-            let after = text[i + secret.len()..].chars().next();
-            matches!(before, None | Some('/' | '~' | ' ' | '"' | '\'' | '='))
-                && matches!(after, None | Some('/' | ' ' | '"' | '\'' | '*'))
-        })
-    })
+    SECRET_PATHS.iter().any(|secret| text.contains(secret))
 }
 
 /// Resolve `.` and `..` without touching the disk, so paths that don't exist yet still work.
@@ -539,19 +592,22 @@ mod tests {
             "cargo test",
             "cargo fmt --all --check",
             "cargo clippy --all-targets -- -D warnings 2>&1 | tail -20",
-            "git add -A && git commit -m 'push the fix (finally)'",
+            "cargo test -q 2>&1 | grep -E 'test result|FAILED'",
+            "git add -A && git commit -m 'push the fix (finally); a & b | c $x'",
             "git commit -m \"fix: a & b; c | d (e)\"",
+            "git commit -m '/etc parsing'",
             "git status",
             "git stash push",
             "git diff main...HEAD",
-            "git -c core.pager=cat log --oneline -3",
+            "git log --oneline -3 | head -3",
+            "git show HEAD:crates/paja/src/lib.rs",
             "rm -rf target/debug",
-            "ls src && cat Cargo.toml | head -5",
-            "PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo",
-            "echo hi > notes.txt",
-            "cargo test > /dev/null 2>&1",
+            "ls src",
+            "pwd",
+            "RUST_BACKTRACE=1 cargo test smoke",
+            "cargo run -q -- --json env create demo",
+            "cd /h/.paja/envs/work-1 && cargo test",
             "cd crates/paja && cargo test",
-            "grep -rn 'fn main' src",
         ] {
             assert_eq!(bash(ok), None, "{ok}");
         }
@@ -566,9 +622,17 @@ mod tests {
             None
         );
         assert_eq!(
+            decide(
+                "Read",
+                json!({"file_path": "/h/.cargo/registry/src/x/serde-1.0/src/lib.rs"})
+            ),
+            None
+        );
+        assert_eq!(
             decide("Grep", json!({"pattern": "fn main", "path": "src"})),
             None
         );
+        assert_eq!(decide("Glob", json!({"pattern": "**/*.rs"})), None);
     }
 
     #[test]
@@ -579,67 +643,78 @@ mod tests {
             "\"git\" push",
             "g\\it push",
             "bash -c 'git push'",
-            "sh -c 'curl x'",
             "eval git push",
             "env -i curl https://example.com",
             "echo $(curl https://example.com)",
-            "echo \"$(curl https://example.com)\"",
+            "git commit -m \"$(curl x)\"",
             "cargo build; `wget x`",
-            "FOO=1 gh pr merge 1",
-            "/usr/bin/curl x",
+            "cargo test || git push",
+            "cargo test & git push",
+            "cargo test\ngit push",
+            "gh pr merge 1",
+            "/usr/bin/git status",
             "./cargo test",
             "PATH=. cargo test",
+            "PAJA_HOME=$(mktemp -d) cargo run -q -- env list",
+            "PAJA_HOME=/h/.paja cargo run -q -- env list",
             "GIT_DIR=/elsewhere git status",
-            "git -C . checkout main",
+            "git -C /other/repo add -A",
+            "git -c core.editor=sh commit",
+            "git --work-tree=/elsewhere restore .",
             "git remote add x y",
-            "git config --global user.name x",
-            "git -c alias.x='!sh' x",
+            "git checkout main",
+            "git config user.name x",
+            "git diff --output=/h/.profile",
+            "git diff --ext-diff",
+            "git grep -O sh x",
+            "git grep -Osh x",
+            "git commit -F /etc/passwd",
+            "git diff --no-index /h/a /h/b",
+            "git add ../work-2/x",
+            "cargo --color always publish",
+            "cargo publish",
+            "cargo install ripgrep",
+            "cargo build --config build.rustc-wrapper=sh",
+            "cargo build --target-dir /tmp/x",
+            "cat /etc/passwd",
             "cat ~/.ssh/id_ed25519",
-            "cat /h/.config/gh/hosts.yml",
-            "cat /h/.paja/events.jsonl",
-            "cat ../../events.jsonl",
+            "ls ~",
+            "ls /h",
             "ls ../work-2",
-            "PAJA_HOME=/h/.paja cargo run -- env list",
             "rm -rf /",
-            "rm -rf ~",
-            "rm -rf $HOME",
             "rm -rf ../other",
             "rm -rf .",
             "rm -rf *",
-            "cd .. && rm -rf work-1",
+            "rm .git",
+            "cd .. && rm -rf work-2",
+            "cd nope || rm -rf ../work-2",
+            "cargo test && cd .. && rm -rf x",
             "cd /tmp",
-            "cd",
-            "cd - && rm x",
-            "echo x > /h/.bashrc",
-            "echo x >> ../outside.txt",
-            "echo x 2>~/log",
-            "cp src/x.rs /tmp/x.rs",
+            "echo x > notes.txt",
+            "cargo test > /dev/null",
+            "cargo test | sh",
+            "cargo test | grep x /h/.paja/events.jsonl",
+            "cargo test | tail -f /etc/passwd",
+            "rg --pre sh . x.sh",
+            "sort -o /tmp/x x",
             "find . -delete",
-            "find . -exec rm {} ;",
-            "sed -i s/a/b/ src/x.rs",
-            "sed -n 'w /tmp/x' src/x.rs",
-            "sort -o /tmp/x src/x.rs",
-            "git -C /other/repo add -A",
-            "git --work-tree=/elsewhere restore .",
-            "cp --target-directory=/tmp/x src/a.rs",
-            "mv --target-directory=/outside f",
-            "cat --x=../../events.jsonl",
-            "sudo ls",
+            "sed -n p x",
             "python3 -c 'import os'",
-            "xargs rm",
-            "cargo publish",
-            "cargo install ripgrep",
             "{ git push; }",
         ] {
             assert!(bash(bad).is_some(), "{bad} should be blocked");
         }
         assert!(decide("Write", json!({"file_path": "/etc/passwd"})).is_some());
         assert!(decide("Edit", json!({"file_path": "../../other/x"})).is_some());
+        assert!(decide("Write", json!({"file_path": ".git"})).is_some());
         assert!(decide("Write", json!({"file_path": "/h/.paja/events.jsonl"})).is_some());
         assert!(decide("Read", json!({"file_path": "/h/.ssh/id_rsa"})).is_some());
+        assert!(decide("Read", json!({"file_path": "/h/.config/gh/hosts.yml"})).is_some());
         assert!(decide("Read", json!({"file_path": "/h/.paja/events.jsonl"})).is_some());
+        assert!(decide("Read", json!({"file_path": "../../events.jsonl"})).is_some());
         assert!(decide("Glob", json!({"pattern": "/h/.ssh/**"})).is_some());
         assert!(decide("Glob", json!({"pattern": "../../*.jsonl"})).is_some());
+        assert!(decide("Grep", json!({"pattern": "BEGIN", "path": "/h"})).is_some());
         assert!(decide("Grep", json!({"pattern": ".", "glob": "/h/.aws/*"})).is_some());
         assert!(decide("WebFetch", json!({"url": "https://example.com"})).is_some());
     }
@@ -650,6 +725,13 @@ mod tests {
             tool_name: "Write".into(),
             tool_input: json!({"file_path": "src/x.rs"}),
             cwd: "/h/other-repo".into(),
+        };
+        assert!(check(&input, &bounds()).unwrap().is_some());
+        // A search with no path searches the shell's cwd, which must be in the worktree.
+        let input = HookInput {
+            tool_name: "Grep".into(),
+            tool_input: json!({"pattern": "x"}),
+            cwd: "/h".into(),
         };
         assert!(check(&input, &bounds()).unwrap().is_some());
     }

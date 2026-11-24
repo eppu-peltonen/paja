@@ -232,7 +232,8 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
          and commit your work on the current branch (never push, never switch branches). End the \
-         commit message with `Closes #{number}`.\n\nIssue #{number}: {title}\n\n{body}\n",
+         commit message with `Closes #{number}`. Read and change files with the file tools; Bash \
+         is only for cargo and local git, and Paja's deny-list hook blocks anything else.\n\nIssue #{number}: {title}\n\n{body}\n",
         number = item.number,
         title = item.title,
         body = item.body

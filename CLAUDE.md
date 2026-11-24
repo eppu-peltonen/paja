@@ -21,6 +21,8 @@ Try the CLI against a throwaway home so you never touch real state:
 PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 ```
 
+Agents Mestari starts already have a throwaway `PAJA_HOME`; they run `cargo run -q -- --json env create demo`.
+
 ## Layout
 
 - `crates/paja/src/events.rs`: the append-only event log, the core's only source of truth.
