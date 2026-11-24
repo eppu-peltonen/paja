@@ -475,6 +475,29 @@ fn the_mcp_server_serves_the_same_core() {
     let (ok, listed) = paja(&home, &repo, &["env", "list"]);
     assert!(ok);
     assert_eq!(listed[0]["name"], "via-mcp");
+    let (ok, mcp_list) = call(&mut request, "env_list", serde_json::json!({}));
+    assert!(ok);
+    assert_eq!(mcp_list, listed, "both doors give the same JSON");
+    let (ok, shown) = call(
+        &mut request,
+        "env_show",
+        serde_json::json!({"name": "via-mcp"}),
+    );
+    assert!(ok);
+    assert_eq!(shown, listed[0]);
+    let (ok, missing) = call(
+        &mut request,
+        "env_show",
+        serde_json::json!({"name": "nope"}),
+    );
+    assert!(!ok);
+    assert!(
+        missing["error"]
+            .as_str()
+            .unwrap()
+            .contains("no environment"),
+        "{missing}"
+    );
     let (ok, err) = call(
         &mut request,
         "env_create",

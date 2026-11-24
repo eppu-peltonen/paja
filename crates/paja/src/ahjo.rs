@@ -192,6 +192,22 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
 
 /// Remove an environment's worktree. The branch is kept, since it may hold work that has not
 /// landed yet. Without `force`, a worktree with uncommitted changes is refused.
+/// What removing an environment reports: the name, and the branch that was kept.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveReport {
+    pub removed: String,
+    pub branch_kept: String,
+}
+
+impl From<&Env> for RemoveReport {
+    fn from(env: &Env) -> Self {
+        Self {
+            removed: env.name.clone(),
+            branch_kept: env.branch.clone(),
+        }
+    }
+}
+
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();

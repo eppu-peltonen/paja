@@ -84,7 +84,8 @@ impl PajaMcp {
     async fn env_create(&self, Parameters(args): Parameters<CreateArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
-            let repo = PathBuf::from(args.repo.unwrap_or_else(|| ".".into()));
+            // Absolute, so errors name the real directory rather than `.`.
+            let repo = std::path::absolute(PathBuf::from(args.repo.unwrap_or_else(|| ".".into())))?;
             let env = ahjo::create(
                 &home,
                 CreateOptions {
@@ -117,7 +118,7 @@ impl PajaMcp {
         let home = self.home.clone();
         call(move || {
             let env = ahjo::remove(&home, &args.name, args.force)?;
-            Ok(json!({ "removed": env.name, "branch_kept": env.branch }))
+            Ok(serde_json::to_value(ahjo::RemoveReport::from(&env))?)
         })
         .await
     }
@@ -125,15 +126,7 @@ impl PajaMcp {
     #[tool(description = "Show the event log, oldest first.")]
     async fn log(&self, Parameters(args): Parameters<LogArgs>) -> Result<String, String> {
         let home = self.home.clone();
-        call(move || {
-            let mut events = home.events().read_all()?;
-            if let Some(limit) = args.limit {
-                let skip = events.len().saturating_sub(limit);
-                events.drain(..skip);
-            }
-            Ok(serde_json::to_value(events)?)
-        })
-        .await
+        call(move || Ok(serde_json::to_value(home.events().tail(args.limit)?)?)).await
     }
 }
 
