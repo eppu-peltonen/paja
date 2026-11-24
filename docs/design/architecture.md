@@ -98,7 +98,8 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   (so no `-C` or `-c`) and is one of add, commit, status, diff, show, log and rm; not `stash`, whose refs every
   checkout shares. Its revisions and paths must stay inside the worktree. Reviewers may not run `cargo fmt` without `--check`.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
-  and never into a `.git`, `.cargo`, `.github` or `.claude` directory at any depth, in any letter case (reading them is fine).
+  and never into a `.git`, `.cargo`, `.github` or `.claude` directory or a `rust-toolchain` file at any depth, in any
+  letter case (reading them is fine).
   `git rm` takes plain files only, and `git commit` needs `-m`.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources
   (`$CARGO_HOME/registry`, `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`,

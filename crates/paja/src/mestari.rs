@@ -231,9 +231,11 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
-         and commit your work on the current branch (never push, never switch branches). End the \
-         commit message with `Closes #{number}`. Read and change files with the file tools; Bash \
-         is only for cargo and local git, and Paja's deny-list hook blocks anything else.\n\nIssue #{number}: {title}\n\n{body}\n",
+         and commit your work on the current branch (never push, never switch branches). Commit \
+         with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
+         that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
+         only for cargo and local git, and Paja's deny-list hook blocks anything else (no `$(`, \
+         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`.\n\nIssue #{number}: {title}\n\n{body}\n",
         number = item.number,
         title = item.title,
         body = item.body
@@ -252,8 +254,10 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
         "Bash(cargo *)",
         "Bash(git add *)",
         "Bash(git commit *)",
+        "Bash(git rm *)",
         "Bash(git status*)",
         "Bash(git diff*)",
+        "Bash(git show*)",
         "Bash(git log*)",
     ];
     claude(home, env, base, &prompt, &tools, None, false).map(|_| ())
@@ -267,7 +271,8 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
          not the branch's copy. Verdicts: `land` if it does what the issue asks, is correct and \
          tested, and breaks no rule; `changes` with concrete comments if it needs work; `escalate` \
          with a question only when the issue's intent is unclear or the change would weaken a check \
-         (a person must decide). Nits alone are not a reason for `changes`.\n\n\
+         (a person must decide). Nits alone are not a reason for `changes`. You may run cargo \
+         and read-only git; you can't change files.\n\n\
          Issue #{number}: {title}\n\n{body}\n",
         number = item.number,
         title = item.title,
@@ -287,6 +292,8 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Read",
         "Glob",
         "Grep",
+        "Bash(cargo *)",
+        "Bash(git status*)",
         "Bash(git diff*)",
         "Bash(git log*)",
         "Bash(git show*)",

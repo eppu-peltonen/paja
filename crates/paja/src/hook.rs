@@ -355,8 +355,9 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             // A wildcard can walk into a symlink the literal prefix never names.
             if let Some(link) = link_out(&resolve(&base), bounds, 0) {
                 return Ok(Some(format!(
-                    "{} is a symlink out of the worktree, and searches here could follow it; \
-                     search a directory without it, or Read files by path",
+                    "{} is a symlink out of the worktree (or nested too deep to check), and \
+                     searches here could follow it; search a directory without it, or Read \
+                     files by path",
                     link.display()
                 )));
             }
@@ -374,6 +375,7 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
 /// The first symlink under `dir` that leads out of the worktree, if any. Git's own directory
 /// is skipped: nothing in it links out, and it is large.
 fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
+    // Deeper than any real source tree: treat it as one, since it can't be checked.
     if depth > 32 {
         return Some(dir.to_path_buf());
     }
@@ -428,9 +430,10 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
             full.display()
         ));
     }
-    if named(".cargo") {
+    if named(".cargo") || named("rust-toolchain") || named("rust-toolchain.toml") {
         return Some(format!(
-            "{} is cargo configuration, which could change how cargo runs; agents never change it",
+            "{} is cargo or toolchain configuration, which could change how cargo runs; agents \
+             never change it",
             full.display()
         ));
     }
@@ -683,17 +686,25 @@ fn check_cargo(args: &[&str], read_only: bool) -> Option<String> {
     let rest = &args[1..];
     let split = rest.iter().position(|a| *a == "--").unwrap_or(rest.len());
     let (own, after) = (&rest[..split], rest.get(split + 1..).unwrap_or(&[]));
-    let mut value_next = false;
+    // A feature may belong to a dependency (`serde/derive`); every other value is a plain name.
+    let value_ok = |flag: &str, value: &str| {
+        is_name(value)
+            || matches!(flag, "-F" | "--features")
+                && value
+                    .split_once('/')
+                    .is_some_and(|(krate, feature)| is_name(krate) && is_name(feature))
+    };
+    let mut value_next = None;
     for arg in own {
-        let ok = if std::mem::take(&mut value_next) {
-            is_name(arg)
+        let ok = if let Some(flag) = value_next.take() {
+            value_ok(flag, arg)
         } else if CARGO_FLAGS.contains(arg) {
             true
         } else if CARGO_NAME_FLAGS.contains(arg) {
-            value_next = true;
+            value_next = Some(*arg);
             true
         } else if let Some((flag, value)) = arg.split_once('=') {
-            CARGO_NAME_FLAGS.contains(&flag) && is_name(value)
+            CARGO_NAME_FLAGS.contains(&flag) && value_ok(flag, value)
         } else {
             // A test name filter. `cargo run` takes the binary's arguments only after `--`.
             sub == "test" && is_name(arg)
@@ -705,8 +716,8 @@ fn check_cargo(args: &[&str], read_only: bool) -> Option<String> {
             ));
         }
     }
-    if value_next {
-        return Some(format!("`cargo {sub}`: a flag is missing its value"));
+    if let Some(flag) = value_next {
+        return Some(format!("`cargo {sub} {flag}` is missing its value"));
     }
     // After `--`, the words go to the program cargo starts.
     let mut lint_next = false;
@@ -1175,6 +1186,12 @@ mod tests {
             None
         );
         assert!(decide("Glob", json!({"pattern": "**/.ssh/*"})).is_some());
+        assert!(decide("Write", json!({"file_path": "rust-toolchain.toml"})).is_some());
+        assert!(decide("Edit", json!({"file_path": "crates/x/Rust-Toolchain"})).is_some());
+        assert_eq!(bash("cargo test --features serde/derive"), None);
+        assert_eq!(bash("cargo test --features=serde/derive"), None);
+        assert!(bash("cargo test --features ../x").is_some());
+        assert!(bash("cargo test -p serde/derive").is_some());
         // `-e` would take the pattern and leave the last word to be read as a file.
         assert!(bash("cargo test 2>&1 | grep -ve -qqq src/lib.rs").is_some());
         assert!(bash("cargo test 2>&1 | grep -e x src/lib.rs").is_some());
