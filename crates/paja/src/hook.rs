@@ -291,10 +291,15 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             };
             if let Some(pattern) = t[key].as_str() {
                 // The literal start of the pattern may be a symlink out of the worktree.
-                let literal: PathBuf = pattern
+                let start = if pattern.starts_with('/') {
+                    PathBuf::from("/")
+                } else {
+                    PathBuf::new()
+                };
+                let literal = pattern
                     .split('/')
                     .take_while(|part| !part.contains(['*', '?', '[']))
-                    .collect();
+                    .fold(start, |path, part| path.join(part));
                 if let Some(reason) = within_root("search", &base.join(literal), bounds) {
                     return Ok(Some(reason));
                 }
@@ -654,6 +659,11 @@ fn check_cargo(args: &[&str]) -> Option<String> {
                 "`cargo {sub} -- {arg}` is not allowed for agents; pass plain names and flags"
             ));
         }
+    }
+    if lint_next {
+        return Some(format!(
+            "`cargo {sub} --`: a lint flag is missing its lint name"
+        ));
     }
     None
 }
@@ -1050,6 +1060,9 @@ mod tests {
         assert!(bash("cargo run -q env create demo").is_some());
         assert!(decide("Glob", json!({"pattern": "{..,x}/../.ssh/*"})).is_some());
         assert!(decide("Glob", json!({"pattern": "{a/b,c}/*"})).is_some());
+        assert!(decide("Glob", json!({"pattern": "/etc/*"})).is_some());
+        assert!(decide("Glob", json!({"pattern": "/h/.paja/envs/work-2/**"})).is_some());
+        assert!(bash("cargo clippy -- -D").is_some());
         assert_eq!(decide("Glob", json!({"pattern": "*.{rs,toml}"})), None);
         assert_eq!(
             decide("Glob", json!({"pattern": format!("{ROOT}/**/*.rs")})),

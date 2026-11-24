@@ -354,15 +354,21 @@ fn claude(
     let _ = std::fs::remove_dir_all(&scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
-    // A run the hook never saw can't be trusted. If it failed, or claims tool turns, throw
-    // away everything it did, so a later run can't resume and land it.
-    let used_tools = output.as_ref().ok().and_then(|o| {
-        let value: Value = serde_json::from_slice(&o.stdout).ok()?;
-        (value.get("is_error") != Some(&Value::Bool(true))).then_some(())?;
-        Some(value["num_turns"].as_u64().unwrap_or(0) > 1)
-    });
-    if !hooked && used_tools != Some(false) {
-        discard(&env.path, before.as_deref().unwrap_or(base));
+    // A session that took more than one turn used tools, so the hook must have run. If it
+    // didn't, something (such as an administrator's policy) switched it off and nothing the
+    // agent did can be trusted: throw it away, so a later run can't resume and land it. When
+    // the output can't be read, any change to the worktree counts as such a run.
+    let parsed: Option<Value> = output
+        .as_ref()
+        .ok()
+        .and_then(|o| serde_json::from_slice(&o.stdout).ok());
+    let unhooked = !hooked
+        && match &parsed {
+            Some(value) => value["num_turns"].as_u64().unwrap_or(0) > 1,
+            None => output.is_ok() && changed_since(&env.path, before.as_deref()),
+        };
+    if unhooked {
+        discard(env, before.as_deref().unwrap_or(base));
         bail!(
             "Claude Code never called Paja's deny-list hook during the agent's run in {}, so \
              its work is not trusted and was discarded; check for settings that disable hooks \
@@ -381,9 +387,6 @@ fn claude(
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("`{program} -p` printed something that is not JSON"))?;
-    // A session that took more than one turn used tools, so the hook must have run. If it
-    // didn't, something (such as an administrator's policy) switched it off, and nothing the
-    // agent did can be trusted.
     if value.get("is_error") == Some(&Value::Bool(true)) {
         bail!("`{program} -p` reported an error: {}", value["result"]);
     }
@@ -402,20 +405,35 @@ fn git_head(repo: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Reset the worktree to `to`, dropping commits and files made since.
-fn discard(repo: &Path, to: &str) {
+/// Whether the worktree's HEAD moved from `before` or it has uncommitted changes.
+fn changed_since(repo: &Path, before: Option<&str>) -> bool {
+    let dirty = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_or(true, |o| !o.stdout.is_empty());
+    dirty || git_head(repo).as_deref() != before
+}
+
+/// Put the environment's own branch back at `to` and drop every file made since, ignored
+/// ones included, even if the agent switched branches.
+fn discard(env: &Env, to: &str) {
     let ok = |args: &[&str]| {
         Command::new("git")
             .arg("-C")
-            .arg(repo)
+            .arg(&env.path)
             .args(args)
             .status()
             .is_ok_and(|s| s.success())
     };
-    if !(ok(&["reset", "-q", "--hard", to]) && ok(&["clean", "-q", "-f", "-d"])) {
+    let reset = ok(&["checkout", "-q", "-f", "-B", &env.branch, to])
+        && ok(&["clean", "-q", "-f", "-d", "-x"]);
+    if !reset {
         eprintln!(
-            "warning: couldn't reset {} to {to}; delete its branch before running it again",
-            repo.display()
+            "warning: couldn't reset {} to {to}; delete the branch {} before running it again",
+            env.path.display(),
+            env.branch
         );
     }
 }
@@ -501,11 +519,14 @@ fn refuse_hook_policies() -> Result<()> {
 /// binary that is running, even if the file on disk has been rebuilt since; copies other runs
 /// left behind are removed once they are a day old.
 fn hook_binary(home: &Home) -> Result<PathBuf> {
-    static COPIED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    static COPIED: std::sync::Mutex<Option<(PathBuf, PathBuf)>> = std::sync::Mutex::new(None);
     let mut copied = COPIED.lock().unwrap_or_else(|e| e.into_inner());
     let _lock = home.lock()?;
     // Another run's cleanup may have removed a copy idle for a day; then copy again.
-    if let Some(exe) = copied.as_ref().filter(|exe| exe.exists()) {
+    if let Some((_, exe)) = copied
+        .as_ref()
+        .filter(|(root, exe)| root == home.root() && exe.exists())
+    {
         // Keep this run's copy fresh so another run's cleanup leaves it alone.
         if let Ok(file) = std::fs::File::options().write(true).open(exe) {
             let _ = file.set_modified(std::time::SystemTime::now());
@@ -545,7 +566,11 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
             exe.display()
         )
     })?;
-    *copied = Some(exe.clone());
+    // A copy keeps the source's age on some systems; make it new so cleanup leaves it be.
+    if let Ok(file) = std::fs::File::options().write(true).open(&exe) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+    *copied = Some((home.root().to_path_buf(), exe.clone()));
     Ok(exe)
 }
 
