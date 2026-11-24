@@ -319,7 +319,7 @@ fn claude(
 ) -> Result<Value> {
     let program = claude_program();
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
-    let settings = hook_settings(&env.path, home.root())?;
+    let settings = hook_settings(&env.path, home)?;
     let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
         Some(text) => format!("The project's CLAUDE.md, as it is on main:\n\n{text}"),
         None => String::new(),
@@ -371,47 +371,15 @@ fn claude(
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
 /// Before handing them out, check that the hook really blocks a push and allows a build; an
 /// agent never starts under a hook that doesn't.
-fn hook_settings(root: &Path, home: &Path) -> Result<String> {
-    let running =
-        std::env::current_exe().context("finding the paja binary for the deny-list hook")?;
-    // After a rebuild the running binary's path is gone (Linux shows it as "... (deleted)").
-    if !running.exists() {
-        bail!(
-            "the paja binary {} was replaced while `paja run` was running; restart `paja run` so \
-             agents get the new deny-list hook",
-            running.display()
-        );
-    }
-    // Run the hook from a copy in the factory home, so an agent's own `cargo build` can't
-    // replace the binary that judges it.
-    let dir = home.join("hook");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Copied once per `paja run`, so a reused process id never picks up an old copy.
-    static COPIED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let exe = match COPIED.get() {
-        Some(exe) => exe.clone(),
-        None => {
-            let exe = dir.join(format!(
-                "paja-{}-{}",
-                std::process::id(),
-                crate::events::now_ms()
-            ));
-            std::fs::copy(&running, &exe).with_context(|| {
-                format!(
-                    "copying {} to {} for the deny-list hook",
-                    running.display(),
-                    exe.display()
-                )
-            })?;
-            COPIED.get_or_init(|| exe).clone()
-        }
-    };
+fn hook_settings(root: &Path, home: &Home) -> Result<String> {
+    refuse_hook_policies()?;
+    let exe = hook_binary(home)?;
     let args = [
         "hook".into(),
         "--root".into(),
         root.as_os_str().to_owned(),
         "--home".into(),
-        home.as_os_str().to_owned(),
+        home.root().as_os_str().to_owned(),
     ];
     let (push, build) = crate::hook::self_test_inputs(root);
     let (code, stderr) = run_hook_once(&exe, &args, &push)?;
@@ -431,7 +399,7 @@ fn hook_settings(root: &Path, home: &Path) -> Result<String> {
         "{} hook --root {} --home {} || exit 2",
         quote(&exe.to_string_lossy()),
         quote(&root.to_string_lossy()),
-        quote(&home.to_string_lossy())
+        quote(&home.root().to_string_lossy())
     );
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
@@ -444,6 +412,81 @@ fn hook_settings(root: &Path, home: &Path) -> Result<String> {
         }
     })
     .to_string())
+}
+
+/// Managed (administrator) settings load whatever `--setting-sources` says, and two of their
+/// keys would silently drop Mestari's hook. Refuse to start agents on such a machine.
+fn refuse_hook_policies() -> Result<()> {
+    for path in [
+        "/etc/claude-code/managed-settings.json",
+        "/Library/Application Support/ClaudeCode/managed-settings.json",
+    ] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let settings: Value = serde_json::from_str(&text)
+            .with_context(|| format!("reading Claude Code's managed settings {path}"))?;
+        for key in ["disableAllHooks", "allowManagedHooksOnly"] {
+            if settings[key] == Value::Bool(true) {
+                bail!(
+                    "Claude Code's managed settings ({path}) set `{key}`, which would switch off \
+                     Paja's deny-list hook, so no agent will start; ask the machine's \
+                     administrator to drop it, or run Paja on another machine"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The paja binary the hook runs from: a copy in the factory home, so an agent's own
+/// `cargo build` can't replace the binary that judges it. Made once per `paja run` from the
+/// binary that is running, even if the file on disk has been rebuilt since; copies other runs
+/// left behind are removed once they are a day old.
+fn hook_binary(home: &Home) -> Result<PathBuf> {
+    static COPIED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let _lock = home.lock()?;
+    if let Some(exe) = COPIED.get() {
+        // Keep this run's copy fresh so another run's cleanup leaves it alone.
+        if let Ok(file) = std::fs::File::options().write(true).open(exe) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+        return Ok(exe.clone());
+    }
+    let dir = home.root().join("hook");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > day);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // On Linux /proc/self/exe still reads the running binary after a rebuild replaced it.
+    let running = match Path::new("/proc/self/exe") {
+        p if p.exists() => p.to_path_buf(),
+        _ => std::env::current_exe().context("finding the paja binary for the deny-list hook")?,
+    };
+    let exe = dir.join(format!(
+        "paja-{}-{}",
+        std::process::id(),
+        crate::events::now_ms()
+    ));
+    std::fs::copy(&running, &exe).with_context(|| {
+        format!(
+            "copying {} to {} for the deny-list hook; if paja was rebuilt, restart `paja run`",
+            running.display(),
+            exe.display()
+        )
+    })?;
+    Ok(COPIED.get_or_init(|| exe).clone())
 }
 
 fn run_hook_once(
@@ -468,6 +511,13 @@ fn run_hook_once(
         }
     }
     drop(child.stdin.take());
+    // Drain stderr while waiting, so a chatty hook can't fill the pipe and look hung.
+    let mut stderr = child.stderr.take().context("the hook's stderr")?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    });
     // The hook blocks itself after its deadline; anything longer is a hung binary.
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(crate::hook::HOOK_DEADLINE_SECS + 10);
@@ -482,11 +532,8 @@ fn run_hook_once(
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let out = child.wait_with_output()?;
-    Ok((
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+    let code = child.wait()?.code();
+    Ok((code, reader.join().unwrap_or_default()))
 }
 
 fn tempfile_dir(near: &Path) -> Result<PathBuf> {

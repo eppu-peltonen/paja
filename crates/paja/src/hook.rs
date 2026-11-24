@@ -317,6 +317,13 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
             full.display()
         ));
     }
+    if named(".github") {
+        return Some(format!(
+            "{} is CI configuration, which runs with the repository's secrets; agents never \
+             change it",
+            full.display()
+        ));
+    }
     if named(".cargo") {
         return Some(format!(
             "{} is cargo configuration, which could change how cargo runs; agents never change it",
@@ -562,7 +569,6 @@ fn check_cargo(args: &[&str]) -> Option<String> {
         } else if let Some((flag, value)) = arg.split_once('=') {
             CARGO_NAME_FLAGS.contains(&flag) && is_name(value)
         } else {
-            // A test name filter, or a binary's arguments for `cargo run`.
             // A test name filter. `cargo run` takes the binary's arguments only after `--`.
             sub == "test" && is_name(arg)
         };
@@ -633,7 +639,7 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
         } else if !paths_only && *arg == "--" {
             paths_only = true;
         } else if !paths_only && arg.starts_with('-') {
-            let count = arg[1..].chars().all(|c| c.is_ascii_digit());
+            let count = arg.len() > 1 && arg[1..].chars().all(|c| c.is_ascii_digit());
             if !flags.contains(arg) && !(count && DIFF_FLAGS == *flags) {
                 return Some(format!(
                     "`git {sub} {arg}` is not allowed: agents use {}",
@@ -644,7 +650,7 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
             return Some(format!(
                 "`git {sub} {arg}`: name revisions and paths plainly"
             ));
-        } else if paths_only || !is_revision_path(arg) {
+        } else if paths_only || !matches!(sub, "diff" | "show" | "log") || !is_revision_path(arg) {
             // A revision such as `main...HEAD` stays inside the root as a path too; anything
             // that leaves it is a path outside the worktree.
             if let Some(reason) = inside_root("use git", &here.join(arg), b) {
@@ -981,6 +987,9 @@ mod tests {
         assert!(decide("Write", json!({"file_path": "crates/x/.cargo/config.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "sub/.git/config"})).is_some());
         assert!(decide("Write", json!({"file_path": ".GIT"})).is_some());
+        assert!(decide("Write", json!({"file_path": ".github/workflows/x.yml"})).is_some());
+        assert!(bash("git rm -r -f x:/../.cargo").is_some());
+        assert!(bash("git log -").is_some());
         assert!(decide("Write", json!({"file_path": ".Cargo/config.toml"})).is_some());
         assert!(decide("Read", json!({"file_path": "/etc/passwd"})).is_some());
         assert!(decide("Read", json!({"file_path": "/var/run/secrets/token"})).is_some());
