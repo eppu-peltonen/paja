@@ -235,7 +235,14 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
         } else {
             removed.with_context(|| {
                 if force {
-                    format!("removing worktree {path}")
+                    // git still tracks it and refuses: say how to clear what git is guarding.
+                    format!(
+                        "removing worktree {path}; git still tracks it, so paja won't delete it \
+                         itself. If it is locked, run `git -C {repo} worktree unlock {path}`; if \
+                         git refuses for another reason, run `git -C {repo} worktree remove -f -f {path}`. \
+                         Then run `paja env remove {name} --force` again",
+                        repo = env.repo.display()
+                    )
                 } else {
                     format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
                 }
@@ -289,8 +296,12 @@ fn main_repo(path: &Path) -> Result<PathBuf> {
     })?;
     let mut lines = dirs.lines();
     let (git_dir, common_dir, top) = (lines.next(), lines.next(), lines.next());
-    let top =
-        top.with_context(|| format!("git gave no top-level directory for {}", path.display()))?;
+    let top = top.with_context(|| {
+        format!(
+            "{} is a bare repository; run paja from a checkout of it",
+            path.display()
+        )
+    })?;
     if git_dir == common_dir {
         // Already the main checkout (this also covers submodules).
         return Ok(PathBuf::from(top));

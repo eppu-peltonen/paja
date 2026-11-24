@@ -46,3 +46,11 @@ flowchart TB
 
 The event log is the only store. It is append-only JSON lines in `$PAJA_HOME/events.jsonl`; every part derives its
 current state by replaying it, and every write holds the home lock. See `crates/paja/src/events.rs`.
+
+A write cut off by a crash leaves bytes after the last newline. Those were never acknowledged, so the next append
+cuts them off and keeps them in `events.jsonl.torn`; a bad line that ends in a newline is an error, never repaired.
+
+## CLI output
+
+Under `--json` every command prints exactly one JSON value on stdout. Failures, usage errors included, carry an
+`error` key and exit non-zero; `--help` prints `{"help": ...}` and `--version` prints `{"version": ...}`.

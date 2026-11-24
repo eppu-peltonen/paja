@@ -376,6 +376,10 @@ fn force_does_not_delete_a_worktree_git_still_guards() {
 
     let (ok, err) = paja(&home, &repo, &["env", "remove", "held", "--force"]);
     assert!(!ok);
-    assert!(err["error"].as_str().unwrap().contains("locked"), "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("locked") && msg.contains("worktree unlock"),
+        "{err}"
+    );
     assert!(path.exists());
 }

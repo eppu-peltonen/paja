@@ -44,48 +44,28 @@ impl EventLog {
 
     /// Read every event in order. A missing log is an empty log.
     ///
-    /// A last line with no trailing newline that stops mid-event is a write that was cut off
+    /// Bytes after the last newline that are not a whole event are a write that was cut off
     /// (crash, full disk). It was never acknowledged, so it is skipped rather than treated as
-    /// corruption. Any other bad line, including a complete but malformed last line, is an error.
+    /// corruption. Any bad line that ends in a newline is an error naming its line.
     pub fn read_all(&self) -> Result<Vec<Event>> {
         let Some(bytes) = self.read_bytes()? else {
             return Ok(Vec::new());
         };
         let (complete, tail) = split_tail(&bytes);
-        let complete = std::str::from_utf8(complete).with_context(|| {
-            format!(
-                "{} is not valid UTF-8; restore it from a backup",
-                self.path.display()
-            )
-        })?;
         let mut events = Vec::new();
-        let mut lines = 0;
-        for (index, line) in complete.lines().enumerate() {
-            lines = index + 1;
+        for (index, line) in complete.split(|&b| b == b'\n').enumerate() {
+            let at = || format!("{} line {}", self.path.display(), index + 1);
+            let line = std::str::from_utf8(line)
+                .with_context(|| format!("{} is not valid UTF-8", at()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let event: Event = serde_json::from_str(line).with_context(|| {
-                format!(
-                    "{} line {} is not a valid event",
-                    self.path.display(),
-                    lines
-                )
-            })?;
+            let event: Event = serde_json::from_str(line)
+                .with_context(|| format!("{} is not a valid event", at()))?;
             events.push(event);
         }
-        match classify_tail(tail) {
-            Tail::None | Tail::Torn => {}
-            Tail::Event(event) => events.push(event),
-            Tail::Malformed(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "{} line {} is not a valid event",
-                        self.path.display(),
-                        lines + 1
-                    )
-                })
-            }
+        if let Tail::Event(event) = classify_tail(tail) {
+            events.push(event);
         }
         Ok(events)
     }
@@ -123,9 +103,10 @@ impl EventLog {
         }
     }
 
-    /// Before appending, make sure the log ends on a line boundary: finish a complete event
-    /// that lost its newline, or cut off a write that stopped mid-event. Only that
-    /// unacknowledged tail is ever touched; a complete line is never changed or dropped.
+    /// Before appending, make sure the log ends on a line boundary: finish a whole event that
+    /// lost its newline, or cut off an unfinished write and keep its bytes in
+    /// `events.jsonl.torn`. Only that unacknowledged tail is ever touched; a newline-terminated
+    /// line is never changed or dropped.
     fn repair_tail(&self) -> Result<()> {
         let Some(bytes) = self.read_bytes()? else {
             return Ok(());
@@ -133,17 +114,21 @@ impl EventLog {
         let (complete, tail) = split_tail(&bytes);
         let repair = match classify_tail(tail) {
             Tail::None => return Ok(()),
-            Tail::Malformed(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "the last line of {} is complete but not a valid event, so paja won't \
-                         touch it; fix or remove that line by hand",
-                        self.path.display()
-                    )
-                })
-            }
             Tail::Event(_) => Repair::AddNewline,
-            Tail::Torn => Repair::Truncate(complete.len() as u64),
+            Tail::Torn => {
+                // Keep the dropped bytes beside the log so nothing vanishes unseen.
+                let aside = self.path.with_extension("jsonl.torn");
+                let mut kept = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&aside)
+                    .with_context(|| format!("opening {}", aside.display()))?;
+                kept.write_all(tail)
+                    .and_then(|()| kept.write_all(b"\n"))
+                    .and_then(|()| kept.sync_data())
+                    .with_context(|| format!("saving a torn write to {}", aside.display()))?;
+                Repair::Truncate(complete.len() as u64)
+            }
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -168,33 +153,30 @@ enum Repair {
 }
 
 /// What the bytes after the last newline are.
+///
+/// `append` writes each event and its newline in one call and reports success only after
+/// that, so bytes after the last newline were never acknowledged: they are either a whole
+/// event that only lost its newline, or a write that stopped part-way (or junk such as the
+/// NUL padding a power cut can leave).
 enum Tail {
     /// The log ends on a newline.
     None,
     /// A whole event that only lost its newline.
     Event(Event),
-    /// A write that stopped part-way: valid JSON so far that ends too early.
+    /// Anything else: an unacknowledged, unfinished write.
     Torn,
-    /// Something that is not the start of an event; never repaired automatically.
-    Malformed(serde_json::Error),
 }
 
 fn classify_tail(tail: &[u8]) -> Tail {
     if tail.is_empty() {
         return Tail::None;
     }
-    let text = match std::str::from_utf8(tail) {
-        Ok(text) => text,
-        // Cut inside a multi-byte character: judge the part before it.
-        Err(err) if err.error_len().is_none() => {
-            std::str::from_utf8(&tail[..err.valid_up_to()]).unwrap_or_default()
-        }
-        Err(_) => return Tail::Malformed(serde::de::Error::custom("the line is not valid UTF-8")),
-    };
-    match serde_json::from_str::<Event>(text) {
-        Ok(event) => Tail::Event(event),
-        Err(err) if err.is_eof() => Tail::Torn,
-        Err(err) => Tail::Malformed(err),
+    match std::str::from_utf8(tail)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Event>(text).ok())
+    {
+        Some(event) => Tail::Event(event),
+        None => Tail::Torn,
     }
 }
 
@@ -261,21 +243,39 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_but_malformed_last_line_is_kept_and_reported() {
+    fn junk_after_the_last_newline_is_set_aside_not_lost() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path()).unwrap();
         let log = home.events();
         let lock = home.lock().unwrap();
-        log.append(&lock, "test.one", json!({})).unwrap();
+        log.append(&lock, "test.one", json!({"ratio": 1.5}))
+            .unwrap();
         let path = dir.path().join("events.jsonl");
-        let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str("{\"v\":1,\"seq\":\"two\"}");
-        std::fs::write(&path, &text).unwrap();
+        let good = std::fs::read(&path).unwrap();
+        // NUL padding from a power cut, and a number cut after its '.'.
+        for junk in [
+            &b"\0\0\0\0"[..],
+            b"{\"v\":1,\"seq\":2,\"data\":{\"r\":1.",
+            b"{}\xc3",
+        ] {
+            let mut bytes = good.clone();
+            bytes.extend_from_slice(junk);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(log.read_all().unwrap().len(), 1);
+            log.repair_tail().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), good, "after {junk:?}");
+        }
+        let aside = std::fs::read(dir.path().join("events.jsonl.torn")).unwrap();
+        assert!(aside.starts_with(b"\0\0\0\0\n"));
+    }
 
-        assert!(format!("{:#}", log.read_all().unwrap_err()).contains("line 2"));
-        let err = log.append(&lock, "test.two", json!({})).unwrap_err();
-        assert!(format!("{err:#}").contains("by hand"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    #[test]
+    fn a_bad_line_names_its_line_even_for_bad_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, b"\n\xff\n").unwrap();
+        let err = EventLog::new(path).read_all().unwrap_err();
+        assert!(format!("{err:#}").contains("line 2"), "{err:#}");
     }
 
     #[test]
