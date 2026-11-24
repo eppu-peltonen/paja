@@ -733,7 +733,8 @@ impl Factory {
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
-                 echo '{{\"is_error\": false, \"result\": \"done\"}}' ;;\nesac\n"
+                 if [ -f {d}/unhooked ]; then echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 5}}'\n\
+                 else echo '{{\"is_error\": false, \"result\": \"done\"}}'; fi ;;\nesac\n"
             ),
         );
         Factory {
@@ -878,6 +879,23 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     assert_eq!(item["status"], "escalated", "never left active");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]), "the worktree is freed");
+}
+
+#[test]
+fn work_from_an_agent_the_hook_never_saw_does_not_land() {
+    // A run with tool turns but no hook call means something switched the hook off.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("unhooked"), "").unwrap();
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("never called Paja's deny-list hook"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr create"));
 }
 
 #[test]

@@ -60,6 +60,9 @@ enum Command {
         /// The factory's home, which agents never touch.
         #[arg(long)]
         home: Option<PathBuf>,
+        /// A file the hook touches on every call, so Mestari can tell it really ran.
+        #[arg(long)]
+        stamp: Option<PathBuf>,
     },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
@@ -155,8 +158,8 @@ fn main() -> ExitCode {
             return code;
         }
     };
-    if let Command::Hook { root, home } = &cli.command {
-        return paja::hook::run(root.clone(), home.clone());
+    if let Command::Hook { root, home, stamp } = &cli.command {
+        return paja::hook::run(root.clone(), home.clone(), stamp.clone());
     }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,

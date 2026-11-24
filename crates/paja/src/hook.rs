@@ -64,7 +64,11 @@ pub const HOOK_DEADLINE_SECS: u64 = 20;
 /// `paja hook`: read one tool call on stdin and answer with an exit code Claude Code
 /// understands. 0 allows; 2 blocks, with the reason on stderr. Anything but a clear "allow"
 /// blocks, a panic included.
-pub fn run(root: Option<PathBuf>, home: Option<PathBuf>) -> ExitCode {
+pub fn run(root: Option<PathBuf>, home: Option<PathBuf>, stamp: Option<PathBuf>) -> ExitCode {
+    // Proof for Mestari that Claude Code called the hook at all.
+    if let Some(stamp) = &stamp {
+        let _ = std::fs::write(stamp, b"");
+    }
     // A hook that runs past Claude Code's timeout counts as "allow"; block well before it.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(HOOK_DEADLINE_SECS));
@@ -167,7 +171,8 @@ const GIT_FLAGS: &[(&str, &[&str])] = &[
     ("diff", DIFF_FLAGS),
     ("show", DIFF_FLAGS),
     ("log", DIFF_FLAGS),
-    ("rm", &["-r", "-q", "--cached", "-f"]),
+    // Plain files only: a recursive remove would reach the directories agents never change.
+    ("rm", &["-q", "--cached", "-f"]),
 ];
 
 const DIFF_FLAGS: &[&str] = &[
@@ -263,7 +268,7 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
         // Searches recurse, so they stay inside the worktree.
         "Glob" | "Grep" | "LS" => {
             let base = t["path"].as_str().map_or(cwd.clone(), |p| cwd.join(p));
-            if let Some(reason) = inside_root("search", &base, bounds) {
+            if let Some(reason) = within_root("search", &base, bounds) {
                 return Ok(Some(reason));
             }
             // Grep's pattern is a regex; Glob's pattern and Grep's glob are paths.
@@ -296,12 +301,8 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
 /// `path` must be inside the worktree, and not git's link to the repository.
 fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     let full = resolve(path);
-    if !full.starts_with(&b.root) {
-        return Some(format!(
-            "agents {what} only inside their own worktree ({}), not {}",
-            b.root.display(),
-            full.display()
-        ));
+    if let Some(reason) = within_root(what, &full, b) {
+        return Some(reason);
     }
     // Git and cargo read configuration from these at any depth.
     let inner = full.strip_prefix(&b.root).unwrap_or(&full);
@@ -331,6 +332,18 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
         ));
     }
     None
+}
+
+/// `path` must be inside the worktree. Reading git, CI and cargo configuration is fine.
+fn within_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
+    let full = resolve(path);
+    (!full.starts_with(&b.root)).then(|| {
+        format!(
+            "agents {what} only inside their own worktree ({}), not {}",
+            b.root.display(),
+            full.display()
+        )
+    })
 }
 
 /// Reads may look at plain files outside the worktree, but not into hidden directories
@@ -444,7 +457,11 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             '2' if !in_word && next_is(&mut chars, ">&1") => {
                 tokens.push(Token::StderrToStdout);
             }
-            c if c.is_ascii_alphanumeric() || "-_./=:,+@%^".contains(c) => {
+            // `~` only inside a word (`HEAD~1`); at its start the shell would expand it.
+            c if c.is_ascii_alphanumeric()
+                || "-_./=:,+@%^".contains(c)
+                || (c == '~' && in_word) =>
+            {
                 in_word = true;
                 word.push(c);
             }
@@ -653,13 +670,20 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
         } else if paths_only || !matches!(sub, "diff" | "show" | "log") || !is_revision_path(arg) {
             // A revision such as `main...HEAD` stays inside the root as a path too; anything
             // that leaves it is a path outside the worktree.
-            if let Some(reason) = inside_root("use git", &here.join(arg), b) {
+            let target = here.join(arg);
+            let reason = if matches!(sub, "diff" | "show" | "log" | "status") {
+                within_root("use git", &target, b)
+            } else {
+                inside_root("use git", &target, b)
+            };
+            if let Some(reason) = reason {
                 return Some(reason);
             }
         }
     }
-    if skip_next {
-        return Some("`git commit -m` needs a message".into());
+    if skip_next || (sub == "commit" && !args.iter().any(|a| matches!(*a, "-m" | "--message"))) {
+        // Without one, git would open an editor and the headless agent would hang.
+        return Some("`git commit` needs `-m '<message>'`".into());
     }
     None
 }
@@ -844,6 +868,7 @@ mod tests {
             "git commit -m '-Fix parsing'",
             "git diff main...HEAD",
             "git log --oneline -3 | head -3",
+            "git diff HEAD~1 -- .github/workflows/ci.yml",
             "git show HEAD:crates/paja/src/lib.rs",
             "pwd",
             "RUST_BACKTRACE=1 cargo test smoke",
@@ -961,6 +986,8 @@ mod tests {
             "git add --pathspec-from=/etc/x",
             "cargo fmt -- /h/other/src/main.rs",
             "git rm -r -- -/../..",
+            "git rm -r -f .",
+            "git commit",
             "git log =cargo",
             "git log --format=%H",
             "rm -rf target/debug",

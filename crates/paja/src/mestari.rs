@@ -318,12 +318,12 @@ fn claude(
     schema: Option<&Value>,
 ) -> Result<Value> {
     let program = claude_program();
-    // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
-    let settings = hook_settings(&env.path, home)?;
+    let (settings, stamp) = hook_settings(&env.path, home)?;
     let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
         Some(text) => format!("The project's CLAUDE.md, as it is on main:\n\n{text}"),
         None => String::new(),
     };
+    // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let scratch = tempfile_dir(&env.path)?;
     let mut cmd = Command::new(&program);
     cmd.current_dir(&env.path)
@@ -362,6 +362,19 @@ fn claude(
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("`{program} -p` printed something that is not JSON"))?;
+    // A session that took more than one turn used tools, so the hook must have run. If it
+    // didn't, something (such as an administrator's policy) switched it off, and nothing the
+    // agent did can be trusted.
+    let hooked = stamp.exists();
+    let _ = std::fs::remove_file(&stamp);
+    if value["num_turns"].as_u64().unwrap_or(0) > 1 && !hooked {
+        bail!(
+            "Claude Code never called Paja's deny-list hook during the agent's run in {}, so \
+             its work is not trusted; check for settings that disable hooks (such as \
+             `disableAllHooks` in managed settings) and run again",
+            env.path.display()
+        );
+    }
     if value.get("is_error") == Some(&Value::Bool(true)) {
         bail!("`{program} -p` reported an error: {}", value["result"]);
     }
@@ -371,7 +384,7 @@ fn claude(
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
 /// Before handing them out, check that the hook really blocks a push and allows a build; an
 /// agent never starts under a hook that doesn't.
-fn hook_settings(root: &Path, home: &Home) -> Result<String> {
+fn hook_settings(root: &Path, home: &Home) -> Result<(String, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
     let args = [
@@ -392,18 +405,22 @@ fn hook_settings(root: &Path, home: &Home) -> Result<String> {
             exe.display()
         );
     }
+    // The self-test leaves no stamp: the hook only gets `--stamp` from Claude Code.
+    let stamp = exe.with_extension(format!("stamp-{}", crate::events::now_ms()));
+    let _ = std::fs::remove_file(&stamp);
     let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails
     // in any other way must block too.
     let command = format!(
-        "{} hook --root {} --home {} || exit 2",
+        "{} hook --root {} --home {} --stamp {} || exit 2",
         quote(&exe.to_string_lossy()),
         quote(&root.to_string_lossy()),
-        quote(&home.root().to_string_lossy())
+        quote(&home.root().to_string_lossy()),
+        quote(&stamp.to_string_lossy())
     );
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
-    Ok(json!({
+    let settings = json!({
         "hooks": {
             "PreToolUse": [{
                 "matcher": "*",
@@ -411,7 +428,8 @@ fn hook_settings(root: &Path, home: &Home) -> Result<String> {
             }]
         }
     })
-    .to_string())
+    .to_string();
+    Ok((settings, stamp))
 }
 
 /// Managed (administrator) settings load whatever `--setting-sources` says, and two of their
@@ -444,9 +462,11 @@ fn refuse_hook_policies() -> Result<()> {
 /// binary that is running, even if the file on disk has been rebuilt since; copies other runs
 /// left behind are removed once they are a day old.
 fn hook_binary(home: &Home) -> Result<PathBuf> {
-    static COPIED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static COPIED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    let mut copied = COPIED.lock().unwrap_or_else(|e| e.into_inner());
     let _lock = home.lock()?;
-    if let Some(exe) = COPIED.get() {
+    // Another run's cleanup may have removed a copy idle for a day; then copy again.
+    if let Some(exe) = copied.as_ref().filter(|exe| exe.exists()) {
         // Keep this run's copy fresh so another run's cleanup leaves it alone.
         if let Ok(file) = std::fs::File::options().write(true).open(exe) {
             let _ = file.set_modified(std::time::SystemTime::now());
@@ -486,7 +506,8 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
             exe.display()
         )
     })?;
-    Ok(COPIED.get_or_init(|| exe).clone())
+    *copied = Some(exe.clone());
+    Ok(exe)
 }
 
 fn run_hook_once(
@@ -507,6 +528,8 @@ fn run_hook_once(
         input.as_bytes(),
     ) {
         if err.kind() != std::io::ErrorKind::BrokenPipe {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(err.into());
         }
     }
@@ -521,7 +544,13 @@ fn run_hook_once(
     // The hook blocks itself after its deadline; anything longer is a hung binary.
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(crate::hook::HOOK_DEADLINE_SECS + 10);
-    while child.try_wait()?.is_none() {
+    while child
+        .try_wait()
+        .inspect_err(|_| {
+            let _ = child.kill();
+        })?
+        .is_none()
+    {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             bail!(
