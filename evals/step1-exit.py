@@ -35,11 +35,15 @@ PROMPT = (
     "You are in a fresh checkout of Paja. Using only CLAUDE.md for guidance, "
     "build Paja and run its full checks."
 )
+# Logs a start line before cargo runs and an end line after, so a run that was killed
+# (a tool timeout, an interrupt) still shows up, as a start with no end.
 SHIM = """#!/bin/sh
+id="$$-$(date +%s%N)"
+log() { python3 -c 'import json,sys; print(json.dumps({"id": sys.argv[1], "code": None if sys.argv[2] == "-" else int(sys.argv[2]), "args": sys.argv[3:]}))' "$@" >> "$PAJA_EVAL_CARGO_LOG"; }
+log "$id" - "$@"
 "$PAJA_EVAL_REAL_CARGO" "$@"
 code=$?
-python3 -c 'import json,sys; print(json.dumps({"args": sys.argv[2:], "code": int(sys.argv[1])}))' \\
-  "$code" "$@" >> "$PAJA_EVAL_CARGO_LOG"
+log "$id" "$code" "$@"
 exit $code
 """
 
@@ -95,6 +99,38 @@ def rewrites(args):
     return sub == "fmt" and "--check" not in args
 
 
+# What CLAUDE.md asks for: each check's first run must include these arguments.
+REQUIRED = {
+    "fmt": {"--all", "--check"},
+    "clippy": {"--all-targets", "-D", "warnings"},
+    "test": set(),
+}
+
+
+def full_check(check, args):
+    """Whether a run is the full check from CLAUDE.md, not a narrower one."""
+    if not REQUIRED[check] <= set(args):
+        return False
+    if check == "test":
+        # No `--no-run`, and no positional test filter before `--`.
+        own = args[: args.index("--")] if "--" in args else args
+        rest = own[own.index(next(a for a in own if subcommand([a]) == "test")) + 1:]
+        if "--no-run" in rest or any(not a.startswith("-") for a in rest):
+            return False
+    return True
+
+
+def pair(lines):
+    """One record per cargo run, from the shim's start and end lines. A run with a start but
+    no end was killed, and counts as failed."""
+    runs = {}
+    for line in lines:
+        rec = runs.setdefault(line.get("id"), {"args": line.get("args", []), "code": -1})
+        if line.get("code") is not None:
+            rec["code"] = line["code"]
+    return list(runs.values())
+
+
 def judge(invocations):
     """Each check must have run, passed on its first run, and never rewritten files. A build
     is covered by clippy and test, which both compile Paja first."""
@@ -103,9 +139,11 @@ def judge(invocations):
         runs = [i for i in invocations if subcommand(i["args"]) == check]
         first = runs[0] if runs else None
         rewrote = any(rewrites(i["args"]) for i in runs)
+        full = first is not None and full_check(check, first["args"])
         steps[check] = {
             "runs": len(runs),
-            "first_passed": first is not None and first["code"] == 0 and not rewrote,
+            "first_was_full_check": full,
+            "first_passed": full and first["code"] == 0 and not rewrote,
             "rewrote_files": rewrote,
         }
     return steps
@@ -119,8 +157,17 @@ def main():
             done({"error": f"`{tool}` is not on PATH; install it (and sign in to claude), then rerun"}, False)
     fetched = run(["git", "fetch", "-q", "origin", "main"], repo)
     if fetched.returncode != 0:
-        done({"error": f"`git fetch origin main` failed in {repo}: {fetched.stderr.strip()}"}, False)
-    base = run(["git", "rev-parse", "origin/main"], repo).stdout.strip()
+        done({"error": f"`git fetch origin main` failed in {repo}: {fetched.stderr.strip()}; "
+                       "check the network and that `origin` points at Paja's repository"}, False)
+    parsed = run(["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"], repo)
+    if parsed.returncode != 0:
+        done({"error": f"can't resolve the fetched main in {repo}: {parsed.stderr.strip()}; "
+                       "check that the remote `origin` has a `main` branch"}, False)
+    base = parsed.stdout.strip()
+
+    # Branches that exist before the run are the owner's: cleanup never deletes them.
+    before = set(run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/paja/"],
+                     repo).stdout.split())
 
     scratch = tempfile.mkdtemp(prefix="paja-eval-")
     home, shim_dir = os.path.join(scratch, "home"), os.path.join(scratch, "bin")
@@ -173,14 +220,15 @@ def main():
             done({"error": f"claude exited {claude.returncode}: {claude.stderr.strip()[-500:]}; "
                            "check that `claude` is signed in, then rerun"}, False)
 
-        invocations = []
+        lines = []
         if os.path.exists(log):
             with open(log) as f:
-                for line in f:
+                for n, line in enumerate(f):
                     try:
-                        invocations.append(json.loads(line))
+                        lines.append(json.loads(line))
                     except json.JSONDecodeError:
-                        invocations.append({"args": ["<unreadable log line>"], "code": -1})
+                        lines.append({"id": f"bad-{n}", "args": ["<unreadable log line>"], "code": -1})
+        invocations = pair(lines)
         if not os.path.exists(log):
             done({"error": "the cargo shim logged nothing, so Claude's cargo calls bypassed it "
                            "(a shell profile may put ~/.cargo/bin back first on PATH); fix PATH "
@@ -200,7 +248,7 @@ def main():
               and all(v is True for v in recheck.values())
               and not changed and not rewrote_anywhere)
         try:
-            said = json.loads(claude.stdout).get("result", "")
+            said = str(json.loads(claude.stdout).get("result") or "")
         except (json.JSONDecodeError, AttributeError):
             said = claude.stdout
         done({"passed": ok, "base": base, "steps": steps, "recheck": recheck,
@@ -209,20 +257,32 @@ def main():
               "claude_said": said[-1500:]}, ok)
     finally:
         # Cleanup never raises, so it can't hide the verdict or print a second value.
-        cleanup = []
+        # Remove every environment in the throwaway home, including any Claude made while
+        # trying the CLI, so no branch or worktree is left in the owner's repository.
+        names = {name}
         if os.path.exists(paja[0]):
-            cleanup.append(paja + ["env", "remove", name, "--force"])
-        cleanup += [
-            ["git", "worktree", "remove", "--force", src],
-            ["git", "worktree", "prune"],
-            ["git", "branch", "-D", f"paja/{name}"],
-        ]
+            try:
+                listed = json.loads(run(paja + ["env", "list"], repo, env).stdout)
+                names |= {e["name"] for e in listed if isinstance(e, dict) and "name" in e}
+            except Exception:
+                pass
+        cleanup = []
+        for n in sorted(names):
+            if os.path.exists(paja[0]):
+                cleanup.append(paja + ["env", "remove", n, "--force"])
+            if f"paja/{n}" not in before:
+                cleanup.append(["git", "branch", "-D", f"paja/{n}"])
+        cleanup.insert(0, ["git", "worktree", "remove", "--force", src])
         for cmd in cleanup:
             try:
                 run(cmd, repo, env)
             except Exception:
                 pass
         shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            run(["git", "worktree", "prune"], repo)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     try:
