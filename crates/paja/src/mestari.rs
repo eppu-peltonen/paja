@@ -349,10 +349,27 @@ fn claude(
     if let Some(schema) = schema {
         cmd.args(["--json-schema", &schema.to_string()]);
     }
+    let before = git_head(&env.path);
     let output = cmd.stdin(std::process::Stdio::null()).output();
     let _ = std::fs::remove_dir_all(&scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
+    // A run the hook never saw can't be trusted. If it failed, or claims tool turns, throw
+    // away everything it did, so a later run can't resume and land it.
+    let used_tools = output.as_ref().ok().and_then(|o| {
+        let value: Value = serde_json::from_slice(&o.stdout).ok()?;
+        (value.get("is_error") != Some(&Value::Bool(true))).then_some(())?;
+        Some(value["num_turns"].as_u64().unwrap_or(0) > 1)
+    });
+    if !hooked && used_tools != Some(false) {
+        discard(&env.path, before.as_deref().unwrap_or(base));
+        bail!(
+            "Claude Code never called Paja's deny-list hook during the agent's run in {}, so \
+             its work is not trusted and was discarded; check for settings that disable hooks \
+             (such as `disableAllHooks` in managed settings) and run again",
+            env.path.display()
+        );
+    }
     let output =
         output.with_context(|| format!("running `{program}` (install Claude Code and sign in)"))?;
     if !output.status.success() {
@@ -367,30 +384,40 @@ fn claude(
     // A session that took more than one turn used tools, so the hook must have run. If it
     // didn't, something (such as an administrator's policy) switched it off, and nothing the
     // agent did can be trusted.
-    if value["num_turns"].as_u64().unwrap_or(0) > 1 && !hooked {
-        // Drop what it committed, so a later run can't resume and land it.
-        let reset = Command::new("git")
-            .arg("-C")
-            .arg(&env.path)
-            .args(["reset", "-q", "--hard", base])
-            .status();
-        if !reset.is_ok_and(|s| s.success()) {
-            eprintln!(
-                "warning: couldn't reset {} to {base}; delete its branch before running it again",
-                env.path.display()
-            );
-        }
-        bail!(
-            "Claude Code never called Paja's deny-list hook during the agent's run in {}, so \
-             its work is not trusted; check for settings that disable hooks (such as \
-             `disableAllHooks` in managed settings) and run again",
-            env.path.display()
-        );
-    }
     if value.get("is_error") == Some(&Value::Bool(true)) {
         bail!("`{program} -p` reported an error: {}", value["result"]);
     }
     Ok(value)
+}
+
+fn git_head(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Reset the worktree to `to`, dropping commits and files made since.
+fn discard(repo: &Path, to: &str) {
+    let ok = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !(ok(&["reset", "-q", "--hard", to]) && ok(&["clean", "-q", "-f", "-d"])) {
+        eprintln!(
+            "warning: couldn't reset {} to {to}; delete its branch before running it again",
+            repo.display()
+        );
+    }
 }
 
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.

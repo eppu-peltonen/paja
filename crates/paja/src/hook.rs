@@ -298,10 +298,13 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 if let Some(reason) = within_root("search", &base.join(literal), bounds) {
                     return Ok(Some(reason));
                 }
-                if pattern.starts_with('/')
-                    || pattern.contains("..")
-                    || pattern.contains(['{', '}'])
-                {
+                // An absolute pattern is fine when its literal start (checked above) is in the
+                // worktree. Brace alternatives may not hold a path of their own.
+                let braced_path = pattern
+                    .split('{')
+                    .skip(1)
+                    .any(|alt| alt.split('}').next().is_some_and(|a| a.contains('/')));
+                if pattern.contains("..") || braced_path {
                     return Ok(Some(format!(
                         "the pattern `{pattern}` reaches outside the worktree; search relative to it"
                     )));
@@ -696,7 +699,8 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
             // files directly).
             let target = here.join(arg);
             let reads = matches!(sub, "diff" | "show" | "log" | "status");
-            let reason = if reads || (!paths_only && is_revision_path(arg)) {
+            // Only reads take revisions; add, rm and commit paths get the full write check.
+            let reason = if reads {
                 within_root("use git", &target, b)
             } else {
                 inside_root("use git", &target, b)
@@ -750,12 +754,6 @@ fn check_pipe_target(words: &[&str]) -> Option<String> {
         }
     };
     (!ok).then(|| format!("`{program}` may only filter the pipe, not read files; {SHAPE}"))
-}
-
-/// `HEAD:src/lib.rs` or `main:x` names a file in a revision, not on disk.
-fn is_revision_path(arg: &str) -> bool {
-    arg.split_once(':')
-        .is_some_and(|(rev, _)| !rev.is_empty() && !rev.contains('/'))
 }
 
 /// A package, target, test filter or lint name: nothing a shell or a program would read as a
@@ -1015,6 +1013,8 @@ mod tests {
             "git commit",
             "git commit -a -- -m",
             "git diff a:/x a:/../../../../../../h/.paja/events.jsonl",
+            "git rm -f -q a:/../.github/workflows/ci.yml",
+            "git add a:/../.cargo/config.toml",
             "git log =cargo",
             "git log --format=%H",
             "rm -rf target/debug",
@@ -1049,6 +1049,12 @@ mod tests {
         assert!(decide("Read", json!({"file_path": "/var/run/secrets/token"})).is_some());
         assert!(bash("cargo run -q env create demo").is_some());
         assert!(decide("Glob", json!({"pattern": "{..,x}/../.ssh/*"})).is_some());
+        assert!(decide("Glob", json!({"pattern": "{a/b,c}/*"})).is_some());
+        assert_eq!(decide("Glob", json!({"pattern": "*.{rs,toml}"})), None);
+        assert_eq!(
+            decide("Glob", json!({"pattern": format!("{ROOT}/**/*.rs")})),
+            None
+        );
         assert!(decide("Glob", json!({"pattern": "**/.ssh/*"})).is_some());
         assert!(decide(
             "Bash",
