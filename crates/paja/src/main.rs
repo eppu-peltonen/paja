@@ -37,7 +37,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum EnvCommand {
-    /// Create an environment on a new branch `paja/<name>`.
+    /// Create an environment on branch `paja/<name>` (resumed if an earlier one kept it).
     Create {
         name: String,
         /// Any path inside the repository (default: current directory).
@@ -65,19 +65,28 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => {
             use clap::error::ErrorKind;
-            if !std::env::args_os().any(|a| a == "--json") {
+            // Flags end at a bare `--`; a later "--json" is a value, not the flag.
+            let json = std::env::args_os()
+                .take_while(|a| a != "--")
+                .any(|a| a == "--json");
+            if !json {
                 err.exit();
             }
             // Agents parse stdout, so help, version and usage errors are one JSON value too.
             let text = err.render().to_string();
-            let (key, code) = match err.kind() {
-                ErrorKind::DisplayHelp => ("help", ExitCode::SUCCESS),
-                // `paja` with no subcommand: help text, but still a usage error.
-                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => ("help", ExitCode::from(2)),
-                ErrorKind::DisplayVersion => ("version", ExitCode::SUCCESS),
-                _ => ("error", ExitCode::from(2)),
+            let text = text.trim();
+            let (value, code) = match err.kind() {
+                ErrorKind::DisplayHelp => (json!({ "help": text }), ExitCode::SUCCESS),
+                // `paja` with no subcommand: still a usage error, so it carries `error` like
+                // every other failure, plus the help text.
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => (
+                    json!({ "error": "a subcommand is required", "help": text }),
+                    ExitCode::from(2),
+                ),
+                ErrorKind::DisplayVersion => (json!({ "version": text }), ExitCode::SUCCESS),
+                _ => (json!({ "error": text }), ExitCode::from(2)),
             };
-            println!("{}", json!({ key: text.trim() }));
+            println!("{value}");
             return code;
         }
     };

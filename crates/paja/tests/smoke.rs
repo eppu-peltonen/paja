@@ -282,3 +282,100 @@ fn force_removes_a_directory_git_no_longer_knows() {
     assert!(ok, "{removed}");
     assert!(!path.exists());
 }
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn a_live_name_is_reported_as_taken_even_with_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let (ok, _) = paja(&home, &repo, &["env", "create", "busy"]);
+    assert!(ok);
+    let (ok, err) = paja(&home, &repo, &["env", "create", "busy", "--base", "main"]);
+    assert!(!ok);
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("already exists") && msg.contains("env remove busy"),
+        "{err}"
+    );
+    assert!(!msg.contains("branch -D"), "{err}");
+}
+
+#[test]
+fn head_means_the_callers_checkout_inside_an_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let (_, parent) = paja(&home, &repo, &["env", "create", "parent"]);
+    let parent_path = Path::new(parent["path"].as_str().unwrap()).to_path_buf();
+    std::fs::write(parent_path.join("more.txt"), "more\n").unwrap();
+    git(&parent_path, &["add", "."]);
+    git(&parent_path, &["commit", "-q", "-m", "more"]);
+    let parent_head = git_out(&parent_path, &["rev-parse", "HEAD"]);
+    assert_ne!(parent_head, git_out(&repo, &["rev-parse", "HEAD"]));
+
+    let (ok, child) = paja(&home, &parent_path, &["env", "create", "child"]);
+    assert!(ok, "{child}");
+    assert_eq!(child["base_commit"].as_str().unwrap(), parent_head);
+    let (ok, rel) = paja(
+        &home,
+        &parent_path,
+        &["env", "create", "rel", "--base", "HEAD~1"],
+    );
+    assert!(ok, "{rel}");
+    assert_eq!(
+        rel["base_commit"].as_str().unwrap(),
+        git_out(&parent_path, &["rev-parse", "HEAD~1"])
+    );
+}
+
+#[test]
+fn a_missing_subcommand_is_an_error_under_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ok, out) = paja(tmp.path(), tmp.path(), &[]);
+    assert!(!ok);
+    assert!(
+        out["error"].as_str().unwrap().contains("subcommand"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_bare_repository_gets_its_own_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bare, home) = (tmp.path().join("bare.git"), tmp.path().join("home"));
+    std::fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare"]);
+    let (ok, err) = paja(&home, &bare, &["env", "create", "x"]);
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("bare repository"),
+        "{err}"
+    );
+}
+
+#[test]
+fn force_does_not_delete_a_worktree_git_still_guards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let (_, env) = paja(&home, &repo, &["env", "create", "held"]);
+    let path = Path::new(env["path"].as_str().unwrap()).to_path_buf();
+    // A locked worktree refuses a single --force; paja must report that, not delete it.
+    git(&repo, &["worktree", "lock", path.to_str().unwrap()]);
+
+    let (ok, err) = paja(&home, &repo, &["env", "remove", "held", "--force"]);
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("locked"), "{err}");
+    assert!(path.exists());
+}

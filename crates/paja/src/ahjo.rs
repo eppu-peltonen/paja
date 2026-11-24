@@ -30,7 +30,8 @@ pub struct Env {
     pub path: PathBuf,
     /// Branch checked out in the worktree.
     pub branch: String,
-    /// Commit the branch was created from.
+    /// Commit the environment started from: the base of a new branch, or the tip of a
+    /// resumed one.
     pub base_commit: String,
     /// First port of this environment's block; it owns `port_base..port_base + port_count`.
     pub port_base: u16,
@@ -86,6 +87,18 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     validate_name(opts.name)?;
     let repo = main_repo(opts.repo)?;
     let branch = format!("paja/{}", opts.name);
+
+    let lock = home.lock()?;
+    let log = home.events();
+    let envs = replay(&log.read_all()?)?;
+    if envs.contains_key(opts.name) {
+        bail!(
+            "an environment named {:?} already exists; pick another name or run `paja env remove {}` first",
+            opts.name,
+            opts.name
+        );
+    }
+
     // `remove` keeps branches, so a reused name may find its old branch: resume it.
     let resume = git(
         &repo,
@@ -104,23 +117,19 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
             repo.display()
         );
     }
-    let start = if resume {
-        branch.as_str()
+    // HEAD and relative names (`HEAD~1`, `@{u}`) mean what they mean where the caller stands,
+    // which may be a linked worktree rather than the main checkout.
+    let (start, start_in) = if resume {
+        (branch.as_str(), repo.as_path())
     } else {
-        opts.base.unwrap_or("HEAD")
+        (opts.base.unwrap_or("HEAD"), opts.repo)
     };
     let base_commit = git(
-        &repo,
+        start_in,
         &["rev-parse", "--verify", &format!("{start}^{{commit}}")],
     )
-    .with_context(|| format!("{start:?} is not a commit in {}", repo.display()))?;
+    .with_context(|| format!("{start:?} is not a commit in {}", start_in.display()))?;
 
-    let lock = home.lock()?;
-    let log = home.events();
-    let envs = replay(&log.read_all()?)?;
-    if envs.contains_key(opts.name) {
-        bail!("an environment named {:?} already exists", opts.name);
-    }
     let port_base = free_port_block(&envs)?;
     let path = home.envs_dir().join(opts.name);
     if path.exists() {
@@ -213,7 +222,7 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
         }
         args.push(path);
         let removed = git(&env.repo, &args);
-        if removed.is_err() && force {
+        if removed.is_err() && force && !is_registered_worktree(&env.repo, &env.path) {
             // git no longer knows this directory as a worktree (re-cloned repo, lost
             // metadata); with --force, delete it directly and let git forget the rest.
             std::fs::remove_dir_all(&env.path).with_context(|| format!("deleting {path}"))?;
@@ -225,12 +234,12 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
             })?;
         } else {
             removed.with_context(|| {
-            if force {
-                format!("removing worktree {path}")
-            } else {
-                format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
-            }
-        })?;
+                if force {
+                    format!("removing worktree {path}")
+                } else {
+                    format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
+                }
+            })?;
         }
     } else {
         // The directory is already gone; let git forget about it too.
@@ -264,20 +273,24 @@ fn main_repo(path: &Path) -> Result<PathBuf> {
             "--show-toplevel",
         ],
     )
-    .with_context(|| {
-        format!(
-            "{} is not inside a git checkout with a working tree",
-            path.display()
-        )
+    .map_err(|err| {
+        let bare = git(path, &["rev-parse", "--is-bare-repository"]).is_ok_and(|b| b == "true");
+        if bare {
+            err.context(format!(
+                "{} is a bare repository; run paja from a checkout of it",
+                path.display()
+            ))
+        } else {
+            err.context(format!(
+                "{} is not inside a git checkout with a working tree",
+                path.display()
+            ))
+        }
     })?;
     let mut lines = dirs.lines();
     let (git_dir, common_dir, top) = (lines.next(), lines.next(), lines.next());
-    let top = top.with_context(|| {
-        format!(
-            "{} is in a bare repository; run paja from a checkout",
-            path.display()
-        )
-    })?;
+    let top =
+        top.with_context(|| format!("git gave no top-level directory for {}", path.display()))?;
     if git_dir == common_dir {
         // Already the main checkout (this also covers submodules).
         return Ok(PathBuf::from(top));
@@ -289,6 +302,17 @@ fn main_repo(path: &Path) -> Result<PathBuf> {
         .and_then(|l| l.strip_prefix("worktree "))
         .map(PathBuf::from)
         .with_context(|| format!("can't find the main checkout for {}", path.display()))
+}
+
+/// Whether git still lists `path` as one of `repo`'s worktrees.
+fn is_registered_worktree(repo: &Path, path: &Path) -> bool {
+    let Ok(list) = git(repo, &["worktree", "list", "--porcelain"]) else {
+        return true; // can't tell: keep git's own error rather than deleting
+    };
+    let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    list.lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)) == want)
 }
 
 fn free_port_block(envs: &BTreeMap<String, Env>) -> Result<u16> {
