@@ -383,3 +383,118 @@ fn force_does_not_delete_a_worktree_git_still_guards() {
     );
     assert!(path.exists());
 }
+
+/// Drive `paja mcp` over stdio: initialize, list tools, then create, list and remove an env.
+#[test]
+fn the_mcp_server_serves_the_same_core() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .arg("mcp")
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next_id = 0;
+    let mut request = |method: &str, params: Value| -> Value {
+        next_id += 1;
+        let msg = serde_json::json!({"jsonrpc": "2.0", "id": next_id, "method": method, "params": params});
+        writeln!(stdin, "{msg}").unwrap();
+        if method == "initialize" {
+            let note = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+            // The client confirms only after the server's reply, as the protocol asks.
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            writeln!(stdin, "{note}").unwrap();
+            return serde_json::from_str(&line).unwrap();
+        }
+        loop {
+            let mut line = String::new();
+            assert!(
+                stdout.read_line(&mut line).unwrap() > 0,
+                "server closed stdout"
+            );
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            if reply["id"] == next_id {
+                return reply;
+            }
+        }
+    };
+    let call =
+        |request: &mut dyn FnMut(&str, Value) -> Value, tool: &str, args: Value| -> (bool, Value) {
+            let reply = request(
+                "tools/call",
+                serde_json::json!({"name": tool, "arguments": args}),
+            );
+            let result = &reply["result"];
+            let text = result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{reply}"));
+            (
+                result["isError"] != true,
+                serde_json::from_str(text).unwrap(),
+            )
+        };
+
+    let init = request(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "smoke", "version": "0"}
+        }),
+    );
+    assert_eq!(init["result"]["serverInfo"]["name"], "paja", "{init}");
+    let tools = request("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for want in ["env_create", "env_list", "env_show", "env_remove", "log"] {
+        assert!(names.contains(&want), "{want} missing from {names:?}");
+    }
+
+    let (ok, env) = call(
+        &mut request,
+        "env_create",
+        serde_json::json!({"name": "via-mcp"}),
+    );
+    assert!(ok, "{env}");
+    assert_eq!(env["branch"], "paja/via-mcp");
+    // The CLI sees what the MCP server wrote: one event log, one truth.
+    let (ok, listed) = paja(&home, &repo, &["env", "list"]);
+    assert!(ok);
+    assert_eq!(listed[0]["name"], "via-mcp");
+    let (ok, err) = call(
+        &mut request,
+        "env_create",
+        serde_json::json!({"name": "via-mcp"}),
+    );
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("already exists"),
+        "{err}"
+    );
+    let (ok, removed) = call(
+        &mut request,
+        "env_remove",
+        serde_json::json!({"name": "via-mcp"}),
+    );
+    assert!(ok, "{removed}");
+    let (ok, log) = call(&mut request, "log", serde_json::json!({"limit": 1}));
+    assert!(ok);
+    assert_eq!(log[0]["kind"], "env.removed");
+
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}

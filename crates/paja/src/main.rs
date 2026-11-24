@@ -27,6 +27,11 @@ enum Command {
         #[command(subcommand)]
         command: EnvCommand,
     },
+    /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
+    ///
+    /// stdout carries the MCP protocol, so this is the one command that never prints a
+    /// result of its own; startup errors still follow --json.
+    Mcp,
     /// Show the event log, newest last.
     Log {
         /// Only the last N events.
@@ -106,6 +111,7 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<()> {
     let home = Home::from_env()?;
     match &cli.command {
+        Command::Mcp => paja::mcp::serve(home)?,
         Command::Env { command } => match command {
             EnvCommand::Create { name, repo, base } => {
                 let env = ahjo::create(
