@@ -59,6 +59,23 @@ survives the issue closing and reopening; a landed issue that reopens is queued 
 open, queued item and marks it active under the home lock, so two runs never share one. A sync that reads its full limit
 of issues refuses to close anything rather than drop work it could not see.
 
+## The run loop
+
+`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, claims the next item and creates an Ahjo
+environment `work-<issue>` from `main` (resuming the branch an earlier run kept). Then, for at most three rounds:
+
+1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
+2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder.
+3. A fresh reviewer agent with read-only tools reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it
+   is on `main`, and answers `land`, `changes` or `escalate`. A change touching a prefix in `.paja/high-risk` (read
+   from `main`) gets two reviewers, who must agree; a split is escalated.
+
+On `land`, Mestari pushes the branch, opens a pull request, waits for CI with `gh pr checks --watch`, squash-merges it
+and marks the item landed. On `escalate`, three failed rounds, a red CI or an error it can't fix, it comments on the
+issue with the question and marks the item escalated; the branch keeps the work. Agents run with a throwaway
+`PAJA_HOME`, so they never touch the factory's own state. Each step is recorded as `run.started`, `run.round`,
+`run.landed` or `run.escalated`. `paja run --every 5` keeps going, checking an empty queue every five minutes.
+
 ## MCP server
 
 `paja mcp` serves the core as MCP tools over stdio (`env_*`, `work_*` and `log`), built on

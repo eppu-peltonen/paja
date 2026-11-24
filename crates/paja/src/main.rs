@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use paja::ahjo::{self, CreateOptions, Env};
 use paja::home::Home;
 use paja::jono;
+use paja::mestari;
 
 /// Paja: a software factory. Every command takes --json for machine-readable output.
 #[derive(Parser)]
@@ -32,6 +33,20 @@ enum Command {
     Work {
         #[command(subcommand)]
         command: WorkCommand,
+    },
+    /// Mestari: take the next work item and run it to an outcome (landed or escalated).
+    ///
+    /// Builds in a fresh environment with headless Claude Code, runs the checks in
+    /// `.paja/checks` on main, has independent reviewer agents read the diff, then lands it
+    /// through a pull request or asks on the issue.
+    Run {
+        /// Any path inside the repository's checkout (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Keep going: after each item take the next, and when the queue is empty check
+        /// again every this many minutes. Prints one JSON value per item.
+        #[arg(long, value_name = "MINUTES")]
+        every: Option<u64>,
     },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
@@ -196,6 +211,28 @@ fn run(cli: &Cli) -> Result<()> {
                     serde_json::to_value(ahjo::RemoveReport::from(&env))?,
                     || format!("removed {} (branch {} kept)", env.name, env.branch),
                 );
+            }
+        },
+        Command::Run { repo, every } => loop {
+            let report = mestari::run_once(&home, mestari::RunOptions { repo })?;
+            let idle = matches!(report, mestari::RunReport::Idle);
+            emit(cli, serde_json::to_value(&report)?, || match &report {
+                mestari::RunReport::Idle => "nothing queued".to_string(),
+                mestari::RunReport::Landed { number, pr, rounds } => {
+                    format!("#{number} landed in {rounds} round(s): {pr}")
+                }
+                mestari::RunReport::Escalated {
+                    number, question, ..
+                } => {
+                    format!("#{number} escalated:\n{question}")
+                }
+            });
+            match every {
+                None => break,
+                Some(minutes) if idle => {
+                    std::thread::sleep(std::time::Duration::from_secs(minutes * 60))
+                }
+                Some(_) => {}
             }
         },
         Command::Work { command } => match command {

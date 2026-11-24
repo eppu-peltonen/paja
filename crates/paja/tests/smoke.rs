@@ -664,3 +664,187 @@ fn work_sync_says_what_to_do_when_gh_fails() {
         "{err}"
     );
 }
+
+/// A repo with a bare `origin`, `.paja/checks` on main, and fake `gh` and `claude` programs.
+/// The fake reviewer's verdict is read from `verdict.txt`; the fake builder writes
+/// `feature.txt` and commits it.
+struct Factory {
+    tmp: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    home: std::path::PathBuf,
+    gh: std::path::PathBuf,
+    claude: std::path::PathBuf,
+}
+
+impl Factory {
+    fn new(checks: &str, verdict: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+        let origin = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        init_repo(&repo);
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/checks"), checks).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "checks"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "origin", "main"]);
+
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("issues.json"),
+            r#"[{"number": 5, "title": "Add a feature file", "body": "Please.", "url": "https://example.com/5"}]"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("verdict.txt"), verdict).unwrap();
+        let script = |name: &str, body: String| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let d = dir.display();
+        let gh = script(
+            "gh",
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+                 \"issue list\") cat {d}/issues.json ;;\n\
+                 \"pr view\") exit 1 ;;\n\
+                 \"pr create\") echo https://example.com/pull/1 ;;\n\
+                 *) ;;\nesac\n"
+            ),
+        );
+        let claude = script(
+            "claude",
+            format!(
+                "#!/bin/sh\necho \"$PAJA_HOME\" >> {d}/claude-homes.log\n\
+                 case \"$*\" in\n\
+                 *--json-schema*) v=$(cat {d}/verdict.txt)\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\"}}}}\" ;;\n\
+                 *) echo built >> feature.txt\n\
+                 if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
+                 git add feature.txt\n\
+                 git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
+                 echo '{{\"is_error\": false, \"result\": \"done\"}}' ;;\nesac\n"
+            ),
+        );
+        Factory {
+            tmp,
+            repo,
+            home,
+            gh,
+            claude,
+        }
+    }
+
+    fn run(&self) -> (bool, Value) {
+        paja_with(
+            &self.home,
+            &self.repo,
+            &["run"],
+            &[
+                ("PAJA_GH", self.gh.as_path()),
+                ("PAJA_CLAUDE", self.claude.as_path()),
+            ],
+        )
+    }
+
+    fn gh_log(&self) -> String {
+        std::fs::read_to_string(self.tmp.path().join("gh.log")).unwrap_or_default()
+    }
+}
+
+#[test]
+fn run_builds_reviews_and_lands_an_issue() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["number"], 5);
+    assert_eq!(report["pr"], "https://example.com/pull/1");
+    let log = f.gh_log();
+    assert!(
+        log.contains("pr create --base main --head paja/work-5"),
+        "{log}"
+    );
+    assert!(
+        log.contains("pr checks https://example.com/pull/1 --watch"),
+        "{log}"
+    );
+    assert!(
+        log.contains("pr merge https://example.com/pull/1 --squash"),
+        "{log}"
+    );
+    // The branch reached origin, the item is landed, and the environment is gone.
+    git(&f.repo, &["fetch", "-q", "origin", "paja/work-5"]);
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "landed");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]));
+    // Agents never see the factory's own PAJA_HOME.
+    let homes = std::fs::read_to_string(f.tmp.path().join("claude-homes.log")).unwrap();
+    assert!(!homes.contains(f.home.to_str().unwrap()), "{homes}");
+
+    // Nothing else is queued.
+    let (ok, idle) = f.run();
+    assert!(ok);
+    assert_eq!(idle["outcome"], "idle");
+}
+
+#[test]
+fn run_escalates_when_the_reviewer_asks_a_question() {
+    let f = Factory::new("true\n", "escalate");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated");
+    assert_eq!(report["question"], "Which API?");
+    assert!(
+        f.gh_log().contains("issue comment 5 --body"),
+        "{}",
+        f.gh_log()
+    );
+    assert!(!f.gh_log().contains("pr merge"));
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated");
+    assert_eq!(item["note"], "Which API?");
+}
+
+#[test]
+fn run_gives_up_after_three_failed_rounds_and_asks() {
+    let f = Factory::new("test -f never.txt\n", "land");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated");
+    assert_eq!(report["rounds"], 3);
+    assert!(
+        report["question"].as_str().unwrap().contains("never.txt"),
+        "{report}"
+    );
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let rounds = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .count();
+    assert_eq!(rounds, 3);
+}
+
+#[test]
+fn run_checks_come_from_main_not_the_branch() {
+    // The builder can't make its change pass by editing .paja/checks on its branch.
+    let f = Factory::new("test -f never.txt\n", "land");
+    std::fs::write(f.tmp.path().join("cheat"), "").unwrap();
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"].as_str().unwrap().contains("never.txt"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr merge"));
+}
