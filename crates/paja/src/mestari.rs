@@ -351,6 +351,8 @@ fn claude(
     }
     let output = cmd.stdin(std::process::Stdio::null()).output();
     let _ = std::fs::remove_dir_all(&scratch);
+    let hooked = stamp.exists();
+    let _ = std::fs::remove_file(&stamp);
     let output =
         output.with_context(|| format!("running `{program}` (install Claude Code and sign in)"))?;
     if !output.status.success() {
@@ -365,9 +367,19 @@ fn claude(
     // A session that took more than one turn used tools, so the hook must have run. If it
     // didn't, something (such as an administrator's policy) switched it off, and nothing the
     // agent did can be trusted.
-    let hooked = stamp.exists();
-    let _ = std::fs::remove_file(&stamp);
     if value["num_turns"].as_u64().unwrap_or(0) > 1 && !hooked {
+        // Drop what it committed, so a later run can't resume and land it.
+        let reset = Command::new("git")
+            .arg("-C")
+            .arg(&env.path)
+            .args(["reset", "-q", "--hard", base])
+            .status();
+        if !reset.is_ok_and(|s| s.success()) {
+            eprintln!(
+                "warning: couldn't reset {} to {base}; delete its branch before running it again",
+                env.path.display()
+            );
+        }
         bail!(
             "Claude Code never called Paja's deny-list hook during the agent's run in {}, so \
              its work is not trusted; check for settings that disable hooks (such as \

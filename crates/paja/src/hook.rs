@@ -22,7 +22,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -218,7 +218,15 @@ const READABLE_HIDDEN: &[&str] = &[".cargo/registry", ".cargo/git", ".rustup"];
 
 /// Tools that touch nothing outside the session. Any tool not named here or handled in
 /// [`check`], MCP tools included, is blocked.
-const HARMLESS_TOOLS: &[&str] = &["TodoWrite", "TodoRead", "Task", "Agent", "ExitPlanMode"];
+/// `StructuredOutput` is how Claude Code returns a `--json-schema` result, such as a verdict.
+const HARMLESS_TOOLS: &[&str] = &[
+    "TodoWrite",
+    "TodoRead",
+    "Task",
+    "Agent",
+    "ExitPlanMode",
+    "StructuredOutput",
+];
 
 /// Decide one tool call. `Ok(None)` allows it, `Ok(Some(reason))` blocks it.
 pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
@@ -244,9 +252,9 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
     }
     match input.tool_name.as_str() {
         "Bash" => {
-            let command = t["command"]
-                .as_str()
-                .context("a Bash call without a command")?;
+            let Some(command) = t["command"].as_str() else {
+                return Ok(Some("a Bash call needs a `command`".into()));
+            };
             if t["run_in_background"] == Value::Bool(true) {
                 return Ok(Some(
                     "agents run commands in the foreground, so their output comes back".into(),
@@ -255,14 +263,18 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             Ok(check_command(command, &cwd, bounds))
         }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
-            let path = ["file_path", "notebook_path"]
+            let Some(path) = ["file_path", "notebook_path"]
                 .iter()
                 .find_map(|key| t[*key].as_str())
-                .context("a file edit without a path")?;
+            else {
+                return Ok(Some("a file edit needs a `file_path`".into()));
+            };
             Ok(inside_root("change files", &cwd.join(path), bounds))
         }
         "Read" => {
-            let path = t["file_path"].as_str().context("a Read without a path")?;
+            let Some(path) = t["file_path"].as_str() else {
+                return Ok(Some("a Read needs a `file_path`".into()));
+            };
             Ok(check_read(&cwd.join(path), bounds))
         }
         // Searches recurse, so they stay inside the worktree.
@@ -278,6 +290,14 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 "pattern"
             };
             if let Some(pattern) = t[key].as_str() {
+                // The literal start of the pattern may be a symlink out of the worktree.
+                let literal: PathBuf = pattern
+                    .split('/')
+                    .take_while(|part| !part.contains(['*', '?', '[']))
+                    .collect();
+                if let Some(reason) = within_root("search", &base.join(literal), bounds) {
+                    return Ok(Some(reason));
+                }
                 if pattern.starts_with('/')
                     || pattern.contains("..")
                     || pattern.contains(['{', '}'])
@@ -646,6 +666,7 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
     };
     let mut paths_only = false;
     let mut skip_next = false;
+    let mut message = false;
     for arg in &args[1..] {
         if std::mem::take(&mut skip_next) {
             continue;
@@ -653,6 +674,7 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
         if !paths_only && sub == "commit" && matches!(*arg, "-m" | "--message") {
             // A commit message is free text, neither a flag nor a path.
             skip_next = true;
+            message = true;
         } else if !paths_only && *arg == "--" {
             paths_only = true;
         } else if !paths_only && arg.starts_with('-') {
@@ -667,11 +689,14 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
             return Some(format!(
                 "`git {sub} {arg}`: name revisions and paths plainly"
             ));
-        } else if paths_only || !matches!(sub, "diff" | "show" | "log") || !is_revision_path(arg) {
-            // A revision such as `main...HEAD` stays inside the root as a path too; anything
-            // that leaves it is a path outside the worktree.
+        } else {
+            // Every word stays inside the root when read as a path: a revision such as
+            // `main...HEAD` or `HEAD:src/lib.rs` does, while one that leaves it would let git
+            // read a file outside the worktree (two outside paths make `git diff` compare
+            // files directly).
             let target = here.join(arg);
-            let reason = if matches!(sub, "diff" | "show" | "log" | "status") {
+            let reads = matches!(sub, "diff" | "show" | "log" | "status");
+            let reason = if reads || (!paths_only && is_revision_path(arg)) {
                 within_root("use git", &target, b)
             } else {
                 inside_root("use git", &target, b)
@@ -681,7 +706,7 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
             }
         }
     }
-    if skip_next || (sub == "commit" && !args.iter().any(|a| matches!(*a, "-m" | "--message"))) {
+    if skip_next || (sub == "commit" && !message) {
         // Without one, git would open an editor and the headless agent would hang.
         return Some("`git commit` needs `-m '<message>'`".into());
     }
@@ -988,6 +1013,8 @@ mod tests {
             "git rm -r -- -/../..",
             "git rm -r -f .",
             "git commit",
+            "git commit -a -- -m",
+            "git diff a:/x a:/../../../../../../h/.paja/events.jsonl",
             "git log =cargo",
             "git log --format=%H",
             "rm -rf target/debug",
@@ -1040,6 +1067,7 @@ mod tests {
         assert!(decide("WebFetch", json!({"url": "https://example.com"})).is_some());
         assert!(decide("mcp__github__merge_pull_request", json!({})).is_some());
         assert_eq!(decide("TodoWrite", json!({"todos": []})), None);
+        assert_eq!(decide("StructuredOutput", json!({"verdict": "land"})), None);
     }
 
     #[test]
@@ -1066,6 +1094,12 @@ mod tests {
         // A link to a file that doesn't exist yet would create it outside.
         std::os::unix::fs::symlink(outside.join("new"), root.join("dangling")).unwrap();
         assert!(call("Write", "dangling").is_some());
+        let glob = HookInput {
+            tool_name: "Glob".into(),
+            tool_input: json!({"pattern": "link/**/*.rs"}),
+            cwd: root.clone(),
+        };
+        assert!(check(&glob, &b).unwrap().is_some());
         assert_eq!(call("Write", "src/new/x.rs"), None);
         std::fs::remove_dir_all(&tmp).unwrap();
     }
@@ -1094,7 +1128,7 @@ mod tests {
             tool_input: json!({}),
             cwd: ROOT.into(),
         };
-        assert!(check(&input, &bounds()).is_err());
+        assert!(check(&input, &bounds()).unwrap().is_some());
         assert!(Bounds::new(Some("rel".into()), Some("/h".into())).is_err());
         assert!(Bounds::new(None, Some("/h".into())).is_err());
     }
