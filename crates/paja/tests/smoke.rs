@@ -868,3 +868,16 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]), "the worktree is freed");
 }
+
+#[test]
+fn an_empty_checks_file_is_an_error_not_a_pass() {
+    let f = Factory::new("# nothing yet\n", "land");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"].as_str().unwrap().contains("no commands"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr merge"));
+}

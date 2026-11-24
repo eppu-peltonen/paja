@@ -121,6 +121,10 @@ fn run_item(
         format!("{CHECKS_FILE} is missing on main; add the check commands there")
     })?;
     let checks: Vec<String> = lines(&checks);
+    if checks.is_empty() {
+        // An empty gate would pass everything; that is never what main meant.
+        bail!("{CHECKS_FILE} on main has no commands; add the check commands there");
+    }
     let high_risk = lines(&read_from_base(repo, base, HIGH_RISK_FILE)?.unwrap_or_default());
     let env = environment(home, repo, base, item)?;
     record(
