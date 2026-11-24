@@ -15,6 +15,7 @@ Prints one JSON value; exits 0 only when the test passes.
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -49,27 +50,43 @@ def done(result, ok):
 
 
 def run(cmd, cwd, env=None, timeout=CHECK_TIMEOUT):
-    return subprocess.run(
-        cmd, cwd=cwd, env=env, capture_output=True, text=True,
-        stdin=subprocess.DEVNULL, timeout=timeout,
+    """Run a command in its own process group; on timeout, kill the whole group."""
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdin=subprocess.DEVNULL, start_new_session=True,
     )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
-def subcommand(args):
-    """The cargo subcommand in an argument list, skipping toolchain and global flags."""
-    for arg in args:
-        if not arg.startswith(("-", "+")):
-            return arg
-    return None
+ALIASES = {"t": "test"}
+
+
+def is_check(args, check):
+    """Whether a cargo argument list runs `check`, wherever global flags put it."""
+    before = args[: args.index("--")] if "--" in args else args
+    return any(ALIASES.get(a, a) == check for a in before)
+
+
+def rewrites(args):
+    """Whether a cargo run edits source instead of checking it."""
+    before = args[: args.index("--")] if "--" in args else args
+    if "fix" in before or "--fix" in before:
+        return True
+    return is_check(args, "fmt") and "--check" not in before
 
 
 def judge(invocations):
     steps = {}
     for check in CHECKS:
-        runs = [i for i in invocations if subcommand(i["args"]) == check]
+        runs = [i for i in invocations if is_check(i["args"], check)]
         first = runs[0] if runs else None
-        # A `cargo fmt` without --check rewrites files instead of checking them.
-        rewrote = check == "fmt" and any("--check" not in i["args"] for i in runs)
+        rewrote = any(rewrites(i["args"]) for i in runs)
         steps[check] = {
             "runs": len(runs),
             "first_passed": first is not None and first["code"] == 0 and not rewrote,
@@ -99,8 +116,16 @@ def main():
     os.chmod(shim, 0o755)
     name = f"exit-{os.urandom(4).hex()}"
     env = dict(os.environ, PAJA_HOME=home)
-    paja = ["cargo", "run", "-q", "--manifest-path", os.path.join(repo, "Cargo.toml"), "--", "--json"]
+    # The paja that makes the environment is built from the same origin/main, not from
+    # whatever the owner has checked out.
+    src = os.path.join(scratch, "src")
+    paja = [os.path.join(scratch, "target", "debug", "paja"), "--json"]
     try:
+        added = run(["git", "worktree", "add", "-q", "--detach", src, base], repo)
+        built = run(["cargo", "build", "-q", "--target-dir", os.path.join(scratch, "target")], src,
+                    env) if added.returncode == 0 else added
+        if built.returncode != 0:
+            done({"error": f"building paja from {base} failed: {built.stderr.strip()[-500:]}"}, False)
         created = run(paja + ["env", "create", name, "--repo", repo, "--base", base], repo, env)
         try:
             info = json.loads(created.stdout)
@@ -133,15 +158,29 @@ def main():
         invocations = []
         if os.path.exists(log):
             with open(log) as f:
-                invocations = [json.loads(line) for line in f if line.strip()]
+                for line in f:
+                    try:
+                        invocations.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        invocations.append({"args": ["<unreadable log line>"], "code": -1})
         steps = judge(invocations)
+        # The checks must pass on origin/main as it is, so Claude must leave no edits behind.
+        changed = run(["git", "status", "--porcelain"], path).stdout.strip()
         recheck = {" ".join(c): run(c, path, env).returncode == 0 for c in RECHECK}
-        ok = all(s["first_passed"] for s in steps.values()) and all(recheck.values())
+        ok = (all(s["first_passed"] for s in steps.values()) and all(recheck.values())
+              and not changed)
+        try:
+            said = json.loads(claude.stdout).get("result", "")
+        except (json.JSONDecodeError, AttributeError):
+            said = claude.stdout
         done({"passed": ok, "base": base, "steps": steps, "recheck": recheck,
-              "cargo": [" ".join(i["args"]) + f" -> {i['code']}" for i in invocations]}, ok)
+              "changed_files": changed.splitlines(),
+              "cargo": [" ".join(i["args"]) + f" -> {i['code']}" for i in invocations],
+              "claude_said": said[-1500:]}, ok)
     finally:
         try:
             run(paja + ["env", "remove", name, "--force"], repo, env)
+            run(["git", "worktree", "remove", "--force", src], repo)
             run(["git", "worktree", "prune"], repo)
             run(["git", "branch", "-D", f"paja/{name}"], repo)
         finally:
