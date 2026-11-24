@@ -893,6 +893,22 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
 }
 
 #[test]
+fn checks_that_change_git_configuration_stop_the_run() {
+    // Branch code run by the checks could plant a credential helper for Mestari's own git.
+    let f = Factory::new("git config paja.planted yes\n", "land");
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("git's configuration, hooks or attributes"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr create"));
+}
+
+#[test]
 fn work_from_an_agent_the_hook_never_saw_does_not_land() {
     // A run with tool turns but no hook call means something switched the hook off.
     let f = Factory::new("true\n", "land");

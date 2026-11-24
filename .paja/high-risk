@@ -17,3 +17,7 @@ rustfmt.toml
 .rustfmt.toml
 clippy.toml
 .clippy.toml
+crates/paja/src/lib.rs
+crates/paja/Cargo.toml
+Cargo.toml
+build.rs

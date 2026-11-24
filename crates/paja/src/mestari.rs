@@ -148,9 +148,12 @@ fn run_item(
             continue;
         }
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
-        let mut failed = run_checks(&env.path, &checks)?;
+        let guard = GitGuard::new(&env.path)?;
+        let result = run_checks(&env.path, &checks);
+        guard.check("Vasara's checks")?;
         // The checks run the branch's code, which could change the tree or even commit. Put it
         // back, and fail the round, so nothing lands that the checks didn't judge.
+        let mut failed = result;
         let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
             || !git(&env.path, &["status", "--porcelain"])?.is_empty();
         if moved {
@@ -159,12 +162,15 @@ fn run_item(
                 &["checkout", "-q", "-f", "-B", env.branch.as_str(), &checked],
             )?;
             git(&env.path, &["clean", "-q", "-f", "-d"])?;
-            failed.get_or_insert_with(|| {
-                "Running the checks changed the worktree or its commits; the change was put \
+            if let Ok(failure) = &mut failed {
+                failure.get_or_insert_with(|| {
+                    "Running the checks changed the worktree or its commits; the change was put \
                  back. Tests and builds must not write to the source tree or commit."
-                    .into()
-            });
+                        .into()
+                });
+            }
         }
+        let failed = failed?;
         if let Some(failure) = failed {
             feedback =
                 format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
@@ -323,6 +329,7 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Bash(git show*)",
     ];
     let before = git(&env.path, &["rev-parse", "HEAD"])?;
+    // `claude` already checks git's configuration once the reviewer is done.
     let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
     // A reviewer changes nothing, but the code its builds and tests run can (a lockfile, even
     // a commit). Put the branch back where the review started, so none of it lands unread.
@@ -408,8 +415,10 @@ fn claude(
     }
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
+    let guard = GitGuard::new(&env.path)?;
     let output = cmd.stdin(std::process::Stdio::null()).output();
     let _ = std::fs::remove_dir_all(&scratch);
+    guard.check("the agent")?;
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
     if let Some(dir) = stamp.parent() {
@@ -471,7 +480,7 @@ fn claude(
 /// while git's global configuration is hidden from them.
 fn git_identity(repo: &Path) -> Vec<(&'static str, String)> {
     let get = |key: &str| {
-        let out = Command::new("git")
+        let out = git_command()
             .arg("-C")
             .arg(repo)
             .args(["config", "--path", key])
@@ -502,7 +511,7 @@ fn git_identity(repo: &Path) -> Vec<(&'static str, String)> {
 }
 
 fn git_head(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "HEAD"])
@@ -520,7 +529,7 @@ fn changed_since(repo: &Path, head: Option<&str>, status: Option<&str>) -> bool 
 
 /// `git status --porcelain`, to compare the worktree before and after an agent's run.
 fn git_status(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .args(["status", "--porcelain"])
@@ -538,7 +547,7 @@ fn discard(env: &Env, to: &str) -> Result<()> {
         &["checkout", "-q", "-f", "-B", &env.branch, to][..],
         &["clean", "-q", "-f", "-d", "-x"],
     ] {
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-C")
             .arg(&env.path)
             .args(args)
@@ -682,21 +691,7 @@ fn refuse_hook_policies() -> Result<()> {
 /// it is the file on disk when the run first needs it); copies other runs
 /// left behind are removed once they are a day old.
 fn hook_binary(home: &Home) -> Result<PathBuf> {
-    static COPIED: std::sync::Mutex<Option<(PathBuf, PathBuf)>> = std::sync::Mutex::new(None);
-    let mut copied = COPIED.lock().unwrap_or_else(|e| e.into_inner());
     let _lock = home.lock()?;
-    // Another run's cleanup may have removed a copy idle for a day; then copy again.
-    if let Some((_, exe)) = copied
-        .as_ref()
-        .filter(|(root, exe)| root == home.root() && exe.exists())
-    {
-        // Keep this run's copy fresh so another run's cleanup leaves it alone. Opened read-only:
-        // the copy may be running, and a running binary can't be opened for writing.
-        if let Ok(file) = std::fs::File::open(exe) {
-            let _ = file.set_modified(std::time::SystemTime::now());
-        }
-        return Ok(exe.clone());
-    }
     let dir = home.root().join("hook");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -718,41 +713,59 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
         p if p.exists() => p.to_path_buf(),
         _ => std::env::current_exe().context("finding the paja binary for the deny-list hook")?,
     };
+    // Read once per process: what this paja is, whatever later happens to the file.
+    static RUNNING: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let bytes = match RUNNING.get() {
+        Some(bytes) => bytes,
+        None => {
+            let read = std::fs::read(&running)
+                .with_context(|| format!("reading {} for the deny-list hook", running.display()))?;
+            RUNNING.get_or_init(|| read)
+        }
+    };
     // One copy per build of paja, shared by every run of it, so copies don't pile up.
-    let meta = std::fs::metadata(&running)
-        .with_context(|| format!("reading {} for the deny-list hook", running.display()))?;
-    let built = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    let exe = dir.join(format!("paja-{}-{built}", meta.len()));
-    if !exe.exists() {
-        // Copy under a temporary name and rename, so no run ever sees half a binary.
+    let digest = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let exe = dir.join(format!("paja-{}-{digest:016x}", bytes.len()));
+    // The copy sits in the factory home, which code an agent runs could reach. Use it only
+    // while it still matches this paja byte for byte; otherwise copy again.
+    if std::fs::read(&exe).ok().as_deref() != Some(bytes.as_slice()) {
+        // Write under a temporary name and rename, so no run ever sees half a binary.
         let partial = dir.join(format!(
             "partial-{}-{}",
             std::process::id(),
             crate::events::now_ms()
         ));
-        std::fs::copy(&running, &partial)
-            .and_then(|_| std::fs::rename(&partial, &exe))
+        let written = (|| {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&partial)?;
+            std::io::Write::write_all(&mut file, bytes)?;
+            drop(file);
+            std::fs::rename(&partial, &exe)
+        })();
+        written
             .inspect_err(|_| {
                 let _ = std::fs::remove_file(&partial);
             })
             .with_context(|| {
                 format!(
-                    "copying {} to {} for the deny-list hook; if paja was rebuilt, restart `paja \
-                     run`",
+                    "copying {} to {} for the deny-list hook; check that {} is writable",
                     running.display(),
-                    exe.display()
+                    exe.display(),
+                    dir.display()
                 )
             })?;
     }
-    // A copy keeps the source's age on some systems; make it new so cleanup leaves it be.
+    // Keep the copy fresh so another run's cleanup leaves it alone. Opened read-only: the
+    // copy may be running, and a running binary can't be opened for writing.
     if let Ok(file) = std::fs::File::open(&exe) {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
-    *copied = Some((home.root().to_path_buf(), exe.clone()));
     Ok(exe)
 }
 
@@ -805,6 +818,7 @@ fn run_hook_once(
     {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             bail!(
                 "the deny-list hook {} hung in its self-test, so no agent will start; rebuild \
                  paja from main",
@@ -1124,7 +1138,7 @@ fn summaries(reviews: &[Review]) -> String {
 /// is an error: a check file that can't be read must never count as an empty one.
 fn read_from_base(repo: &Path, base: &str, path: &str) -> Result<Option<String>> {
     let spec = format!("{base}:{path}");
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(["show", &spec])
@@ -1186,8 +1200,91 @@ fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Git as Mestari runs it, with Mestari's own credentials. Code run in a worktree could plant
+/// hooks or a file-system monitor for it to run, so those are always off; [`GitGuard`] catches
+/// the rest of a planted configuration.
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ]);
+    cmd
+}
+
+/// A snapshot of the git configuration, hooks and attributes a worktree's git reads, all of
+/// them outside the worktree and shared with the repository. Code that an agent, Vasara's
+/// checks or a reviewer's build runs could change them to make Mestari's own git run a program
+/// with Mestari's credentials (a credential helper, a filter). Mestari takes the snapshot before
+/// such code runs and checks it before it runs git there again.
+struct GitGuard {
+    files: Vec<PathBuf>,
+    hooks: PathBuf,
+    snapshot: Vec<Option<Vec<u8>>>,
+}
+
+impl GitGuard {
+    fn new(worktree: &Path) -> Result<GitGuard> {
+        let dir = |arg: &str| -> Result<PathBuf> {
+            let path = PathBuf::from(git(worktree, &["rev-parse", arg])?);
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                worktree.join(path)
+            })
+        };
+        let (own, common) = (dir("--absolute-git-dir")?, dir("--git-common-dir")?);
+        let hooks = common.join("hooks");
+        let mut guard = GitGuard {
+            files: vec![
+                common.join("config"),
+                common.join("config.worktree"),
+                own.join("config.worktree"),
+                common.join("info/attributes"),
+            ],
+            hooks,
+            snapshot: Vec::new(),
+        };
+        guard.snapshot = guard.read();
+        Ok(guard)
+    }
+
+    fn read(&self) -> Vec<Option<Vec<u8>>> {
+        let mut hooks: Vec<PathBuf> = std::fs::read_dir(&self.hooks)
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        hooks.sort();
+        self.files
+            .iter()
+            .chain(&hooks)
+            .flat_map(|path| {
+                [
+                    Some(path.as_os_str().as_encoded_bytes().to_vec()),
+                    std::fs::read(path).ok(),
+                ]
+            })
+            .collect()
+    }
+
+    /// Fails, before Mestari runs git again, when anything changed since the snapshot.
+    fn check(&self, what: &str) -> Result<()> {
+        if self.read() != self.snapshot {
+            bail!(
+                "git's configuration, hooks or attributes outside the worktree ({} and {}) \
+                 changed while {what} ran, so Mestari stopped before running git there again; \
+                 a person must check those files and restore them",
+                self.files[0].display(),
+                self.hooks.display()
+            );
+        }
+        Ok(())
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)

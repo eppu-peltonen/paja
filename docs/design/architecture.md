@@ -117,10 +117,11 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 It fails closed: unreadable input, missing bounds, a crash and running past its own 20-second deadline all block, and
 the hook command ends in `|| exit 2` so a binary that can't start or is killed blocks too. Claude Code's own hook
 timeout is set well above that deadline. The hook runs from a copy of the paja binary in the factory home, so an agent's
-`cargo build` can't replace the binary that judges it. Managed settings still load, so Mestari refuses to start agents
-when they set `disableAllHooks` or `allowManagedHooksOnly`. Policy can arrive in other ways too, so the hook also
-touches a stamp file on every call: an agent run that took more than one turn or changed the worktree without one is
-rejected, and its branch is reset to where the run started. Only the two managed-settings locations (each file and its
+`cargo build` can't replace the binary that judges it; Mestari uses the copy only while it matches the running binary
+byte for byte, and writes it again otherwise. Managed settings still load, so Mestari refuses to start agents when they
+set `disableAllHooks` or `allowManagedHooksOnly`. Policy can arrive in other ways too, so the hook also touches a stamp
+file on every call: an agent run that took more than one turn or changed the worktree without one is rejected, and its
+branch is reset to where the run started. Only the two managed-settings locations (each file and its
 `managed-settings.d` drop-ins) are checked up front. The stamp catches a hook that was silently dropped, not an agent
 that forges it while hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook
 blocks a `git push` (for a reviewer, a local `git commit`) with the deny-list's message and allows `cargo test`, and
@@ -131,10 +132,13 @@ switched off, and with the owner's commit name, email and global ignore file pas
 same branch code, so they run with the same environment and a throwaway `HOME` as well (cargo keeps its real
 `CARGO_HOME`, so its registry token stays reachable). Agents keep the owner's `HOME`, which Claude Code needs to sign
 in, so code they run can still read credential files there (such as `.netrc`), and a token written into the remote's URL
-is not covered: closing those is the sandbox's job. Reviewers run the hook with `--read-only`: no file edits, no `cargo
-fmt` without `--check` and no git command that changes the branch; after the review, the branch and worktree are put
-back where it started, whatever the code its builds ran did. Because no settings file loads, agents authenticate the way
-`claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider
+is not covered: closing those is the sandbox's job. That code could also change the git configuration, hooks or
+attributes the worktree shares with the repository, to make Mestari's own git run a program with Mestari's credentials.
+So Mestari's git never runs hooks or a file-system monitor, and Mestari snapshots those files before each agent and
+check run and stops, for a person to look, if they changed. Reviewers run the hook with `--read-only`: no file edits, no
+`cargo fmt` without `--check` and no git command that changes the branch; after the review, the branch and worktree are
+put back where it started, whatever the code its builds ran did. Because no settings file loads, agents authenticate the
+way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider
 settings.
 
 ## MCP server
