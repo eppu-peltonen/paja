@@ -114,14 +114,15 @@ timeout is set well above that deadline. The hook runs from a copy of the paja b
 agent's `cargo build` can't replace the binary that judges it. Managed settings still load, so Mestari refuses to
 start agents when they set `disableAllHooks` or `allowManagedHooksOnly`. Policy can arrive in other ways too, so the
 hook also touches a stamp file on every call: an agent run that took more than one turn or changed the worktree
-without one is rejected, and its branch is reset to where the run started. Only the two managed-settings file
-locations are checked up front. The stamp catches a hook that was silently dropped, not an agent that forges it while
+without one is rejected, and its branch is reset to where the run started. Only the two managed-settings locations
+(each file and its `managed-settings.d` drop-ins) are checked up front. The stamp catches a hook that was silently dropped, not an agent that forges it while
 hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook blocks a `git push`
 (for a reviewer, a local `git commit`) with the deny-list's message and allows `cargo test`, and refuses to start the
 agent if not. The hook is a guardrail,
 not a sandbox: code the agent writes still runs under `cargo test`. Mestari takes away the easy ways that code could reach
-GitHub: agents run without GitHub tokens or the SSH agent, with gh's login and git's global and system configuration
-hidden, and with the owner's commit name and email passed in instead. Vasara's checks run the same branch code, so
+GitHub: agents run without GitHub or registry tokens, the SSH agent or askpass programs, with gh's login, git's global
+and system configuration and every credential helper switched off, and with the owner's commit name, email and global
+ignore file passed in instead. A token written into the remote's URL is not covered. Vasara's checks run the same branch code, so
 they run with the same environment. Reviewers run the hook with `--read-only`: no file edits, no `cargo fmt` without
 `--check` and no git command that changes the branch; anything their builds change in the worktree is reset after the
 review. Because no settings file loads, agents

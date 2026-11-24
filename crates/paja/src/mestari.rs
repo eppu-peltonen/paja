@@ -294,9 +294,17 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
     let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
     // A reviewer changes nothing, but its builds can (a lockfile, say). Undo that, so none of
     // it reaches the branch as if the builder had made it. Ignored files such as `target/` stay.
-    git(&env.path, &["reset", "-q", "--hard"])?;
-    git(&env.path, &["clean", "-q", "-f", "-d"])?;
-    let out = out?;
+    let reset = git(&env.path, &["reset", "-q", "--hard"])
+        .and_then(|_| git(&env.path, &["clean", "-q", "-f", "-d"]));
+    let out = match (out, reset) {
+        (Err(err), Err(reset)) => {
+            return Err(err.context(format!("and resetting the worktree failed too: {reset:#}")))
+        }
+        (out, reset) => {
+            reset?;
+            out?
+        }
+    };
     let structured = out
         .get("structured_output")
         .cloned()
@@ -423,14 +431,14 @@ fn claude(
     Ok(value)
 }
 
-/// The owner's commit name and email, which agents' commits use while git's global
-/// configuration is hidden from them.
+/// The owner's commit name and email, and their global ignore file, which agents' git uses
+/// while git's global configuration is hidden from them.
 fn git_identity(repo: &Path) -> Vec<(&'static str, String)> {
     let get = |key: &str| {
         let out = Command::new("git")
             .arg("-C")
             .arg(repo)
-            .args(["config", key])
+            .args(["config", "--path", key])
             .output()
             .ok()?;
         let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -445,6 +453,15 @@ fn git_identity(repo: &Path) -> Vec<(&'static str, String)> {
         vars.push(("GIT_AUTHOR_EMAIL", email.clone()));
         vars.push(("GIT_COMMITTER_EMAIL", email));
     }
+    // Without it, editor and system files the owner ignores everywhere would be committed.
+    // Mestari sets two config entries; when there is no ignore file, the second repeats the
+    // first, so git's own default ignore file still applies.
+    let (key, value) = match get("core.excludesFile") {
+        Some(file) => ("core.excludesFile", file),
+        None => ("credential.helper", String::new()),
+    };
+    vars.push(("GIT_CONFIG_KEY_1", key.into()));
+    vars.push(("GIT_CONFIG_VALUE_1", value));
     vars
 }
 
@@ -572,11 +589,27 @@ fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, P
 /// Managed (administrator) settings load whatever `--setting-sources` says, and two of their
 /// keys would silently drop Mestari's hook. Refuse to start agents on such a machine.
 fn refuse_hook_policies() -> Result<()> {
-    for path in [
-        "/etc/claude-code/managed-settings.json",
-        "/Library/Application Support/ClaudeCode/managed-settings.json",
+    let mut paths = Vec::new();
+    for dir in [
+        "/etc/claude-code",
+        "/Library/Application Support/ClaudeCode",
     ] {
-        let text = match std::fs::read_to_string(path) {
+        let dir = Path::new(dir);
+        paths.push(dir.join("managed-settings.json"));
+        // Drop-in files next to it carry the same keys.
+        if let Ok(entries) = std::fs::read_dir(dir.join("managed-settings.d")) {
+            let mut drop_ins: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            drop_ins.sort();
+            paths.extend(drop_ins);
+        }
+    }
+    for path in &paths {
+        let path = path.display();
+        let text = match std::fs::read_to_string(path.to_string()) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
@@ -786,9 +819,18 @@ fn commit_leftovers(env: &Env, item: &WorkItem) -> Result<()> {
 
 /// Give `cmd` a throwaway PAJA_HOME (`scratch`) and keep GitHub Mestari's: take away the easy
 /// ways an agent, or the code it wrote, could reach it (tokens, the SSH agent, gh's stored
-/// login and git's credential helpers). Determined code run by `cargo test` is the sandbox's
-/// job.
+/// login, git's credential helpers and askpass programs, and registry tokens). A token
+/// written into the remote's URL is not covered. Determined code run by `cargo test` is the
+/// sandbox's job.
 fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&str, String)>) {
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("GIT_CONFIG_")
+            || name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_TOKEN")
+        {
+            cmd.env_remove(name.as_ref());
+        }
+    }
     cmd.env("PAJA_HOME", scratch)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
@@ -796,11 +838,19 @@ fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&st
         .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env_remove("PAJA_GH")
         .env_remove("SSH_AUTH_SOCK")
+        .env_remove("CARGO_REGISTRY_TOKEN")
         .env("GH_CONFIG_DIR", scratch)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "false")
+        .env("SSH_ASKPASS", "false")
         .env("GIT_SSH_COMMAND", "false")
+        // Configuration from the environment comes last, and an empty helper clears the list
+        // so far, so no credential helper from the repository's own config runs either.
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
         // Without the global config, commits still need the owner's name and email.
         .envs(git_identity);
 }
