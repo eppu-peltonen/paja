@@ -42,8 +42,18 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
   Vasara's rules and scenarios are read from `main`, never from the branch under review.
 - **Small changes.** One concern per pull request.
 
-## Risk tiers
+## How changes land
 
-These areas always wait for a human before landing, even when checks pass: sandbox and secrets handling, the deny-list
-hook, landing and revert logic, Vasara's rules and the harness evals, and the event log's format (`events.rs`).
-Everything else may land on green.
+No human reviews pull requests. The person sets intent, approves specs and answers escalations; agents review and land
+code.
+
+- **Every change** needs green CI and an independent reviewer agent that did not write it. The reviewer reads the
+  diff cold, against the spec or issue, and decides whether it lands.
+- **High-risk changes** pass a stricter gate instead of waiting for a person: two independent reviewer agents who
+  must agree, plus the full eval suite once it exists. High risk means anything touching sandbox and secrets
+  handling, the deny-list hook, landing and revert logic, Vasara's rules, the harness evals, or the event log's
+  format (`events.rs`). Automation decides the tier from the files a change touches.
+- **Escalate, don't wait.** If reviewers disagree, a check can't decide, or a change would weaken a check, the
+  question goes to Posti (today: the project thread) as an intent decision, with options and a recommendation.
+- **Until Paja's own reviewer runs (build step 3)**, Claude does the review and landing for these hand-built seed
+  pull requests under the same rules.
