@@ -371,8 +371,8 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
     }
 }
 
-/// The first symlink under `dir` that leads out of the worktree, if any. Build output and
-/// git's own directory are skipped: agents don't search them, and they are large.
+/// The first symlink under `dir` that leads out of the worktree, if any. Git's own directory
+/// is skipped: nothing in it links out, and it is large.
 fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
     if depth > 32 {
         return Some(dir.to_path_buf());
@@ -386,7 +386,7 @@ fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
             if !resolve(&path).starts_with(&b.root) {
                 return Some(path);
             }
-        } else if kind.is_dir() && !matches!(entry.file_name().to_str(), Some(".git" | "target")) {
+        } else if kind.is_dir() && entry.file_name() != ".git" {
             if let Some(found) = link_out(&path, b, depth + 1) {
                 return Some(found);
             }
@@ -935,9 +935,10 @@ fn resolve_within(path: &Path, depth: u32) -> PathBuf {
     out
 }
 
-/// The two calls Mestari's self-test sends, run in `root`: a push that must be blocked and a
-/// build that must be allowed.
-pub fn self_test_inputs(root: &Path) -> (String, String) {
+/// The calls Mestari's self-test sends, run in `root`: one that must be blocked and a build
+/// that must be allowed. A builder's hook must block a push; a reviewer's must block even a
+/// local commit, which proves it runs read-only.
+pub fn self_test_inputs(root: &Path, read_only: bool) -> (String, String) {
     let call = |command: &str| {
         serde_json::json!({
             "tool_name": "Bash",
@@ -946,7 +947,12 @@ pub fn self_test_inputs(root: &Path) -> (String, String) {
         })
         .to_string()
     };
-    (call("git push origin main"), call("cargo test"))
+    let blocked = if read_only {
+        "git commit -q -m self-test"
+    } else {
+        "git push origin main"
+    };
+    (call(blocked), call("cargo test"))
 }
 
 #[cfg(test)]
@@ -1303,10 +1309,20 @@ mod tests {
 
     #[test]
     fn the_self_test_blocks_a_push_and_allows_a_build() {
-        let (push, build) = self_test_inputs(Path::new(ROOT));
-        let push: HookInput = serde_json::from_str(&push).unwrap();
-        let build: HookInput = serde_json::from_str(&build).unwrap();
-        assert!(check(&push, &bounds()).unwrap().is_some());
-        assert!(check(&build, &bounds()).unwrap().is_none());
+        for read_only in [false, true] {
+            let b = Bounds {
+                read_only,
+                ..bounds()
+            };
+            let (blocked, build) = self_test_inputs(Path::new(ROOT), read_only);
+            let blocked: HookInput = serde_json::from_str(&blocked).unwrap();
+            let build: HookInput = serde_json::from_str(&build).unwrap();
+            assert!(check(&blocked, &b).unwrap().is_some());
+            assert!(check(&build, &b).unwrap().is_none());
+        }
+        // The reviewer's blocked call is one a builder may make.
+        let (commit, _) = self_test_inputs(Path::new(ROOT), true);
+        let commit: HookInput = serde_json::from_str(&commit).unwrap();
+        assert!(check(&commit, &bounds()).unwrap().is_none());
     }
 }

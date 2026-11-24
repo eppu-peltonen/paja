@@ -766,7 +766,12 @@ impl Factory {
 
 #[test]
 fn run_builds_reviews_and_lands_an_issue() {
-    let f = Factory::new("test -f feature.txt\n", "land");
+    // Vasara's checks run the branch's code, so they get no GitHub access either: Mestari's
+    // `PAJA_GH` is gone, and so is its PAJA_HOME.
+    let f = Factory::new(
+        "test -f feature.txt\ntest -z \"$PAJA_GH\"\ntest ! -e \"$PAJA_HOME/events.jsonl\"\n",
+        "land",
+    );
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");

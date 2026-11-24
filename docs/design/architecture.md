@@ -117,11 +117,14 @@ hook also touches a stamp file on every call: an agent run that took more than o
 without one is rejected, and its branch is reset to where the run started. Only the two managed-settings file
 locations are checked up front. The stamp catches a hook that was silently dropped, not an agent that forges it while
 hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook blocks a `git push`
-with the deny-list's message and allows `cargo test`, and refuses to start the agent if not. The hook is a guardrail,
+(for a reviewer, a local `git commit`) with the deny-list's message and allows `cargo test`, and refuses to start the
+agent if not. The hook is a guardrail,
 not a sandbox: code the agent writes still runs under `cargo test`. Mestari takes away the easy ways that code could reach
 GitHub: agents run without GitHub tokens or the SSH agent, with gh's login and git's global and system configuration
-hidden, and with the owner's commit name and email passed in instead. Reviewers run the hook with `--read-only`: no
-file edits and no git command that changes the branch. Because no settings file loads, agents
+hidden, and with the owner's commit name and email passed in instead. Vasara's checks run the same branch code, so
+they run with the same environment. Reviewers run the hook with `--read-only`: no file edits, no `cargo fmt` without
+`--check` and no git command that changes the branch; anything their builds change in the worktree is reset after the
+review. Because no settings file loads, agents
 authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
 `apiKeyHelper` or provider settings.
 

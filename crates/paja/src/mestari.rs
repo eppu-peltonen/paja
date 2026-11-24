@@ -291,7 +291,12 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Bash(git log*)",
         "Bash(git show*)",
     ];
-    let out = claude(home, env, base, &prompt, &tools, Some(&schema), true)?;
+    let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
+    // A reviewer changes nothing, but its builds can (a lockfile, say). Undo that, so none of
+    // it reaches the branch as if the builder had made it. Ignored files such as `target/` stay.
+    git(&env.path, &["reset", "-q", "--hard"])?;
+    git(&env.path, &["clean", "-q", "-f", "-d"])?;
+    let out = out?;
     let structured = out
         .get("structured_output")
         .cloned()
@@ -334,42 +339,26 @@ fn claude(
         }
     };
     let mut cmd = Command::new(&program);
-    cmd.current_dir(&env.path)
-        .env("PAJA_HOME", &scratch)
-        // GitHub stays Mestari's. Take away the easy ways the agent, or code it runs, could
-        // reach it: tokens, the SSH agent, gh's stored login and git's credential helpers.
-        // Determined code run by `cargo test` is the sandbox's job.
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_ENTERPRISE_TOKEN")
-        .env_remove("GITHUB_ENTERPRISE_TOKEN")
-        .env_remove("PAJA_GH")
-        .env_remove("SSH_AUTH_SOCK")
-        .env("GH_CONFIG_DIR", &scratch)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "false")
-        // Without the global config, commits still need the owner's name and email.
-        .envs(git_identity)
-        .args([
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-        ])
-        // No settings files at all, only the deny-list hook: neither the owner's settings nor
-        // a settings file on the branch can loosen or switch it off.
-        .args(["--setting-sources", "", "--settings", &settings])
-        // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
-        // main: the branch under review can't rewrite the rules its agents follow.
-        .args(["--append-system-prompt", &harness])
-        // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
-        .arg("--strict-mcp-config")
-        .arg("--allowedTools")
-        .args(tools);
+    cmd.current_dir(&env.path);
+    without_credentials(&mut cmd, &scratch, git_identity);
+    cmd.args([
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "acceptEdits",
+    ])
+    // No settings files at all, only the deny-list hook: neither the owner's settings nor
+    // a settings file on the branch can loosen or switch it off.
+    .args(["--setting-sources", "", "--settings", &settings])
+    // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
+    // main: the branch under review can't rewrite the rules its agents follow.
+    .args(["--append-system-prompt", &harness])
+    // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
+    .arg("--strict-mcp-config")
+    .arg("--allowedTools")
+    .args(tools);
     if let Some(schema) = schema {
         cmd.args(["--json-schema", &schema.to_string()]);
     }
@@ -515,22 +504,26 @@ fn discard(env: &Env, to: &str) -> Result<()> {
 fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
-    let args = [
+    let mut args: Vec<std::ffi::OsString> = vec![
         "hook".into(),
         "--root".into(),
         root.as_os_str().to_owned(),
         "--home".into(),
         home.root().as_os_str().to_owned(),
     ];
-    let (push, build) = crate::hook::self_test_inputs(root);
-    let (code, stderr) = run_hook_once(&exe, &args, &push)?;
+    if read_only {
+        args.push("--read-only".into());
+    }
+    let (blocked, build) = crate::hook::self_test_inputs(root, read_only);
+    let (code, stderr) = run_hook_once(&exe, &args, &blocked)?;
     let blocked = code == Some(2) && stderr.contains("Blocked by Paja's deny-list");
     let (code, _) = run_hook_once(&exe, &args, &build)?;
     if !blocked || code != Some(0) {
         bail!(
-            "the deny-list hook {} failed its self-test (it must block `git push` and allow \
+            "the deny-list hook {} failed its self-test (it must block `{}` and allow \
              `cargo test`), so no agent will start; rebuild paja from main",
-            exe.display()
+            exe.display(),
+            if read_only { "git commit" } else { "git push" }
         );
     }
     // The self-test leaves no stamp: the hook only gets `--stamp` from Claude Code. The stamp
@@ -595,8 +588,12 @@ fn refuse_hook_policies() -> Result<()> {
                 })
             }
         };
-        let settings: Value = serde_json::from_str(&text)
-            .with_context(|| format!("reading Claude Code's managed settings {path}"))?;
+        let settings: Value = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "reading Claude Code's managed settings {path}, which is not valid JSON; ask \
+                     the machine's administrator to fix it, or run Paja on another machine"
+            )
+        })?;
         for key in ["disableAllHooks", "allowManagedHooksOnly"] {
             if settings[key] == Value::Bool(true) {
                 bail!(
@@ -670,6 +667,9 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
         ));
         std::fs::copy(&running, &partial)
             .and_then(|_| std::fs::rename(&partial, &exe))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&partial);
+            })
             .with_context(|| {
                 format!(
                     "copying {} to {} for the deny-list hook; if paja was rebuilt, restart `paja \
@@ -784,19 +784,48 @@ fn commit_leftovers(env: &Env, item: &WorkItem) -> Result<()> {
     Ok(())
 }
 
-/// Run each check in the environment. Returns the first failure's command and output.
+/// Give `cmd` a throwaway PAJA_HOME (`scratch`) and keep GitHub Mestari's: take away the easy
+/// ways an agent, or the code it wrote, could reach it (tokens, the SSH agent, gh's stored
+/// login and git's credential helpers). Determined code run by `cargo test` is the sandbox's
+/// job.
+fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&str, String)>) {
+    cmd.env("PAJA_HOME", scratch)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env_remove("PAJA_GH")
+        .env_remove("SSH_AUTH_SOCK")
+        .env("GH_CONFIG_DIR", scratch)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "false")
+        // Without the global config, commits still need the owner's name and email.
+        .envs(git_identity);
+}
+
+/// Run each check in the environment. Returns the first failure's command and output. The
+/// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
-    for check in checks {
-        let output = Command::new("sh")
-            .args(["-c", check])
-            .current_dir(dir)
-            .output()
-            .with_context(|| format!("running check `{check}`"))?;
-        if !output.status.success() {
-            return Ok(Some(format!("`{check}` failed:\n\n{}", tail(&output))));
+    let scratch = tempfile_dir(dir)?;
+    let result = (|| {
+        for check in checks {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", check]).current_dir(dir);
+            without_credentials(&mut cmd, &scratch, git_identity(dir));
+            let output = cmd
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("running check `{check}`"))?;
+            if !output.status.success() {
+                return Ok(Some(format!("`{check}` failed:\n\n{}", tail(&output))));
+            }
         }
-    }
-    Ok(None)
+        Ok(None)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
 }
 
 fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Result<RunReport> {
