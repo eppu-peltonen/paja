@@ -8,3 +8,4 @@ crates/paja/src/main.rs
 evals/
 CLAUDE.md
 .github/
+.claude/

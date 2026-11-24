@@ -328,6 +328,12 @@ fn claude(
     let mut cmd = Command::new(&program);
     cmd.current_dir(&env.path)
         .env("PAJA_HOME", &scratch)
+        // GitHub stays Mestari's: agents and the code they run never see its tokens.
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env_remove("PAJA_GH")
         .args([
             "-p",
             prompt,
@@ -350,10 +356,14 @@ fn claude(
         cmd.args(["--json-schema", &schema.to_string()]);
     }
     let before = git_head(&env.path);
+    let status_before = git_status(&env.path);
     let output = cmd.stdin(std::process::Stdio::null()).output();
     let _ = std::fs::remove_dir_all(&scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
+    if let Some(dir) = stamp.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
     // A session that took more than one turn, or changed the worktree, used tools, so the hook
     // must have run. If it didn't, something (such as an administrator's policy) switched it
     // off and nothing the agent did can be trusted: throw it away, so a later run can't resume
@@ -364,7 +374,10 @@ fn claude(
         .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
         .and_then(|value| value["num_turns"].as_u64())
         .unwrap_or(0);
-    if !hooked && output.is_ok() && (turns > 1 || changed_since(&env.path, before.as_deref())) {
+    if !hooked
+        && output.is_ok()
+        && (turns > 1 || changed_since(&env.path, before.as_deref(), status_before.as_deref()))
+    {
         let fate = match before.as_deref() {
             Some(before) => match discard(env, before) {
                 Ok(()) => "was discarded".to_string(),
@@ -415,15 +428,22 @@ fn git_head(repo: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Whether the worktree's HEAD moved from `before` or it has uncommitted changes.
-fn changed_since(repo: &Path, before: Option<&str>) -> bool {
-    let dirty = Command::new("git")
+/// Whether the worktree's HEAD or its uncommitted changes differ from before the run.
+fn changed_since(repo: &Path, head: Option<&str>, status: Option<&str>) -> bool {
+    git_head(repo).as_deref() != head || git_status(repo).as_deref() != status
+}
+
+/// `git status --porcelain`, to compare the worktree before and after an agent's run.
+fn git_status(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["status", "--porcelain"])
         .output()
-        .map_or(true, |o| !o.stdout.is_empty());
-    dirty || git_head(repo).as_deref() != before
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Put the environment's own branch back at `to` and drop every file made since, ignored
@@ -470,14 +490,24 @@ fn hook_settings(root: &Path, home: &Home) -> Result<(String, PathBuf)> {
             exe.display()
         );
     }
-    // The self-test leaves no stamp: the hook only gets `--stamp` from Claude Code.
-    // Outside the factory home, so writing it needs no home lock.
-    let stamp = std::env::temp_dir().join(format!(
+    // The self-test leaves no stamp: the hook only gets `--stamp` from Claude Code. The stamp
+    // sits in a fresh directory only this user can enter, so nobody can plant it beforehand;
+    // creating the directory fails if the name is already taken.
+    let private = std::env::temp_dir().join(format!(
         "paja-stamp-{}-{}",
         std::process::id(),
         crate::events::now_ms()
     ));
-    let _ = std::fs::remove_file(&stamp);
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .with_context(|| {
+                format!("creating the hook's stamp directory {}", private.display())
+            })?;
+    }
+    let stamp = private.join("stamp");
     let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails
     // in any other way must block too.
@@ -529,7 +559,8 @@ fn refuse_hook_policies() -> Result<()> {
 
 /// The paja binary the hook runs from: a copy in the factory home, so an agent's own
 /// `cargo build` can't replace the binary that judges it. Made once per `paja run` from the
-/// binary that is running, even if the file on disk has been rebuilt since; copies other runs
+/// binary that is running (on Linux even if the file on disk has been rebuilt since; elsewhere
+/// it is the file on disk when the run first needs it); copies other runs
 /// left behind are removed once they are a day old.
 fn hook_binary(home: &Home) -> Result<PathBuf> {
     static COPIED: std::sync::Mutex<Option<(PathBuf, PathBuf)>> = std::sync::Mutex::new(None);
@@ -607,7 +638,12 @@ fn run_hook_once(
         if err.kind() != std::io::ErrorKind::BrokenPipe {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(err.into());
+            return Err(err).with_context(|| {
+                format!(
+                    "sending the self-test to the deny-list hook {}; rebuild paja from main",
+                    exe.display()
+                )
+            });
         }
     }
     drop(child.stdin.take());
@@ -625,7 +661,8 @@ fn run_hook_once(
         .try_wait()
         .inspect_err(|_| {
             let _ = child.kill();
-        })?
+        })
+        .with_context(|| format!("waiting for the deny-list hook {}", exe.display()))?
         .is_none()
     {
         if std::time::Instant::now() > deadline {
@@ -638,7 +675,10 @@ fn run_hook_once(
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let code = child.wait()?.code();
+    let code = child
+        .wait()
+        .with_context(|| format!("waiting for the deny-list hook {}", exe.display()))?
+        .code();
     Ok((code, reader.join().unwrap_or_default()))
 }
 

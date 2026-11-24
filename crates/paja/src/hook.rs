@@ -353,6 +353,12 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
             full.display()
         ));
     }
+    if named(".claude") {
+        return Some(format!(
+            "{} is Claude Code configuration for later sessions; agents never change it",
+            full.display()
+        ));
+    }
     if named(".cargo") {
         return Some(format!(
             "{} is cargo configuration, which could change how cargo runs; agents never change it",
@@ -1052,6 +1058,7 @@ mod tests {
         assert!(decide("Write", json!({"file_path": "crates/x/.cargo/config.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "sub/.git/config"})).is_some());
         assert!(decide("Write", json!({"file_path": ".GIT"})).is_some());
+        assert!(decide("Write", json!({"file_path": ".claude/settings.json"})).is_some());
         assert!(decide("Write", json!({"file_path": ".github/workflows/x.yml"})).is_some());
         assert!(bash("git rm -r -f x:/../.cargo").is_some());
         assert!(bash("git log -").is_some());

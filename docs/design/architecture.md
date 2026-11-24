@@ -98,7 +98,7 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   (so no `-C` or `-c`) and is one of add, commit, status, diff, show, log and rm; not `stash`, whose refs every
   checkout shares. Its revisions and paths must stay inside the worktree.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
-  and never into a `.git`, `.cargo` or `.github` directory at any depth, in any letter case (reading them is fine).
+  and never into a `.git`, `.cargo`, `.github` or `.claude` directory at any depth, in any letter case (reading them is fine).
   `git rm` takes plain files only, and `git commit` needs `-m`.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`.cargo/registry`,
   `.cargo/git`, `.rustup`); never `/proc`, `/sys`, `/dev`, other hidden directories or the factory home. Searches
@@ -117,7 +117,8 @@ without one is rejected, and its branch is reset to where the run started. Only 
 locations are checked up front. The stamp catches a hook that was silently dropped, not an agent that forges it while
 hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook blocks a `git push`
 with the deny-list's message and allows `cargo test`, and refuses to start the agent if not. The hook is a guardrail,
-not a sandbox: code the agent writes still runs under `cargo test`. Because no settings file loads, agents
+not a sandbox: code the agent writes still runs under `cargo test`. Mestari keeps GitHub tokens (`GH_TOKEN`,
+`GITHUB_TOKEN` and the like) out of the agent's environment. Because no settings file loads, agents
 authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
 `apiKeyHelper` or provider settings.
 
