@@ -2,6 +2,7 @@
 # Read from main, never from the branch under review.
 crates/paja/src/events.rs
 crates/paja/src/mestari.rs
+crates/paja/src/hook.rs
 .paja/
 evals/
 CLAUDE.md

@@ -30,6 +30,7 @@ PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 - `crates/paja/src/mestari.rs`: `paja run`, the build, check, review and land loop for one work item.
 - `.paja/checks`, `.paja/high-risk`: Vasara's check commands and the high-risk path prefixes. `paja run` reads both
   from `main`, never from the branch under review.
+- `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It fails closed.
 - `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary.

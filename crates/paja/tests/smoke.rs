@@ -725,6 +725,7 @@ impl Factory {
             "claude",
             format!(
                 "#!/bin/sh\necho \"$PAJA_HOME\" >> {d}/claude-homes.log\n\
+                 echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
                  *--json-schema*) v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\"}}}}\" ;;\n\
@@ -788,6 +789,16 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]));
+    // Every agent runs under the deny-list hook, with project settings only.
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert!(
+        args.contains("--setting-sources project --settings"),
+        "{args}"
+    );
+    assert!(
+        args.contains("PreToolUse") && args.contains("hook"),
+        "{args}"
+    );
     // Agents never see the factory's own PAJA_HOME.
     let homes = std::fs::read_to_string(f.tmp.path().join("claude-homes.log")).unwrap();
     assert!(!homes.contains(f.home.to_str().unwrap()), "{homes}");
@@ -880,4 +891,45 @@ fn an_empty_checks_file_is_an_error_not_a_pass() {
         "{report}"
     );
     assert!(!f.gh_log().contains("pr merge"));
+}
+
+/// Run `paja hook` with a tool call on stdin; returns its exit code and stderr.
+fn hook(input: &str) -> (Option<i32>, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .arg("hook")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn the_deny_list_hook_blocks_and_fails_closed() {
+    let call = |cmd: &str| {
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": "/w/env"})
+            .to_string()
+    };
+    let (code, why) = hook(&call("cargo test && git push origin main"));
+    assert_eq!(code, Some(2), "{why}");
+    assert!(why.contains("git push"), "{why}");
+    assert_eq!(hook(&call("cargo test")).0, Some(0));
+    let write = serde_json::json!({"tool_name": "Write", "tool_input": {"file_path": "/etc/x"}, "cwd": "/w/env"});
+    assert_eq!(hook(&write.to_string()).0, Some(2));
+    // Anything it can't read blocks too.
+    let (code, why) = hook("not json");
+    assert_eq!(code, Some(2));
+    assert!(why.contains("fails closed"), "{why}");
 }

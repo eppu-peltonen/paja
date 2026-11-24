@@ -49,6 +49,10 @@ enum Command {
         #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
         every: Option<u64>,
     },
+    /// The deny-list hook Mestari runs agents under (Claude Code `PreToolUse`). Reads the
+    /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow.
+    #[command(hide = true)]
+    Hook,
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
     /// stdout carries the MCP protocol, so this is the one command that never prints a
@@ -143,6 +147,9 @@ fn main() -> ExitCode {
             return code;
         }
     };
+    if matches!(cli.command, Command::Hook) {
+        return run_hook();
+    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -156,9 +163,33 @@ fn main() -> ExitCode {
     }
 }
 
+/// Fail closed: anything but a clear "allowed" blocks the call.
+fn run_hook() -> ExitCode {
+    let decision = (|| -> Result<Option<String>> {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        let input: paja::hook::HookInput = serde_json::from_str(&input)?;
+        paja::hook::check(&input)
+    })();
+    match decision {
+        Ok(None) => ExitCode::SUCCESS,
+        Ok(Some(reason)) => {
+            eprintln!("Blocked by Paja's deny-list: {reason}");
+            ExitCode::from(2)
+        }
+        Err(err) => {
+            eprintln!(
+                "Blocked: Paja's deny-list hook couldn't decide ({err:#}), so it fails closed"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn run(cli: &Cli) -> Result<()> {
     let home = Home::from_env()?;
     match &cli.command {
+        Command::Hook => unreachable!("handled before the home is opened"),
         Command::Mcp => {
             // Once the session is up, stdout is the protocol: report a later failure on
             // stderr so it can't be read as a frame.

@@ -312,6 +312,7 @@ fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Re
     let program = claude_program();
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let scratch = tempfile_dir(&env.path)?;
+    let settings = hook_settings()?;
     let mut cmd = Command::new(&program);
     cmd.current_dir(&env.path)
         .env("PAJA_HOME", &scratch)
@@ -323,6 +324,9 @@ fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Re
             "--permission-mode",
             "acceptEdits",
         ])
+        // Project settings only, plus the deny-list hook: the owner's own settings and any
+        // settings on the branch can't loosen it.
+        .args(["--setting-sources", "project", "--settings", &settings])
         .arg("--allowedTools")
         .args(tools);
     if let Some(schema) = schema {
@@ -345,6 +349,41 @@ fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Re
         bail!("`{program} -p` reported an error: {}", value["result"]);
     }
     Ok(value)
+}
+
+/// Claude Code settings that run every tool call through `paja hook`. Before handing them
+/// out, check that the hook really blocks; an agent never starts under a hook that doesn't.
+fn hook_settings() -> Result<String> {
+    let exe = std::env::current_exe().context("finding the paja binary for the deny-list hook")?;
+    let mut test = Command::new(&exe)
+        .arg("hook")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting the deny-list hook {}", exe.display()))?;
+    std::io::Write::write_all(
+        test.stdin.as_mut().context("the hook's stdin")?,
+        crate::hook::self_test_input().as_bytes(),
+    )?;
+    drop(test.stdin.take());
+    if test.wait()?.code() != Some(2) {
+        bail!(
+            "the deny-list hook {} did not block a `git push` in its self-test, so no agent will \
+             start; rebuild paja from main",
+            exe.display()
+        );
+    }
+    let command = format!(
+        "'{}' hook",
+        exe.display().to_string().replace('\'', r"'\''")
+    );
+    Ok(json!({
+        "hooks": {
+            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": command}]}]
+        }
+    })
+    .to_string())
 }
 
 fn tempfile_dir(near: &Path) -> Result<PathBuf> {

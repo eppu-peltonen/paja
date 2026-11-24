@@ -76,6 +76,16 @@ issue with the question and marks the item escalated; the branch keeps the work.
 `PAJA_HOME`, so they never touch the factory's own state. Each step is recorded as `run.started`, `run.round`,
 `run.landed` or `run.escalated`. `paja run --every 5` keeps going, checking an empty queue every five minutes.
 
+## The deny-list hook
+
+Every agent Mestari starts runs with `--setting-sources project` and settings that send each tool call to `paja hook`
+as a Claude Code `PreToolUse` hook, so neither the owner's settings nor the branch's can loosen it. The hook blocks
+pushing, GitHub and network commands, `sudo`, switching branches or rewriting history, publishing or installing, changes
+to `PAJA_HOME`, anything touching credential paths (`~/.ssh`, `~/.config/gh` and the like), writes outside the
+environment's worktree, and `rm` outside it. It splits commands at `;`, `&&`, `|` and substitutions so a denied command
+can't hide behind another. It fails closed: unreadable input blocks too, and before each agent Mestari checks that the
+hook blocks a `git push`, refusing to start the agent if it doesn't.
+
 ## MCP server
 
 `paja mcp` serves the core as MCP tools over stdio (`env_*`, `work_*` and `log`), built on
