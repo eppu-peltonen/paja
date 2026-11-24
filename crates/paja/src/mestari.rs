@@ -318,8 +318,8 @@ fn claude(
 ) -> Result<Value> {
     let program = claude_program();
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
-    let scratch = tempfile_dir(&env.path)?;
     let settings = hook_settings(&env.path, home.root())?;
+    let scratch = tempfile_dir(&env.path)?;
     let mut cmd = Command::new(&program);
     cmd.current_dir(&env.path)
         .env("PAJA_HOME", &scratch)
@@ -334,6 +334,8 @@ fn claude(
         // No settings files at all, only the deny-list hook: neither the owner's settings nor
         // a settings file on the branch can loosen or switch it off. CLAUDE.md still loads.
         .args(["--setting-sources", "", "--settings", &settings])
+        // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
+        .arg("--strict-mcp-config")
         .arg("--allowedTools")
         .args(tools);
     if let Some(schema) = schema {

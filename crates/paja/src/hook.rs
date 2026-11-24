@@ -49,8 +49,8 @@ impl Bounds {
     pub fn new(root: Option<PathBuf>, home: Option<PathBuf>) -> Result<Bounds> {
         match (root, home) {
             (Some(root), Some(home)) if root.is_absolute() && home.is_absolute() => Ok(Bounds {
-                root: normalize(&root),
-                home: normalize(&home),
+                root: resolve(&root),
+                home: resolve(&home),
             }),
             _ => bail!("`paja hook` needs absolute --root and --home paths; Mestari passes both"),
         }
@@ -162,9 +162,13 @@ const SECRET_PATHS: &[&str] = &[
 /// sources and the toolchain.
 const READABLE_HIDDEN: &[&str] = &[".cargo/registry", ".cargo/git", ".rustup"];
 
+/// Tools that touch nothing outside the session. Any tool not named here or handled in
+/// [`check`], MCP tools included, is blocked.
+const HARMLESS_TOOLS: &[&str] = &["TodoWrite", "TodoRead", "Task", "Agent", "ExitPlanMode"];
+
 /// Decide one tool call. `Ok(None)` allows it, `Ok(Some(reason))` blocks it.
 pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
-    let cwd = normalize(&input.cwd);
+    let cwd = resolve(&input.cwd);
     let t = &input.tool_input;
     match input.tool_name.as_str() {
         "Bash" => {
@@ -206,14 +210,17 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
             Ok(None)
         }
         "WebFetch" | "WebSearch" => Ok(Some("no network access from agents".into())),
-        // Other tools (todo lists and the like) touch nothing outside the session.
-        _ => Ok(None),
+        name if HARMLESS_TOOLS.contains(&name) => Ok(None),
+        name => Ok(Some(format!(
+            "agents don't use the `{name}` tool; Mestari's agents use the file tools, cargo and \
+             local git"
+        ))),
     }
 }
 
 /// `path` must be inside the worktree, and not git's link to the repository.
 fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
-    let full = normalize(path);
+    let full = resolve(path);
     if !full.starts_with(&b.root) {
         return Some(format!(
             "agents {what} only inside their own worktree ({}), not {}",
@@ -227,15 +234,30 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
             full.display()
         ));
     }
+    if full.starts_with(b.root.join(".cargo")) {
+        return Some(format!(
+            "{} is cargo configuration, which could change how cargo runs; agents never change it",
+            full.display()
+        ));
+    }
     None
 }
 
 /// Reads may look at plain files outside the worktree, but not into hidden directories
 /// (where credentials live) other than dependency sources, and never at the factory's state.
 fn check_read(path: &Path, b: &Bounds) -> Option<String> {
-    let full = normalize(path);
+    let full = resolve(path);
     if full.starts_with(&b.root) {
         return None;
+    }
+    if ["/proc", "/sys", "/dev"]
+        .iter()
+        .any(|p| full.starts_with(p))
+    {
+        return Some(format!(
+            "{} exposes processes and devices; agents don't read it",
+            full.display()
+        ));
     }
     if full.starts_with(&b.home) {
         return Some(format!(
@@ -334,7 +356,7 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
 /// Consume `rest` from `chars` if it comes next and ends the word.
 fn next_is(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, rest: &str) -> bool {
     let ahead: String = chars.clone().take(rest.len() + 1).collect();
-    let ends = ahead.len() == rest.len() || ahead.ends_with([' ', '\t']);
+    let ends = ahead.len() == rest.len() || ahead.ends_with([' ', '\t', '|', '&']);
     if ahead.starts_with(rest) && ends {
         for _ in 0..rest.len() {
             chars.next();
@@ -423,15 +445,25 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
             if let Some(opt) = denied_option(args, GIT_DENIED_OPTIONS) {
                 return Some(format!("`git {sub} {opt}` is not allowed for agents"));
             }
-            // A commit message is not a path.
+            // Every path git is given, as an operand or as `--opt=value`, stays in the
+            // worktree. A commit message is not a path, and neither is `rev:path`.
+            let takes_message = matches!(sub, "commit" | "stash");
             let mut paths = Vec::new();
             let mut message = false;
             for arg in &args[1..] {
-                if message {
-                    message = false;
-                } else if matches!(*arg, "-m" | "--message") {
+                if std::mem::take(&mut message) {
+                    continue;
+                }
+                if takes_message && matches!(*arg, "-m" | "--message") {
                     message = true;
-                } else if !arg.starts_with("-m") && !arg.starts_with("--message=") {
+                } else if takes_message && (arg.starts_with("-m") || arg.starts_with("--message="))
+                {
+                    // The message is attached.
+                } else if let Some((_, value)) =
+                    arg.strip_prefix("--").and_then(|o| o.split_once('='))
+                {
+                    paths.push(value);
+                } else if !arg.starts_with('-') && !is_revision_path(arg) {
                     paths.push(*arg);
                 }
             }
@@ -446,18 +478,25 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
             if *program == "rm"
                 && args
                     .iter()
-                    .any(|a| !a.starts_with('-') && normalize(&here.join(a)) == b.root)
+                    .any(|a| !a.starts_with('-') && resolve(&here.join(a)) == b.root)
             {
                 return Some("agents don't remove their whole worktree".into());
             }
         }
         "pwd" => {}
         // Only as the first step, so a failed `cd` stops the rest.
+        // A bare relative name could follow CDPATH and `-` goes back to OLDPWD, so neither
+        // is allowed.
         "cd" if first => {
             let [target] = args else {
                 return Some("`cd` takes one directory inside the worktree".into());
             };
-            let to = normalize(&here.join(target));
+            if !(target.starts_with('/') || target.starts_with("./") || target.starts_with("../")) {
+                return Some(format!(
+                    "`cd {target}`: give an absolute path or one starting with `./`"
+                ));
+            }
+            let to = resolve(&here.join(target));
             if let Some(reason) = inside_root("cd", &to, b) {
                 return Some(reason);
             }
@@ -476,23 +515,33 @@ fn check_pipe_target(words: &[&str]) -> Option<String> {
     if !PIPE_TARGETS.contains(program) {
         return Some(format!("`{program}` can't read a pipe here; {SHAPE}"));
     }
-    // Flags only, plus grep's one pattern: nothing that names a file.
-    let plain: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    let flags = args.iter().filter(|a| a.starts_with('-'));
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    // Nothing that names a file: grep takes flags and one pattern; head and tail take a
+    // count (`-20`, `-n20`, `-n 20`); wc takes `-l`, `-c` or `-w`.
     let ok = match *program {
         "grep" => {
-            plain.len() == 1
-                && flags
-                    .into_iter()
+            args.iter().filter(|a| !a.starts_with('-')).count() == 1
+                && args
+                    .iter()
+                    .filter(|a| a.starts_with('-'))
                     .all(|a| a.len() > 1 && a[1..].chars().all(|c| "inEvcwFxqo".contains(c)))
         }
+        "wc" => args.iter().all(|a| matches!(*a, "-l" | "-c" | "-w")),
         _ => {
-            plain.iter().all(|a| a.chars().all(|c| c.is_ascii_digit()))
-                && flags.into_iter().all(|a| {
-                    a[1..]
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || "nlcw".contains(c))
-                })
+            let mut count_next = false;
+            args.iter().all(|a| {
+                if std::mem::take(&mut count_next) {
+                    return digits(a);
+                }
+                match a.strip_prefix('-') {
+                    Some("n" | "c") => {
+                        count_next = true;
+                        true
+                    }
+                    Some(rest) => digits(rest.strip_prefix(['n', 'c']).unwrap_or(rest)),
+                    None => false,
+                }
+            }) && !count_next
         }
     };
     (!ok).then(|| format!("`{program}` may only filter the pipe, not read files; {SHAPE}"))
@@ -510,12 +559,14 @@ fn denied_option<'a>(args: &[&'a str], denied: &[&str]) -> Option<&'a str> {
     })
 }
 
+/// `HEAD:src/lib.rs` or `main:x` names a file in a revision, not on disk.
+fn is_revision_path(arg: &str) -> bool {
+    arg.split_once(':')
+        .is_some_and(|(rev, _)| !rev.is_empty() && !rev.contains('/'))
+}
+
 fn operands_inside(args: &[&str], here: &Path, b: &Bounds, what: &str) -> Option<String> {
     for arg in args.iter().filter(|a| !a.starts_with('-')) {
-        // `rev:path` names a revision, not a file.
-        if arg.contains(':') {
-            continue;
-        }
         if let Some(reason) = inside_root(what, &here.join(arg), b) {
             return Some(reason);
         }
@@ -533,7 +584,27 @@ fn touches_secret(text: &str) -> bool {
     SECRET_PATHS.iter().any(|secret| text.contains(secret))
 }
 
-/// Resolve `.` and `..` without touching the disk, so paths that don't exist yet still work.
+/// Resolve symlinks in the part of `path` that exists, and `.` and `..` in the rest, so a link
+/// can't lead out of the worktree and paths that don't exist yet still work.
+fn resolve(path: &Path) -> PathBuf {
+    let path = normalize(path);
+    let mut existing = path.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return rest.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return path,
+        }
+    }
+}
+
+/// Resolve `.` and `..` without touching the disk.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {
@@ -607,7 +678,11 @@ mod tests {
             "RUST_BACKTRACE=1 cargo test smoke",
             "cargo run -q -- --json env create demo",
             "cd /h/.paja/envs/work-1 && cargo test",
-            "cd crates/paja && cargo test",
+            "cd ./crates/paja && cargo test",
+            "cargo test 2>&1|tail -n 20",
+            "git log -m --oneline -3",
+            "git log --format=%H -1",
+            "cargo test | wc -l",
         ] {
             assert_eq!(bash(ok), None, "{ok}");
         }
@@ -701,6 +776,14 @@ mod tests {
             "sed -n p x",
             "python3 -c 'import os'",
             "{ git push; }",
+            "cd - && rm -rf src",
+            "cd src && rm -rf x",
+            "git blame --contents=/h/.paja/events.jsonl src/lib.rs",
+            "git diff -m /h/.paja/events.jsonl src/lib.rs",
+            "rm -rf ../work-2/a:b",
+            "ls /h/.paja/envs/work-2:",
+            "cargo test | head 10",
+            "cargo test | tail -n",
         ] {
             assert!(bash(bad).is_some(), "{bad} should be blocked");
         }
@@ -716,7 +799,33 @@ mod tests {
         assert!(decide("Glob", json!({"pattern": "../../*.jsonl"})).is_some());
         assert!(decide("Grep", json!({"pattern": "BEGIN", "path": "/h"})).is_some());
         assert!(decide("Grep", json!({"pattern": ".", "glob": "/h/.aws/*"})).is_some());
+        assert!(decide("Write", json!({"file_path": ".cargo/config.toml"})).is_some());
+        assert!(decide("Read", json!({"file_path": "/proc/self/environ"})).is_some());
         assert!(decide("WebFetch", json!({"url": "https://example.com"})).is_some());
+        assert!(decide("mcp__github__merge_pull_request", json!({})).is_some());
+        assert_eq!(decide("TodoWrite", json!({"todos": []})), None);
+    }
+
+    #[test]
+    fn symlinks_cannot_lead_out_of_the_worktree() {
+        let tmp = std::env::temp_dir().join(format!("paja-hook-{}", std::process::id()));
+        let root = tmp.join("home/envs/a");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let b = Bounds::new(Some(root.clone()), Some(tmp.join("home"))).unwrap();
+        let call = |tool: &str, path: &str| {
+            let input = HookInput {
+                tool_name: tool.into(),
+                tool_input: json!({ "file_path": path }),
+                cwd: root.clone(),
+            };
+            check(&input, &b).unwrap()
+        };
+        assert!(call("Write", "link/x").is_some());
+        assert_eq!(call("Write", "src/new/x.rs"), None);
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

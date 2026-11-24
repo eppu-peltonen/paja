@@ -78,23 +78,27 @@ issue with the question and marks the item escalated; the branch keeps the work.
 
 ## The deny-list hook
 
-Every agent Mestari starts runs with `--setting-sources ""` and settings that send each tool call to
+Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config` and settings that send each tool call to
 `paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file is loaded,
 so neither the owner's settings nor a file on the branch can loosen the hook or switch it off; `CLAUDE.md` still loads.
+No MCP servers load either.
 The bounds are passed in rather than read from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
+- **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
+  tools included, is blocked.
 - **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
-  leading `cd` into the worktree, then `cargo`, local `git`, `ls`, `rm` or `pwd` commands joined by `&&`, each
+  leading `cd` into the worktree (an absolute path or one starting with `./`), then `cargo`, local `git`, `ls`, `rm` or `pwd` commands joined by `&&`, each
   optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, `~`,
   redirections other than `2>&1`, or other separators outside single quotes. Cargo is limited to build, check, test,
   fmt, clippy, run, doc, tree and metadata, with no `--config`, `-Z` or other output directories. Git's subcommand
   must come first (so no `-C` or `-c`) and be a local one (add, commit, status, diff, log, show, stash and the like),
   without options that run programs or reach other files (`--output`, `--ext-diff`, `-O`, `-F`, `--no-index`). Only
   `RUST_BACKTRACE` and `RUST_LOG` may be set in front of a command.
-- **Writes** stay in the environment: file edits and the paths given to `git`, `ls` and `rm` must resolve inside the
-  root, never at its `.git` link, and `rm` can't remove the root itself.
+- **Writes** stay in the environment: file edits and the paths given to `git` (as operands or `--opt=value`), `ls`
+  and `rm` must resolve inside the root, with symlinks followed, and never at its `.git` link or `.cargo`
+  configuration. `rm` can't remove the root itself.
 - **Reads** of single files may look outside the worktree, but not into hidden directories other than dependency
-  sources (`.cargo/registry`, `.rustup`) and never into the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so
+  sources (`.cargo/registry`, `.rustup`), never into `/proc`, `/sys` or `/dev`, and never into the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so
   they stay inside the worktree. Nothing may name a credential path (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
 
