@@ -384,8 +384,10 @@ fn hook_settings(root: &Path, home: &Path) -> Result<String> {
         );
     }
     let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails
+    // in any other way must block too.
     let command = format!(
-        "{} hook --root {} --home {}",
+        "{} hook --root {} --home {} || exit 2",
         quote(&exe.to_string_lossy()),
         quote(&root.to_string_lossy()),
         quote(&home.to_string_lossy())

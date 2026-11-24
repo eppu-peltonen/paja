@@ -119,7 +119,6 @@ const GIT_SUBCOMMANDS: &[&str] = &[
     "rm",
     "mv",
     "restore",
-    "stash",
 ];
 
 /// Git options that run programs, read or write files outside the repository, or compare
@@ -138,6 +137,9 @@ const GIT_DENIED_OPTIONS: &[&str] = &[
     "--pathspec-from-file",
     "--no-index",
 ];
+
+/// Git options whose value is a path.
+const GIT_PATH_OPTIONS: &[&str] = &["--contents", "--ignore-revs-file", "--orderfile"];
 
 /// Variables an agent may set in front of a command.
 const ALLOWED_VARIABLES: &[&str] = &["RUST_BACKTRACE", "RUST_LOG"];
@@ -266,13 +268,20 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
         ));
     }
     let text = full.to_string_lossy();
-    let hidden = full
+    // Every hidden directory on the way must be one of the dependency roots.
+    let parts: Vec<String> = full
         .components()
-        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
-    let allowed = READABLE_HIDDEN
-        .iter()
-        .any(|dir| text.contains(&format!("/{dir}/")));
-    if touches_secret(&text) || (hidden && !allowed) {
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let hidden_ok = parts.iter().enumerate().all(|(n, part)| {
+        !part.starts_with('.')
+            || READABLE_HIDDEN.iter().any(|dir| {
+                let mut want = dir.split('/');
+                want.next() == Some(part.as_str())
+                    && want.all(|next| parts.get(n + 1).map(String::as_str) == Some(next))
+            })
+    });
+    if touches_secret(&text) || !hidden_ok {
         return Some(format!(
             "{} is in a hidden directory outside the worktree; agents don't read those",
             full.display()
@@ -381,7 +390,10 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
     // `&&` steps, each a pipeline of simple commands.
     let mut here = cwd.to_path_buf();
     for (i, step) in tokens.split(|t| *t == Token::And).enumerate() {
-        for (j, stage) in step.split(|t| *t == Token::Pipe).enumerate() {
+        let stages: Vec<&[Token]> = step.split(|t| *t == Token::Pipe).collect();
+        // A `cd` only moves the shell when it is the whole first step.
+        let moves = i == 0 && stages.len() == 1;
+        for (j, stage) in stages.into_iter().enumerate() {
             let mut words: Vec<&str> = Vec::new();
             for (k, token) in stage.iter().enumerate() {
                 match token {
@@ -391,7 +403,7 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
                 }
             }
             let reason = if j == 0 {
-                check_simple(&words, i == 0, &mut here, b)
+                check_simple(&words, moves, &mut here, b)
             } else {
                 check_pipe_target(&words)
             };
@@ -442,13 +454,9 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
                     GIT_SUBCOMMANDS.join(", ")
                 ));
             }
-            if let Some(opt) = denied_option(args, GIT_DENIED_OPTIONS) {
-                return Some(format!("`git {sub} {opt}` is not allowed for agents"));
-            }
-            // Every path git is given, as an operand or as `--opt=value`, stays in the
-            // worktree. A commit message is not a path, and neither is `rev:path`.
-            let takes_message = matches!(sub, "commit" | "stash");
-            let mut paths = Vec::new();
+            // A commit message is not an option or a path; leave it out of both checks.
+            let takes_message = sub == "commit";
+            let mut rest = Vec::new();
             let mut message = false;
             for arg in &args[1..] {
                 if std::mem::take(&mut message) {
@@ -456,16 +464,29 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
                 }
                 if takes_message && matches!(*arg, "-m" | "--message") {
                     message = true;
-                } else if takes_message && (arg.starts_with("-m") || arg.starts_with("--message="))
+                } else if !(takes_message
+                    && (arg.starts_with("-m") || arg.starts_with("--message=")))
                 {
-                    // The message is attached.
-                } else if let Some((_, value)) =
-                    arg.strip_prefix("--").and_then(|o| o.split_once('='))
-                {
-                    paths.push(value);
-                } else if !arg.starts_with('-') && !is_revision_path(arg) {
-                    paths.push(*arg);
+                    rest.push(*arg);
                 }
+            }
+            if let Some(opt) = denied_option(&rest, GIT_DENIED_OPTIONS) {
+                return Some(format!("`git {sub} {opt}` is not allowed for agents"));
+            }
+            // Every path git is given, as an operand or the value of an option that takes a
+            // path, stays in the worktree. `rev:path` names a file in a revision.
+            let paths: Vec<&str> = rest
+                .iter()
+                .filter_map(|arg| match arg.split_once('=') {
+                    Some((opt, value)) if GIT_PATH_OPTIONS.contains(&opt) => Some(value),
+                    _ if GIT_PATH_OPTIONS.contains(arg) => None,
+                    _ => (!arg.starts_with('-') && !is_revision_path(arg)).then_some(*arg),
+                })
+                .collect();
+            if let Some(opt) = rest.iter().find(|a| GIT_PATH_OPTIONS.contains(a)) {
+                return Some(format!(
+                    "write `{opt}=<path>` so the path can be checked against the worktree"
+                ));
             }
             if let Some(reason) = operands_inside(&paths, here, b, "use git") {
                 return Some(reason);
@@ -502,7 +523,7 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
             }
             *here = to;
         }
-        "cd" => return Some("`cd` may only start a command".into()),
+        "cd" => return Some("`cd` may only be the first step of a command, on its own".into()),
         other => return Some(format!("`{other}` is not allowed; {SHAPE}")),
     }
     None
@@ -584,36 +605,27 @@ fn touches_secret(text: &str) -> bool {
     SECRET_PATHS.iter().any(|secret| text.contains(secret))
 }
 
-/// Resolve symlinks in the part of `path` that exists, and `.` and `..` in the rest, so a link
+/// Resolve symlinks in the part of `path` that exists, and `.` and `..` everywhere, so a link
 /// can't lead out of the worktree and paths that don't exist yet still work.
 fn resolve(path: &Path) -> PathBuf {
-    let path = normalize(path);
-    let mut existing = path.as_path();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(real) = existing.canonicalize() {
-            return rest.iter().rev().fold(real, |acc, part| acc.join(part));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_owned());
-                existing = parent;
-            }
-            _ => return path,
-        }
-    }
-}
-
-/// Resolve `.` and `..` without touching the disk.
-fn normalize(path: &Path) -> PathBuf {
+    // Walk one component at a time, as the kernel does: a `..` after a symlink leaves the
+    // link's target, not the link.
     let mut out = PathBuf::new();
     for part in path.components() {
         match part {
+            Component::CurDir => {}
             Component::ParentDir => {
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
                 out.pop();
             }
-            Component::CurDir => {}
-            other => out.push(other),
+            other => {
+                out.push(other);
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
+            }
         }
     }
     out
@@ -668,7 +680,8 @@ mod tests {
             "git commit -m \"fix: a & b; c | d (e)\"",
             "git commit -m '/etc parsing'",
             "git status",
-            "git stash push",
+            "git commit -m '-Fix parsing'",
+            "git log --grep=/api --author=/x/",
             "git diff main...HEAD",
             "git log --oneline -3 | head -3",
             "git show HEAD:crates/paja/src/lib.rs",
@@ -784,6 +797,10 @@ mod tests {
             "ls /h/.paja/envs/work-2:",
             "cargo test | head 10",
             "cargo test | tail -n",
+            "cd ./a/b | wc -l && rm -rf ../work-2",
+            "git stash clear",
+            "git stash pop",
+            "git blame --contents /h/.paja/events.jsonl src/lib.rs",
         ] {
             assert!(bash(bad).is_some(), "{bad} should be blocked");
         }
@@ -801,6 +818,11 @@ mod tests {
         assert!(decide("Grep", json!({"pattern": ".", "glob": "/h/.aws/*"})).is_some());
         assert!(decide("Write", json!({"file_path": ".cargo/config.toml"})).is_some());
         assert!(decide("Read", json!({"file_path": "/proc/self/environ"})).is_some());
+        assert!(decide(
+            "Read",
+            json!({"file_path": "/h/.config/app/.cargo/registry/token"})
+        )
+        .is_some());
         assert!(decide("WebFetch", json!({"url": "https://example.com"})).is_some());
         assert!(decide("mcp__github__merge_pull_request", json!({})).is_some());
         assert_eq!(decide("TodoWrite", json!({"todos": []})), None);
@@ -824,6 +846,8 @@ mod tests {
             check(&input, &b).unwrap()
         };
         assert!(call("Write", "link/x").is_some());
+        // `link/..` is the link target's parent, outside the worktree.
+        assert!(call("Write", "link/../x").is_some());
         assert_eq!(call("Write", "src/new/x.rs"), None);
         std::fs::remove_dir_all(&tmp).unwrap();
     }

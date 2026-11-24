@@ -21,7 +21,9 @@ Try the CLI against a throwaway home so you never touch real state:
 PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 ```
 
-Agents Mestari starts already have a throwaway `PAJA_HOME`; they run `cargo run -q -- --json env create demo`.
+Agents Mestari starts already have a throwaway `PAJA_HOME`, and Paja's deny-list hook doesn't let them set it. They
+try read-only commands such as `cargo run -q -- --json work list`, and leave `env create`, which adds a worktree to
+the real repository, to the smoke tests.
 
 ## Layout
 
