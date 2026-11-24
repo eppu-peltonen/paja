@@ -61,7 +61,24 @@ enum EnvCommand {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            use clap::error::ErrorKind;
+            let wants_json = std::env::args().any(|a| a == "--json");
+            let is_info = matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            );
+            if wants_json && !is_info {
+                // Agents parse stdout, so even a usage error must be one JSON value there.
+                let message = err.render().to_string();
+                println!("{}", json!({ "error": message.trim() }));
+                return ExitCode::from(2);
+            }
+            err.exit();
+        }
+    };
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

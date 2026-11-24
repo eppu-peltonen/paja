@@ -87,3 +87,117 @@ fn env_lifecycle() {
         ["env.created", "env.created", "env.removed", "env.created"]
     );
 }
+
+fn init_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("hello.txt"), "hi\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "init"]);
+}
+
+#[test]
+fn a_removed_name_can_be_reused_and_resumes_its_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+
+    let (ok, a) = paja(&home, &repo, &["env", "create", "alpha"]);
+    assert!(ok, "{a}");
+    let path = Path::new(a["path"].as_str().unwrap()).to_path_buf();
+    std::fs::write(path.join("work.txt"), "unlanded\n").unwrap();
+    git(&path, &["add", "."]);
+    git(&path, &["commit", "-q", "-m", "work"]);
+    let (ok, _) = paja(&home, &repo, &["env", "remove", "alpha"]);
+    assert!(ok);
+
+    let (ok, again) = paja(&home, &repo, &["env", "create", "alpha"]);
+    assert!(ok, "{again}");
+    assert!(
+        path.join("work.txt").exists(),
+        "the kept branch should be resumed"
+    );
+
+    // --base can't apply to a branch that already exists, and the error says what to do.
+    paja(&home, &repo, &["env", "remove", "alpha"]);
+    let (ok, err) = paja(&home, &repo, &["env", "create", "alpha", "--base", "main"]);
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("branch -D"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_env_created_inside_an_env_belongs_to_the_main_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+
+    let (_, parent) = paja(&home, &repo, &["env", "create", "parent"]);
+    let parent_path = Path::new(parent["path"].as_str().unwrap()).to_path_buf();
+    let (ok, child) = paja(&home, &parent_path, &["env", "create", "child"]);
+    assert!(ok, "{child}");
+    assert_eq!(
+        Path::new(child["repo"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        repo.canonicalize().unwrap()
+    );
+    let (ok, _) = paja(&home, &repo, &["env", "remove", "parent"]);
+    assert!(ok);
+    let (ok, removed) = paja(&home, &repo, &["env", "remove", "child"]);
+    assert!(ok, "{removed}");
+}
+
+#[test]
+fn a_relative_paja_home_is_made_absolute() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("app");
+    init_repo(&repo);
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let (ok, env) = paja(
+        Path::new("rel-home"),
+        &elsewhere,
+        &["env", "create", "gamma", "--repo", repo.to_str().unwrap()],
+    );
+    assert!(ok, "{env}");
+    let path = Path::new(env["path"].as_str().unwrap());
+    assert!(path.is_absolute());
+    assert!(path.starts_with(elsewhere.join("rel-home")));
+    let (ok, _) = paja(
+        Path::new("rel-home"),
+        &elsewhere,
+        &["env", "remove", "gamma"],
+    );
+    assert!(ok);
+    assert!(!path.exists());
+}
+
+#[test]
+fn an_env_whose_repo_is_gone_can_still_be_removed_with_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let (_, env) = paja(&home, &repo, &["env", "create", "orphan"]);
+    std::fs::remove_dir_all(&repo).unwrap();
+
+    let (ok, err) = paja(&home, tmp.path(), &["env", "remove", "orphan"]);
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("--force"), "{err}");
+    let (ok, removed) = paja(&home, tmp.path(), &["env", "remove", "orphan", "--force"]);
+    assert!(ok, "{removed}");
+    assert!(!Path::new(env["path"].as_str().unwrap()).exists());
+    let (_, list) = paja(&home, tmp.path(), &["env", "list"]);
+    assert!(list.as_array().unwrap().is_empty());
+}
+
+#[test]
+fn usage_errors_are_json_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ok, err) = paja(tmp.path(), tmp.path(), &["env", "create"]);
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("NAME"), "{err}");
+}

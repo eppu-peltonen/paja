@@ -84,14 +84,36 @@ pub struct CreateOptions<'a> {
 
 pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     validate_name(opts.name)?;
-    let repo = PathBuf::from(git(opts.repo, &["rev-parse", "--show-toplevel"])?);
-    let base = opts.base.unwrap_or("HEAD");
+    let repo = main_repo(opts.repo)?;
+    let branch = format!("paja/{}", opts.name);
+    // `remove` keeps branches, so a reused name may find its old branch: resume it.
+    let resume = git(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok();
+    if resume && opts.base.is_some() {
+        bail!(
+            "branch {branch} already exists (kept from an earlier environment), so --base can't apply; \
+             omit --base to resume it, or delete it with `git -C {} branch -D {branch}`",
+            repo.display()
+        );
+    }
+    let start = if resume {
+        branch.as_str()
+    } else {
+        opts.base.unwrap_or("HEAD")
+    };
     let base_commit = git(
         &repo,
-        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        &["rev-parse", "--verify", &format!("{start}^{{commit}}")],
     )
-    .with_context(|| format!("{base:?} is not a commit in {}", repo.display()))?;
-    let branch = format!("paja/{}", opts.name);
+    .with_context(|| format!("{start:?} is not a commit in {}", repo.display()))?;
 
     let lock = home.lock()?;
     let log = home.events();
@@ -108,19 +130,17 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
         );
     }
     std::fs::create_dir_all(home.envs_dir())?;
+    let path_str = path
+        .to_str()
+        .context("environment path is not UTF-8")?
+        .to_string();
 
-    git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            path.to_str().context("environment path is not UTF-8")?,
-            &base_commit,
-        ],
-    )
-    .with_context(|| format!("creating worktree for {:?}", opts.name))?;
+    let add: Vec<&str> = if resume {
+        vec!["worktree", "add", &path_str, &branch]
+    } else {
+        vec!["worktree", "add", "-b", &branch, &path_str, &base_commit]
+    };
+    git(&repo, &add).with_context(|| format!("creating worktree for {:?}", opts.name))?;
 
     let env = Env {
         name: opts.name.to_string(),
@@ -132,7 +152,20 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
         port_count: PORT_BLOCK,
         created_ms: now_ms(),
     };
-    log.append(&lock, EV_CREATED, serde_json::to_value(&env)?)?;
+    let recorded = serde_json::to_value(&env)
+        .map_err(anyhow::Error::from)
+        .and_then(|data| log.append(&lock, EV_CREATED, data));
+    if let Err(err) = recorded {
+        // Without its event the worktree would be an orphan that blocks the name; undo it.
+        let _ = git(&env.repo, &["worktree", "remove", "--force", &path_str]);
+        if !resume {
+            let _ = git(&env.repo, &["branch", "-D", &env.branch]);
+        }
+        return Err(err.context(format!(
+            "recording environment {:?}; the worktree was rolled back",
+            opts.name
+        )));
+    }
     Ok(env)
 }
 
@@ -144,9 +177,21 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     let env = replay(&log.read_all()?)?
         .remove(name)
         .with_context(|| format!("no environment named {name:?}"))?;
+    let path = env.path.to_str().context("environment path is not UTF-8")?;
 
-    if env.path.exists() {
-        let path = env.path.to_str().context("environment path is not UTF-8")?;
+    if !env.repo.exists() {
+        // git can't run against a repository that is gone; only the directory is left.
+        if env.path.exists() {
+            if !force {
+                bail!(
+                    "repository {} no longer exists, so git can't remove the worktree; \
+                     pass --force to delete {path} directly",
+                    env.repo.display()
+                );
+            }
+            std::fs::remove_dir_all(&env.path).with_context(|| format!("deleting {path}"))?;
+        }
+    } else if env.path.exists() {
         let mut args = vec!["worktree", "remove"];
         if force {
             args.push("--force");
@@ -156,7 +201,7 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
             if force {
                 format!("removing worktree {path}")
             } else {
-                format!("removing worktree {path} (use --force to discard uncommitted changes)")
+                format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
             }
         })?;
     } else {
@@ -170,6 +215,24 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
         serde_json::to_value(Removed { name: name.into() })?,
     )?;
     Ok(env)
+}
+
+/// The main repository's top level for any path inside it, even from inside a worktree
+/// (an agent creating an environment from within its own environment).
+fn main_repo(path: &Path) -> Result<PathBuf> {
+    let common = PathBuf::from(git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?);
+    if common.file_name().is_some_and(|n| n == ".git") {
+        if let Some(top) = common.parent() {
+            return Ok(top.to_path_buf());
+        }
+    }
+    bail!(
+        "{} is not inside a repository with a working tree (bare repositories aren't supported)",
+        path.display()
+    )
 }
 
 fn free_port_block(envs: &BTreeMap<String, Env>) -> Result<u16> {
