@@ -9,3 +9,5 @@ evals/
 CLAUDE.md
 .github/
 .claude/
+.cargo/
+rust-toolchain

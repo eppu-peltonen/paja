@@ -96,39 +96,40 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
   (so no `-C` or `-c`) and is one of add, commit, status, diff, show, log and rm; not `stash`, whose refs every
-  checkout shares. Its revisions and paths must stay inside the worktree. Reviewers may not run `cargo fmt` without `--check`.
+  checkout shares. Its revisions and paths must stay inside the worktree. `cargo fmt` takes options only with
+  `--check`, since `--all` and `-p` can reach path dependencies outside the worktree.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
   and never into a `.git`, `.cargo`, `.github` or `.claude` directory or a `rust-toolchain` file at any depth, in any
-  letter case (reading them is fine).
-  `git rm` takes plain files only, and `git commit` needs `-m`.
-- **Reads** of single files outside the worktree are limited to `/usr` and dependency sources
-  (`$CARGO_HOME/registry`, `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`,
-  `/sys`, `/dev`, other hidden directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay
-  inside the worktree, symlinks followed, and are blocked while the directory searched holds a symlink out of the
-  worktree. A file tool path may not start with `~`, a search pattern may not hold `..` or a path inside braces, and
-  no tool may name a credential path (`.ssh`, `.config/gh` and the like).
+  letter case (reading them is fine). `git rm` takes plain files only, and `git commit` needs `-m`.
+- **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
+  `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
+  directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
+  followed, and are blocked while the directory searched holds a symlink out of the worktree. A file tool path may not
+  start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
+  (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
 
 It fails closed: unreadable input, missing bounds, a crash and running past its own 20-second deadline all block, and
 the hook command ends in `|| exit 2` so a binary that can't start or is killed blocks too. Claude Code's own hook
-timeout is set well above that deadline. The hook runs from a copy of the paja binary in the factory home, so an
-agent's `cargo build` can't replace the binary that judges it. Managed settings still load, so Mestari refuses to
-start agents when they set `disableAllHooks` or `allowManagedHooksOnly`. Policy can arrive in other ways too, so the
-hook also touches a stamp file on every call: an agent run that took more than one turn or changed the worktree
-without one is rejected, and its branch is reset to where the run started. Only the two managed-settings locations
-(each file and its `managed-settings.d` drop-ins) are checked up front. The stamp catches a hook that was silently dropped, not an agent that forges it while
-hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook blocks a `git push`
-(for a reviewer, a local `git commit`) with the deny-list's message and allows `cargo test`, and refuses to start the
-agent if not. The hook is a guardrail,
-not a sandbox: code the agent writes still runs under `cargo test`. Mestari takes away the easy ways that code could reach
-GitHub: agents run without GitHub or registry tokens, the SSH agent or askpass programs, with gh's login, git's global
-and system configuration and every credential helper switched off, and with the owner's commit name, email and global
-ignore file passed in instead. A token written into the remote's URL is not covered. Vasara's checks run the same branch code, so
-they run with the same environment. Reviewers run the hook with `--read-only`: no file edits, no `cargo fmt` without
-`--check` and no git command that changes the branch; anything their builds change in the worktree is reset after the
-review. Because no settings file loads, agents
-authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
-`apiKeyHelper` or provider settings.
+timeout is set well above that deadline. The hook runs from a copy of the paja binary in the factory home, so an agent's
+`cargo build` can't replace the binary that judges it. Managed settings still load, so Mestari refuses to start agents
+when they set `disableAllHooks` or `allowManagedHooksOnly`. Policy can arrive in other ways too, so the hook also
+touches a stamp file on every call: an agent run that took more than one turn or changed the worktree without one is
+rejected, and its branch is reset to where the run started. Only the two managed-settings locations (each file and its
+`managed-settings.d` drop-ins) are checked up front. The stamp catches a hook that was silently dropped, not an agent
+that forges it while hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook
+blocks a `git push` (for a reviewer, a local `git commit`) with the deny-list's message and allows `cargo test`, and
+refuses to start the agent if not. The hook is a guardrail, not a sandbox: code the agent writes still runs under `cargo
+test`. Mestari takes away the easy ways that code could reach GitHub: agents run without GitHub or registry tokens, the
+SSH agent or askpass programs, with gh's login, git's global and system configuration and every credential helper
+switched off, and with the owner's commit name, email and global ignore file passed in instead. Vasara's checks run the
+same branch code, so they run with the same environment and a throwaway `HOME` as well. Agents keep the owner's `HOME`,
+which Claude Code needs to sign in, so code they run can still read credential files there (such as `.netrc`), and a
+token written into the remote's URL is not covered: closing those is the sandbox's job. Reviewers run the hook with
+`--read-only`: no file edits, no `cargo fmt` without `--check` and no git command that changes the branch; after the
+review, the branch and worktree are put back where it started, whatever the code its builds ran did. Because no settings
+file loads, agents authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not
+through `apiKeyHelper` or provider settings.
 
 ## MCP server
 

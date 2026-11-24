@@ -179,6 +179,7 @@ const CARGO_NAME_FLAGS: &[&str] = &[
     "--bin",
     "--example",
     "--features",
+    "-F",
     "-j",
     "--jobs",
 ];
@@ -682,6 +683,20 @@ fn check_cargo(args: &[&str], read_only: bool) -> Option<String> {
     // `cargo fmt` rewrites sources unless it only checks them; a reviewer changes nothing.
     if read_only && sub == "fmt" && !args.contains(&"--check") {
         return Some("reviewers change nothing: use `cargo fmt --all --check`".into());
+    }
+    // `--all` and `-p` can also format path dependencies, which may sit outside the
+    // worktree, so formatting (as opposed to checking) covers the workspace only.
+    if sub == "fmt"
+        && !args.contains(&"--check")
+        && !args[1..]
+            .iter()
+            .all(|a| matches!(*a, "-q" | "--quiet" | "-v" | "--verbose"))
+    {
+        return Some(
+            "`cargo fmt` with options could rewrite path dependencies outside the worktree; \
+             use plain `cargo fmt` to format, or `cargo fmt --all --check` to check"
+                .into(),
+        );
     }
     let rest = &args[1..];
     let split = rest.iter().position(|a| *a == "--").unwrap_or(rest.len());
@@ -1192,6 +1207,11 @@ mod tests {
         assert_eq!(bash("cargo test --features=serde/derive"), None);
         assert!(bash("cargo test --features ../x").is_some());
         assert!(bash("cargo test -p serde/derive").is_some());
+        assert_eq!(bash("cargo test -F serde/derive"), None);
+        assert!(bash("cargo fmt --all").is_some());
+        assert_eq!(bash("cargo fmt"), None);
+        assert_eq!(bash("cargo fmt --all --check"), None);
+        assert!(bash("cargo fmt -p other").is_some());
         // `-e` would take the pattern and leave the last word to be read as a file.
         assert!(bash("cargo test 2>&1 | grep -ve -qqq src/lib.rs").is_some());
         assert!(bash("cargo test 2>&1 | grep -e x src/lib.rs").is_some());

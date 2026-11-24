@@ -298,11 +298,16 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
         "Bash(git log*)",
         "Bash(git show*)",
     ];
+    let before = git(&env.path, &["rev-parse", "HEAD"])?;
     let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
-    // A reviewer changes nothing, but its builds can (a lockfile, say). Undo that, so none of
-    // it reaches the branch as if the builder had made it. Ignored files such as `target/` stay.
-    let reset = git(&env.path, &["reset", "-q", "--hard"])
-        .and_then(|_| git(&env.path, &["clean", "-q", "-f", "-d"]));
+    // A reviewer changes nothing, but the code its builds and tests run can (a lockfile, even
+    // a commit). Put the branch back where the review started, so none of it lands unread.
+    // Ignored files such as `target/` stay.
+    let reset = git(
+        &env.path,
+        &["checkout", "-q", "-f", "-B", env.branch.as_str(), &before],
+    )
+    .and_then(|_| git(&env.path, &["clean", "-q", "-f", "-d"]));
     let out = match (out, reset) {
         (Err(err), Err(reset)) => {
             return Err(err.context(format!("and resetting the worktree failed too: {reset:#}")))
@@ -826,9 +831,10 @@ fn commit_leftovers(env: &Env, item: &WorkItem) -> Result<()> {
 
 /// Give `cmd` a throwaway PAJA_HOME (`scratch`) and keep GitHub Mestari's: take away the easy
 /// ways an agent, or the code it wrote, could reach it (tokens, the SSH agent, gh's stored
-/// login, git's credential helpers and askpass programs, and registry tokens). A token
-/// written into the remote's URL is not covered. Determined code run by `cargo test` is the
-/// sandbox's job.
+/// login, git's credential helpers and askpass programs, and registry tokens). Agents keep
+/// the owner's `HOME`, which Claude Code needs to sign in, so code they run can still read
+/// credential files there (`.netrc`, say), and a token written into the remote's URL is not
+/// covered. Determined code run by `cargo test` is the sandbox's job.
 fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&str, String)>) {
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
@@ -865,12 +871,25 @@ fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&st
 /// Run each check in the environment. Returns the first failure's command and output. The
 /// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
+    let home_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let toolchain = (
+        std::env::var_os("CARGO_HOME").map_or(home_dir.join(".cargo"), PathBuf::from),
+        std::env::var_os("RUSTUP_HOME").map_or(home_dir.join(".rustup"), PathBuf::from),
+    );
     let scratch = tempfile_dir(dir)?;
     let result = (|| {
         for check in checks {
             let mut cmd = Command::new("sh");
             cmd.args(["-c", check]).current_dir(dir);
             without_credentials(&mut cmd, &scratch, git_identity(dir));
+            // The checks don't need the owner's home either, and it holds credential files
+            // (`.netrc`, cargo's `credentials.toml`) that git and cargo read on their own.
+            // Cargo and rustup keep their real directories.
+            cmd.env("HOME", &scratch)
+                .env("CARGO_HOME", &toolchain.0)
+                .env("RUSTUP_HOME", &toolchain.1);
             let output = cmd
                 .stdin(std::process::Stdio::null())
                 .output()
