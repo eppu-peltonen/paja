@@ -38,7 +38,7 @@ PROMPT = (
 # Logs a start line before cargo runs and an end line after, so a run that was killed
 # (a tool timeout, an interrupt) still shows up, as a start with no end.
 SHIM = """#!/bin/sh
-id="$$-$(date +%s%N)"
+id=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 log() { python3 -c 'import json,sys; print(json.dumps({"id": sys.argv[1], "code": None if sys.argv[2] == "-" else int(sys.argv[2]), "args": sys.argv[3:]}))' "$@" >> "$PAJA_EVAL_CARGO_LOG"; }
 log "$id" - "$@"
 "$PAJA_EVAL_REAL_CARGO" "$@"
@@ -107,16 +107,35 @@ REQUIRED = {
 }
 
 
+# cargo test flags that take a separate value, so the value is not a test filter.
+TEST_VALUE_FLAGS = VALUE_FLAGS | {"-p", "--package", "--features", "-F", "--test", "--bin",
+                                  "--example", "--bench", "--exclude", "-j", "--jobs",
+                                  "--target", "--target-dir", "--profile", "--message-format"}
+
+
 def full_check(check, args):
     """Whether a run is the full check from CLAUDE.md, not a narrower one."""
-    if not REQUIRED[check] <= set(args):
+    flat = set(args)
+    if check == "clippy" and ({"-Dwarnings", "--deny=warnings"} & flat
+                              or any(a == "--deny" and b == "warnings" for a, b in zip(args, args[1:]))):
+        flat |= {"-D", "warnings"}
+    if not REQUIRED[check] <= flat:
         return False
     if check == "test":
         # No `--no-run`, and no positional test filter before `--`.
         own = args[: args.index("--")] if "--" in args else args
         rest = own[own.index(next(a for a in own if subcommand([a]) == "test")) + 1:]
-        if "--no-run" in rest or any(not a.startswith("-") for a in rest):
+        if "--no-run" in rest:
             return False
+        skip = False
+        for a in rest:
+            if skip:
+                skip = False
+            elif a in TEST_VALUE_FLAGS:
+                skip = True
+            elif not a.startswith("-"):
+                return False  # a test name filter narrows the run
+
     return True
 
 
