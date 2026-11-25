@@ -103,9 +103,9 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   checkout shares. Its revisions and paths must stay inside the worktree. `cargo fmt` takes options only with
   `--check`, since `--all` and `-p` can reach path dependencies outside the worktree.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
-  and never into a `.git`, `.cargo`, `.github` or `.claude` directory, a `rust-toolchain` file or a rustfmt or clippy
-  configuration file at any depth, in any letter case (reading them is fine). A file tool path may not hold `..`. `git
-  rm` takes plain files only, and `git commit` needs `-m`.
+  and never into a `.git`, `.cargo`, `.github` or `.claude` directory, a `rust-toolchain` or `.gitattributes` file or
+  a rustfmt or clippy configuration file at any depth, in any letter case (reading them is fine). A file tool path may
+  not hold `..`. `git rm` takes plain files only, and `git commit` needs `-m`.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks

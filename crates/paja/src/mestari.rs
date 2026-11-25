@@ -1321,7 +1321,10 @@ impl GitGuard {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
         if !owner_hooks.is_empty() {
-            hooks.push(worktree.join(owner_hooks));
+            // A relative path is relative to where git runs: gh runs it in the main checkout,
+            // next to the shared git directory, not in this worktree.
+            let main_checkout = common.parent().unwrap_or(&common).to_path_buf();
+            hooks.push(main_checkout.join(owner_hooks));
         }
         // The owner's global configuration, which Mestari's own git reads.
         let home = std::env::var_os("HOME").map(PathBuf::from);

@@ -462,6 +462,13 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
             full.display()
         ));
     }
+    if named(".gitattributes") {
+        return Some(format!(
+            "{} decides how git shows and stores files, so it could hide a change from the \
+             reviewer; agents never change it",
+            full.display()
+        ));
+    }
     if [
         "rustfmt.toml",
         ".rustfmt.toml",
@@ -1250,6 +1257,7 @@ mod tests {
         assert!(decide("Glob", json!({"pattern": "**/.ssh/*"})).is_some());
         assert!(decide("Write", json!({"file_path": "rust-toolchain.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "rustfmt.toml"})).is_some());
+        assert!(decide("Write", json!({"file_path": "src/.gitattributes"})).is_some());
         assert!(decide("Write", json!({"file_path": "crates/x/.clippy.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": format!("{ROOT}/src/../x.rs")})).is_some());
         assert_eq!(decide("TaskCreate", json!({"subject": "x"})), None);

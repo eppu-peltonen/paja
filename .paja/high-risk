@@ -22,3 +22,4 @@ crates/paja/Cargo.toml
 Cargo.toml
 build.rs
 crates/paja/src/ahjo.rs
+.gitattributes

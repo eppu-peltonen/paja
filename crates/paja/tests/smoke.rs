@@ -893,6 +893,17 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
 }
 
 #[test]
+fn checks_that_change_the_worktree_fail_and_are_put_back() {
+    // Branch code run by the checks must not leave files or commits for the reviewer to miss.
+    let f = Factory::new("touch stray.txt\n", "land");
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(!f.gh_log().contains("pr create"));
+    let log = std::fs::read_to_string(f.home.join("events.jsonl")).unwrap();
+    assert!(log.contains("changed the worktree or its commits"), "{log}");
+}
+
+#[test]
 fn checks_that_change_git_configuration_stop_the_run() {
     // Branch code run by the checks could plant a credential helper for Mestari's own git.
     let f = Factory::new("git config paja.planted yes\n", "land");
