@@ -1677,6 +1677,9 @@ impl GitGuard {
         // The repository's hooks, and wherever the owner's `core.hooksPath` points: gh runs
         // git without Paja's overrides.
         let mut hooks = vec![common.join("hooks")];
+        // A relative path in the configuration is relative to where git runs: gh runs it in the
+        // main checkout, next to the shared git directory, not in this worktree.
+        let main_checkout = common.parent().unwrap_or(&common).to_path_buf();
         // Asked without Paja's own override, which would answer `/dev/null`. Reading the
         // configuration runs no hook.
         let owner_hooks = Command::new("git")
@@ -1689,9 +1692,6 @@ impl GitGuard {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
         if !owner_hooks.is_empty() {
-            // A relative path is relative to where git runs: gh runs it in the main checkout,
-            // next to the shared git directory, not in this worktree.
-            let main_checkout = common.parent().unwrap_or(&common).to_path_buf();
             hooks.push(main_checkout.join(owner_hooks));
         }
         // The owner's global configuration, which Mestari's own git reads.
@@ -1753,8 +1753,14 @@ impl GitGuard {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
         if !attributes.is_empty() {
-            guard.files.push(worktree.join(&attributes));
-            guard.raw.push(worktree.join(attributes));
+            // Mestari's own git reads a relative one here, gh's in the main checkout.
+            for base in [worktree, main_checkout.as_path()] {
+                let path = base.join(&attributes);
+                if !guard.files.contains(&path) {
+                    guard.files.push(path.clone());
+                    guard.raw.push(path);
+                }
+            }
         }
         // Every file git reads configuration from here, includes and the system file among
         // them, and every file an include names, read or not: one that doesn't exist yet
@@ -1969,6 +1975,51 @@ mod tests {
         let line = shown_line("Fix\r\x1b[2Kpaja: landed #5\nnext\u{2028}\u{202E}x\u{2067}y");
         assert!(!line.chars().any(unsafe_on_a_terminal), "{line:?}");
         assert!(shown_line(&"x".repeat(1000)).chars().count() <= 303);
+    }
+
+    #[test]
+    fn guard_watches_a_relative_attributes_file_in_the_main_checkout() {
+        let dir = std::env::temp_dir().join(format!("paja-attributes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", tail(&out));
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.name=paja",
+            "-c",
+            "user.email=paja@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ]);
+        let worktree = dir.join("work");
+        run(&["worktree", "add", "-q", worktree.to_str().unwrap()]);
+        run(&["config", "core.attributesFile", "attrs"]);
+        std::fs::write(main.join("attrs"), "").unwrap();
+        std::fs::write(worktree.join("attrs"), "").unwrap();
+        let guard = GitGuard::new(&worktree).unwrap();
+        let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+        let watched: Vec<_> = guard.raw.iter().filter_map(|p| canonical(p)).collect();
+        for expected in [main.join("attrs"), worktree.join("attrs")] {
+            assert!(
+                watched.contains(&canonical(&expected).unwrap()),
+                "{} not in {watched:?}",
+                expected.display()
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
