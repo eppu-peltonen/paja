@@ -94,6 +94,12 @@ fn claude_program() -> String {
     std::env::var("PAJA_CLAUDE").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// Tell the person watching what `paja run` is doing now: one line on stderr, so stdout keeps
+/// its one JSON value per item. A long step says so, since silence reads as broken.
+pub fn progress(message: &str) {
+    eprintln!("paja: {message}");
+}
+
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let repo = std::path::absolute(opts.repo)?;
@@ -130,10 +136,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         "fetching origin/main; check the network and that `origin` is the GitHub repository",
     )?;
     let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    progress("checking the queue (issues labelled paja)");
     jono::sync(home, &repo)?;
     let Some(item) = jono::claim(home)? else {
         return Ok(RunReport::Idle);
     };
+    progress(&format!("picked #{}: {}", item.number, item.title));
     // Anything that goes wrong from here is reported on the issue, not lost.
     let mut rounds = 0;
     match run_item(home, &repo, &base, &item, &mut rounds) {
@@ -162,6 +170,10 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 )?;
                 return Err(err);
             }
+            progress(&format!(
+                "#{} stopped on an error and was parked; see the question on the issue",
+                item.number
+            ));
             let _ = comment(&repo, &item, &question);
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
@@ -199,8 +211,12 @@ fn run_item(
     let mut feedback = String::new();
     let mut prior: Option<Prior> = None;
     let mut follow_ups: Vec<String> = Vec::new();
+    progress(&format!("working in {}", env.path.display()));
     for round in 1..=MAX_ROUNDS {
         *rounds = round;
+        progress(&format!(
+            "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
+        ));
         build(home, &env, item, base, &feedback)?;
         commit_leftovers(&env, item)?;
         if git(
@@ -209,6 +225,7 @@ fn run_item(
         )? == "0"
         {
             feedback = "The previous round made no commits. Make the change and commit it.".into();
+            progress("the builder committed nothing; asking again");
             record_round(home, item, round, "no_change", &feedback)?;
             continue;
         }
@@ -219,12 +236,17 @@ fn run_item(
                     "The previous round made no new commits. Fix these blockers and commit:\n\n{}",
                     prior.blockers
                 );
+                progress("the builder committed no fix; asking again");
                 record_round(home, item, round, "no_change", &feedback)?;
                 continue;
             }
         }
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
         let guard = GitGuard::new(&env.path)?;
+        progress(&format!(
+            "running Vasara's checks ({} commands)",
+            checks.len()
+        ));
         let result = run_checks(&env.path, &checks);
         guard.check("Vasara's checks")?;
         // The checks run the branch's code, which could change the tree or even commit. Put it
@@ -257,6 +279,7 @@ fn run_item(
                     prior.blockers
                 ));
             }
+            progress("the checks failed; sending the failure back to the builder");
             record_round(home, item, round, "checks_failed", &failure)?;
             continue;
         }
@@ -296,7 +319,18 @@ fn run_item(
         let reviews = (0..reviewers)
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
-            .map(|_| review(home, &env, item, base, prior.as_ref().filter(|_| !risky)))
+            .map(|i| {
+                progress(&format!(
+                    "checks passed; reviewer {} of {reviewers} is reading the change{}",
+                    i + 1,
+                    if risky {
+                        " (high risk: two must agree)"
+                    } else {
+                        ""
+                    }
+                ));
+                review(home, &env, item, base, prior.as_ref().filter(|_| !risky))
+            })
             .collect::<Result<Vec<_>>>()?;
         // Only the round that lands files its follow-ups: an earlier round's may be about code
         // the fix has since changed.
@@ -309,6 +343,7 @@ fn run_item(
             }
         }
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
+        progress(&format!("review verdict: {}", verdicts.join(", ")));
         record_round(home, item, round, &verdicts.join(","), &summaries(&reviews))?;
 
         if let Some(esc) = reviews.iter().find(|r| r.verdict == "escalate") {
@@ -1259,6 +1294,7 @@ fn land(
         )?,
     };
     // CI must be green before landing; a red CI is a failed check, not a merge.
+    progress(&format!("opened {pr}; waiting for CI"));
     if let Err(err) = wait_for_ci(repo, &pr) {
         let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
         return escalated(home, repo, env, item, &question, rounds);
@@ -1268,6 +1304,7 @@ fn land(
     ahjo::remove(home, &env.name, true)?;
     run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
         .with_context(|| format!("{gh} pr merge {pr}"))?;
+    progress(&format!("landed #{} ({pr})", item.number));
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, item.number, Status::Landed, Some(&pr));
     let _ = record(
@@ -1290,6 +1327,10 @@ fn escalated(
     question: &str,
     rounds: u32,
 ) -> Result<RunReport> {
+    progress(&format!(
+        "#{} needs a decision; asked on the issue (answer there, then `paja work set {} queued`)",
+        item.number, item.number
+    ));
     // The branch keeps the work; the worktree and its ports are freed.
     let _ = ahjo::remove(home, &env.name, true);
     escalate(home, repo, item, question, rounds)?;

@@ -285,10 +285,16 @@ fn run(cli: &Cli) -> Result<()> {
                         emit(cli, json!({ "error": format!("{err:#}") }), || {
                             format!("error: {err:#}")
                         });
+                        mestari::progress("that pass failed; Paja keeps going");
                         true
                     }
                 };
                 if idle {
+                    mestari::progress(&format!(
+                        "nothing to do right now; checking again in {minutes} minute{} (Ctrl+C \
+                         stops)",
+                        if *minutes == 1 { "" } else { "s" }
+                    ));
                     std::thread::sleep(std::time::Duration::from_secs(minutes.saturating_mul(60)));
                 }
             }

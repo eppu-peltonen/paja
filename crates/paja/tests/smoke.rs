@@ -851,6 +851,35 @@ fn run_builds_reviews_and_lands_an_issue() {
 }
 
 #[test]
+fn run_says_what_it_is_doing_on_stderr() {
+    // Building takes minutes; a silent run reads as a broken one. Stdout stays one JSON value.
+    let f = Factory::new("true\n", "land");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for step in [
+        "picked #5: Add a feature file",
+        "round 1 of 3: Claude is building the change",
+        "running Vasara's checks",
+        "reviewer 1 of 1 is reading the change",
+        "review verdict: land",
+        "waiting for CI",
+        "landed #5",
+    ] {
+        assert!(stderr.contains(step), "missing {step:?} in:\n{stderr}");
+    }
+}
+
+#[test]
 fn run_escalates_when_the_reviewer_asks_a_question() {
     let f = Factory::new("true\n", "escalate");
     let (ok, report) = f.run();
