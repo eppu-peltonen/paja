@@ -27,7 +27,8 @@ pub fn home_dir() -> Option<PathBuf> {
         .find(|p| p.is_absolute())
 }
 
-/// Where Claude Code reads managed (administrator) settings on this platform.
+/// Where Claude Code reads managed (administrator) settings on this platform. On Windows it
+/// reads files only, not the registry (checked against Claude Code's own lookup).
 pub fn managed_settings_dirs() -> Vec<PathBuf> {
     if cfg!(windows) {
         // Claude Code names these two literally; the environment's spelling is checked too, in
@@ -502,7 +503,8 @@ mod win {
         let refuse = |why: &str| {
             Error::other(format!(
                 "{} {why}, so another account could change what's in it; delete it and Paja \
-                 recreates it for this user only",
+                 recreates it for this user only (on a drive without permissions, such as FAT32 \
+                 or exFAT, set PAJA_HOME to a folder on an NTFS drive instead)",
                 dir.display()
             ))
         };
