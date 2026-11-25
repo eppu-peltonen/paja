@@ -48,6 +48,11 @@ enum Command {
         /// per item.
         #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
         every: Option<u64>,
+        /// After Paja stopped because git's configuration changed during a run: you have
+        /// checked and restored the files it named, and Paja may run git in this repository
+        /// again.
+        #[arg(long)]
+        tamper_checked: bool,
     },
     /// The deny-list hook Mestari runs agents under (Claude Code `PreToolUse`). Reads the
     /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow. Prints no
@@ -242,8 +247,18 @@ fn run(cli: &Cli) -> Result<()> {
                 );
             }
         },
-        Command::Run { repo, every } => loop {
-            let outcome = mestari::run_once(&home, mestari::RunOptions { repo });
+        Command::Run {
+            repo,
+            every,
+            tamper_checked,
+        } => loop {
+            let outcome = mestari::run_once(
+                &home,
+                mestari::RunOptions {
+                    repo,
+                    tamper_checked: *tamper_checked,
+                },
+            );
             let Some(minutes) = every else {
                 let report = outcome?;
                 emit(cli, serde_json::to_value(&report)?, || {

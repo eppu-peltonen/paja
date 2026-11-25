@@ -925,6 +925,16 @@ fn checks_that_change_git_configuration_stop_the_run() {
     assert!(!f.gh_log().contains("issue comment"), "{}", f.gh_log());
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
+    // Later runs run no git there until a person says the repository was checked.
+    let (ok, again) = f.run();
+    assert!(!ok, "{again}");
+    assert!(
+        again["error"]
+            .as_str()
+            .unwrap()
+            .contains("--tamper-checked"),
+        "{again}"
+    );
 }
 
 #[test]

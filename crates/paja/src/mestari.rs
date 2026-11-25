@@ -28,6 +28,10 @@ pub const EV_STARTED: &str = "run.started";
 pub const EV_ROUND: &str = "run.round";
 pub const EV_LANDED: &str = "run.landed";
 pub const EV_ESCALATED: &str = "run.escalated";
+/// Branch code changed git's configuration in `repo`; Paja runs no git there until a person
+/// has checked it and recorded [`EV_TAMPER_CHECKED`].
+pub const EV_TAMPERED: &str = "run.tampered";
+pub const EV_TAMPER_CHECKED: &str = "run.tamper_checked";
 
 /// How a run ended.
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +68,9 @@ pub struct Review {
 pub struct RunOptions<'a> {
     /// Any path inside the repository's main checkout.
     pub repo: &'a Path,
+    /// A person has checked the repository's git configuration after Paja stopped on
+    /// tampering, and Paja may run git there again.
+    pub tamper_checked: bool,
 }
 
 /// `claude`, or the program named by `PAJA_CLAUDE` (tests point it at a fake).
@@ -74,6 +81,25 @@ fn claude_program() -> String {
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let repo = std::path::absolute(opts.repo)?;
+    // A repository whose configuration was tampered with gets no git, not even a fetch, until
+    // a person says it was checked.
+    let key = repo.display().to_string();
+    if opts.tamper_checked {
+        record(home, EV_TAMPER_CHECKED, json!({ "repo": key }))?;
+    }
+    let last =
+        home.events().read_all()?.into_iter().rev().find(|e| {
+            (e.kind == EV_TAMPERED || e.kind == EV_TAMPER_CHECKED) && e.data["repo"] == key
+        });
+    if let Some(event) = last.filter(|e| e.kind == EV_TAMPERED) {
+        return Err(Tampered(format!(
+            "Paja stopped on {key} because git's configuration changed during a run ({}); it \
+             runs no git there until a person has checked and restored those files and runs \
+             `paja run --tamper-checked`",
+            event.data["error"].as_str().unwrap_or("see the event log")
+        ))
+        .into());
+    }
     git(&repo, &["fetch", "-q", "origin", "main"]).context(
         "fetching origin/main; check the network and that `origin` is the GitHub repository",
     )?;
@@ -102,6 +128,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
             if is_tampered(&err) {
                 // gh would run git in the repository to find it, and removing the environment
                 // runs git too; stop instead, loop included, and let the error tell the person.
+                // The event keeps later runs out until a person has checked.
+                record(
+                    home,
+                    EV_TAMPERED,
+                    json!({ "repo": key, "number": item.number, "error": format!("{err:#}") }),
+                )?;
                 return Err(err);
             }
             let _ = comment(&repo, &item, &question);
@@ -167,11 +199,7 @@ fn run_item(
             || hidden
             || !git(&env.path, &["status", "--porcelain"])?.is_empty();
         if moved {
-            git(
-                &env.path,
-                &["checkout", "-q", "-f", "-B", env.branch.as_str(), &checked],
-            )?;
-            git(&env.path, &["clean", "-q", "-f", "-d"])?;
+            put_back(&env, &checked)?;
             if let Ok(failure) = &mut failed {
                 failure.get_or_insert_with(|| {
                     "Running the checks changed the worktree or its commits; the change was put \
@@ -353,11 +381,7 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
     // A reviewer changes nothing, but the code its builds and tests run can (a lockfile, even
     // a commit). Put the branch back where the review started, so none of it lands unread.
     // Ignored files such as `target/` stay.
-    let reset = git(
-        &env.path,
-        &["checkout", "-q", "-f", "-B", env.branch.as_str(), &before],
-    )
-    .and_then(|_| git(&env.path, &["clean", "-q", "-f", "-d"]));
+    let reset = put_back(env, &before);
     let out = match (out, reset) {
         (Err(err), Err(reset)) => {
             return Err(err.context(format!("and resetting the worktree failed too: {reset:#}")))
@@ -563,6 +587,27 @@ fn git_status(repo: &Path) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Put the environment's branch, index and files back at `to` after code ran there. The
+/// index is rebuilt from scratch, so no file stays hidden behind an assume-unchanged or
+/// skip-worktree flag. Ignored files such as `target/` stay.
+fn put_back(env: &Env, to: &str) -> Result<()> {
+    let index = git(&env.path, &["rev-parse", "--git-path", "index"])?;
+    let index = env.path.join(index);
+    match std::fs::remove_file(&index) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("removing git's index {}", index.display()))
+        }
+    }
+    git(
+        &env.path,
+        &["checkout", "-q", "-f", "-B", env.branch.as_str(), to],
+    )?;
+    git(&env.path, &["clean", "-q", "-f", "-d"])?;
+    Ok(())
 }
 
 /// Put the environment's own branch back at `to` and drop every file made since, ignored
@@ -1010,16 +1055,6 @@ fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
 /// Run each check in the environment. Returns the first failure's command and output. The
 /// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
-    let home_dir = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|h| h.is_absolute());
-    let dir_of = |var: &str, default: &str| {
-        std::env::var_os(var)
-            .map(PathBuf::from)
-            .or_else(|| home_dir.as_ref().map(|h| h.join(default)))
-    };
-    let cargo_home = dir_of("CARGO_HOME", ".cargo");
-    let rustup_home = dir_of("RUSTUP_HOME", ".rustup");
     // Read before any check runs: later, the branch's code may have changed the configuration.
     let identity = git_identity(dir);
     let scratch = tempfile_dir(dir)?;
@@ -1028,16 +1063,8 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
             let mut cmd = Command::new("sh");
             cmd.args(["-c", check]).current_dir(dir);
             without_credentials(&mut cmd, &scratch, identity.clone());
-            // The checks don't need the owner's home either, and it holds credential files,
-            // such as the `.netrc` git reads on its own. Cargo and rustup keep their real
-            // directories, so cargo's own `credentials.toml` stays reachable.
-            cmd.env("HOME", &scratch);
-            if let Some(dir) = &cargo_home {
-                cmd.env("CARGO_HOME", dir);
-            }
-            if let Some(dir) = &rustup_home {
-                cmd.env("RUSTUP_HOME", dir);
-            }
+            // The checks keep the owner's HOME, as agents do: toolchain managers find cargo
+            // through it. Credential files there stay reachable until the sandbox.
             let output = cmd
                 .stdin(std::process::Stdio::null())
                 .output()
@@ -1392,7 +1419,6 @@ impl GitGuard {
                 own.join("config.worktree"),
                 common.join("info/attributes"),
                 common.join("info/grafts"),
-                common.join("shallow"),
                 worktree.join(".git"),
                 own.join("commondir"),
                 own.join("gitdir"),
@@ -1455,13 +1481,14 @@ impl GitGuard {
             &[
                 "config",
                 "--path",
+                "--null",
                 "--get-regexp",
                 r"^include(if\..*)?\.path$",
             ],
         )
         .unwrap_or_default();
-        for line in includes.lines() {
-            if let Some((_, file)) = line.split_once(' ') {
+        for entry in includes.split('\0') {
+            if let Some((_, file)) = entry.split_once('\n') {
                 let path = PathBuf::from(file);
                 // A relative include is relative to the file that names it: the repository's
                 // config or the owner's global one, so watch it against both.

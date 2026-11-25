@@ -66,7 +66,7 @@ environment `work-<issue>` from `main` (resuming the branch an earlier run kept)
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
 2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
-   check run that changed the worktree or its commits, which are put back first.
+   check run that changed the worktree, its index or its commits, which are put back first.
 3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
    answers `land`, `changes` or `escalate`. It may read, run cargo and use read-only git, and changes nothing. A change
    touching a path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
@@ -130,24 +130,26 @@ refuses to start the agent if not. The hook is a guardrail, not a sandbox: code 
 test`. Mestari takes away the easy ways that code could reach GitHub: agents run without GitHub or registry tokens, the
 SSH agent or askpass programs, with gh's login, git's global and system configuration and every credential helper
 switched off, and with the owner's commit name, email and global ignore file passed in instead. Vasara's checks run the
-same branch code, so they run with the same environment and a throwaway `HOME` as well (cargo keeps its real
-`CARGO_HOME`, so its registry token stays reachable). Agents keep the owner's `HOME`, which Claude Code needs to sign
-in, so code they run can still read credential files there (such as `.netrc`), and a token written into the remote's URL
-is not covered: closing those is the sandbox's job. That code could also change the git configuration, hooks or
-attributes the worktree shares with the repository, to make Mestari's own git run a program with Mestari's credentials.
-So Paja's own git never runs hooks or a file-system monitor, and no git Paja starts honours replacement refs or grafts,
-and Mestari snapshots those files, and the owner's global git configuration, before each agent and check run. Those
-files include every file git reads configuration from and the worktree's links to the repository. If they changed, it
-parks the item and stops with an error for the person (a `--every` loop included) without running git or gh there again,
-not even to clean up or comment on the issue. The hook's copy is checked again after each agent run, and a copy that
-changed counts as a run the hook never saw. Each phase takes its own snapshot, so a change made between phases (by a
-process the code left running, say) is not caught, nor is a relative include resolved against a file other than the
-repository's or the owner's main configuration. The guardrail's limit stays: code that runs as the owner can still
-change things none of these checks look at, and only the sandbox closes that. Reviewers run the hook with `--read-only`:
-no file edits, no `cargo fmt` without `--check` and no git command that changes the branch; after the review, the branch
-and worktree are put back where it started, whatever the code its builds ran did. Because no settings file loads, agents
-authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
-`apiKeyHelper` or provider settings.
+same branch code, so they run with the same environment. Agents and checks keep the owner's `HOME`, which Claude Code
+needs to sign in and toolchain managers use to find cargo, so code they run can still read credential files there (such
+as `.netrc` or cargo's `credentials.toml`), and a token written into the remote's URL is not covered: closing those is
+the sandbox's job. That code could also change the git configuration, hooks or attributes the worktree shares with the
+repository, to make Mestari's own git run a program with Mestari's credentials. So Paja's own git never runs hooks or a
+file-system monitor, and no git Paja starts honours replacement refs or grafts, and Mestari snapshots those files, and
+the owner's global git configuration, before each agent and check run. Those files include every file git reads
+configuration from and the worktree's links to the repository. If they changed, it parks the item, records
+`run.tampered` and stops with an error naming the changed files (a `--every` loop included) without running git or gh
+there again, not even to clean up or comment on the issue. Later runs on that repository refuse to start until a person
+has checked it and runs `paja run --tamper-checked`. Configuration files are compared by the entries git reads, leaving
+out `branch.*`, which ordinary git work writes; every other file byte for byte. The hook's copy is checked again after
+each agent run, and a copy that changed counts as a run the hook never saw. Each phase takes its own snapshot, so a
+change made between phases (by a process the code left running, say) is not caught, nor is a relative include resolved
+against a file other than the repository's or the owner's main configuration. The guardrail's limit stays: code that
+runs as the owner can still change things none of these checks look at, and only the sandbox closes that. Reviewers run
+the hook with `--read-only`: no file edits, no `cargo fmt` without `--check` and no git command that changes the branch;
+after the review, the branch and worktree are put back where it started, whatever the code its builds ran did. Because
+no settings file loads, agents authenticate the way `claude` does without one (a signed-in subscription or
+`ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider settings.
 
 ## MCP server
 
