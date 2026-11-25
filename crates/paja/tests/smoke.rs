@@ -906,11 +906,12 @@ fn checks_that_change_git_configuration_stop_the_run() {
         "{report}"
     );
     assert!(!f.gh_log().contains("pr create"));
-    // The item is parked and the person told, but Paja runs no more git there, not even to
-    // remove the environment.
+    // The item is parked, and the error tells the person; Paja runs no more git there, not
+    // even to remove the environment.
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "escalated");
-    assert!(f.gh_log().contains("issue comment"), "{}", f.gh_log());
+    // Not even gh, which runs git to find the repository.
+    assert!(!f.gh_log().contains("issue comment"), "{}", f.gh_log());
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
 }

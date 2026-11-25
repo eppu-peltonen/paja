@@ -99,11 +99,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 EV_ESCALATED,
                 json!({ "number": item.number, "rounds": rounds }),
             )?;
-            let _ = comment(&repo, &item, &question);
             if is_tampered(&err) {
-                // Removing the environment runs git; stop instead, loop included.
+                // gh would run git in the repository to find it, and removing the environment
+                // runs git too; stop instead, loop included, and let the error tell the person.
                 return Err(err);
             }
+            let _ = comment(&repo, &item, &question);
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
                 number: item.number,
@@ -334,6 +335,11 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
     ];
     let before = git(&env.path, &["rev-parse", "HEAD"])?;
     let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
+    let out = match out {
+        // No git at all now, not even to reset: a planted filter would run.
+        Err(err) if is_tampered(&err) => return Err(err),
+        out => out,
+    };
     // A reviewer changes nothing, but the code its builds and tests run can (a lockfile, even
     // a commit). Put the branch back where the review started, so none of it lands unread.
     // Ignored files such as `target/` stay.
@@ -343,7 +349,6 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
     )
     .and_then(|_| git(&env.path, &["clean", "-q", "-f", "-d"]));
     let out = match (out, reset) {
-        (Err(err), _) if is_tampered(&err) => return Err(err),
         (Err(err), Err(reset)) => {
             return Err(err.context(format!("and resetting the worktree failed too: {reset:#}")))
         }
@@ -491,7 +496,9 @@ fn git_identity(repo: &Path) -> Vec<(&'static str, String)> {
         let out = git_command()
             .arg("-C")
             .arg(repo)
-            .args(["config", "--path", key])
+            .args(["config"])
+            .args((key == "core.excludesFile").then_some("--path"))
+            .arg(key)
             .output()
             .ok()?;
         let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1280,16 +1287,43 @@ impl GitGuard {
             .chain(std::env::var_os("GIT_CONFIG_GLOBAL").map(PathBuf::from))
             .collect();
         let mut guard = GitGuard {
+            // The worktree's links to the repository too: rewriting them would point git at
+            // another configuration without touching these files.
             files: vec![
                 common.join("config"),
                 common.join("config.worktree"),
                 own.join("config.worktree"),
                 common.join("info/attributes"),
+                worktree.join(".git"),
+                own.join("commondir"),
+                own.join("gitdir"),
             ],
             hooks,
             snapshot: Vec::new(),
         };
         guard.files.extend(global);
+        // Every file git reads configuration from here, includes and the system file among
+        // them.
+        let origins = git(
+            worktree,
+            &["config", "--list", "--show-origin", "--name-only"],
+        )?;
+        for line in origins.lines() {
+            if let Some(file) = line
+                .strip_prefix("file:")
+                .and_then(|l| l.split('\t').next())
+            {
+                let path = Path::new(file);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    worktree.join(path)
+                };
+                if !guard.files.contains(&path) {
+                    guard.files.push(path);
+                }
+            }
+        }
         guard.snapshot = guard.read();
         Ok(guard)
     }
