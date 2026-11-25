@@ -97,7 +97,8 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   tools included, is blocked. Subagents run in the same worktree in the foreground, under the same hook; one with
   `isolation` or `run_in_background` is blocked, since Claude Code would make its worktree without a call to judge.
 - **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
-  `cd` to the worktree's root as a step of its own, then `cargo`, local `git` and `pwd` commands joined by `&&`, each
+  `cd` to the worktree's root as a step of its own (an absolute path with no `.` or `..` parts, since bash's `cd`
+  drops `..` as text before following links), then `cargo`, local `git` and `pwd` commands joined by `&&`, each
   optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading `~`
   or `=`, redirections other than `2>&1`, or other separators outside single quotes. Only `RUST_BACKTRACE` and
   `RUST_LOG` may be set in front of a command.

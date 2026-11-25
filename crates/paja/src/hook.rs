@@ -746,14 +746,18 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
         "git" => check_git(args, here, b),
         "pwd" if args.is_empty() => None,
         // Only into the worktree's root, and only as a step of its own, so a failed `cd`
-        // stops the rest.
+        // stops the rest. No `.` or `..` parts: bash's `cd` drops `..` as text before it
+        // follows links, so `link/..` would land beside the link, not where `resolve` says.
         "cd" if first => match args {
             [target]
-                if crate::platform::path_problem(
-                    &crate::platform::shell_path(target).to_string_lossy(),
-                    false,
-                )
-                .is_none()
+                if !target
+                    .split(['/', '\\'])
+                    .any(|part| part == "." || part == "..")
+                    && crate::platform::path_problem(
+                        &crate::platform::shell_path(target).to_string_lossy(),
+                        false,
+                    )
+                    .is_none()
                     && crate::platform::shell_path(target).is_absolute()
                     && resolve(&crate::platform::shell_path(target)) == b.root =>
             {
@@ -1435,6 +1439,40 @@ mod tests {
     }
 
     #[test]
+    fn cd_takes_the_root_only_without_dot_parts() {
+        let tmp = std::env::temp_dir().join(format!("paja-hook-cd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("home/envs/a");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        // A link outside the worktree to a directory inside it: `resolve` reads `L/..` as the
+        // root, but bash's `cd` drops `..` first and lands in the link's own parent.
+        std::os::unix::fs::symlink(root.join("sub"), tmp.join("L")).unwrap();
+        let b = Bounds::new(Some(root.clone()), Some(tmp.join("home"))).unwrap();
+        let bash = |command: String| {
+            let input = HookInput {
+                tool_name: "Bash".into(),
+                tool_input: json!({ "command": command }),
+                cwd: root.clone(),
+            };
+            check(&input, &b).unwrap()
+        };
+        let root = b.root.display().to_string();
+        let link = tmp.join("L").display().to_string();
+        for blocked in [
+            format!("cd {root}/sub/.. && git status"),
+            format!("cd {link}/.."),
+            format!("cd {link}/.. && git status"),
+            format!("cd {root}/. && git status"),
+            format!("cd {root}/./ && git status"),
+        ] {
+            assert!(bash(blocked.clone()).is_some(), "{blocked} was allowed");
+        }
+        assert_eq!(bash(format!("cd {root} && git status")), None);
+        assert_eq!(bash(format!("cd {root}/ && git status")), None);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     fn the_boundary_is_the_root_not_where_the_shell_moved() {
         let input = HookInput {
             tool_name: "Write".into(),
@@ -1641,6 +1679,15 @@ mod windows_tests {
         let msys = format!("/{drive}{}", windows[2..].replace('\\', "/"));
         assert_eq!(e.bash(&format!("cd {msys} && cargo test")), None);
         assert!(e.bash("cd C:\\Windows && cargo test").is_some());
+        // `.` and `..` parts are refused in either spelling, even when they lead to the root.
+        assert!(e
+            .bash(&format!("cd '{windows}\\src\\..' && cargo test"))
+            .is_some());
+        assert!(e.bash(&format!("cd {msys}/src/.. && cargo test")).is_some());
+        assert!(e
+            .bash(&format!("cd '{windows}\\.' && cargo test"))
+            .is_some());
+        assert_eq!(e.bash(&format!("cd '{windows}\\' && cargo test")), None);
         assert!(e.bash("cd /c/Windows && cargo test").is_some());
         // The advice can be followed as given: a plain, quoted path, no `\\?\`.
         let why = e.bash("cd /c/Windows && cargo test").unwrap();
