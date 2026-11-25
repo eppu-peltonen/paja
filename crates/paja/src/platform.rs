@@ -7,22 +7,24 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-/// The owner's home directory: `HOME`, or on Windows `USERPROFILE` when `HOME` is unset (Git
-/// for Windows reads them in the same order).
+/// The owner's home directory, as git finds it: `HOME`, and on Windows, when that is unset or
+/// Unix-style (`/c/Users/me` isn't absolute there), `HOMEDRIVE` plus `HOMEPATH`, then
+/// `USERPROFILE`. On Unix any non-empty `HOME` counts, as it does for git.
 pub fn home_dir() -> Option<PathBuf> {
-    // A Unix-style HOME such as `/c/Users/me` isn't absolute on Windows: skip it.
-    let var = |name: &str| {
-        std::env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|v| v.is_absolute())
-    };
-    var("HOME").or_else(|| {
-        if cfg!(windows) {
-            var("USERPROFILE")
-        } else {
-            None
-        }
-    })
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    if !cfg!(windows) {
+        return var("HOME").map(PathBuf::from);
+    }
+    let drive_path = var("HOMEDRIVE").zip(var("HOMEPATH")).map(|(drive, path)| {
+        let mut joined = drive;
+        joined.push(path);
+        joined
+    });
+    [var("HOME"), drive_path, var("USERPROFILE")]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .find(|p| p.is_absolute())
 }
 
 /// Where Claude Code reads managed (administrator) settings on this platform.
@@ -32,7 +34,10 @@ pub fn managed_settings_dirs() -> Vec<PathBuf> {
             std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
         vec![
             PathBuf::from(program_files).join("ClaudeCode"),
-            PathBuf::from(r"C:\ProgramData\ClaudeCode"),
+            PathBuf::from(
+                std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()),
+            )
+            .join("ClaudeCode"),
         ]
     } else {
         vec![
@@ -52,15 +57,20 @@ pub fn running_exe() -> std::io::Result<PathBuf> {
     std::env::current_exe()
 }
 
-/// Set `path`'s modification time to now, ignoring failure. On Unix the file is opened
-/// read-only, since a running binary can't be opened for writing; Windows needs write access
-/// to change the time, and allows it on a running binary.
+/// Set `path`'s modification time to now, ignoring failure. The file may be a running binary,
+/// which can't be opened for writing: Unix opens it read-only, Windows asks only for the right
+/// to change its attributes.
 pub fn touch(path: &Path) {
-    let file = if cfg!(windows) {
-        std::fs::OpenOptions::new().write(true).open(path)
-    } else {
-        std::fs::File::open(path)
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)
     };
+    #[cfg(not(windows))]
+    let file = std::fs::File::open(path);
     if let Ok(file) = file {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
@@ -122,15 +132,21 @@ fn posix_shell() -> Result<PathBuf> {
         }
     }
     candidates.extend(find_on_path("sh.exe"));
-    candidates.into_iter().find(|path| path.is_file()).context(
-        "Vasara's checks need a POSIX shell, and none was found: install Git for Windows \
+    // Only absolute paths: checks run in the worktree, where a relative one could name a shell
+    // the branch under review committed.
+    candidates
+        .into_iter()
+        .find(|path| path.is_absolute() && path.is_file())
+        .context(
+            "Vasara's checks need a POSIX shell, and none was found: install Git for Windows \
              (https://git-scm.com/downloads/win), which Claude Code on Windows needs too, or set \
              CLAUDE_CODE_GIT_BASH_PATH to its bash.exe",
-    )
+        )
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|path| path.is_file())
 }

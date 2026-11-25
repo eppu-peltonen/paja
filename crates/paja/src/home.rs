@@ -26,7 +26,8 @@ impl Home {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
             _ => {
                 let home = crate::platform::home_dir().context(
-                    "neither PAJA_HOME nor HOME (USERPROFILE on Windows) is set; set PAJA_HOME",
+                    "PAJA_HOME is unset and no home directory was found (HOME, or on Windows an \
+                     absolute HOME, HOMEDRIVE and HOMEPATH, or USERPROFILE); set PAJA_HOME",
                 )?;
                 home.join(".paja")
             }
