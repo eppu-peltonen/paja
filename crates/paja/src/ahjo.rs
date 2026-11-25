@@ -85,10 +85,12 @@ pub struct CreateOptions<'a> {
 
 pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     validate_name(opts.name)?;
+    // Under the lock, so a tamper stop recorded meanwhile is seen before any more git runs.
+    let lock = home.lock()?;
+    ensure_untampered(home, opts.repo)?;
     let repo = main_repo(opts.repo)?;
     let branch = format!("paja/{}", opts.name);
 
-    let lock = home.lock()?;
     let log = home.events();
     let envs = replay(&log.read_all()?)?;
     if envs.contains_key(opts.name) {
@@ -218,6 +220,9 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
         .path
         .to_str()
         .with_context(|| format!("environment path {} is not UTF-8", env.path.display()))?;
+    if env.repo.exists() {
+        ensure_untampered(home, &env.repo)?;
+    }
 
     if !env.repo.exists() {
         // git can't run against a repository that is gone; only the directory is left.
@@ -280,6 +285,71 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
         serde_json::to_value(Removed { name: name.into() })?,
     )?;
     Ok(env)
+}
+
+/// Branch code changed git's configuration in `repo`; Paja runs no git or gh there until a
+/// person has checked it and recorded [`EV_TAMPER_CHECKED`].
+pub const EV_TAMPERED: &str = "run.tampered";
+pub const EV_TAMPER_CHECKED: &str = "run.tamper_checked";
+
+/// The error Paja raises when git's configuration changed under it, or when a command is
+/// asked to run git or gh in a repository locked by [`EV_TAMPERED`]. Nothing may run git in
+/// that repository afterwards, not even to clean up, until a person has looked.
+#[derive(Debug)]
+pub struct Tampered(pub(crate) String);
+
+impl std::fmt::Display for Tampered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Tampered {}
+
+/// The key the tamper lock uses for the repository at any path inside it, however that path
+/// was spelled: its shared git directory, which rev-parse finds without running any program
+/// from the configuration.
+pub fn repo_key(path: &Path) -> Result<String> {
+    let common = git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .with_context(|| format!("finding the git repository at {}", path.display()))?;
+    Ok(std::fs::canonicalize(&common)
+        .unwrap_or_else(|_| PathBuf::from(&common))
+        .display()
+        .to_string())
+}
+
+/// Refuse with [`Tampered`] when the repository at `path` is locked: the log's last tamper
+/// event for it is [`EV_TAMPERED`]. Every command that runs git or gh in a repository calls
+/// this first. Returns the repository's key.
+pub fn ensure_untampered(home: &Home, path: &Path) -> Result<String> {
+    let key = repo_key(path)?;
+    let last =
+        home.events().read_all()?.into_iter().rev().find(|e| {
+            (e.kind == EV_TAMPERED || e.kind == EV_TAMPER_CHECKED) && e.data["repo"] == key
+        });
+    if let Some(event) = last.filter(|e| e.kind == EV_TAMPERED) {
+        return Err(Tampered(format!(
+            "Paja stopped on {key} because git's configuration changed during a run ({}); it \
+             runs no git or gh there until a person has checked and restored those files and \
+             runs `paja run --tamper-checked`",
+            event.data["error"].as_str().unwrap_or("see the event log")
+        ))
+        .into());
+    }
+    Ok(key)
+}
+
+/// A person has checked the repository at `path` after a tamper stop: record it, so Paja
+/// runs git and gh there again. Returns the repository's key.
+pub fn clear_tampered(home: &Home, path: &Path) -> Result<String> {
+    let key = repo_key(path)?;
+    let lock = home.lock()?;
+    home.events()
+        .append(&lock, EV_TAMPER_CHECKED, serde_json::json!({ "repo": key }))?;
+    Ok(key)
 }
 
 /// The main repository's top level for any path inside it, even from inside a linked

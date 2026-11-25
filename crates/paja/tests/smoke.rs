@@ -1115,6 +1115,28 @@ fn checks_that_change_git_configuration_stop_the_run() {
             .contains("--tamper-checked"),
         "{again}"
     );
+    // Nor do the other commands that run git or gh there.
+    let with_gh = [("PAJA_GH", f.gh.as_path())];
+    let sync_runs = || f.gh_log().matches("issue list").count();
+    let synced_before = sync_runs();
+    for args in [
+        &["work", "sync"][..],
+        &["env", "remove", "work-5", "--force"],
+        &["env", "create", "other"],
+    ] {
+        let (ok, refused) = paja_with(&f.home, &f.repo, args, &with_gh);
+        assert!(!ok, "{args:?}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("paja run --tamper-checked"),
+            "{args:?}: {refused}"
+        );
+    }
+    assert_eq!(sync_runs(), synced_before, "{}", f.gh_log());
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
     // A person's check opens it again: the run fetches and syncs as usual (the item itself
     // stays escalated, so the queue is empty).
     let (ok, checked) = paja_with(
@@ -1128,6 +1150,10 @@ fn checks_that_change_git_configuration_stop_the_run() {
     );
     assert!(ok, "{checked}");
     assert_eq!(checked["outcome"], "idle", "{checked}");
+    let (ok, synced) = paja_with(&f.home, &f.repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{synced}");
+    let (ok, removed) = paja(&f.home, &f.repo, &["env", "remove", "work-5", "--force"]);
+    assert!(ok, "{removed}");
 }
 
 #[test]

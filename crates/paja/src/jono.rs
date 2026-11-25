@@ -231,6 +231,8 @@ pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
             repo.display()
         );
     }
+    // gh runs git in the checkout to find its GitHub repository.
+    crate::ahjo::ensure_untampered(home, repo)?;
     let issues = fetch_issues(repo)?;
     apply(home, &issues)
 }
