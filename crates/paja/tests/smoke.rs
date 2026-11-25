@@ -750,7 +750,8 @@ impl Factory {
                  case \"$*\" in\n\
                  *--json-schema*) v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
-                 *) echo built >> feature.txt\n\
+                 *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\"}}'; exit 0; fi ;; esac\n\
+                 echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
@@ -1189,6 +1190,95 @@ fn a_second_review_judges_only_the_fix() {
         rereview.contains("Judge only the fix: `git diff "),
         "{args}"
     );
+}
+
+#[test]
+fn a_fix_round_resumes_the_builders_session_and_reviews_start_fresh() {
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(!builds[0].contains("--resume"), "{}", builds[0]);
+    assert!(builds[1].contains("--resume s-1"), "{}", builds[1]);
+    // Only the feedback goes to the resumed session, under the same safety flags.
+    assert!(
+        builds[1].starts_with("This is another round"),
+        "{}",
+        builds[1]
+    );
+    assert!(builds[1].contains("add more"), "{}", builds[1]);
+    assert!(
+        builds[1].contains("--setting-sources  --settings")
+            && builds[1].contains("--strict-mcp-config")
+            && builds[1].contains("--allowedTools"),
+        "{}",
+        builds[1]
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|c| c.contains("--json-schema"))
+            .all(|c| !c.contains("--resume")),
+        "{calls:?}"
+    );
+    // The resumed step records its own spend: Claude Code's running total comes off.
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let steps: Vec<Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .flat_map(|e| e["data"]["steps"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(steps[2]["step"], "build", "{steps:?}");
+    assert_eq!(steps[2]["resumed"], true, "{steps:?}");
+    assert_eq!(steps[2]["cost_usd"], 0.0, "{steps:?}");
+    assert_eq!(steps[0]["cost_usd"], 0.25, "{steps:?}");
+}
+
+#[test]
+fn a_resume_that_fails_starts_a_fresh_session() {
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    std::fs::write(f.tmp.path().join("resume-fails"), "").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("resuming the builder's session failed")
+            && stderr.contains("starting a fresh one"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 3, "{calls:?}");
+    // The fresh session gets the whole issue again, with the feedback.
+    assert!(
+        builds[2].starts_with("You are Paja's builder"),
+        "{}",
+        builds[2]
+    );
+    assert!(!builds[2].contains("--resume"), "{}", builds[2]);
+    assert!(builds[2].contains("add more"), "{}", builds[2]);
 }
 
 #[test]

@@ -65,6 +65,13 @@ of issues refuses to close anything rather than drop work it could not see.
 environment `work-<issue>` from `main` (resuming the branch an earlier run kept). Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
+   A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own
+   session from earlier in the same run with `--resume <session_id>` and sends only the feedback, so it keeps what it
+   learned and its earlier turns come from the prompt cache. It runs with the same flags and hook as any session. When
+   there is no session from this run (a new `paja run`, so a recreated environment too) or resuming fails, it starts a
+   fresh session with the whole issue and says so in a progress line. Reviewers never resume: each review is a fresh
+   session reading cold. A resumed step records `resumed: true` and only its own share of the session's running
+   `total_cost_usd` and `modelUsage`.
 2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
    fresh index, so the only assume-unchanged or skip-worktree flags left are the ones sparse checkout gives; a check

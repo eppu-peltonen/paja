@@ -102,6 +102,9 @@ pub struct StepUsage {
     pub num_turns: Option<u64>,
     pub duration_ms: Option<u64>,
     pub session_id: Option<String>,
+    /// The step resumed an earlier session of the same run (a builder's fix round).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
 }
 
 /// One model's share of a step, from Claude Code's `modelUsage`.
@@ -115,6 +118,44 @@ pub struct ModelUsage {
 }
 
 impl StepUsage {
+    /// This step's own share of a resumed session. Claude Code reports `total_cost_usd` and
+    /// `modelUsage` for the whole session so far, so the earlier result's values come off;
+    /// `usage` already counts only this run.
+    pub fn since(&self, earlier: &StepUsage) -> Self {
+        fn less<T: std::ops::Sub<Output = T> + PartialOrd + Copy>(
+            now: Option<T>,
+            before: Option<T>,
+        ) -> Option<T> {
+            match (now, before) {
+                (Some(now), Some(before)) if now >= before => Some(now - before),
+                // Unknown, or a total that went down: say unknown, never guess.
+                (Some(_), Some(_)) | (Some(_), None) | (None, _) => None,
+            }
+        }
+        let mut step = self.clone();
+        step.cost_usd = less(self.cost_usd, earlier.cost_usd);
+        for (name, used) in &mut step.models {
+            let before = earlier.models.get(name).cloned().unwrap_or(ModelUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                cache_read_input_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                cost_usd: Some(0.0),
+            });
+            used.input_tokens = less(used.input_tokens, before.input_tokens);
+            used.output_tokens = less(used.output_tokens, before.output_tokens);
+            used.cache_read_input_tokens =
+                less(used.cache_read_input_tokens, before.cache_read_input_tokens);
+            used.cache_creation_input_tokens = less(
+                used.cache_creation_input_tokens,
+                before.cache_creation_input_tokens,
+            );
+            used.cost_usd = less(used.cost_usd, before.cost_usd);
+        }
+        step.resumed = true;
+        step
+    }
+
     /// Read the usage fields from a `claude -p` JSON result.
     pub fn from_result(
         step: &str,
@@ -156,6 +197,7 @@ impl StepUsage {
             num_turns: result["num_turns"].as_u64(),
             duration_ms: result["duration_ms"].as_u64(),
             session_id: result["session_id"].as_str().map(str::to_string),
+            resumed: false,
         }
     }
 }
@@ -414,6 +456,10 @@ fn run_item(
     let mut feedback = String::new();
     let mut prior: Option<Prior> = None;
     let mut follow_ups: Vec<String> = Vec::new();
+    // The builder's last result in this run: its session is resumed for a fix round, and its
+    // running totals come off the next step's. Never kept across runs, so an environment made
+    // again (or a later `paja run`) always starts a fresh session.
+    let mut builder: Option<StepUsage> = None;
     progress(&format!("working in {}", env.path.display()));
     for round in 1..=MAX_ROUNDS {
         *rounds = round;
@@ -421,7 +467,18 @@ fn run_item(
             "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
         ));
         let role = if round == 1 { "build" } else { "fix" };
-        let mut steps = vec![build(home, &env, item, base, &feedback, &models, role)?];
+        let (step, raw) = build(
+            home,
+            &env,
+            item,
+            base,
+            &feedback,
+            &models,
+            role,
+            builder.as_ref(),
+        )?;
+        builder = Some(raw);
+        let mut steps = vec![step];
         commit_leftovers(&env, item)?;
         if git(
             &env.path,
@@ -673,6 +730,7 @@ fn review_role(risky: bool, reviewer: usize, fix_only: bool) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build(
     home: &Home,
     env: &Env,
@@ -681,7 +739,8 @@ fn build(
     feedback: &str,
     models: &Models,
     role: &str,
-) -> Result<StepUsage> {
+    resume: Option<&StepUsage>,
+) -> Result<(StepUsage, StepUsage)> {
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
@@ -694,10 +753,11 @@ fn build(
         title = item.title,
         body = item.body
     );
+    let again = format!(
+        "This is another round on the same branch (based on {base}). Address this first:\n\n{feedback}\n"
+    );
     if !feedback.is_empty() {
-        prompt.push_str(&format!(
-            "\nThis is another round on the same branch (based on {base}). Address this first:\n\n{feedback}\n"
-        ));
+        prompt.push_str(&format!("\n{again}"));
     }
     let tools = [
         "Read",
@@ -719,6 +779,28 @@ fn build(
         "Bash(wc *)",
         "Bash(pwd)",
     ];
+    // A fix round resumes the builder's own session, which keeps what it learned and, on a
+    // subscription, reads its earlier turns from the prompt cache. It gets only the feedback.
+    // Every other flag, the hook included, is the same as for a fresh session.
+    let session = resume.and_then(|earlier| earlier.session_id.as_deref());
+    if let (Some(id), false) = (session, feedback.is_empty()) {
+        let mut args = models.args(role);
+        args.extend(["--resume".to_string(), id.to_string()]);
+        match claude(home, env, base, &again, &tools, None, false, &args) {
+            Ok(out) => {
+                let raw = StepUsage::from_result("build", None, models, role, &out);
+                let step = resume.map_or_else(|| raw.clone(), |earlier| raw.since(earlier));
+                return Ok((step, raw));
+            }
+            Err(err) if err.chain().any(|e| e.is::<ClaudeFailed>()) => progress(&format!(
+                "resuming the builder's session failed ({}); starting a fresh one",
+                shown_line(&format!("{err:#}"))
+            )),
+            Err(err) => return Err(err),
+        }
+    } else if !feedback.is_empty() {
+        progress("no builder session to resume; starting a fresh one");
+    }
     let out = claude(
         home,
         env,
@@ -729,7 +811,8 @@ fn build(
         false,
         &models.args(role),
     )?;
-    Ok(StepUsage::from_result("build", None, models, role, &out))
+    let raw = StepUsage::from_result("build", None, models, role, &out);
+    Ok((raw.clone(), raw))
 }
 
 /// What a reviewer is asked. `checked` is the commit Vasara's checks passed at, which is the
@@ -876,6 +959,19 @@ fn agent_tools(read_only: bool) -> &'static str {
     }
 }
 
+/// Claude Code ran and exited with an error or reported one: nothing Paja itself refused, so a
+/// failed resume may be tried again as a fresh session.
+#[derive(Debug)]
+struct ClaudeFailed(String);
+
+impl std::fmt::Display for ClaudeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ClaudeFailed {}
+
 /// Run headless Claude Code in the environment and return its JSON result.
 #[allow(clippy::too_many_arguments)]
 fn claude(
@@ -994,16 +1090,21 @@ fn claude(
         )
     })?;
     if !output.status.success() {
-        bail!(
+        return Err(ClaudeFailed(format!(
             "`{program} -p` failed in {}: {}",
             env.path.display(),
             tail(&output)
-        );
+        ))
+        .into());
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("`{program} -p` printed something that is not JSON"))?;
     if value.get("is_error") == Some(&Value::Bool(true)) {
-        bail!("`{program} -p` reported an error: {}", value["result"]);
+        return Err(ClaudeFailed(format!(
+            "`{program} -p` reported an error: {}",
+            value["result"]
+        ))
+        .into());
     }
     Ok(value)
 }
@@ -2428,5 +2529,37 @@ mod tests {
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         assert!(prompt.contains("don't run `cargo fmt`, `cargo clippy` or the whole `cargo test`"));
         assert!(prompt.contains("`cargo test <name>`"));
+    }
+
+    #[test]
+    fn a_resumed_step_counts_only_its_own_spend() {
+        use super::{Models, StepUsage};
+        let none = Models::default();
+        let first = StepUsage::from_result(
+            "build",
+            None,
+            &none,
+            "build",
+            &serde_json::json!({"total_cost_usd": 0.5, "usage": {"input_tokens": 10},
+                "modelUsage": {"m": {"inputTokens": 10, "costUSD": 0.5}}}),
+        );
+        let later = StepUsage::from_result(
+            "build",
+            None,
+            &none,
+            "fix",
+            &serde_json::json!({"total_cost_usd": 0.75, "usage": {"input_tokens": 4},
+                "modelUsage": {"m": {"inputTokens": 14, "costUSD": 0.75}}}),
+        );
+        let step = later.since(&first);
+        assert!(step.resumed);
+        assert_eq!(step.cost_usd, Some(0.25));
+        // `usage` already counts only this run; `modelUsage` is the session's running total.
+        assert_eq!(step.input_tokens, Some(4));
+        assert_eq!(step.models["m"].input_tokens, Some(4));
+        assert_eq!(step.models["m"].cost_usd, Some(0.25));
+        // An earlier total that is unknown leaves this step's cost unknown, never a guess.
+        let unknown = StepUsage::from_result("build", None, &none, "build", &serde_json::json!({}));
+        assert_eq!(later.since(&unknown).cost_usd, None);
     }
 }
