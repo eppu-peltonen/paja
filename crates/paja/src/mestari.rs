@@ -251,6 +251,12 @@ fn run_item(
         if let Some(failure) = failed {
             feedback =
                 format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
+            if let Some(prior) = &prior {
+                feedback.push_str(&format!(
+                    "\n\nThe review's blockers still need fixing too:\n\n{}",
+                    prior.blockers
+                ));
+            }
             record_round(home, item, round, "checks_failed", &failure)?;
             continue;
         }
@@ -271,6 +277,22 @@ fn run_item(
             .filter(|path| !path.is_empty())
             .any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
+        // A fix that merged or rewrote history isn't a plain diff on what was reviewed: read it all.
+        if let Some(p) = &prior {
+            let plain = git(
+                &env.path,
+                &["merge-base", "--is-ancestor", &p.reviewed, "HEAD"],
+            )
+            .is_ok()
+                && git(
+                    &env.path,
+                    &["rev-list", "--merges", &format!("{}..HEAD", p.reviewed)],
+                )?
+                .is_empty();
+            if !plain {
+                prior = None;
+            }
+        }
         let reviews = (0..reviewers)
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
@@ -293,26 +315,25 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = land(home, repo, &env, item, round, &checked)?;
+            let report = land(home, repo, &env, item, round, &checked);
             match &report {
-                RunReport::Landed { pr, .. } => file_follow_ups(home, repo, item, pr, &follow_ups),
-                // Not landed after all (CI): keep the findings in the log, for later.
+                Ok(RunReport::Landed { pr, .. }) => {
+                    file_follow_ups(home, repo, item, pr, &follow_ups)
+                }
+                // Not landed after all: keep the findings in the log, for later.
                 _ => {
                     for finding in &follow_ups {
-                        let _ = record(
+                        record_follow_up(
                             home,
-                            EV_FOLLOW_UP,
-                            json!({
-                                "number": item.number,
-                                "finding": finding,
-                                "issue": null,
-                                "error": "not filed: the change did not land",
-                            }),
+                            item,
+                            finding,
+                            None,
+                            "not filed: the change did not land",
                         );
                     }
                 }
             }
-            return Ok(report);
+            return report;
         }
         if risky && verdicts.contains(&"land") {
             // High-risk reviewers must agree; a split is a question, not another round.
@@ -429,7 +450,8 @@ fn review(
         Some(prior) => format!(
             "An earlier review of this change (at {reviewed}) found these blockers:\n\n{blockers}\n\n\
              Judge only the fix: `git diff {reviewed}..HEAD`. Land it if it resolves those \
-             blockers and adds none; don't reopen what that review accepted. It also noted these \
+             blockers and adds none. That review read the whole change and named every blocker it \
+             found, so don't reopen the rest. It also noted these \
              follow-ups; repeat in your `follow_ups` the ones that still apply:\n\n{follow_ups}\n",
             reviewed = prior.reviewed,
             blockers = prior.blockers,
@@ -445,7 +467,8 @@ fn review(
          whether it lands.\n\n{scope} Judge it by the rules in CLAUDE.md as they are on main \
          (`git show {base}:CLAUDE.md`), not the branch's copy.\n\n\
          Verdicts: `land` if it does what the issue asks and has no blocker; `changes` only for \
-         blockers, each named in `comments`; `escalate` with a question only when the issue's \
+         blockers, naming every blocker in the whole diff in `comments` (a later review reads \
+         only the fix); `escalate` with a question only when the issue's \
          intent is unclear or the change would weaken a check (a person must decide). A blocker \
          is a bug in what the issue asks for, a security hole the change opens, a broken \
          CLAUDE.md rule, or missing tests for the new behaviour. Anything else, including \
@@ -1318,7 +1341,18 @@ const MAX_FOLLOW_UPS: usize = 5;
 /// landed. A failure here is recorded, never turned into an escalation: the change is already
 /// merged.
 fn file_follow_ups(home: &Home, repo: &Path, item: &WorkItem, pr: &str, findings: &[String]) {
-    let mut findings: Vec<String> = findings.to_vec();
+    // Review text came from an agent that read untrusted code: keep each finding short, and
+    // never let it mention anyone.
+    let mut findings: Vec<String> = findings
+        .iter()
+        .map(|finding| {
+            let mut text: String = finding.chars().take(4000).collect();
+            if text.len() < finding.len() {
+                text.push_str("\n\n(cut short)");
+            }
+            text.replace('@', "@\u{200b}")
+        })
+        .collect();
     if findings.len() > MAX_FOLLOW_UPS {
         let rest = findings.split_off(MAX_FOLLOW_UPS - 1);
         findings.push(format!(
@@ -1328,8 +1362,6 @@ fn file_follow_ups(home: &Home, repo: &Path, item: &WorkItem, pr: &str, findings
         ));
     }
     for finding in &findings {
-        // Review text came from an agent that read untrusted code; keep each issue short.
-        let finding: String = finding.chars().take(4000).collect();
         let title: String = finding
             .lines()
             .map(|line| {
@@ -1360,17 +1392,34 @@ fn file_follow_ups(home: &Home, repo: &Path, item: &WorkItem, pr: &str, findings
                 &body,
             ],
         );
-        let _ = record(
-            home,
-            EV_FOLLOW_UP,
-            json!({
-                "number": item.number,
-                "title": title,
-                "issue": filed.as_ref().ok(),
-                "error": filed.as_ref().err().map(|e| format!("{e:#}")),
-            }),
-        );
+        match &filed {
+            Ok(issue) => record_follow_up(home, item, finding, Some(issue.as_str()), ""),
+            Err(err) => record_follow_up(
+                home,
+                item,
+                finding,
+                None,
+                &format!(
+                    "{err:#}; if the label is missing, create it with `gh label create \
+                     {FOLLOW_UP_LABEL}` and file this finding by hand"
+                ),
+            ),
+        }
     }
+}
+
+/// Keep a follow-up in the log, filed or not, so no finding is lost.
+fn record_follow_up(home: &Home, item: &WorkItem, finding: &str, issue: Option<&str>, error: &str) {
+    let _ = record(
+        home,
+        EV_FOLLOW_UP,
+        json!({
+            "number": item.number,
+            "finding": finding,
+            "issue": issue,
+            "error": (!error.is_empty()).then_some(error),
+        }),
+    );
 }
 
 /// Ask the person on the issue.

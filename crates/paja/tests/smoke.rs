@@ -898,6 +898,12 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     assert_eq!(item["status"], "escalated", "never left active");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]), "the worktree is freed");
+    // The reviewer's follow-up isn't filed, but it isn't lost either.
+    let log = std::fs::read_to_string(f.home.join("events.jsonl")).unwrap();
+    assert!(
+        log.contains("run.follow_up") && log.contains("not filed: the change did not land"),
+        "{log}"
+    );
 }
 
 #[test]

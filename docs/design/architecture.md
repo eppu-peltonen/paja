@@ -79,7 +79,7 @@ On `land`, Mestari pushes the exact commit the checks and reviewers judged as th
 for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
-recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`. `paja run --every 5` keeps going, checking an
+recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `paja run --every 5` keeps going, checking an
 empty queue every five minutes.
 
 ## The deny-list hook
