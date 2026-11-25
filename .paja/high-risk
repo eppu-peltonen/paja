@@ -1,8 +1,26 @@
 # Path prefixes that make a change high risk: two independent reviewers must agree.
 # Read from main, never from the branch under review.
+# An entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches at any depth, in any
+# letter case.
 crates/paja/src/events.rs
 crates/paja/src/mestari.rs
+crates/paja/src/hook.rs
+crates/paja/src/main.rs
 .paja/
 evals/
 CLAUDE.md
 .github/
+.claude/
+.cargo/
+rust-toolchain
+rustfmt.toml
+.rustfmt.toml
+clippy.toml
+.clippy.toml
+crates/paja/src/lib.rs
+crates/paja/Cargo.toml
+Cargo.toml
+build.rs
+crates/paja/src/ahjo.rs
+.gitattributes
+Cargo.lock

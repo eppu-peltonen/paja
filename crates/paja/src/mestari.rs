@@ -28,6 +28,10 @@ pub const EV_STARTED: &str = "run.started";
 pub const EV_ROUND: &str = "run.round";
 pub const EV_LANDED: &str = "run.landed";
 pub const EV_ESCALATED: &str = "run.escalated";
+/// Branch code changed git's configuration in `repo`; Paja runs no git there until a person
+/// has checked it and recorded [`EV_TAMPER_CHECKED`].
+pub const EV_TAMPERED: &str = "run.tampered";
+pub const EV_TAMPER_CHECKED: &str = "run.tamper_checked";
 
 /// How a run ended.
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +68,9 @@ pub struct Review {
 pub struct RunOptions<'a> {
     /// Any path inside the repository's main checkout.
     pub repo: &'a Path,
+    /// A person has checked the repository's git configuration after Paja stopped on
+    /// tampering, and Paja may run git there again.
+    pub tamper_checked: bool,
 }
 
 /// `claude`, or the program named by `PAJA_CLAUDE` (tests point it at a fake).
@@ -74,6 +81,35 @@ fn claude_program() -> String {
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let repo = std::path::absolute(opts.repo)?;
+    // A repository whose configuration was tampered with gets no git, not even a fetch, until
+    // a person says it was checked.
+    // One key per repository, however its path was spelled: the shared git directory, which
+    // rev-parse finds without running any program from the configuration.
+    let common = git(
+        &repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .with_context(|| format!("finding the git repository at {}", repo.display()))?;
+    let key = std::fs::canonicalize(&common)
+        .unwrap_or_else(|_| PathBuf::from(&common))
+        .display()
+        .to_string();
+    if opts.tamper_checked {
+        record(home, EV_TAMPER_CHECKED, json!({ "repo": key }))?;
+    }
+    let last =
+        home.events().read_all()?.into_iter().rev().find(|e| {
+            (e.kind == EV_TAMPERED || e.kind == EV_TAMPER_CHECKED) && e.data["repo"] == key
+        });
+    if let Some(event) = last.filter(|e| e.kind == EV_TAMPERED) {
+        return Err(Tampered(format!(
+            "Paja stopped on {key} because git's configuration changed during a run ({}); it \
+             runs no git there until a person has checked and restored those files and runs \
+             `paja run --tamper-checked`",
+            event.data["error"].as_str().unwrap_or("see the event log")
+        ))
+        .into());
+    }
     git(&repo, &["fetch", "-q", "origin", "main"]).context(
         "fetching origin/main; check the network and that `origin` is the GitHub repository",
     )?;
@@ -99,6 +135,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 EV_ESCALATED,
                 json!({ "number": item.number, "rounds": rounds }),
             )?;
+            if is_tampered(&err) {
+                // gh would run git in the repository to find it, and removing the environment
+                // runs git too; stop instead, loop included, and let the error tell the person.
+                // The event keeps later runs out until a person has checked.
+                record(
+                    home,
+                    EV_TAMPERED,
+                    json!({ "repo": key, "number": item.number, "error": format!("{err:#}") }),
+                )?;
+                return Err(err);
+            }
             let _ = comment(&repo, &item, &question);
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
@@ -136,7 +183,7 @@ fn run_item(
     let mut feedback = String::new();
     for round in 1..=MAX_ROUNDS {
         *rounds = round;
-        build(&env, item, base, &feedback)?;
+        build(home, &env, item, base, &feedback)?;
         commit_leftovers(&env, item)?;
         if git(
             &env.path,
@@ -147,7 +194,32 @@ fn run_item(
             record_round(home, item, round, "no_change", &feedback)?;
             continue;
         }
-        if let Some(failure) = run_checks(&env.path, &checks)? {
+        let checked = git(&env.path, &["rev-parse", "HEAD"])?;
+        let guard = GitGuard::new(&env.path)?;
+        let result = run_checks(&env.path, &checks);
+        guard.check("Vasara's checks")?;
+        // The checks run the branch's code, which could change the tree or even commit. Put it
+        // back, and fail the round, so nothing lands that the checks didn't judge.
+        let mut failed = result;
+        // Files marked assume-unchanged or skip-worktree would hide from `git status`.
+        let hidden = git(&env.path, &["ls-files", "-v"])?
+            .lines()
+            .any(|line| line.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'));
+        let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
+            || hidden
+            || !git(&env.path, &["status", "--porcelain"])?.is_empty();
+        if moved {
+            put_back(&env, &checked)?;
+            if let Ok(failure) = &mut failed {
+                failure.get_or_insert_with(|| {
+                    "Running the checks changed the worktree or its commits; the change was put \
+                 back. Tests and builds must not write to the source tree or commit."
+                        .into()
+                });
+            }
+        }
+        let failed = failed?;
+        if let Some(failure) = failed {
             feedback =
                 format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
             record_round(home, item, round, "checks_failed", &failure)?;
@@ -160,17 +232,18 @@ fn run_item(
                 "diff",
                 "--name-only",
                 "--no-renames",
+                // NUL-separated paths are never quoted, whatever characters they hold.
+                "-z",
                 &format!("{base}...HEAD"),
             ],
         )?;
-        let risky = changed.lines().any(|path| {
-            high_risk
-                .iter()
-                .any(|prefix| path.starts_with(prefix.as_str()))
-        });
+        let risky = changed
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
         let reviews = (0..reviewers)
-            .map(|_| review(&env, item, base))
+            .map(|_| review(home, &env, item, base))
             .collect::<Result<Vec<_>>>()?;
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
         record_round(home, item, round, &verdicts.join(","), &summaries(&reviews))?;
@@ -179,7 +252,7 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            return land(home, repo, &env, item, round);
+            return land(home, repo, &env, item, round, &checked);
         }
         if risky && verdicts.contains(&"land") {
             // High-risk reviewers must agree; a split is a question, not another round.
@@ -227,12 +300,15 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
     )
 }
 
-fn build(env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<()> {
+fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<()> {
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
-         and commit your work on the current branch (never push, never switch branches). End the \
-         commit message with `Closes #{number}`.\n\nIssue #{number}: {title}\n\n{body}\n",
+         and commit your work on the current branch (never push, never switch branches). Commit \
+         with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
+         that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
+         only for cargo and local git, and Paja's deny-list hook blocks anything else (no `$(`, \
+         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`.\n\nIssue #{number}: {title}\n\n{body}\n",
         number = item.number,
         title = item.title,
         body = item.body
@@ -251,14 +327,21 @@ fn build(env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<()> {
         "Bash(cargo *)",
         "Bash(git add *)",
         "Bash(git commit *)",
+        "Bash(git rm *)",
         "Bash(git status*)",
         "Bash(git diff*)",
+        "Bash(git show*)",
         "Bash(git log*)",
+        "Bash(tail *)",
+        "Bash(head *)",
+        "Bash(grep *)",
+        "Bash(wc *)",
+        "Bash(pwd)",
     ];
-    claude(env, &prompt, &tools, None).map(|_| ())
+    claude(home, env, base, &prompt, &tools, None, false).map(|_| ())
 }
 
-fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
+fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
     let prompt = format!(
         "You are an independent reviewer for Paja. You did not write this change. Read it cold \
          and decide whether it lands.\n\nThe change is `git diff {base}...HEAD`. Judge it against \
@@ -266,7 +349,8 @@ fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
          not the branch's copy. Verdicts: `land` if it does what the issue asks, is correct and \
          tested, and breaks no rule; `changes` with concrete comments if it needs work; `escalate` \
          with a question only when the issue's intent is unclear or the change would weaken a check \
-         (a person must decide). Nits alone are not a reason for `changes`.\n\n\
+         (a person must decide). Nits alone are not a reason for `changes`. You may run cargo \
+         and read-only git; you can't change files.\n\n\
          Issue #{number}: {title}\n\n{body}\n",
         number = item.number,
         title = item.title,
@@ -286,11 +370,37 @@ fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
         "Read",
         "Glob",
         "Grep",
+        "Bash(cargo *)",
+        "Bash(git status*)",
         "Bash(git diff*)",
         "Bash(git log*)",
+        "Bash(tail *)",
+        "Bash(head *)",
+        "Bash(grep *)",
+        "Bash(wc *)",
+        "Bash(pwd)",
         "Bash(git show*)",
     ];
-    let out = claude(env, &prompt, &tools, Some(&schema))?;
+    let before = git(&env.path, &["rev-parse", "HEAD"])?;
+    let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
+    let out = match out {
+        // No git at all now, not even to reset: a planted filter would run.
+        Err(err) if is_tampered(&err) => return Err(err),
+        out => out,
+    };
+    // A reviewer changes nothing, but the code its builds and tests run can (a lockfile, even
+    // a commit). Put the branch back where the review started, so none of it lands unread.
+    // Ignored files such as `target/` stay.
+    let reset = put_back(env, &before);
+    let out = match (out, reset) {
+        (Err(err), Err(reset)) => {
+            return Err(err.context(format!("and resetting the worktree failed too: {reset:#}")))
+        }
+        (out, reset) => {
+            reset?;
+            out?
+        }
+    };
     let structured = out
         .get("structured_output")
         .cloned()
@@ -308,28 +418,104 @@ fn review(env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
 }
 
 /// Run headless Claude Code in the environment and return its JSON result.
-fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Result<Value> {
+fn claude(
+    home: &Home,
+    env: &Env,
+    base: &str,
+    prompt: &str,
+    tools: &[&str],
+    schema: Option<&Value>,
+    read_only: bool,
+) -> Result<Value> {
     let program = claude_program();
+    let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
+        Some(text) => format!("The project's CLAUDE.md, as it is on main:\n\n{text}"),
+        None => String::new(),
+    };
+    let git_identity = git_identity(&env.path);
+    let guard = GitGuard::new(&env.path)?;
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let scratch = tempfile_dir(&env.path)?;
+    let (settings, stamp, exe) = match hook_settings(&env.path, home, read_only) {
+        Ok(made) => made,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Err(err);
+        }
+    };
     let mut cmd = Command::new(&program);
-    cmd.current_dir(&env.path)
-        .env("PAJA_HOME", &scratch)
-        .args([
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-        ])
-        .arg("--allowedTools")
-        .args(tools);
+    cmd.current_dir(&env.path);
+    without_credentials(&mut cmd, &scratch, git_identity);
+    cmd.args([
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "acceptEdits",
+    ])
+    // No settings files at all, only the deny-list hook: neither the owner's settings nor
+    // a settings file on the branch can loosen or switch it off.
+    .args(["--setting-sources", "", "--settings", &settings])
+    // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
+    // main: the branch under review can't rewrite the rules its agents follow.
+    .args(["--append-system-prompt", &harness])
+    // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
+    .arg("--strict-mcp-config")
+    .arg("--allowedTools")
+    .args(tools);
     if let Some(schema) = schema {
         cmd.args(["--json-schema", &schema.to_string()]);
     }
+    let before = git_head(&env.path);
+    let status_before = git_status(&env.path);
     let output = cmd.stdin(std::process::Stdio::null()).output();
     let _ = std::fs::remove_dir_all(&scratch);
+    let hooked = stamp.exists();
+    let _ = std::fs::remove_file(&stamp);
+    if let Some(dir) = stamp.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    guard.check("the agent")?;
+    // Code the agent ran could also have swapped the hook's copy during the session.
+    let hooked = hooked && hook_copy_intact(&exe);
+    // A session that took more than one turn, or changed the worktree, used tools, so the hook
+    // must have run. If it didn't, something (such as an administrator's policy) switched it
+    // off and nothing the agent did can be trusted: throw it away, so a later run can't resume
+    // and land it.
+    let turns = output
+        .as_ref()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .and_then(|value| value["num_turns"].as_u64())
+        .unwrap_or(0);
+    if !hooked
+        && output.is_ok()
+        && (turns > 1 || changed_since(&env.path, before.as_deref(), status_before.as_deref()))
+    {
+        let fate = match before.as_deref() {
+            Some(before) => match discard(env, before) {
+                Ok(()) => "was discarded".to_string(),
+                Err(err) => format!(
+                    "could not be discarded ({err:#}); delete the branch {} before running it again",
+                    env.branch
+                ),
+            },
+            None => format!(
+                "is still on the branch {} (its starting commit was unknown); check or delete it \
+                 before running it again",
+                env.branch
+            ),
+        };
+        bail!(
+            "Claude Code never called Paja's deny-list hook during the agent's run in {}, or the \
+             hook's copy {} changed during it, so its work is not trusted and {fate}; check for \
+             settings that disable hooks (such as `disableAllHooks` in managed settings) and run \
+             again",
+            env.path.display(),
+            exe.display()
+        );
+    }
     let output =
         output.with_context(|| format!("running `{program}` (install Claude Code and sign in)"))?;
     if !output.status.success() {
@@ -347,18 +533,456 @@ fn claude(env: &Env, prompt: &str, tools: &[&str], schema: Option<&Value>) -> Re
     Ok(value)
 }
 
-fn tempfile_dir(near: &Path) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "paja-agent-{}-{}",
+/// The owner's commit name and email, and their global ignore file, which agents' git uses
+/// while git's global configuration is hidden from them.
+fn git_identity(repo: &Path) -> Vec<(&'static str, String)> {
+    let get = |key: &str| {
+        let out = git_command()
+            .arg("-C")
+            .arg(repo)
+            .args(["config"])
+            .args((key == "core.excludesFile").then_some("--path"))
+            .arg(key)
+            .output()
+            .ok()?;
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !value.is_empty()).then_some(value)
+    };
+    let mut vars = Vec::new();
+    if let Some(name) = get("user.name") {
+        vars.push(("GIT_AUTHOR_NAME", name.clone()));
+        vars.push(("GIT_COMMITTER_NAME", name));
+    }
+    if let Some(email) = get("user.email") {
+        vars.push(("GIT_AUTHOR_EMAIL", email.clone()));
+        vars.push(("GIT_COMMITTER_EMAIL", email));
+    }
+    // Without it, editor and system files the owner ignores everywhere would be committed.
+    // Mestari sets two config entries; when there is no ignore file, the second repeats the
+    // first, so git's own default ignore file still applies.
+    let (key, value) = match get("core.excludesFile") {
+        Some(file) => ("core.excludesFile", file),
+        None => ("credential.helper", String::new()),
+    };
+    vars.push(("GIT_CONFIG_KEY_1", key.into()));
+    vars.push(("GIT_CONFIG_VALUE_1", value));
+    vars
+}
+
+fn git_head(repo: &Path) -> Option<String> {
+    let out = git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Whether the worktree's HEAD or its uncommitted changes differ from before the run.
+fn changed_since(repo: &Path, head: Option<&str>, status: Option<&str>) -> bool {
+    git_head(repo).as_deref() != head || git_status(repo).as_deref() != status
+}
+
+/// `git status --porcelain`, to compare the worktree before and after an agent's run.
+fn git_status(repo: &Path) -> Option<String> {
+    let out = git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Put the environment's branch, index and files back at `to` after code ran there. The
+/// index is rebuilt from scratch, so no file stays hidden behind an assume-unchanged or
+/// skip-worktree flag. Ignored files such as `target/` stay.
+fn put_back(env: &Env, to: &str) -> Result<()> {
+    let index = git(&env.path, &["rev-parse", "--git-path", "index"])?;
+    let index = env.path.join(index);
+    match std::fs::remove_file(&index) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("removing git's index {}", index.display()))
+        }
+    }
+    git(
+        &env.path,
+        &["checkout", "-q", "-f", "-B", env.branch.as_str(), to],
+    )?;
+    git(&env.path, &["clean", "-q", "-f", "-d"])?;
+    Ok(())
+}
+
+/// Put the environment's own branch back at `to` and drop every file made since, ignored
+/// ones included, even if the agent switched branches.
+fn discard(env: &Env, to: &str) -> Result<()> {
+    for args in [
+        &["checkout", "-q", "-f", "-B", &env.branch, to][..],
+        &["clean", "-q", "-f", "-d", "-x"],
+    ] {
+        let status = git_command()
+            .arg("-C")
+            .arg(&env.path)
+            .args(args)
+            .status()
+            .context("running git")?;
+        if !status.success() {
+            bail!("`git {}` failed in {}", args.join(" "), env.path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Keeps stamp directory names unique within one process.
+static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
+/// Before handing them out, check that the hook really blocks a push and allows a build; an
+/// agent never starts under a hook that doesn't.
+fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf, PathBuf)> {
+    refuse_hook_policies()?;
+    let exe = hook_binary(home)?;
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "hook".into(),
+        "--root".into(),
+        root.as_os_str().to_owned(),
+        "--home".into(),
+        home.root().as_os_str().to_owned(),
+    ];
+    if read_only {
+        args.push("--read-only".into());
+    }
+    let (blocked, build) = crate::hook::self_test_inputs(root, read_only);
+    let (code, stderr) = run_hook_once(&exe, &args, &blocked)?;
+    let blocked = code == Some(2) && stderr.contains("Blocked by Paja's deny-list");
+    let (code, _) = run_hook_once(&exe, &args, &build)?;
+    if !blocked || code != Some(0) {
+        bail!(
+            "the deny-list hook {} failed its self-test (it must block `{}` and allow \
+             `cargo test`), so no agent will start; rebuild paja from main",
+            exe.display(),
+            if read_only { "git commit" } else { "git push" }
+        );
+    }
+    // The self-test leaves no stamp: the hook only gets `--stamp` from Claude Code. The stamp
+    // sits in a fresh directory only this user can enter, so nobody can plant it beforehand;
+    // creating the directory fails if the name is already taken.
+    let private = std::env::temp_dir().join(format!(
+        "paja-stamp-{}-{}-{}",
         std::process::id(),
-        crate::events::now_ms()
+        crate::events::now_ms(),
+        STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&dir).with_context(|| {
-        format!(
-            "creating a scratch home for the agent in {}",
-            near.display()
-        )
-    })?;
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .with_context(|| {
+                format!("creating the hook's stamp directory {}", private.display())
+            })?;
+    }
+    let stamp = private.join("stamp");
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails
+    // in any other way must block too.
+    let command = format!(
+        "{} hook --root {} --home {} --stamp {}{} || exit 2",
+        quote(&exe.to_string_lossy()),
+        quote(&root.to_string_lossy()),
+        quote(&home.root().to_string_lossy()),
+        quote(&stamp.to_string_lossy()),
+        if read_only { " --read-only" } else { "" }
+    );
+    // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
+    let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
+    let settings = json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{"type": "command", "command": command, "timeout": timeout}]
+            }]
+        }
+    })
+    .to_string();
+    Ok((settings, stamp, exe))
+}
+
+/// Managed (administrator) settings load whatever `--setting-sources` says, and two of their
+/// keys would silently drop Mestari's hook. Refuse to start agents on such a machine.
+fn refuse_hook_policies() -> Result<()> {
+    let mut paths = Vec::new();
+    for dir in [
+        "/etc/claude-code",
+        "/Library/Application Support/ClaudeCode",
+    ] {
+        let dir = Path::new(dir);
+        paths.push(dir.join("managed-settings.json"));
+        // Drop-in files next to it carry the same keys.
+        if let Ok(entries) = std::fs::read_dir(dir.join("managed-settings.d")) {
+            let mut drop_ins: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            drop_ins.sort();
+            paths.extend(drop_ins);
+        }
+    }
+    for path in &paths {
+        let path = path.display();
+        let text = match std::fs::read_to_string(path.to_string()) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "reading Claude Code's managed settings {path}, which could switch off \
+                         Paja's deny-list hook; make it readable or run Paja elsewhere"
+                    )
+                })
+            }
+        };
+        let settings: Value = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "reading Claude Code's managed settings {path}, which is not valid JSON; ask \
+                     the machine's administrator to fix it, or run Paja on another machine"
+            )
+        })?;
+        for key in ["disableAllHooks", "allowManagedHooksOnly"] {
+            if settings[key] == Value::Bool(true) {
+                bail!(
+                    "Claude Code's managed settings ({path}) set `{key}`, which would switch off \
+                     Paja's deny-list hook, so no agent will start; ask the machine's \
+                     administrator to drop it, or run Paja on another machine"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// This paja's own bytes, read once per process: what the hook copy must match, whatever later
+/// happens to the file.
+static RUNNING: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Whether the hook's copy still matches this paja byte for byte.
+fn hook_copy_intact(exe: &Path) -> bool {
+    RUNNING
+        .get()
+        .is_some_and(|bytes| read_regular(exe).as_deref() == Some(bytes.as_slice()))
+}
+
+/// A git configuration file's entries as git itself reads them, leaving out `branch.*`:
+/// ordinary git work (`push -u`, `checkout -b`) writes those, and they run no program. `None`
+/// when git can't parse the file, which is then compared byte for byte. Includes are watched
+/// as files of their own, so they aren't followed here. Only called on plain files.
+fn config_entries(path: &Path) -> Option<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("config")
+        .arg("--file")
+        .arg(path)
+        .args(["--no-includes", "--list", "--null"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let mut kept = Vec::new();
+    for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        if !entry.to_ascii_lowercase().starts_with(b"branch.") {
+            kept.extend_from_slice(entry);
+            kept.push(0);
+        }
+    }
+    Some(kept)
+}
+
+/// A file's contents, read only when it is a plain file: opening a FIFO someone planted
+/// would hang. Anything else reads as a marker that differs from every real content.
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => std::fs::read(path).ok(),
+        Ok(_) => Some(b"\0not a regular file\0".to_vec()),
+        Err(_) => None,
+    }
+}
+
+/// The paja binary the hook runs from: a copy in the factory home, so an agent's own
+/// `cargo build` can't replace the binary that judges it. Made once per `paja run` from the
+/// binary that is running (on Linux even if the file on disk has been rebuilt since; elsewhere
+/// it is the file on disk when the run first needs it); copies other runs
+/// left behind are removed once they are a day old.
+fn hook_binary(home: &Home) -> Result<PathBuf> {
+    let _lock = home.lock()?;
+    let dir = home.root().join("hook");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > day);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // On Linux /proc/self/exe still reads the running binary after a rebuild replaced it.
+    let running = match Path::new("/proc/self/exe") {
+        p if p.exists() => p.to_path_buf(),
+        _ => std::env::current_exe().context("finding the paja binary for the deny-list hook")?,
+    };
+    let bytes = match RUNNING.get() {
+        Some(bytes) => bytes,
+        None => {
+            let read = std::fs::read(&running)
+                .with_context(|| format!("reading {} for the deny-list hook", running.display()))?;
+            RUNNING.get_or_init(|| read)
+        }
+    };
+    // One copy per build of paja, shared by every run of it, so copies don't pile up.
+    let digest = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let exe = dir.join(format!("paja-{}-{digest:016x}", bytes.len()));
+    // The copy sits in the factory home, which code an agent runs could reach. Use it only
+    // while it still matches this paja byte for byte; otherwise copy again.
+    if !hook_copy_intact(&exe) {
+        // Write under a temporary name and rename, so no run ever sees half a binary.
+        let partial = dir.join(format!(
+            "partial-{}-{}",
+            std::process::id(),
+            crate::events::now_ms()
+        ));
+        let written = (|| {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&partial)?;
+            std::io::Write::write_all(&mut file, bytes)?;
+            drop(file);
+            std::fs::rename(&partial, &exe)
+        })();
+        written
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&partial);
+            })
+            .with_context(|| {
+                format!(
+                    "copying {} to {} for the deny-list hook; check that {} is writable",
+                    running.display(),
+                    exe.display(),
+                    dir.display()
+                )
+            })?;
+    }
+    // Keep the copy fresh so another run's cleanup leaves it alone. Opened read-only: the
+    // copy may be running, and a running binary can't be opened for writing.
+    if let Ok(file) = std::fs::File::open(&exe) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+    Ok(exe)
+}
+
+fn run_hook_once(
+    exe: &Path,
+    args: &[std::ffi::OsString],
+    input: &str,
+) -> Result<(Option<i32>, String)> {
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting the deny-list hook {}", exe.display()))?;
+    // A hook that exits without reading its input is judged by its exit code, not the pipe.
+    if let Err(err) = std::io::Write::write_all(
+        child.stdin.as_mut().context("the hook's stdin")?,
+        input.as_bytes(),
+    ) {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err).with_context(|| {
+                format!(
+                    "sending the self-test to the deny-list hook {}; rebuild paja from main",
+                    exe.display()
+                )
+            });
+        }
+    }
+    drop(child.stdin.take());
+    // Drain stderr while waiting, so a chatty hook can't fill the pipe and look hung.
+    let mut stderr = child.stderr.take().context("the hook's stderr")?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    });
+    // The hook blocks itself after its deadline; anything longer is a hung binary.
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(crate::hook::HOOK_DEADLINE_SECS + 10);
+    while child
+        .try_wait()
+        .inspect_err(|_| {
+            let _ = child.kill();
+        })
+        .with_context(|| format!("waiting for the deny-list hook {}", exe.display()))?
+        .is_none()
+    {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "the deny-list hook {} hung in its self-test, so no agent will start; rebuild \
+                 paja from main",
+                exe.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let code = child
+        .wait()
+        .with_context(|| format!("waiting for the deny-list hook {}", exe.display()))?
+        .code();
+    Ok((code, reader.join().unwrap_or_default()))
+}
+
+fn tempfile_dir(near: &Path) -> Result<PathBuf> {
+    // A fresh directory only this user can enter; creating it fails if the name is taken, so
+    // nobody can prepare it beforehand.
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "paja-agent-{}-{}-{}",
+        std::process::id(),
+        crate::events::now_ms(),
+        COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::create_dir_all(std::env::temp_dir());
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| {
+            format!(
+                "creating a scratch home {} for work in {}; check that the temporary \
+                 directory (TMPDIR) exists and is writable",
+                dir.display(),
+                near.display()
+            )
+        })?;
     Ok(dir)
 }
 
@@ -380,22 +1004,102 @@ fn commit_leftovers(env: &Env, item: &WorkItem) -> Result<()> {
     Ok(())
 }
 
-/// Run each check in the environment. Returns the first failure's command and output.
-fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
-    for check in checks {
-        let output = Command::new("sh")
-            .args(["-c", check])
-            .current_dir(dir)
-            .output()
-            .with_context(|| format!("running check `{check}`"))?;
-        if !output.status.success() {
-            return Ok(Some(format!("`{check}` failed:\n\n{}", tail(&output))));
+/// Give `cmd` a throwaway PAJA_HOME (`scratch`) and keep GitHub Mestari's: take away the easy
+/// ways an agent, or the code it wrote, could reach it (tokens, the SSH agent, gh's stored
+/// login, git's credential helpers and askpass programs, and registry tokens). Agents keep
+/// the owner's `HOME`, which Claude Code needs to sign in, so code they run can still read
+/// credential files there (`.netrc`, say), and a token written into the remote's URL is not
+/// covered. Determined code run by `cargo test` is the sandbox's job.
+fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&str, String)>) {
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("GIT_CONFIG_")
+            || name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_TOKEN")
+        {
+            cmd.env_remove(name.as_ref());
         }
     }
-    Ok(None)
+    cmd.env("PAJA_HOME", scratch)
+        // Replacement refs would let code show the reviewer a different history.
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env_remove("PAJA_GH")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("CARGO_REGISTRY_TOKEN")
+        .env("GH_CONFIG_DIR", scratch)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "false")
+        .env("SSH_ASKPASS", "false")
+        .env("GIT_SSH_COMMAND", "false")
+        // Configuration from the environment comes last, and an empty helper clears the list
+        // so far, so no credential helper from the repository's own config runs either.
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
+        // Without the global config, commits still need the owner's name and email.
+        .envs(git_identity);
 }
 
-fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Result<RunReport> {
+/// Whether a changed path is high risk: it starts with one of `prefixes`, or, for a prefix
+/// that is a single name (`.cargo/`, `CLAUDE.md`), any directory or file in it is that name,
+/// or that name with an extension (`rust-toolchain.toml`), in any letter case, since nested
+/// configuration counts as much as the top level.
+fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        let name = prefix.trim_end_matches('/').to_lowercase();
+        path.to_lowercase().starts_with(&prefix.to_lowercase())
+            || !name.contains('/')
+                && path
+                    .split('/')
+                    .map(str::to_lowercase)
+                    .any(|part| part == name || part.starts_with(&format!("{name}.")))
+    })
+}
+
+/// Run each check in the environment. Returns the first failure's command and output. The
+/// checks run the branch's code, so they get no more credentials than the agent that wrote it.
+fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
+    // Read before any check runs: later, the branch's code may have changed the configuration.
+    let identity = git_identity(dir);
+    let scratch = tempfile_dir(dir)?;
+    let result = (|| {
+        for check in checks {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", check]).current_dir(dir);
+            without_credentials(&mut cmd, &scratch, identity.clone());
+            // The checks keep the owner's HOME, as agents do: toolchain managers find cargo
+            // through it. Credential files there stay reachable until the sandbox.
+            let output = cmd
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("running check `{check}`"))?;
+            if !output.status.success() {
+                return Ok(Some(format!("`{check}` failed:\n\n{}", tail(&output))));
+            }
+        }
+        Ok(None)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// Push `judged`, the commit Vasara's checks and the reviewers saw, as the environment's
+/// branch, and land it. Not whatever the branch points at now: code run in the worktree could
+/// have moved it.
+fn land(
+    home: &Home,
+    repo: &Path,
+    env: &Env,
+    item: &WorkItem,
+    rounds: u32,
+    judged: &str,
+) -> Result<RunReport> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
     git(
@@ -403,10 +1107,11 @@ fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Re
         &[
             "push",
             "-q",
-            "-u",
+            // No `-u`: that would write the branch into the shared git configuration, which
+            // other runs' guards watch.
             "origin",
-            &format!("{branch}:{branch}"),
-            "--force-with-lease",
+            &format!("{judged}:refs/heads/{branch}"),
+            &format!("--force-with-lease=refs/heads/{branch}"),
         ],
     )?;
     let title = format!("{} (#{})", item.title, item.number);
@@ -570,7 +1275,7 @@ fn summaries(reviews: &[Review]) -> String {
 /// is an error: a check file that can't be read must never count as an empty one.
 fn read_from_base(repo: &Path, base: &str, path: &str) -> Result<Option<String>> {
     let spec = format!("{base}:{path}");
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(["show", &spec])
@@ -632,8 +1337,279 @@ fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Git as Mestari runs it, with Mestari's own credentials. Code run in a worktree could plant
+/// hooks or a file-system monitor for it to run, so those are always off; [`GitGuard`] catches
+/// the rest of a planted configuration.
+fn git_command() -> Command {
+    ahjo::git_command()
+}
+
+/// The error a [`GitGuard`] raises. Nothing may run git in that repository afterwards, not
+/// even to clean up, until a person has looked.
+#[derive(Debug)]
+pub struct Tampered(String);
+
+impl std::fmt::Display for Tampered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Tampered {}
+
+/// Whether `err` is, or was caused by, a [`Tampered`] repository.
+pub fn is_tampered(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<Tampered>())
+}
+
+/// A snapshot of the git configuration, hooks and attributes a worktree's git reads, all of
+/// them outside the worktree and shared with the repository. Code that an agent, Vasara's
+/// checks or a reviewer's build runs could change them to make Mestari's own git run a program
+/// with Mestari's credentials (a credential helper, a filter). Mestari takes the snapshot before
+/// such code runs and checks it before it runs git there again.
+struct GitGuard {
+    files: Vec<PathBuf>,
+    /// Watched files that are not git configuration, compared byte for byte.
+    raw: Vec<PathBuf>,
+    hooks: Vec<PathBuf>,
+    snapshot: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// Every other worktree's links and configuration: code here could repoint another
+    /// environment's git. Those come and go as other runs work, so only a file that still
+    /// exists and now differs counts.
+    others: Vec<PathBuf>,
+    others_snapshot: Vec<Option<Vec<u8>>>,
+}
+
+impl GitGuard {
+    fn new(worktree: &Path) -> Result<GitGuard> {
+        let dir = |arg: &str| -> Result<PathBuf> {
+            let path = PathBuf::from(git(worktree, &["rev-parse", arg])?);
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                worktree.join(path)
+            })
+        };
+        let (own, common) = (dir("--absolute-git-dir")?, dir("--git-common-dir")?);
+        // The repository's hooks, and wherever the owner's `core.hooksPath` points: gh runs
+        // git without Paja's overrides.
+        let mut hooks = vec![common.join("hooks")];
+        // Asked without Paja's own override, which would answer `/dev/null`. Reading the
+        // configuration runs no hook.
+        let owner_hooks = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["config", "--path", "core.hooksPath"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !owner_hooks.is_empty() {
+            // A relative path is relative to where git runs: gh runs it in the main checkout,
+            // next to the shared git directory, not in this worktree.
+            let main_checkout = common.parent().unwrap_or(&common).to_path_buf();
+            hooks.push(main_checkout.join(owner_hooks));
+        }
+        // The owner's global configuration, which Mestari's own git reads.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".config")));
+        let global: Vec<PathBuf> = home
+            .iter()
+            .map(|h| h.join(".gitconfig"))
+            .chain(
+                xdg.iter()
+                    .flat_map(|x| [x.join("git/config"), x.join("git/attributes")]),
+            )
+            .chain(std::env::var_os("GIT_CONFIG_GLOBAL").map(PathBuf::from))
+            .collect();
+        let mut guard = GitGuard {
+            // The worktree's links to the repository too: rewriting them would point git at
+            // another configuration without touching these files.
+            files: vec![
+                common.join("config"),
+                common.join("config.worktree"),
+                own.join("config.worktree"),
+                common.join("info/attributes"),
+                common.join("info/grafts"),
+                worktree.join(".git"),
+                own.join("commondir"),
+                own.join("gitdir"),
+                common.join("info/exclude"),
+            ],
+            raw: Vec::new(),
+            hooks,
+            snapshot: Vec::new(),
+            others: Vec::new(),
+            others_snapshot: Vec::new(),
+        };
+        guard.files.extend(global);
+        guard.raw = guard
+            .files
+            .iter()
+            .filter(|path| {
+                !(path.ends_with("config")
+                    || path.ends_with("config.worktree")
+                    || path.ends_with(".gitconfig"))
+            })
+            .cloned()
+            .collect();
+        // A global attributes file the owner chose, wherever it is.
+        let attributes = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["config", "--path", "core.attributesFile"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !attributes.is_empty() {
+            guard.files.push(worktree.join(&attributes));
+            guard.raw.push(worktree.join(attributes));
+        }
+        // Every file git reads configuration from here, includes and the system file among
+        // them, and every file an include names, read or not: one that doesn't exist yet
+        // could be created.
+        let origins = git(
+            worktree,
+            &["config", "--list", "--show-origin", "--name-only"],
+        )?;
+        for line in origins.lines() {
+            if let Some(file) = line
+                .strip_prefix("file:")
+                .and_then(|l| l.split('\t').next())
+            {
+                let path = Path::new(file);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    worktree.join(path)
+                };
+                if !guard.files.contains(&path) {
+                    guard.files.push(path);
+                }
+            }
+        }
+        let includes = git(
+            worktree,
+            &[
+                "config",
+                "--path",
+                "--null",
+                "--get-regexp",
+                r"^include(if\..*)?\.path$",
+            ],
+        )
+        .unwrap_or_default();
+        for entry in includes.split('\0') {
+            if let Some((_, file)) = entry.split_once('\n') {
+                let path = PathBuf::from(file);
+                // A relative include is relative to the file that names it: the repository's
+                // config or the owner's global one, so watch it against both.
+                let candidates: Vec<PathBuf> = if path.is_absolute() {
+                    vec![path]
+                } else {
+                    [Some(common.clone()), home.clone()]
+                        .into_iter()
+                        .flatten()
+                        .map(|base| base.join(&path))
+                        .collect()
+                };
+                for path in candidates {
+                    if !guard.files.contains(&path) {
+                        guard.files.push(path);
+                    }
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                for name in ["gitdir", "commondir", "config.worktree"] {
+                    guard.others.push(dir.join(name));
+                }
+                // `gitdir` names the worktree's `.git` file, which points back here.
+                if let Some(link) = read_regular(&dir.join("gitdir")) {
+                    let link = String::from_utf8_lossy(&link).trim().to_string();
+                    if !link.is_empty() {
+                        guard.others.push(PathBuf::from(link));
+                    }
+                }
+            }
+        }
+        guard.others.retain(|path| !guard.files.contains(path));
+        guard.others_snapshot = guard.others.iter().map(|p| read_regular(p)).collect();
+        guard.snapshot = guard.read();
+        Ok(guard)
+    }
+
+    fn read(&self) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        let mut hooks: Vec<PathBuf> = self
+            .hooks
+            .iter()
+            .flat_map(|dir| {
+                std::fs::read_dir(dir)
+                    .map(|entries| entries.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        hooks.sort();
+        self.files
+            .iter()
+            .chain(&hooks)
+            .map(|path| {
+                let raw = read_regular(path);
+                let content = if self.raw.contains(path) || !self.files.contains(path) {
+                    raw
+                } else {
+                    raw.map(|bytes| config_entries(path).unwrap_or(bytes))
+                };
+                (path.clone(), content)
+            })
+            .collect()
+    }
+
+    /// Fails, before Mestari runs git again, when anything changed since the snapshot.
+    fn check(&self, what: &str) -> Result<()> {
+        let now = self.read();
+        let others: Vec<String> = self
+            .others
+            .iter()
+            .zip(&self.others_snapshot)
+            .filter(|(path, before)| {
+                let after = read_regular(path);
+                after.is_some() && after != **before
+            })
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        if now != self.snapshot || !others.is_empty() {
+            let mut changed: Vec<String> = now
+                .iter()
+                .filter(|entry| !self.snapshot.contains(entry))
+                .chain(self.snapshot.iter().filter(|entry| !now.contains(entry)))
+                .map(|(path, _)| path.display().to_string())
+                .chain(others)
+                .collect();
+            changed.sort();
+            changed.dedup();
+            return Err(Tampered(format!(
+                "git's configuration, hooks or attributes changed while {what} ran ({}), so \
+                 Paja stopped before running git there again; a person must check and restore \
+                 those files before running Paja again. Your own edits to them during a run \
+                 stop it too",
+                changed.join(", ")
+            ))
+            .into());
+        }
+        Ok(())
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -652,6 +1628,46 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nested_configuration_is_high_risk() {
+        let prefixes: Vec<String> = [".cargo/", "CLAUDE.md", "crates/paja/src/hook.rs"]
+            .map(String::from)
+            .to_vec();
+        assert!(super::is_high_risk(
+            "crates/x/.Cargo/config.toml",
+            &prefixes
+        ));
+        assert!(super::is_high_risk("docs/CLAUDE.md", &prefixes));
+        let names: Vec<String> = ["rust-toolchain", ".paja/"].map(String::from).to_vec();
+        assert!(super::is_high_risk("rust-toolchain.toml", &names));
+        let dir = std::env::temp_dir().join(format!("paja-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config");
+        std::fs::write(
+            &file,
+            "[core]\n\tbare = false\n[branch \"x\"]\n\tremote = origin\n",
+        )
+        .unwrap();
+        let plain = super::config_entries(&file).unwrap();
+        std::fs::write(&file, "[core]\n\tbare = false\n").unwrap();
+        assert_eq!(super::config_entries(&file).unwrap(), plain);
+        // A section started on the same line as a branch header still counts.
+        std::fs::write(
+            &file,
+            "[core]\n\tbare = false\n[branch \"x\"][credential]\n\thelper = y\n",
+        )
+        .unwrap();
+        assert_ne!(super::config_entries(&file).unwrap(), plain);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!super::is_high_risk("src/.pajarc", &names));
+        assert!(super::is_high_risk("crates/paja/src/hook.rs", &prefixes));
+        assert!(!super::is_high_risk("crates/paja/src/jono.rs", &prefixes));
+        assert!(!super::is_high_risk(
+            "other/crates/paja/src/hook.rs",
+            &prefixes
+        ));
+    }
+
     use super::*;
 
     #[test]

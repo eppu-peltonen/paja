@@ -366,9 +366,28 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Git as Paja runs it, with the owner's credentials. Code run in a worktree could plant hooks
+/// or a file-system monitor for it to run, so those are always off.
+pub(crate) fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    // Replacement refs would let code in a worktree change the history Paja judges.
+    cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null");
+    cmd.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        // Paths come back as plain text, so non-ASCII names still match high-risk entries.
+        "-c",
+        "core.quotePath=false",
+    ]);
+    cmd
+}
+
 /// Run git in `dir` and return trimmed stdout, or an error carrying git's stderr.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)

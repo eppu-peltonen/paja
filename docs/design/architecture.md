@@ -65,16 +65,93 @@ of issues refuses to close anything rather than drop work it could not see.
 environment `work-<issue>` from `main` (resuming the branch an earlier run kept). Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
-2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder.
-3. A fresh reviewer agent with read-only tools reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it
-   is on `main`, and answers `land`, `changes` or `escalate`. A change touching a prefix in `.paja/high-risk` (read
-   from `main`) gets two reviewers, who must agree; a split is escalated.
+2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
+   check run that changed the worktree, its index or its commits, which are put back first.
+3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
+   answers `land`, `changes` or `escalate`. It may read, run cargo and use read-only git, and changes nothing. A change
+   touching a path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
+   An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
+   or the name with an extension, at any depth, in any letter case.
 
-On `land`, Mestari pushes the branch, opens a pull request, waits for CI with `gh pr checks --watch`, squash-merges it
-and marks the item landed. On `escalate`, three failed rounds, a red CI or an error it can't fix, it comments on the
-issue with the question and marks the item escalated; the branch keeps the work. Agents run with a throwaway
-`PAJA_HOME`, so they never touch the factory's own state. Each step is recorded as `run.started`, `run.round`,
-`run.landed` or `run.escalated`. `paja run --every 5` keeps going, checking an empty queue every five minutes.
+On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
+for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
+red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
+keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
+recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`. `paja run --every 5` keeps going, checking an
+empty queue every five minutes.
+
+## The deny-list hook
+
+Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config` and settings that send each tool
+call to `paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file
+and no MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it
+off. Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the
+branch under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read
+from the tool call, because the reported `cwd` moves when the agent runs `cd`.
+
+- **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
+  tools included, is blocked. Subagents run in the same worktree in the foreground, under the same hook; one with
+  `isolation` or `run_in_background` is blocked, since Claude Code would make its worktree without a call to judge.
+- **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
+  `cd` to the worktree's root as a step of its own, then `cargo`, local `git` and `pwd` commands joined by `&&`, each
+  optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading `~`
+  or `=`, redirections other than `2>&1`, or other separators outside single quotes. Only `RUST_BACKTRACE` and
+  `RUST_LOG` may be set in front of a command.
+- **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
+  option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
+  clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
+  (so no `-C` or `-c`) and is one of add, commit, status, diff, show, log and rm; not `stash`, whose refs every
+  checkout shares. Its revisions and paths must stay inside the worktree. `cargo fmt` takes options only with
+  `--check`, since `--all` and `-p` can reach path dependencies outside the worktree.
+- **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
+  and never into a `.git`, `.cargo`, `.github` or `.claude` directory, a `rust-toolchain` or `.gitattributes` file or
+  a rustfmt or clippy configuration file at any depth, in any letter case (reading them is fine). A file tool path may
+  not hold `..`. `git rm` takes plain files only, and `git commit` needs `-m`. These rules cover paths an agent names;
+  a file its code writes can still be staged by `git add -A`, and then makes the change high risk.
+- **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
+  `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
+  directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
+  followed, and are blocked while the worktree holds a symlink out of the worktree. A file tool path may not
+  start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
+  (`.ssh`, `.config/gh` and the like).
+- **Network tools** (`WebFetch`, `WebSearch`) are blocked.
+
+It fails closed: unreadable input, missing bounds, a crash and running past its own 20-second deadline all block, and
+the hook command ends in `|| exit 2` so a binary that can't start or is killed blocks too. Claude Code's own hook
+timeout is set well above that deadline. The hook runs from a copy of the paja binary in the factory home, so an agent's
+`cargo build` can't replace the binary that judges it; Mestari uses the copy only while it matches the running binary
+byte for byte, and writes it again otherwise. Managed settings still load, so Mestari refuses to start agents when they
+set `disableAllHooks` or `allowManagedHooksOnly`. Policy can arrive in other ways too, so the hook also touches a stamp
+file on every call: an agent run that took more than one turn or changed the worktree without one is rejected, and its
+branch is reset to where the run started. Only the two managed-settings locations (each file and its
+`managed-settings.d` drop-ins) are checked up front. The stamp catches a hook that was silently dropped, not an agent
+that forges it while hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook
+blocks a `git push` (for a reviewer, a local `git commit`) with the deny-list's message and allows `cargo test`, and
+refuses to start the agent if not. The hook is a guardrail, not a sandbox: code the agent writes still runs under `cargo
+test`. Mestari takes away the easy ways that code could reach GitHub: agents run without GitHub or registry tokens, the
+SSH agent or askpass programs, with gh's login, git's global and system configuration and every credential helper
+switched off, and with the owner's commit name, email and global ignore file passed in instead. Vasara's checks run the
+same branch code, so they run with the same environment. Agents and checks keep the owner's `HOME`, which Claude Code
+needs to sign in and toolchain managers use to find cargo, so code they run can still read credential files there (such
+as `.netrc` or cargo's `credentials.toml`), and a token written into the remote's URL is not covered: closing those is
+the sandbox's job. That code could also change the git configuration, hooks or attributes the worktree shares with the
+repository, to make Mestari's own git run a program with Mestari's credentials. So Paja's own git never runs hooks or a
+file-system monitor, and no git Paja starts honours replacement refs or grafts, and Mestari snapshots those files, and
+the owner's global git configuration, before each agent and check run. Those files include every file git reads
+configuration from and the worktree's links to the repository. If they changed, it parks the item, records
+`run.tampered` and stops with an error naming the changed files (a `--every` loop included) without running git or gh
+there again, not even to clean up or comment on the issue. The guard also notices another environment's links and
+configuration changing. Later runs on that repository (found by its shared git directory, however its path is spelled)
+refuse to start until a person has checked it and runs `paja run --tamper-checked`. Configuration files are compared by
+the entries git reads, leaving out `branch.*`, which ordinary git work writes; every other file byte for byte. The
+hook's copy is checked again after each agent run, and a copy that changed counts as a run the hook never saw. Each
+phase takes its own snapshot, so a change made between phases (by a process the code left running, say) is not caught,
+nor is a relative include resolved against a file other than the repository's or the owner's main configuration. The
+guardrail's limit stays: code that runs as the owner can still change things none of these checks look at, and only the
+sandbox closes that. Reviewers run the hook with `--read-only`: no file edits, no `cargo fmt` without `--check` and no
+git command that changes the branch; after the review, the branch and worktree are put back where it started, whatever
+the code its builds ran did. Because no settings file loads, agents authenticate the way `claude` does without one (a
+signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider settings.
 
 ## MCP server
 

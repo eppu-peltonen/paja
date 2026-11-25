@@ -48,6 +48,29 @@ enum Command {
         /// per item.
         #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
         every: Option<u64>,
+        /// After Paja stopped because git's configuration changed during a run: you have
+        /// checked and restored the files it named, and Paja may run git in this repository
+        /// again.
+        #[arg(long)]
+        tamper_checked: bool,
+    },
+    /// The deny-list hook Mestari runs agents under (Claude Code `PreToolUse`). Reads the
+    /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow. Prints no
+    /// JSON: Claude Code reads only its exit code and stderr.
+    #[command(hide = true)]
+    Hook {
+        /// The agent's environment: the only place it may change files.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// The factory's home, which agents never touch.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// A file the hook touches on every call, so Mestari can tell it really ran.
+        #[arg(long)]
+        stamp: Option<PathBuf>,
+        /// For reviewers: block every change, inside the worktree too.
+        #[arg(long)]
+        read_only: bool,
     },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
@@ -143,6 +166,15 @@ fn main() -> ExitCode {
             return code;
         }
     };
+    if let Command::Hook {
+        root,
+        home,
+        stamp,
+        read_only,
+    } = &cli.command
+    {
+        return paja::hook::run(root.clone(), home.clone(), stamp.clone(), *read_only);
+    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -159,6 +191,7 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<()> {
     let home = Home::from_env()?;
     match &cli.command {
+        Command::Hook { .. } => unreachable!("handled before the home is opened"),
         Command::Mcp => {
             // Once the session is up, stdout is the protocol: report a later failure on
             // stderr so it can't be read as a frame.
@@ -214,34 +247,52 @@ fn run(cli: &Cli) -> Result<()> {
                 );
             }
         },
-        Command::Run { repo, every } => loop {
-            let outcome = mestari::run_once(&home, mestari::RunOptions { repo });
-            let Some(minutes) = every else {
-                let report = outcome?;
-                emit(cli, serde_json::to_value(&report)?, || {
-                    describe_run(&report)
-                });
-                break;
-            };
-            // A long-running loop reports an error and carries on; it must not stop the factory.
-            let idle = match outcome {
-                Ok(report) => {
+        Command::Run {
+            repo,
+            every,
+            tamper_checked,
+        } => {
+            // The person's word that the repository was checked counts once, for the first
+            // pass, not for every later stop of a long-running loop.
+            let mut checked = *tamper_checked;
+            loop {
+                let outcome = mestari::run_once(
+                    &home,
+                    mestari::RunOptions {
+                        repo,
+                        tamper_checked: std::mem::take(&mut checked),
+                    },
+                );
+                let Some(minutes) = every else {
+                    let report = outcome?;
                     emit(cli, serde_json::to_value(&report)?, || {
                         describe_run(&report)
                     });
-                    matches!(report, mestari::RunReport::Idle)
+                    break;
+                };
+                // A long-running loop reports an error and carries on; it must not stop the factory.
+                let idle = match outcome {
+                    Ok(report) => {
+                        emit(cli, serde_json::to_value(&report)?, || {
+                            describe_run(&report)
+                        });
+                        matches!(report, mestari::RunReport::Idle)
+                    }
+                    // Except when git's configuration was tampered with: then running git again is
+                    // the danger, so the loop stops for a person.
+                    Err(err) if mestari::is_tampered(&err) => return Err(err),
+                    Err(err) => {
+                        emit(cli, json!({ "error": format!("{err:#}") }), || {
+                            format!("error: {err:#}")
+                        });
+                        true
+                    }
+                };
+                if idle {
+                    std::thread::sleep(std::time::Duration::from_secs(minutes.saturating_mul(60)));
                 }
-                Err(err) => {
-                    emit(cli, json!({ "error": format!("{err:#}") }), || {
-                        format!("error: {err:#}")
-                    });
-                    true
-                }
-            };
-            if idle {
-                std::thread::sleep(std::time::Duration::from_secs(minutes.saturating_mul(60)));
             }
-        },
+        }
         Command::Work { command } => match command {
             WorkCommand::Sync { repo } => {
                 let report = jono::sync(&home, repo)?;

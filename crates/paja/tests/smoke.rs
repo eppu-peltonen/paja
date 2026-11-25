@@ -725,10 +725,13 @@ impl Factory {
             "claude",
             format!(
                 "#!/bin/sh\necho \"$PAJA_HOME\" >> {d}/claude-homes.log\n\
+                 echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
                  *--json-schema*) v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\"}}}}\" ;;\n\
                  *) echo built >> feature.txt\n\
+                 stamp=$(echo \"$*\" | sed -n \"s/.*--stamp '\\([^']*\\)'.*/\\1/p\")\n\
+                 if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
@@ -763,7 +766,12 @@ impl Factory {
 
 #[test]
 fn run_builds_reviews_and_lands_an_issue() {
-    let f = Factory::new("test -f feature.txt\n", "land");
+    // Vasara's checks run the branch's code, so they get no GitHub access either: Mestari's
+    // `PAJA_GH` is gone, and so is its PAJA_HOME.
+    let f = Factory::new(
+        "test -f feature.txt\ntest -z \"$PAJA_GH\"\ntest ! -e \"$PAJA_HOME/events.jsonl\"\n",
+        "land",
+    );
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
@@ -788,6 +796,21 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]));
+    // Every agent runs under the deny-list hook, bounded to its environment, and with no
+    // settings files that could switch the hook off.
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert!(args.contains("--setting-sources  --settings"), "{args}");
+    // CLAUDE.md doesn't load without setting sources, so main's copy comes with the prompt.
+    assert!(args.contains("--append-system-prompt"), "{args}");
+    // Reviewers run read-only under the hook; builders don't.
+    let reviewer = args.lines().find(|l| l.contains("--json-schema")).unwrap();
+    let builder = args.lines().find(|l| !l.contains("--json-schema")).unwrap();
+    assert!(reviewer.contains("--read-only"), "{reviewer}");
+    assert!(!builder.contains("--read-only"), "{builder}");
+    assert!(
+        args.contains("PreToolUse") && args.contains("hook --root") && args.contains("work-5"),
+        "{args}"
+    );
     // Agents never see the factory's own PAJA_HOME.
     let homes = std::fs::read_to_string(f.tmp.path().join("claude-homes.log")).unwrap();
     assert!(!homes.contains(f.home.to_str().unwrap()), "{homes}");
@@ -870,6 +893,93 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
 }
 
 #[test]
+fn checks_that_change_the_worktree_fail_and_are_put_back() {
+    // Branch code run by the checks must not leave files or commits for the reviewer to miss.
+    let f = Factory::new("touch stray.txt\n", "land");
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(!f.gh_log().contains("pr create"));
+    let log = std::fs::read_to_string(f.home.join("events.jsonl")).unwrap();
+    assert!(log.contains("changed the worktree or its commits"), "{log}");
+}
+
+#[test]
+fn checks_that_change_git_configuration_stop_the_run() {
+    // Branch code run by the checks could plant a credential helper for Mestari's own git.
+    let f = Factory::new("git config paja.planted yes\n", "land");
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("git's configuration, hooks or attributes"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr create"));
+    // The item is parked, and the error tells the person; Paja runs no more git there, not
+    // even to remove the environment.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated");
+    // Not even gh, which runs git to find the repository.
+    assert!(!f.gh_log().contains("issue comment"), "{}", f.gh_log());
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
+    // Later runs run no git there until a person says the repository was checked.
+    let (ok, again) = f.run();
+    assert!(!ok, "{again}");
+    assert!(
+        again["error"]
+            .as_str()
+            .unwrap()
+            .contains("--tamper-checked"),
+        "{again}"
+    );
+    // A person's check opens it again: the run fetches and syncs as usual (the item itself
+    // stays escalated, so the queue is empty).
+    let (ok, checked) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run", "--tamper-checked"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+        ],
+    );
+    assert!(ok, "{checked}");
+    assert_eq!(checked["outcome"], "idle", "{checked}");
+}
+
+#[test]
+fn work_from_an_agent_the_hook_never_saw_does_not_land() {
+    // A run with tool turns but no hook call means something switched the hook off.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("unhooked"), "").unwrap();
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("never called Paja's deny-list hook"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr create"));
+    // Its commits are gone from the branch, so a later run can't resume them.
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&f.repo)
+        .args(["log", "--oneline", "paja/work-5"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&log.stdout).contains("built"),
+        "{}",
+        String::from_utf8_lossy(&log.stdout)
+    );
+}
+
+#[test]
 fn an_empty_checks_file_is_an_error_not_a_pass() {
     let f = Factory::new("# nothing yet\n", "land");
     let (ok, report) = f.run();
@@ -880,4 +990,65 @@ fn an_empty_checks_file_is_an_error_not_a_pass() {
         "{report}"
     );
     assert!(!f.gh_log().contains("pr merge"));
+}
+
+/// Run `paja hook` with a tool call on stdin; returns its exit code and stderr.
+fn hook(input: &str) -> (Option<i32>, String) {
+    hook_with(&["--root", "/w/env", "--home", "/w/home"], input)
+}
+
+fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .arg("hook")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn the_deny_list_hook_blocks_and_fails_closed() {
+    let call = |cmd: &str| {
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": "/w/env"})
+            .to_string()
+    };
+    let (code, why) = hook(&call("cargo test && git push origin main"));
+    assert_eq!(code, Some(2), "{why}");
+    assert!(why.contains("git push"), "{why}");
+    assert_eq!(hook(&call("cargo test")).0, Some(0));
+    let write = serde_json::json!({"tool_name": "Write", "tool_input": {"file_path": "/etc/x"}, "cwd": "/w/env"});
+    assert_eq!(hook(&write.to_string()).0, Some(2));
+    // Anything it can't read blocks too.
+    let (code, why) = hook("not json");
+    assert_eq!(code, Some(2));
+    assert!(why.contains("fails closed"), "{why}");
+    // So does a hook started without its bounds.
+    let (code, why) = hook_with(&[], &call("cargo test"));
+    assert_eq!(code, Some(2));
+    assert!(why.contains("--root"), "{why}");
+    // The factory's own state is off limits, the environment inside it is not.
+    let read = |path: &str| {
+        serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": path}, "cwd": "/w/home/envs/a"})
+            .to_string()
+    };
+    let inside = ["--root", "/w/home/envs/a", "--home", "/w/home"];
+    assert_eq!(hook_with(&inside, &read("/w/home/events.jsonl")).0, Some(2));
+    assert_eq!(
+        hook_with(&inside, &read("/w/home/envs/a/src/lib.rs")).0,
+        Some(0)
+    );
 }
