@@ -20,17 +20,17 @@ The design lives in [`docs/`](docs/index.md): start with the [overview](docs/des
 | Vasara | hammer | Verifier |
 | Paja Desk | workshop desk | App for watching and steering the fleet |
 
-## Status
+## Getting started
 
-Step 1 of the build order: the seed, written by hand. Today Paja has the event log and Ahjo environments:
+Paja runs natively on Windows, Linux and macOS. [`docs/setup.md`](docs/setup.md) lists what to install and how to
+start Paja on its own queue (`paja run --every 5`). Every command also takes `--json`:
 
 ```sh
-cargo install --path crates/paja
 paja env create fix-login        # isolated worktree on branch paja/fix-login with its own ports
-paja env list
-paja --json env show fix-login   # every command speaks JSON
-paja env remove fix-login        # the branch is kept
+paja --json env show fix-login
+paja work list                   # the queue, imported from issues labelled paja
 paja log                         # the append-only event log
 ```
 
-State lives in `$PAJA_HOME` (default `~/.paja`). See [CLAUDE.md](CLAUDE.md) for how to work on Paja.
+State lives in `$PAJA_HOME` (default `.paja` in your home directory). See [CLAUDE.md](CLAUDE.md) for how to work on
+Paja.
