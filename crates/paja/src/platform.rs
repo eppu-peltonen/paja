@@ -438,7 +438,9 @@ mod win {
     /// Create `dir` with a protected ACL that gives this user full control, of it and of what
     /// is created in it, and nobody else anything.
     pub fn create_owner_only(dir: &Path) -> Result<()> {
-        let sddl = format!("D:P(A;OICI;FA;;;{})", user_sid_string()?);
+        // Owned by this user too: an elevated process would otherwise give it to Administrators.
+        let sid = user_sid_string()?;
+        let sddl = format!("O:{sid}D:P(A;OICI;FA;;;{sid})");
         let sddl = wide(std::ffi::OsStr::new(&sddl));
         let path = wide(dir.as_os_str());
         // SAFETY: the conversion allocates the descriptor, which CreateDirectoryW copies and
