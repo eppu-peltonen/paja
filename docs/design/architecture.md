@@ -68,10 +68,12 @@ environment `work-<issue>` from `main` (resuming the branch an earlier run kept)
 2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first.
 3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
-   answers `land`, `changes` or `escalate`. It may read, run cargo and use read-only git, and changes nothing. A change
-   touching a path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
-   An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
-   or the name with an extension, at any depth, in any letter case.
+   answers `land`, `changes` (blockers only) or `escalate`, plus non-blocking follow-ups that Mestari files as `paja`
+   issues once the change lands. A later round's reviewer judges only the fix for the earlier blockers. It may read,
+   run cargo and use read-only git, and changes nothing. A change touching a path in `.paja/high-risk` (read from
+   `main`) gets two reviewers, who must agree; a split is escalated. An entry matches as a prefix, and an entry that
+   is a single name (`.cargo/`, `CLAUDE.md`) also matches that name, or the name with an extension, at any depth, in
+   any letter case.
 
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
 for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a

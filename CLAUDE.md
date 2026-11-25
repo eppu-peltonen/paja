@@ -77,5 +77,9 @@ code.
 - **Escalate, don't wait.** If reviewers disagree, a check can't decide, or a change would weaken a check, the
   question goes to Posti (until Posti exists: a comment on the issue or pull request) as an intent decision, with
   options and a recommendation. Details: `docs/design/landing.md`.
+- **Review converges.** At most three review rounds per change. Only blockers (a bug in what the issue asks for, a
+  security hole the change opens, a broken rule, missing tests) need another round; every other finding becomes a
+  follow-up `paja` issue. A re-review reads only the fix. Each review runs in its own fresh session. Details:
+  `docs/design/landing.md`.
 - **Until Paja's own reviewer runs (build step 3)**, Claude does the review and landing for these hand-built seed
   pull requests under the same rules.

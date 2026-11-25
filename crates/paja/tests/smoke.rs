@@ -728,8 +728,9 @@ impl Factory {
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
                  *--json-schema*) v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\"}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
                  *) echo built >> feature.txt\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp '\\([^']*\\)'.*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
@@ -798,6 +799,11 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(envs, serde_json::json!([]));
     // Every agent runs under the deny-list hook, bounded to its environment, and with no
     // settings files that could switch the hook off.
+    // A finding that didn't block landing becomes a `paja` issue.
+    assert!(
+        log.contains("issue create --label paja --title Tidy the helper"),
+        "{log}"
+    );
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
     assert!(args.contains("--setting-sources  --settings"), "{args}");
     // CLAUDE.md doesn't load without setting sources, so main's copy comes with the prompt.
@@ -890,6 +896,21 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     assert_eq!(item["status"], "escalated", "never left active");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]), "the worktree is freed");
+}
+
+#[test]
+fn a_second_review_judges_only_the_fix() {
+    // Round one asks for changes; round two's reviewer sees the earlier blockers and the fix's
+    // own diff, and lands it.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert!(args.contains("Judge only the fix"), "{args}");
+    assert!(args.contains("add more"), "{args}");
 }
 
 #[test]
