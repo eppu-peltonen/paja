@@ -748,13 +748,15 @@ impl Factory {
                 "#!/bin/sh\necho \"$PAJA_HOME\" >> {d}/claude-homes.log\n\
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
-                 *--json-schema*) v=$(cat {d}/verdict.txt)\n\
+                 *--json-schema*) if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
+                 v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\"}}'; exit 0; fi ;; esac\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
+                 if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
@@ -1279,6 +1281,85 @@ fn a_resume_that_fails_starts_a_fresh_session() {
     );
     assert!(!builds[2].contains("--resume"), "{}", builds[2]);
     assert!(builds[2].contains("add more"), "{}", builds[2]);
+}
+
+#[test]
+fn a_builder_at_its_turn_limit_is_asked_to_finish_smaller_then_escalates() {
+    // Once: the round fails with a note, and the next round is told to finish smaller.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("build-limit-once"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let calls = f.claude_calls();
+    assert!(calls[0].contains("--max-turns 80"), "{}", calls[0]);
+    assert!(
+        calls[1].contains("the builder hit the turn limit of 80. Finish smaller"),
+        "{}",
+        calls[1]
+    );
+    let reviewer = calls.iter().find(|c| c.contains("--json-schema")).unwrap();
+    assert!(reviewer.contains("--max-turns 30"), "{reviewer}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let first = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "run.round")
+        .unwrap()
+        .clone();
+    assert_eq!(first["data"]["verdict"], "turn_limit", "{first}");
+    assert_eq!(
+        first["data"]["detail"],
+        "the builder hit the turn limit of 80"
+    );
+    // The capped session's spend still counts.
+    assert_eq!(first["data"]["steps"][0]["cost_usd"], 0.1, "{first}");
+
+    // Twice in one run: a person is asked instead of spending another round.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("build-limit"), "").unwrap();
+    f.on_main(".paja/models", "max-turns build 5\nmax-turns fix 6\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("the builder hit the turn limit of 6, the second time")
+            && question.contains("max-turns"),
+        "{question}"
+    );
+    assert!(f.claude_calls()[0].contains("--max-turns 5"));
+}
+
+#[test]
+fn a_reviewer_at_its_turn_limit_fails_the_round_then_escalates() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("review-limit"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("reviewer 1 hit the turn limit of 30, the second time"),
+        "{report}"
+    );
+    let builds: Vec<String> = f
+        .claude_calls()
+        .into_iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert!(
+        builds[1].contains("The change was not reviewed: reviewer 1 hit the turn limit"),
+        "{}",
+        builds[1]
+    );
+    assert!(!f.gh_log().contains("pr merge"));
 }
 
 #[test]
