@@ -21,6 +21,9 @@ Try the CLI against a throwaway home so you never touch real state:
 PAJA_HOME=$(mktemp -d) cargo run -q -- --json env create demo
 ```
 
+In PowerShell on Windows: `$env:PAJA_HOME = (New-Item -ItemType Directory (Join-Path $env:TEMP (New-Guid))).FullName;
+cargo run -q -- --json env create demo`.
+
 Agents Mestari starts already have a throwaway `PAJA_HOME`, and Paja's deny-list hook doesn't let them set it. They
 try read-only commands such as `cargo run -q -- --json work list`, and leave `env create`, which adds a worktree to
 the real repository, to the smoke tests.
@@ -36,6 +39,8 @@ the real repository, to the smoke tests.
   from `main`, never from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It fails closed.
 - `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.
+- `crates/paja/src/platform.rs`: what differs between Windows and Unix. Paja runs natively on both; keep
+  `std::os::unix`, `/`-only paths and `sh` assumptions out of the other modules.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary.
 - `evals/`: harness evals that run headless Claude Code (need a signed-in `claude`; not run in CI).

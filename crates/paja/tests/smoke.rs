@@ -554,6 +554,23 @@ fn the_mcp_server_serves_the_same_core() {
 }
 
 /// A fake `gh` that prints the issues in `issues.json` next to it, and logs its arguments.
+// The fakes below are shell scripts and the hook cases use Unix paths; both come to Windows
+// with the deny-list hook's Windows port (#23). Until then `paja run` refuses on Windows.
+#[cfg(windows)]
+#[test]
+fn run_refuses_on_windows_until_the_hook_is_ported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let (ok, out) = paja(&home, &repo, &["run"]);
+    assert!(!ok, "{out}");
+    assert!(
+        out["error"].as_str().unwrap().contains("Windows paths"),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
 fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(dir.join("issues.json"), issues).unwrap();
@@ -571,6 +588,7 @@ fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
     script
 }
 
+#[cfg(unix)]
 #[test]
 fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     let tmp = tempfile::tempdir().unwrap();
@@ -646,6 +664,7 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn work_sync_says_what_to_do_when_gh_fails() {
     let tmp = tempfile::tempdir().unwrap();
@@ -668,6 +687,7 @@ fn work_sync_says_what_to_do_when_gh_fails() {
 /// A repo with a bare `origin`, `.paja/checks` on main, and fake `gh` and `claude` programs.
 /// The fake reviewer's verdict is read from `verdict.txt`; the fake builder writes
 /// `feature.txt` and commits it.
+#[cfg(unix)]
 struct Factory {
     tmp: tempfile::TempDir,
     repo: std::path::PathBuf,
@@ -676,6 +696,7 @@ struct Factory {
     claude: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl Factory {
     fn new(checks: &str, verdict: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
@@ -766,6 +787,7 @@ impl Factory {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn run_builds_reviews_and_lands_an_issue() {
     // Vasara's checks run the branch's code, so they get no GitHub access either: Mestari's
@@ -829,6 +851,7 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(idle["outcome"], "idle");
 }
 
+#[cfg(unix)]
 #[test]
 fn run_escalates_when_the_reviewer_asks_a_question() {
     let f = Factory::new("true\n", "escalate");
@@ -847,6 +870,7 @@ fn run_escalates_when_the_reviewer_asks_a_question() {
     assert_eq!(item["note"], "Which API?");
 }
 
+#[cfg(unix)]
 #[test]
 fn run_gives_up_after_three_failed_rounds_and_asks() {
     let f = Factory::new("test -f never.txt\n", "land");
@@ -868,6 +892,7 @@ fn run_gives_up_after_three_failed_rounds_and_asks() {
     assert_eq!(rounds, 3);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_checks_come_from_main_not_the_branch() {
     // The builder can't make its change pass by editing .paja/checks on its branch.
@@ -882,6 +907,7 @@ fn run_checks_come_from_main_not_the_branch() {
     assert!(!f.gh_log().contains("pr merge"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     let f = Factory::new("true\n", "land");
@@ -906,6 +932,7 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_second_review_judges_only_the_fix() {
     // Round one asks for changes; round two's reviewer sees the earlier blockers and the fix's
@@ -931,6 +958,7 @@ fn a_second_review_judges_only_the_fix() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fix_round_without_commits_is_not_reviewed() {
     // After a review asks for changes, a round that commits nothing goes back to the builder
@@ -954,6 +982,7 @@ fn a_fix_round_without_commits_is_not_reviewed() {
     assert!(rereview.contains("Tidy the helper"), "{args}");
 }
 
+#[cfg(unix)]
 #[test]
 fn checks_that_change_the_worktree_fail_and_are_put_back() {
     // Branch code run by the checks must not leave files or commits for the reviewer to miss.
@@ -965,6 +994,7 @@ fn checks_that_change_the_worktree_fail_and_are_put_back() {
     assert!(log.contains("changed the worktree or its commits"), "{log}");
 }
 
+#[cfg(unix)]
 #[test]
 fn checks_that_change_git_configuration_stop_the_run() {
     // Branch code run by the checks could plant a credential helper for Mestari's own git.
@@ -1012,6 +1042,7 @@ fn checks_that_change_git_configuration_stop_the_run() {
     assert_eq!(checked["outcome"], "idle", "{checked}");
 }
 
+#[cfg(unix)]
 #[test]
 fn work_from_an_agent_the_hook_never_saw_does_not_land() {
     // A run with tool turns but no hook call means something switched the hook off.
@@ -1041,6 +1072,7 @@ fn work_from_an_agent_the_hook_never_saw_does_not_land() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_empty_checks_file_is_an_error_not_a_pass() {
     let f = Factory::new("# nothing yet\n", "land");
@@ -1055,10 +1087,12 @@ fn an_empty_checks_file_is_an_error_not_a_pass() {
 }
 
 /// Run `paja hook` with a tool call on stdin; returns its exit code and stderr.
+#[cfg(unix)]
 fn hook(input: &str) -> (Option<i32>, String) {
     hook_with(&["--root", "/w/env", "--home", "/w/home"], input)
 }
 
+#[cfg(unix)]
 fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
     use std::io::Write;
     use std::process::Stdio;
@@ -1082,6 +1116,7 @@ fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn the_deny_list_hook_blocks_and_fails_closed() {
     let call = |cmd: &str| {

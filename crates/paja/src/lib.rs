@@ -7,3 +7,4 @@ pub mod hook;
 pub mod jono;
 pub mod mcp;
 pub mod mestari;
+pub mod platform;

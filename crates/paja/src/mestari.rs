@@ -96,6 +96,9 @@ fn claude_program() -> String {
 
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
+    if let Some(why) = crate::platform::unguarded() {
+        bail!("paja run can't start: {why}");
+    }
     let repo = std::path::absolute(opts.repo)?;
     // A repository whose configuration was tampered with gets no git, not even a fetch, until
     // a person says it was checked.
@@ -807,25 +810,17 @@ fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, P
         crate::events::now_ms(),
         STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&private)
-            .with_context(|| {
-                format!("creating the hook's stamp directory {}", private.display())
-            })?;
-    }
+    crate::platform::create_private_dir(&private)
+        .with_context(|| format!("creating the hook's stamp directory {}", private.display()))?;
     let stamp = private.join("stamp");
-    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails
     // in any other way must block too.
     let command = format!(
         "{} hook --root {} --home {} --stamp {}{} || exit 2",
-        quote(&exe.to_string_lossy()),
-        quote(&root.to_string_lossy()),
-        quote(&home.root().to_string_lossy()),
-        quote(&stamp.to_string_lossy()),
+        crate::platform::quote_hook_word(&exe)?,
+        crate::platform::quote_hook_word(root)?,
+        crate::platform::quote_hook_word(home.root())?,
+        crate::platform::quote_hook_word(&stamp)?,
         if read_only { " --read-only" } else { "" }
     );
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
@@ -991,12 +986,7 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
             crate::events::now_ms()
         ));
         let written = (|| {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o700)
-                .open(&partial)?;
+            let mut file = crate::platform::create_private_file(&partial)?;
             std::io::Write::write_all(&mut file, bytes)?;
             drop(file);
             std::fs::rename(&partial, &exe)
@@ -1097,19 +1087,15 @@ fn tempfile_dir(near: &Path) -> Result<PathBuf> {
         crate::events::now_ms(),
         COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    use std::os::unix::fs::DirBuilderExt;
     let _ = std::fs::create_dir_all(std::env::temp_dir());
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .with_context(|| {
-            format!(
-                "creating a scratch home {} for work in {}; check that the temporary \
+    crate::platform::create_private_dir(&dir).with_context(|| {
+        format!(
+            "creating a scratch home {} for work in {}; check that the temporary \
                  directory (TMPDIR) exists and is writable",
-                dir.display(),
-                near.display()
-            )
-        })?;
+            dir.display(),
+            near.display()
+        )
+    })?;
     Ok(dir)
 }
 
@@ -1197,8 +1183,8 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     let scratch = tempfile_dir(dir)?;
     let result = (|| {
         for check in checks {
-            let mut cmd = Command::new("sh");
-            cmd.args(["-c", check]).current_dir(dir);
+            let mut cmd = crate::platform::shell(check)?;
+            cmd.current_dir(dir);
             without_credentials(&mut cmd, &scratch, identity.clone());
             // The checks keep the owner's HOME, as agents do: toolchain managers find cargo
             // through it. Credential files there stay reachable until the sandbox.
@@ -1631,7 +1617,7 @@ impl GitGuard {
             hooks.push(main_checkout.join(owner_hooks));
         }
         // The owner's global configuration, which Mestari's own git reads.
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::platform::home_dir();
         let xdg = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(".config")));

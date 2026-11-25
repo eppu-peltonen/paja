@@ -73,7 +73,7 @@ fn dependency_roots() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
-    let home = var("HOME");
+    let home = crate::platform::home_dir().filter(|p| p.is_absolute());
     let cargo = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo")));
     let rustup = var("RUSTUP_HOME").or_else(|| home.as_ref().map(|h| h.join(".rustup")));
     let mut roots: Vec<PathBuf> = cargo
@@ -101,6 +101,10 @@ pub fn run(
     // Proof for Mestari that Claude Code called the hook at all.
     if let Some(stamp) = &stamp {
         let _ = std::fs::write(stamp, b"");
+    }
+    if let Some(why) = crate::platform::unguarded() {
+        eprintln!("Blocked: {why}");
+        return ExitCode::from(2);
     }
     // A hook that runs past Claude Code's timeout counts as "allow"; block well before it.
     std::thread::spawn(|| {
@@ -1055,7 +1059,8 @@ pub fn self_test_inputs(root: &Path, read_only: bool) -> (String, String) {
     (call(blocked), call("cargo test"))
 }
 
-#[cfg(test)]
+// The cases use Unix paths; Windows ones come with the hook's Windows port (#23).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
