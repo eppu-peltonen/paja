@@ -28,7 +28,7 @@ pub const EV_STARTED: &str = "run.started";
 pub const EV_ROUND: &str = "run.round";
 pub const EV_LANDED: &str = "run.landed";
 pub const EV_ESCALATED: &str = "run.escalated";
-/// A non-blocking review finding filed as a `paja` issue after landing.
+/// A non-blocking review finding filed as a `paja-follow-up` issue after landing.
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// Branch code changed git's configuration in `repo`; Paja runs no git there until a person
 /// has checked it and recorded [`EV_TAMPER_CHECKED`].
@@ -65,8 +65,8 @@ pub struct Review {
     /// The intent question for a person, when the verdict is `escalate`.
     #[serde(default)]
     pub question: String,
-    /// Findings that don't block landing. Mestari files each as a `paja` issue once the change
-    /// lands, so they are fixed later instead of holding this change up.
+    /// Findings that don't block landing. Mestari files each as a `paja-follow-up` issue once
+    /// the change lands, for a person to queue, instead of holding this change up.
     #[serde(default)]
     pub follow_ups: Vec<String>,
 }
@@ -259,8 +259,13 @@ fn run_item(
             .any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
         let reviews = (0..reviewers)
-            .map(|_| review(home, &env, item, base, prior.as_ref()))
+            // High-risk reviewers read the whole change every round: the two must agree on all
+            // of it, not only on the fix.
+            .map(|_| review(home, &env, item, base, prior.as_ref().filter(|_| !risky)))
             .collect::<Result<Vec<_>>>()?;
+        // Only the round that lands files its follow-ups: an earlier round's may be about code
+        // the fix has since changed.
+        follow_ups.clear();
         for review in &reviews {
             for finding in &review.follow_ups {
                 if !finding.trim().is_empty() && !follow_ups.contains(finding) {
@@ -401,8 +406,8 @@ fn review(
          is a bug in what the issue asks for, a security hole the change opens, a broken \
          CLAUDE.md rule, or missing tests for the new behaviour. Anything else, including \
          hardening ideas, edge cases outside the issue and nits, goes in `follow_ups`, one \
-         finding each, starting with a short title line; Paja files them as issues after \
-         landing, and they never hold the change up. You may run cargo and read-only git; you \
+         finding each, starting with a short title line, at most five; Paja files them as issues \
+         after landing, and they never hold the change up. You may run cargo and read-only git; you \
          can't change files.\n\n\
          Issue #{number}: {title}\n\n{body}\n",
         number = item.number,
@@ -1257,29 +1262,51 @@ fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u
     Ok(())
 }
 
-/// Ask the person on the issue.
-/// File each non-blocking review finding as a `paja` issue, once the change has landed. A
-/// failure here is recorded, never turned into an escalation: the change is already merged.
+/// The label follow-up issues get. Jono imports only `paja`, so a follow-up waits until a
+/// person relabels it: reviewers suggest work, people set intent.
+pub const FOLLOW_UP_LABEL: &str = "paja-follow-up";
+
+/// At most this many follow-up issues per change; the rest are folded into the last one.
+const MAX_FOLLOW_UPS: usize = 5;
+
+/// File each non-blocking review finding as a `paja-follow-up` issue, once the change has
+/// landed. A failure here is recorded, never turned into an escalation: the change is already
+/// merged.
 fn file_follow_ups(home: &Home, repo: &Path, item: &WorkItem, pr: &str, findings: &[String]) {
-    for finding in findings {
+    let mut findings: Vec<String> = findings.to_vec();
+    if findings.len() > MAX_FOLLOW_UPS {
+        let rest = findings.split_off(MAX_FOLLOW_UPS - 1);
+        findings.push(format!(
+            "More review follow-ups for #{}\n\n{}",
+            item.number,
+            rest.join("\n\n---\n\n")
+        ));
+    }
+    for finding in &findings {
         let title: String = finding
             .lines()
-            .next()
+            .map(|line| line.trim().trim_start_matches(['#', '-', '*', ' ']).trim())
+            .find(|line| !line.is_empty())
             .unwrap_or("Review follow-up")
-            .trim()
-            .trim_start_matches(['#', '-', '*', ' '])
             .chars()
             .take(100)
             .collect();
         let body = format!(
             "{finding}\n\nA reviewer found this while reviewing #{number} ({pr}). It did not \
-             block landing.",
+             block landing. Relabel it `paja` to queue it.",
             number = item.number
         );
         let filed = run_gh(
             repo,
             &[
-                "issue", "create", "--label", "paja", "--title", &title, "--body", &body,
+                "issue",
+                "create",
+                "--label",
+                FOLLOW_UP_LABEL,
+                "--title",
+                &title,
+                "--body",
+                &body,
             ],
         );
         let _ = record(
@@ -1295,6 +1322,7 @@ fn file_follow_ups(home: &Home, repo: &Path, item: &WorkItem, pr: &str, findings
     }
 }
 
+/// Ask the person on the issue.
 fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
     let body = format!(
         "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer here, then run \

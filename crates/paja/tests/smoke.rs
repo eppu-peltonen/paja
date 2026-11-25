@@ -797,13 +797,14 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]));
-    // Every agent runs under the deny-list hook, bounded to its environment, and with no
-    // settings files that could switch the hook off.
-    // A finding that didn't block landing becomes a `paja` issue.
+    // A finding that didn't block landing becomes an issue for a person to queue, not queued
+    // work.
     assert!(
-        log.contains("issue create --label paja --title Tidy the helper"),
+        log.contains("issue create --label paja-follow-up --title Tidy the helper"),
         "{log}"
     );
+    // Every agent runs under the deny-list hook, bounded to its environment, and with no
+    // settings files that could switch the hook off.
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
     assert!(args.contains("--setting-sources  --settings"), "{args}");
     // CLAUDE.md doesn't load without setting sources, so main's copy comes with the prompt.
@@ -909,8 +910,18 @@ fn a_second_review_judges_only_the_fix() {
     assert_eq!(report["outcome"], "landed", "{report}");
     assert_eq!(report["rounds"], 2, "{report}");
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
-    assert!(args.contains("Judge only the fix"), "{args}");
-    assert!(args.contains("add more"), "{args}");
+    // Each logged call starts with `-p`; the reviewer's carries `--json-schema`.
+    let rereview = args
+        .split("\n-p ")
+        .filter(|call| call.contains("--json-schema"))
+        .nth(1)
+        .unwrap_or_default();
+    assert!(rereview.contains("found these blockers"), "{args}");
+    assert!(rereview.contains("add more"), "{args}");
+    assert!(
+        rereview.contains("Judge only the fix: `git diff "),
+        "{args}"
+    );
 }
 
 #[test]
