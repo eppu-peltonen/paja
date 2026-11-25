@@ -732,17 +732,9 @@ fn build(
     Ok(StepUsage::from_result("build", None, models, role, &out))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn review(
-    home: &Home,
-    env: &Env,
-    item: &WorkItem,
-    base: &str,
-    prior: Option<&Prior>,
-    reviewer: u32,
-    models: &Models,
-    role: &str,
-) -> Result<(Review, StepUsage)> {
+/// What a reviewer is asked. `checked` is the commit Vasara's checks passed at, which is the
+/// commit the reviewer judges.
+fn review_prompt(item: &WorkItem, base: &str, checked: &str, prior: Option<&Prior>) -> String {
     // A first review reads the whole change; a later one judges only the fix for the blockers
     // an earlier review named, so review rounds converge instead of starting over.
     let scope = match prior {
@@ -764,7 +756,7 @@ fn review(
             }
         ),
     };
-    let prompt = format!(
+    format!(
         "You are an independent reviewer for Paja. You did not write this change; decide \
          whether it lands.\n\n{scope} Judge it by the rules in CLAUDE.md as they are on main \
          (`git show {base}:CLAUDE.md`), not the branch's copy.\n\n\
@@ -777,13 +769,32 @@ fn review(
          hardening ideas, edge cases outside the issue and nits, goes in `follow_ups`, one \
          finding each, starting with a short title line, at most five; Paja files them as public \
          issues after landing, so never copy secrets, environment details or run output into \
-         them. They never hold the change up. You may run cargo and read-only git; you \
-         can't change files.\n\n\
+         them. They never hold the change up.\n\n\
+         Vasara's checks (every command in `.paja/checks` on main: formatting, lints and the full \
+         test suite) already passed at {checked}, the commit you are judging, so don't run \
+         `cargo fmt`, `cargo clippy` or the whole `cargo test` again. To probe a behaviour, run \
+         one named test (`cargo test <name>`) or the CLI, with long output piped through \
+         `tail -n 80` or `grep`. Read-only git is fine; you can't change files.\n\n\
          Issue #{number}: {title}\n\n{body}\n",
         number = item.number,
         title = item.title,
         body = item.body
-    );
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review(
+    home: &Home,
+    env: &Env,
+    item: &WorkItem,
+    base: &str,
+    prior: Option<&Prior>,
+    reviewer: u32,
+    models: &Models,
+    role: &str,
+) -> Result<(Review, StepUsage)> {
+    let before = git(&env.path, &["rev-parse", "HEAD"])?;
+    let prompt = review_prompt(item, base, &before, prior);
     let schema = json!({
         "type": "object",
         "properties": {
@@ -810,7 +821,6 @@ fn review(
         "Bash(pwd)",
         "Bash(git show*)",
     ];
-    let before = git(&env.path, &["rev-parse", "HEAD"])?;
     let out = claude(
         home,
         env,
@@ -2383,5 +2393,23 @@ mod tests {
         // High-risk reviewers read the whole change every round, so never `re-review`.
         assert_eq!(review_role(true, 0, true), "review");
         assert_eq!(review_role(true, 1, true), "review-2");
+    }
+
+    #[test]
+    fn the_review_prompt_names_the_checked_commit_and_skips_the_suite() {
+        let item = crate::jono::WorkItem {
+            number: 9,
+            title: "T".into(),
+            body: "B".into(),
+            url: String::new(),
+            open: true,
+            status: crate::jono::Status::Active,
+            note: None,
+            usage: None,
+        };
+        let prompt = super::review_prompt(&item, "base1", "abc123", None);
+        assert!(prompt.contains("already passed at abc123"), "{prompt}");
+        assert!(prompt.contains("don't run `cargo fmt`, `cargo clippy` or the whole `cargo test`"));
+        assert!(prompt.contains("`cargo test <name>`"));
     }
 }
