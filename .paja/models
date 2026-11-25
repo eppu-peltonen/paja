@@ -9,3 +9,10 @@ fix sonnet
 review opus
 re-review sonnet medium
 review-2 sonnet medium
+# The most turns one session of a role may take: `max-turns <role> <turns>`. A role with no
+# line gets 80 (build, fix) or 30 (the reviews); no session runs uncapped.
+max-turns build 80
+max-turns fix 80
+max-turns review 30
+max-turns re-review 30
+max-turns review-2 30

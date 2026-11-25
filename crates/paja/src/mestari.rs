@@ -215,6 +215,8 @@ pub struct RoleModel {
 pub struct Models {
     pub roles: std::collections::BTreeMap<String, RoleModel>,
     pub fallback: Option<String>,
+    /// `max-turns <role> <n>` lines: the most turns one session of the role may take.
+    pub max_turns: std::collections::BTreeMap<String, u32>,
 }
 
 impl Models {
@@ -243,6 +245,32 @@ impl Models {
                      or `claude-opus-4-1` (letters, digits, `.`, `-`, `_`, `[`, `]`)",
                     at()
                 );
+            }
+            if role == "max-turns" {
+                let (Some(named), Some(Ok(limit)), 2) = (
+                    rest.first(),
+                    rest.get(1).map(|n| n.parse::<u32>()),
+                    rest.len(),
+                ) else {
+                    bail!("{}: write it as `max-turns <role> <turns>`", at());
+                };
+                if !ROLES.contains(named) {
+                    bail!(
+                        "{}: unknown role {named:?}; use one of {}",
+                        at(),
+                        ROLES.join(", ")
+                    );
+                }
+                if limit == 0 {
+                    bail!("{}: a turn limit must be at least 1", at());
+                }
+                if models.max_turns.insert(named.to_string(), limit).is_some() {
+                    bail!(
+                        "{}: `max-turns {named}` is named twice; keep one line",
+                        at()
+                    );
+                }
+                continue;
             }
             if role == "fallback" {
                 let [model] = rest else {
@@ -285,12 +313,28 @@ impl Models {
         Ok(models)
     }
 
-    /// The flags `claude -p` gets for a role: none when the file doesn't name it.
+    /// The most turns one session of the role may take: the file's `max-turns` line, or 80 for
+    /// builders and 30 for reviewers. No session runs without a cap, so an agent going in
+    /// circles can't spend the account's usage window.
+    pub fn max_turns(&self, role: &str) -> u32 {
+        self.max_turns
+            .get(role)
+            .copied()
+            .unwrap_or(if matches!(role, "build" | "fix") {
+                80
+            } else {
+                30
+            })
+    }
+
+    /// The flags `claude -p` gets for a role. The model flags are left out when the file
+    /// doesn't name the role.
     fn args(&self, role: &str) -> Vec<String> {
+        let mut args = vec!["--max-turns".to_string(), self.max_turns(role).to_string()];
         let Some(chosen) = self.roles.get(role) else {
-            return Vec::new();
+            return args;
         };
-        let mut args = vec!["--model".to_string(), chosen.model.clone()];
+        args.extend(["--model".to_string(), chosen.model.clone()]);
         if let Some(effort) = &chosen.effort {
             args.extend(["--effort".to_string(), effort.clone()]);
         }
@@ -460,6 +504,8 @@ fn run_item(
     // running totals come off the next step's. Never kept across runs, so an environment made
     // again (or a later `paja run`) always starts a fresh session.
     let mut builder: Option<StepUsage> = None;
+    // How often each kind of step hit its turn limit in this run: a second hit escalates.
+    let (mut builder_limits, mut review_limits) = (0u32, 0u32);
     progress(&format!("working in {}", env.path.display()));
     for round in 1..=MAX_ROUNDS {
         *rounds = round;
@@ -467,7 +513,7 @@ fn run_item(
             "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
         ));
         let role = if round == 1 { "build" } else { "fix" };
-        let (step, raw) = build(
+        let built = build(
             home,
             &env,
             item,
@@ -476,7 +522,48 @@ fn run_item(
             &models,
             role,
             builder.as_ref(),
-        )?;
+        );
+        let (step, raw) = match built {
+            Ok(built) => built,
+            Err(err) => {
+                let Some(limit) = turn_limit(&err) else {
+                    return Err(err);
+                };
+                let raw = StepUsage::from_result("build", None, &models, role, &limit.0);
+                // A resumed session's totals include its earlier rounds.
+                let step = match &builder {
+                    Some(earlier)
+                        if earlier.session_id.is_some() && earlier.session_id == raw.session_id =>
+                    {
+                        raw.since(earlier)
+                    }
+                    _ => raw.clone(),
+                };
+                builder = Some(raw);
+                let note = format!(
+                    "the builder hit the turn limit of {}",
+                    models.max_turns(role)
+                );
+                builder_limits += 1;
+                record_round(home, item, round, "turn_limit", &note, &[step])?;
+                if builder_limits > 1 {
+                    return turn_limit_twice(home, repo, &env, item, &note, round);
+                }
+                progress(&format!("{note}; asking it to finish smaller"));
+                feedback = format!(
+                    "Your last session stopped because {note}. Finish smaller: do only what the \
+                     issue needs, avoid long explorations, commit what works, and keep outputs \
+                     short (pipe long ones through `tail` or `grep`)."
+                );
+                if let Some(p) = &prior {
+                    feedback.push_str(&format!(
+                        "\n\nThe review's blockers still need fixing too:\n\n{}",
+                        p.blockers
+                    ));
+                }
+                continue;
+            }
+        };
         builder = Some(raw);
         let mut steps = vec![step];
         commit_leftovers(&env, item)?;
@@ -583,38 +670,79 @@ fn run_item(
                 prior = None;
             }
         }
-        let reviews = (0..reviewers)
+        let mut reviews: Vec<Review> = Vec::new();
+        let mut limited = None;
+        for i in 0..reviewers {
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
-            .map(|i| {
-                progress(&format!(
-                    "checks passed; reviewer {} of {reviewers} is reading the change{}",
-                    i + 1,
-                    if risky {
-                        " (high risk: two must agree)"
-                    } else {
-                        ""
+            progress(&format!(
+                "checks passed; reviewer {} of {reviewers} is reading the change{}",
+                i + 1,
+                if risky {
+                    " (high risk: two must agree)"
+                } else {
+                    ""
+                }
+            ));
+            let role = review_role(risky, i, prior.is_some());
+            let reviewer = i as u32 + 1;
+            let reviewed = review(
+                home,
+                &env,
+                item,
+                base,
+                prior.as_ref().filter(|_| !risky),
+                reviewer,
+                &models,
+                role,
+            );
+            match reviewed {
+                Ok((review, used)) => {
+                    steps.push(used);
+                    reviews.push(review);
+                }
+                // The review already put the worktree back. Its spend still counts.
+                Err(err) => match turn_limit(&err) {
+                    Some(limit) => {
+                        let used = StepUsage::from_result(
+                            "review",
+                            Some(reviewer),
+                            &models,
+                            role,
+                            &limit.0,
+                        );
+                        steps.push(used);
+                        limited = Some(format!(
+                            "reviewer {reviewer} hit the turn limit of {}",
+                            models.max_turns(role)
+                        ));
+                        break;
                     }
+                    None => return Err(err),
+                },
+            }
+        }
+        if let Some(note) = limited {
+            review_limits += 1;
+            record_round(home, item, round, "turn_limit", &note, &steps)?;
+            if review_limits > 1 {
+                return turn_limit_twice(home, repo, &env, item, &note, round);
+            }
+            progress(&format!(
+                "{note}; asking the builder to make the change easier to review"
+            ));
+            feedback = format!(
+                "The change was not reviewed: {note} reading it. Make it smaller and easier to \
+                 review: drop anything the issue doesn't need, and commit."
+            );
+            if let Some(p) = &prior {
+                feedback.push_str(&format!(
+                    "\n\nThe review's blockers still need fixing too:\n\n{}",
+                    p.blockers
                 ));
-                review(
-                    home,
-                    &env,
-                    item,
-                    base,
-                    prior.as_ref().filter(|_| !risky),
-                    i as u32 + 1,
-                    &models,
-                    review_role(risky, i, prior.is_some()),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let reviews: Vec<Review> = reviews
-            .into_iter()
-            .map(|(review, used)| {
-                steps.push(used);
-                review
-            })
-            .collect();
+            }
+            continue;
+        }
         // Only the round that lands files its follow-ups: an earlier round's may be about code
         // the fix has since changed.
         follow_ups.clear();
@@ -697,6 +825,25 @@ fn run_item(
         item.number
     );
     escalated(home, repo, &env, item, &question, MAX_ROUNDS)
+}
+
+/// The same kind of step hit its turn limit a second time in this run: ask a person rather
+/// than spend another round.
+fn turn_limit_twice(
+    home: &Home,
+    repo: &Path,
+    env: &Env,
+    item: &WorkItem,
+    note: &str,
+    round: u32,
+) -> Result<RunReport> {
+    let question = format!(
+        "In this run {note}, the second time that step stopped at its turn limit. The issue may \
+         be too big for one change: split it into smaller issues, or raise the limit with a \
+         `max-turns` line in `{MODELS_FILE}` on main, then run `paja work set {} queued`.",
+        item.number
+    );
+    escalated(home, repo, env, item, &question, round)
 }
 
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
@@ -959,6 +1106,23 @@ fn agent_tools(read_only: bool) -> &'static str {
     }
 }
 
+/// A session stopped at its `--max-turns` limit. Carries Claude Code's result, which still
+/// reports what the session spent and its session id.
+#[derive(Debug)]
+struct TurnLimit(Value);
+
+impl std::fmt::Display for TurnLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Claude Code stopped at its turn limit")
+    }
+}
+
+impl std::error::Error for TurnLimit {}
+
+fn turn_limit(err: &anyhow::Error) -> Option<&TurnLimit> {
+    err.chain().find_map(|e| e.downcast_ref::<TurnLimit>())
+}
+
 /// Claude Code ran and exited with an error or reported one: nothing Paja itself refused, so a
 /// failed resume may be tried again as a fresh session.
 #[derive(Debug)]
@@ -1089,6 +1253,12 @@ fn claude(
             crate::platform::CLAUDE_HINT
         )
     })?;
+    // Checked before the exit status: a session at its turn limit exits with an error.
+    if let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) {
+        if value["subtype"] == "error_max_turns" {
+            return Err(TurnLimit(value).into());
+        }
+    }
     if !output.status.success() {
         return Err(ClaudeFailed(format!(
             "`{program} -p` failed in {}: {}",
@@ -2463,10 +2633,15 @@ mod tests {
         let models =
             Models::parse("# comment\n\nbuild sonnet\nreview opus high\nfallback sonnet\n")
                 .unwrap();
-        assert_eq!(models.args("build"), ["--model", "sonnet"]);
+        assert_eq!(
+            models.args("build"),
+            ["--max-turns", "80", "--model", "sonnet"]
+        );
         assert_eq!(
             models.args("review"),
             [
+                "--max-turns",
+                "30",
                 "--model",
                 "opus",
                 "--effort",
@@ -2475,8 +2650,12 @@ mod tests {
                 "sonnet"
             ]
         );
-        // A role with no line keeps the account's default: no flags at all.
-        assert!(models.args("fix").is_empty());
+        // A role with no line keeps the account's default model, but never runs uncapped.
+        assert_eq!(models.args("fix"), ["--max-turns", "80"]);
+        let capped = Models::parse("max-turns build 5\nmax-turns review-2 7\n").unwrap();
+        assert_eq!(capped.max_turns("build"), 5);
+        assert_eq!(capped.max_turns("review-2"), 7);
+        assert_eq!(capped.max_turns("re-review"), 30);
         assert_eq!(Models::parse("").unwrap(), Models::default());
         for (text, says) in [
             ("reviewer opus", "line 1: \"reviewer opus\": unknown role"),
@@ -2489,6 +2668,14 @@ mod tests {
             ("build sonnet\nbuild opus", "line 2"),
             ("fallback", "write it as `fallback <model>`"),
             ("fallback a\nfallback b", "`fallback` is named twice"),
+            ("max-turns build", "write it as `max-turns <role> <turns>`"),
+            (
+                "max-turns build many",
+                "write it as `max-turns <role> <turns>`",
+            ),
+            ("max-turns builder 3", "unknown role \"builder\""),
+            ("max-turns build 0", "at least 1"),
+            ("max-turns fix 3\nmax-turns fix 4", "named twice"),
             ("build $(x)", "not a plain model or effort name"),
             (
                 "build --dangerously-skip-permissions",

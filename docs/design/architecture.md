@@ -94,6 +94,14 @@ with no line passes neither and runs on the account's default. A `fallback <mode
 (left out where it is the role's own model), so a busy model doesn't fail the round. An unknown role, effort or a
 malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`.
 
+Every session also gets `--max-turns`, from `max-turns <role> <turns>` lines in the same file (80 for `build` and
+`fix`, 30 for the reviews when a role has no line), so an agent going in circles can't spend the account's usage
+window. A session that stops at its limit fails the round with a note (`turn_limit`, "the builder hit the turn limit
+of 80") and its spend is still recorded. The builder's next round is told to finish smaller; after a reviewer hits the
+limit, its worktree is put back as after any review and the builder is told to make the change easier to review. The
+same kind of step (build or review) hitting its limit a second time in a run escalates with a question that says so,
+instead of using another round.
+
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
 for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
