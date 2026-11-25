@@ -278,6 +278,15 @@ fn run_item(
             }
         }
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
+        // Files marked assume-unchanged or skip-worktree hide from `git status`. Sparse
+        // checkout marks every file outside its cone skip-worktree, so the checks are judged
+        // by whether they changed the flags. Any flag the builder's code set goes first: a
+        // fresh index keeps only the ones sparse checkout gives.
+        let mut flags = git(&env.path, &["ls-files", "-v"])?;
+        if has_index_flags(&flags) {
+            put_back(&env, &checked)?;
+            flags = git(&env.path, &["ls-files", "-v"])?;
+        }
         let guard = GitGuard::new(&env.path)?;
         progress(&format!(
             "running Vasara's checks ({} command{})",
@@ -289,12 +298,8 @@ fn run_item(
         // The checks run the branch's code, which could change the tree or even commit. Put it
         // back, and fail the round, so nothing lands that the checks didn't judge.
         let mut failed = result;
-        // Files marked assume-unchanged or skip-worktree would hide from `git status`.
-        let hidden = git(&env.path, &["ls-files", "-v"])?
-            .lines()
-            .any(|line| line.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'));
         let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
-            || hidden
+            || git(&env.path, &["ls-files", "-v"])? != flags
             || !git(&env.path, &["status", "--porcelain"])?.is_empty();
         if moved {
             put_back(&env, &checked)?;
@@ -802,9 +807,18 @@ fn git_status(repo: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Whether a `git ls-files -v` listing marks any file assume-unchanged (a lowercase tag) or
+/// skip-worktree (`S`).
+fn has_index_flags(listing: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'))
+}
+
 /// Put the environment's branch, index and files back at `to` after code ran there. The
-/// index is rebuilt from scratch, so no file stays hidden behind an assume-unchanged or
-/// skip-worktree flag. Ignored files such as `target/` stay.
+/// index is rebuilt from scratch, so no file stays hidden behind an assume-unchanged flag,
+/// and only sparse checkout's own skip-worktree flags come back. Ignored files such as
+/// `target/` stay.
 fn put_back(env: &Env, to: &str) -> Result<()> {
     let index = git(&env.path, &["rev-parse", "--git-path", "index"])?;
     let index = env.path.join(index);
@@ -1745,6 +1759,9 @@ impl GitGuard {
                 own.join("commondir"),
                 own.join("gitdir"),
                 common.join("info/exclude"),
+                // Sparse checkout's patterns decide which files may be skip-worktree; new
+                // ones could hide a test from the checks.
+                own.join("info/sparse-checkout"),
             ],
             raw: Vec::new(),
             hooks,

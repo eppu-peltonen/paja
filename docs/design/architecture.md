@@ -66,7 +66,9 @@ environment `work-<issue>` from `main` (resuming the branch an earlier run kept)
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
 2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
-   check run that changed the worktree, its index or its commits, which are put back first.
+   check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
+   fresh index, so the only assume-unchanged or skip-worktree flags left are the ones sparse checkout gives; a check
+   run that changes those flags changed the index.
 3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
    answers `land`, `changes` (blockers only) or `escalate`, plus non-blocking follow-ups that Mestari files as
    `paja-follow-up` issues once the change lands. A later round's reviewer judges only the fix for the earlier

@@ -1040,6 +1040,50 @@ fn checks_that_change_the_worktree_fail_and_are_put_back() {
 }
 
 #[test]
+fn checks_that_hide_a_file_fail_and_the_file_is_put_back() {
+    // A file marked assume-unchanged or skip-worktree hides from `git status`. The first
+    // round's checks change one and hide it; the second round's find it put back and pass.
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let marker = "\"$(git rev-parse --git-dir)/marked\"";
+        let f = Factory::new(
+            &format!(
+                "if [ -f {marker} ]; then test \"$(cat hello.txt)\" = hi; \
+                 else touch {marker} && echo x >> hello.txt && git update-index {flag} hello.txt; fi\n"
+            ),
+            "land",
+        );
+        let (ok, report) = f.run();
+        assert!(ok, "{flag}: {report}");
+        assert_eq!(report["outcome"], "landed", "{flag}: {report}");
+        assert_eq!(report["rounds"], 2, "{flag}: {report}");
+        let log = std::fs::read_to_string(f.home.join("events.jsonl")).unwrap();
+        assert!(log.contains("changed the worktree or its commits"), "{log}");
+    }
+}
+
+#[test]
+fn a_sparse_checkout_lands_when_its_checks_pass() {
+    // Sparse checkout marks every file outside its cone skip-worktree; that is not a change
+    // the checks made.
+    let f = Factory::new(
+        "test ! -e outside/big.txt\ngit ls-files -v | grep -q '^S outside/big.txt'\n\
+         test -f feature.txt\n",
+        "land",
+    );
+    std::fs::create_dir_all(f.repo.join("outside")).unwrap();
+    std::fs::write(f.repo.join("outside/big.txt"), "far away\n").unwrap();
+    git(&f.repo, &["add", "."]);
+    git(&f.repo, &["commit", "-q", "-m", "outside"]);
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+    // Only the top-level files; `git worktree add` copies this to the environment.
+    git(&f.repo, &["sparse-checkout", "init", "--cone"]);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 1, "{report}");
+}
+
+#[test]
 fn checks_that_change_git_configuration_stop_the_run() {
     // Branch code run by the checks could plant a credential helper for Mestari's own git.
     let f = Factory::new("git config paja.planted yes\n", "land");
