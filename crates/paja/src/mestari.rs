@@ -94,6 +94,47 @@ fn claude_program() -> String {
     std::env::var("PAJA_CLAUDE").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// Tell the person watching what `paja run` is doing now: one line on stderr, so stdout keeps
+/// its one JSON value per item. A long step says so, since silence reads as broken.
+/// Text from outside (an issue title, a verdict) can carry terminal escapes or line breaks
+/// that would fake or rewrite earlier lines, so control characters become spaces and a long
+/// message is cut.
+pub fn progress(message: &str) {
+    use std::io::Write;
+    // A closed stderr must never abort a run halfway, for example between merge and record.
+    let _ = writeln!(std::io::stderr(), "paja: {}", shown_line(message));
+}
+
+/// Characters that can break, reorder or hide text on a terminal: controls, line and
+/// paragraph separators, bidi overrides and isolates, and zero-width marks.
+fn unsafe_on_a_terminal(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
+}
+
+fn shown_line(message: &str) -> String {
+    const MAX: usize = 300;
+    let mut line: String = message
+        .chars()
+        .map(|c| if unsafe_on_a_terminal(c) { ' ' } else { c })
+        .take(MAX)
+        .collect();
+    if message.chars().count() > MAX {
+        line.push_str("...");
+    }
+    line
+}
+
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let repo = std::path::absolute(opts.repo)?;
@@ -130,10 +171,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         "fetching origin/main; check the network and that `origin` is the GitHub repository",
     )?;
     let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    progress("checking the queue (issues labelled paja)");
     jono::sync(home, &repo)?;
     let Some(item) = jono::claim(home)? else {
         return Ok(RunReport::Idle);
     };
+    progress(&format!("picked #{}: {}", item.number, item.title));
     // Anything that goes wrong from here is reported on the issue, not lost.
     let mut rounds = 0;
     match run_item(home, &repo, &base, &item, &mut rounds) {
@@ -162,7 +205,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 )?;
                 return Err(err);
             }
-            let _ = comment(&repo, &item, &question);
+            let asked = comment(&repo, &item, &question);
+            progress(&parked_line(
+                &format!("#{} stopped on an error and was parked", item.number),
+                item.number,
+                asked.err(),
+            ));
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
                 number: item.number,
@@ -199,8 +247,12 @@ fn run_item(
     let mut feedback = String::new();
     let mut prior: Option<Prior> = None;
     let mut follow_ups: Vec<String> = Vec::new();
+    progress(&format!("working in {}", env.path.display()));
     for round in 1..=MAX_ROUNDS {
         *rounds = round;
+        progress(&format!(
+            "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
+        ));
         build(home, &env, item, base, &feedback)?;
         commit_leftovers(&env, item)?;
         if git(
@@ -209,6 +261,7 @@ fn run_item(
         )? == "0"
         {
             feedback = "The previous round made no commits. Make the change and commit it.".into();
+            progress("the builder committed nothing; asking again");
             record_round(home, item, round, "no_change", &feedback)?;
             continue;
         }
@@ -219,12 +272,18 @@ fn run_item(
                     "The previous round made no new commits. Fix these blockers and commit:\n\n{}",
                     prior.blockers
                 );
+                progress("the builder committed no fix; asking again");
                 record_round(home, item, round, "no_change", &feedback)?;
                 continue;
             }
         }
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
         let guard = GitGuard::new(&env.path)?;
+        progress(&format!(
+            "running Vasara's checks ({} command{})",
+            checks.len(),
+            if checks.len() == 1 { "" } else { "s" }
+        ));
         let result = run_checks(&env.path, &checks);
         guard.check("Vasara's checks")?;
         // The checks run the branch's code, which could change the tree or even commit. Put it
@@ -257,6 +316,7 @@ fn run_item(
                     prior.blockers
                 ));
             }
+            progress("the checks failed; sending the failure back to the builder");
             record_round(home, item, round, "checks_failed", &failure)?;
             continue;
         }
@@ -296,7 +356,18 @@ fn run_item(
         let reviews = (0..reviewers)
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
-            .map(|_| review(home, &env, item, base, prior.as_ref().filter(|_| !risky)))
+            .map(|i| {
+                progress(&format!(
+                    "checks passed; reviewer {} of {reviewers} is reading the change{}",
+                    i + 1,
+                    if risky {
+                        " (high risk: two must agree)"
+                    } else {
+                        ""
+                    }
+                ));
+                review(home, &env, item, base, prior.as_ref().filter(|_| !risky))
+            })
             .collect::<Result<Vec<_>>>()?;
         // Only the round that lands files its follow-ups: an earlier round's may be about code
         // the fix has since changed.
@@ -309,6 +380,7 @@ fn run_item(
             }
         }
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
+        progress(&format!("review verdict: {}", verdicts.join(", ")));
         record_round(home, item, round, &verdicts.join(","), &summaries(&reviews))?;
 
         if let Some(esc) = reviews.iter().find(|r| r.verdict == "escalate") {
@@ -1259,6 +1331,7 @@ fn land(
         )?,
     };
     // CI must be green before landing; a red CI is a failed check, not a merge.
+    progress(&format!("opened {pr}; waiting for CI"));
     if let Err(err) = wait_for_ci(repo, &pr) {
         let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
         return escalated(home, repo, env, item, &question, rounds);
@@ -1275,6 +1348,7 @@ fn land(
         EV_LANDED,
         json!({ "number": item.number, "pr": pr, "rounds": rounds }),
     );
+    progress(&format!("landed #{} ({pr})", item.number));
     Ok(RunReport::Landed {
         number: item.number,
         pr,
@@ -1292,7 +1366,12 @@ fn escalated(
 ) -> Result<RunReport> {
     // The branch keeps the work; the worktree and its ports are freed.
     let _ = ahjo::remove(home, &env.name, true);
-    escalate(home, repo, item, question, rounds)?;
+    let failed = escalate(home, repo, item, question, rounds)?;
+    progress(&parked_line(
+        &format!("#{} needs a decision", item.number),
+        item.number,
+        failed,
+    ));
     Ok(RunReport::Escalated {
         number: item.number,
         question: question.to_string(),
@@ -1300,8 +1379,28 @@ fn escalated(
     })
 }
 
-/// Ask the person on the issue, and park the item until they answer.
-fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u32) -> Result<()> {
+/// The progress line for a parked item: where the question is and how to retry come first,
+/// so a long gh error at the end can't push them out of the line.
+fn parked_line(what: &str, number: u64, comment_error: Option<anyhow::Error>) -> String {
+    let retry = format!("then `paja work set {number} queued`");
+    match comment_error {
+        None => format!("{what}; asked on the issue, answer there ({retry})"),
+        Some(err) => format!(
+            "{what}; couldn't comment on the issue, so see `paja work show {number}` for the \
+             question ({retry}); gh said: {err:#}"
+        ),
+    }
+}
+
+/// Ask the person on the issue, and park the item until they answer. Returns the comment's
+/// error when it didn't reach the issue.
+fn escalate(
+    home: &Home,
+    repo: &Path,
+    item: &WorkItem,
+    question: &str,
+    rounds: u32,
+) -> Result<Option<anyhow::Error>> {
     // Park the item first, so it never stays active if the comment fails.
     jono::set_status(home, item.number, Status::Escalated, Some(question))?;
     record(
@@ -1310,13 +1409,8 @@ fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u
         json!({ "number": item.number, "rounds": rounds }),
     )?;
     // The item is parked either way; a failed comment must not escalate it a second time.
-    if let Err(err) = comment(repo, item, question) {
-        eprintln!(
-            "warning: couldn't comment on issue #{}: {err:#}",
-            item.number
-        );
-    }
-    Ok(())
+    // The caller reports it, cleaned for the terminal.
+    Ok(comment(repo, item, question).err())
 }
 
 /// The label follow-up issues get. Jono imports only `paja`, so a follow-up waits until a
@@ -1889,6 +1983,13 @@ mod tests {
             lines("# checks\ncargo test\n\n  cargo fmt --all --check \n"),
             ["cargo test", "cargo fmt --all --check"]
         );
+    }
+
+    #[test]
+    fn progress_lines_cannot_carry_terminal_controls() {
+        let line = shown_line("Fix\r\x1b[2Kpaja: landed #5\nnext\u{2028}\u{202E}x\u{2067}y");
+        assert!(!line.chars().any(unsafe_on_a_terminal), "{line:?}");
+        assert!(shown_line(&"x".repeat(1000)).chars().count() <= 303);
     }
 
     #[test]
