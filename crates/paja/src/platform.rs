@@ -97,8 +97,8 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     win::create_owner_only(dir)
 }
 
-/// Make sure `dir` exists and only this user can change it. On Unix create it if needed, as
-/// Paja always has. On Windows create it owner-only, or, if it exists, check that this user
+/// Make sure `dir` exists and only this user can change it. On Unix create it 0700 if needed
+/// (an existing one is left as it is). On Windows create it owner-only, or, if it exists, check that this user
 /// owns it and that its ACL is protected and lets no other account in; checked on every call,
 /// so a later change is caught.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -112,7 +112,15 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
             Err(err) => Err(err),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(any(unix, windows)))]
     std::fs::create_dir_all(dir)
 }
 
@@ -216,9 +224,9 @@ pub fn shell_path(word: &str) -> PathBuf {
 /// reads some spellings differently from how they look: device and UNC paths (`\\?\`,
 /// `\\server\share`), drive-relative paths (`C:foo`), paths rooted without a drive (`\x`,
 /// which a tool may map to another drive or Git's own directory), names with a trailing dot
-/// or space (`.git.` is `.git`), alternate data streams (`a:stream`), unless `revisions`
-/// allows git's revision forms (`HEAD:path`, `main..`), reserved device names (`NUL`, `COM1`) and characters
-/// Windows forbids in names. All are refused rather than interpreted. (An 8.3 short name such
+/// or space (`.git.` is `.git`), alternate data streams (`a:stream`), reserved device names (`NUL`, `COM1`) and characters
+/// Windows forbids in names. All are refused rather than interpreted. `revisions` lifts only
+/// the stream and trailing-dot rules, for git's revision forms (`HEAD:path`, `main..`). (An 8.3 short name such
 /// as `GIT~1` only names something that exists, and the hook resolves existing paths to their
 /// long names, so it needs no rule.)
 /// Nothing is refused on Unix.
@@ -299,6 +307,21 @@ pub const CLAUDE_HINT: &str = if cfg!(windows) {
 } else {
     ""
 };
+
+/// `path` for a message: as the user would type it. On Windows that drops the `\\?\` prefix
+/// `canonicalize` adds (`\\?\UNC\` becomes `\\`), which the hook itself refuses in a path.
+pub fn shown(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    text
+}
 
 /// Quote `path` as one word of a hook command line. Claude Code runs hooks with the system
 /// shell: `sh` on Unix, `cmd.exe` on Windows (or Git Bash, in some versions). On Windows the

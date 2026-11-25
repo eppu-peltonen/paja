@@ -388,7 +388,7 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                     "{} is a symlink out of the worktree (or nested too deep to check), and \
                      searches here could follow it; search a directory without it, or Read \
                      files by path",
-                    link.display()
+                    crate::platform::shown(&link)
                 )));
             }
             Ok(None)
@@ -465,34 +465,34 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     if named(".git") {
         return Some(format!(
             "{} is git's own data or link to the repository; agents never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".github") {
         return Some(format!(
             "{} is CI configuration, which runs with the repository's secrets; agents never \
              change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".claude") {
         return Some(format!(
             "{} is Claude Code configuration for later sessions; agents never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".cargo") || named("rust-toolchain") || named("rust-toolchain.toml") {
         return Some(format!(
             "{} is cargo or toolchain configuration, which could change how cargo runs; agents \
              never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".gitattributes") {
         return Some(format!(
             "{} decides how git shows and stores files, so it could hide a change from the \
              reviewer; agents never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if [
@@ -507,7 +507,7 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
         return Some(format!(
             "{} configures the format and lint checks that judge the change; agents never \
              change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     None
@@ -519,8 +519,8 @@ fn within_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     (!full.starts_with(&b.root)).then(|| {
         format!(
             "agents {what} only inside their own worktree ({}), not {}",
-            b.root.display(),
-            full.display()
+            crate::platform::shown(&b.root),
+            crate::platform::shown(&full)
         )
     })
 }
@@ -538,13 +538,13 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
     {
         return Some(format!(
             "{} exposes processes and devices; agents don't read it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if full.starts_with(&b.home) {
         return Some(format!(
             "{} is the factory's own state; agents never touch it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     let text = full.to_string_lossy();
@@ -572,7 +572,7 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
         return Some(format!(
             "{} is outside the worktree; agents read only the worktree, {}dependency sources \
              ($CARGO_HOME/registry, $CARGO_HOME/git, $RUSTUP_HOME)",
-            full.display(),
+            crate::platform::shown(&full),
             crate::platform::SYSTEM_READS
         ));
     }
@@ -736,9 +736,9 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
     // Cargo and git act on the directory they run in, which must be the worktree.
     if matches!(*program, "cargo" | "git") && !here.starts_with(&b.root) {
         return Some(format!(
-            "the shell is in {}, outside the worktree; start with `cd {} &&`",
-            here.display(),
-            b.root.display()
+            "the shell is in {}, outside the worktree; start with `cd '{}' &&`",
+            crate::platform::shown(here),
+            crate::platform::shown(&b.root)
         ));
     }
     match *program {
@@ -761,8 +761,8 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
                 None
             }
             _ => Some(format!(
-                "`cd` only goes to the worktree's root, {}",
-                b.root.display()
+                "`cd` only goes to the worktree's root: `cd '{}'`",
+                crate::platform::shown(&b.root)
             )),
         },
         "cd" => Some("`cd` may only be the first step of a command, on its own".into()),
@@ -1642,6 +1642,11 @@ mod windows_tests {
         assert_eq!(e.bash(&format!("cd {msys} && cargo test")), None);
         assert!(e.bash("cd C:\\Windows && cargo test").is_some());
         assert!(e.bash("cd /c/Windows && cargo test").is_some());
+        // The advice can be followed as given: a plain, quoted path, no `\\?\`.
+        let why = e.bash("cd /c/Windows && cargo test").unwrap();
+        let advice = why.split('`').nth(3).unwrap();
+        assert!(!advice.contains(r"\\?\"), "{why}");
+        assert_eq!(e.bash(&format!("{advice} && cargo test")), None, "{why}");
     }
 
     #[test]
