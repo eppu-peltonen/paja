@@ -271,12 +271,13 @@ fn run(cli: &Cli) -> Result<()> {
                     break;
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
-                let idle = match outcome {
+                let wait = match outcome {
                     Ok(report) => {
                         emit(cli, serde_json::to_value(&report)?, || {
                             describe_run(&report)
                         });
                         matches!(report, mestari::RunReport::Idle)
+                            .then_some("nothing to do right now")
                     }
                     // Except when git's configuration was tampered with (running git again is the
                     // danger) or no later pass could start either: the loop stops for a person.
@@ -285,14 +286,12 @@ fn run(cli: &Cli) -> Result<()> {
                         emit(cli, json!({ "error": format!("{err:#}") }), || {
                             format!("error: {err:#}")
                         });
-                        mestari::progress("that pass failed; Paja keeps going");
-                        true
+                        Some("that pass failed; Paja keeps going")
                     }
                 };
-                if idle {
+                if let Some(why) = wait {
                     mestari::progress(&format!(
-                        "nothing to do right now; checking again in {minutes} minute{} (Ctrl+C \
-                         stops)",
+                        "{why}; checking again in {minutes} minute{} (Ctrl+C stops)",
                         if *minutes == 1 { "" } else { "s" }
                     ));
                     std::thread::sleep(std::time::Duration::from_secs(minutes.saturating_mul(60)));

@@ -880,6 +880,30 @@ fn run_says_what_it_is_doing_on_stderr() {
 }
 
 #[test]
+fn run_says_when_it_needs_a_decision() {
+    let f = Factory::new("true\n", "escalate");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for step in [
+        "running Vasara's checks (1 command)",
+        "#5 needs a decision; asked on the issue",
+        "paja work set 5 queued",
+    ] {
+        assert!(stderr.contains(step), "missing {step:?} in:\n{stderr}");
+    }
+}
+
+#[test]
 fn run_escalates_when_the_reviewer_asks_a_question() {
     let f = Factory::new("true\n", "escalate");
     let (ok, report) = f.run();

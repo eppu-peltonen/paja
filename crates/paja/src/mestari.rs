@@ -96,8 +96,24 @@ fn claude_program() -> String {
 
 /// Tell the person watching what `paja run` is doing now: one line on stderr, so stdout keeps
 /// its one JSON value per item. A long step says so, since silence reads as broken.
+/// Text from outside (an issue title, a verdict) can carry terminal escapes or line breaks
+/// that would fake or rewrite earlier lines, so control characters become spaces and a long
+/// message is cut.
 pub fn progress(message: &str) {
-    eprintln!("paja: {message}");
+    eprintln!("paja: {}", shown_line(message));
+}
+
+fn shown_line(message: &str) -> String {
+    const MAX: usize = 300;
+    let mut line: String = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX)
+        .collect();
+    if message.chars().count() > MAX {
+        line.push_str("...");
+    }
+    line
 }
 
 /// Take the next work item and run it to an outcome.
@@ -170,11 +186,16 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 )?;
                 return Err(err);
             }
+            let asked = comment(&repo, &item, &question).is_ok();
             progress(&format!(
-                "#{} stopped on an error and was parked; see the question on the issue",
-                item.number
+                "#{} stopped on an error and was parked; {}",
+                item.number,
+                if asked {
+                    "see the question on the issue"
+                } else {
+                    "couldn't comment on the issue, so see `paja work show` for the question"
+                }
             ));
-            let _ = comment(&repo, &item, &question);
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
                 number: item.number,
@@ -244,8 +265,9 @@ fn run_item(
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
         let guard = GitGuard::new(&env.path)?;
         progress(&format!(
-            "running Vasara's checks ({} commands)",
-            checks.len()
+            "running Vasara's checks ({} command{})",
+            checks.len(),
+            if checks.len() == 1 { "" } else { "s" }
         ));
         let result = run_checks(&env.path, &checks);
         guard.check("Vasara's checks")?;
@@ -1327,13 +1349,18 @@ fn escalated(
     question: &str,
     rounds: u32,
 ) -> Result<RunReport> {
-    progress(&format!(
-        "#{} needs a decision; asked on the issue (answer there, then `paja work set {} queued`)",
-        item.number, item.number
-    ));
     // The branch keeps the work; the worktree and its ports are freed.
     let _ = ahjo::remove(home, &env.name, true);
-    escalate(home, repo, item, question, rounds)?;
+    let asked = escalate(home, repo, item, question, rounds)?;
+    progress(&format!(
+        "#{n} needs a decision; {where_} (then `paja work set {n} queued`)",
+        n = item.number,
+        where_ = if asked {
+            "asked on the issue, answer there"
+        } else {
+            "couldn't comment on the issue, so see `paja work show` for the question"
+        }
+    ));
     Ok(RunReport::Escalated {
         number: item.number,
         question: question.to_string(),
@@ -1341,8 +1368,15 @@ fn escalated(
     })
 }
 
-/// Ask the person on the issue, and park the item until they answer.
-fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u32) -> Result<()> {
+/// Ask the person on the issue, and park the item until they answer. Says whether the comment
+/// reached the issue.
+fn escalate(
+    home: &Home,
+    repo: &Path,
+    item: &WorkItem,
+    question: &str,
+    rounds: u32,
+) -> Result<bool> {
     // Park the item first, so it never stays active if the comment fails.
     jono::set_status(home, item.number, Status::Escalated, Some(question))?;
     record(
@@ -1356,8 +1390,9 @@ fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u
             "warning: couldn't comment on issue #{}: {err:#}",
             item.number
         );
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The label follow-up issues get. Jono imports only `paja`, so a follow-up waits until a
@@ -1930,6 +1965,13 @@ mod tests {
             lines("# checks\ncargo test\n\n  cargo fmt --all --check \n"),
             ["cargo test", "cargo fmt --all --check"]
         );
+    }
+
+    #[test]
+    fn progress_lines_cannot_carry_terminal_controls() {
+        let line = shown_line("Fix\r\x1b[2Kpaja: landed #5\nnext");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(shown_line(&"x".repeat(1000)).chars().count() <= 303);
     }
 
     #[test]
