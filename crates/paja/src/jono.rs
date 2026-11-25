@@ -11,6 +11,7 @@ use serde_json::json;
 
 use crate::events::Event;
 use crate::home::Home;
+use crate::mestari::{StepUsage, EV_ROUND};
 
 /// Most issues one sync reads. A sync that hits it refuses to close anything.
 pub const FETCH_LIMIT: usize = 1000;
@@ -49,7 +50,7 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkItem {
     /// The GitHub issue number.
     pub number: u64,
@@ -63,6 +64,49 @@ pub struct WorkItem {
     /// Why the status last changed, for example the escalation question.
     #[serde(default)]
     pub note: Option<String>,
+    /// What every agent step of the item's runs spent, added up from the `run.round` events.
+    /// None until a step is recorded.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// An item's agent usage, totalled over every recorded step. Steps whose result had no usage
+/// fields (or no cost) count in `unknown_steps` and add nothing, so a total is never padded
+/// with zeros it didn't see.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub steps: u64,
+    pub unknown_steps: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub num_turns: u64,
+    pub duration_ms: u64,
+    /// Claude Code's estimate, in US dollars.
+    pub cost_usd: f64,
+}
+
+impl Usage {
+    fn add(&mut self, step: &StepUsage) {
+        self.steps += 1;
+        let tokens = [
+            step.input_tokens,
+            step.output_tokens,
+            step.cache_read_input_tokens,
+            step.cache_creation_input_tokens,
+        ];
+        if tokens.iter().any(Option::is_none) || step.cost_usd.is_none() {
+            self.unknown_steps += 1;
+        }
+        self.input_tokens += step.input_tokens.unwrap_or(0);
+        self.output_tokens += step.output_tokens.unwrap_or(0);
+        self.cache_read_input_tokens += step.cache_read_input_tokens.unwrap_or(0);
+        self.cache_creation_input_tokens += step.cache_creation_input_tokens.unwrap_or(0);
+        self.num_turns += step.num_turns.unwrap_or(0);
+        self.duration_ms += step.duration_ms.unwrap_or(0);
+        self.cost_usd += step.cost_usd.unwrap_or(0.0);
+    }
 }
 
 /// An issue as `gh issue list --json number,title,body,url` prints it.
@@ -87,6 +131,15 @@ pub struct SyncReport {
 #[derive(Deserialize)]
 struct Number {
     number: u64,
+}
+
+/// The part of a `run.round` event the queue reads. Rounds recorded before usage was kept have
+/// no `steps`.
+#[derive(Deserialize)]
+struct Round {
+    number: u64,
+    #[serde(default)]
+    steps: Vec<StepUsage>,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +168,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                         open: true,
                         status: Status::Queued,
                         note: None,
+                        usage: None,
                     },
                 );
             }
@@ -145,6 +199,15 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                 if let Some(item) = items.get_mut(&change.number) {
                     item.status = change.status;
                     item.note = change.note;
+                }
+            }
+            EV_ROUND => {
+                let round: Round =
+                    serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
+                if let Some(item) = items.get_mut(&round.number) {
+                    for step in &round.steps {
+                        item.usage.get_or_insert_with(Usage::default).add(step);
+                    }
                 }
             }
             _ => {}
@@ -386,5 +449,49 @@ mod tests {
         assert_eq!(claim(&home).unwrap().unwrap().number, 2);
         assert!(claim(&home).unwrap().is_none());
         assert_eq!(get(&home, 1).unwrap().status, Status::Active);
+    }
+
+    #[test]
+    fn usage_adds_up_rounds_and_reads_old_rounds_without_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        apply(&home, &[issue(1, "One")]).unwrap();
+        let lock = home.lock().unwrap();
+        let log = home.events();
+        // A round recorded before usage was kept.
+        log.append(
+            &lock,
+            EV_ROUND,
+            json!({ "number": 1, "round": 1, "verdict": "changes", "detail": "" }),
+        )
+        .unwrap();
+        assert_eq!(get(&home, 1).unwrap().usage, None);
+        let known = json!({ "step": "build", "input_tokens": 10, "output_tokens": 2,
+            "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5, "cost_usd": 0.5,
+            "num_turns": 3, "duration_ms": 1000, "session_id": "a" });
+        let unknown = json!({ "step": "review", "reviewer": 1, "input_tokens": null,
+            "output_tokens": null, "cache_read_input_tokens": null,
+            "cache_creation_input_tokens": null, "cost_usd": null, "num_turns": 2,
+            "duration_ms": null, "session_id": null });
+        log.append(
+            &lock,
+            EV_ROUND,
+            json!({ "number": 1, "round": 2, "steps": [known.clone(), unknown] }),
+        )
+        .unwrap();
+        log.append(
+            &lock,
+            EV_ROUND,
+            json!({ "number": 1, "round": 3, "steps": [known] }),
+        )
+        .unwrap();
+        drop(lock);
+        let usage = get(&home, 1).unwrap().usage.unwrap();
+        assert_eq!(usage.steps, 3);
+        assert_eq!(usage.unknown_steps, 1);
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 200);
+        assert_eq!(usage.num_turns, 8);
+        assert_eq!(usage.cost_usd, 1.0);
     }
 }
