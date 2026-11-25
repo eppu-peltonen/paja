@@ -375,6 +375,9 @@ pub(crate) fn git_command() -> Command {
         "core.hooksPath=/dev/null",
         "-c",
         "core.fsmonitor=false",
+        // Paths come back as plain text, so non-ASCII names still match high-risk entries.
+        "-c",
+        "core.quotePath=false",
     ]);
     cmd
 }

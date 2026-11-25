@@ -859,17 +859,25 @@ fn run_hook_once(
 }
 
 fn tempfile_dir(near: &Path) -> Result<PathBuf> {
+    // A fresh directory only this user can enter; creating it fails if the name is taken, so
+    // nobody can prepare it beforehand.
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "paja-agent-{}-{}",
+        "paja-agent-{}-{}-{}",
         std::process::id(),
-        crate::events::now_ms()
+        crate::events::now_ms(),
+        COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&dir).with_context(|| {
-        format!(
-            "creating a scratch home for the agent in {}",
-            near.display()
-        )
-    })?;
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| {
+            format!(
+                "creating a scratch home for the agent in {}",
+                near.display()
+            )
+        })?;
     Ok(dir)
 }
 
@@ -995,7 +1003,8 @@ fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Re
         &[
             "push",
             "-q",
-            "-u",
+            // No `-u`: that would write the branch into the shared git configuration, which
+            // other runs' guards watch.
             "origin",
             &format!("{branch}:{branch}"),
             "--force-with-lease",
@@ -1303,7 +1312,8 @@ impl GitGuard {
         };
         guard.files.extend(global);
         // Every file git reads configuration from here, includes and the system file among
-        // them.
+        // them, and every file an include names, read or not: one that doesn't exist yet
+        // could be created.
         let origins = git(
             worktree,
             &["config", "--list", "--show-origin", "--name-only"],
@@ -1321,6 +1331,37 @@ impl GitGuard {
                 };
                 if !guard.files.contains(&path) {
                     guard.files.push(path);
+                }
+            }
+        }
+        let includes = git(
+            worktree,
+            &[
+                "config",
+                "--path",
+                "--get-regexp",
+                r"^include(if\..*)?\.path$",
+            ],
+        )
+        .unwrap_or_default();
+        for line in includes.lines() {
+            if let Some((_, file)) = line.split_once(' ') {
+                let path = PathBuf::from(file);
+                // A relative include is relative to the file that names it: the repository's
+                // config or the owner's global one, so watch it against both.
+                let candidates: Vec<PathBuf> = if path.is_absolute() {
+                    vec![path]
+                } else {
+                    [Some(common.clone()), home.clone()]
+                        .into_iter()
+                        .flatten()
+                        .map(|base| base.join(&path))
+                        .collect()
+                };
+                for path in candidates {
+                    if !guard.files.contains(&path) {
+                        guard.files.push(path);
+                    }
                 }
             }
         }
