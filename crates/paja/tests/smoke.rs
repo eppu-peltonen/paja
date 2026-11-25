@@ -935,6 +935,19 @@ fn checks_that_change_git_configuration_stop_the_run() {
             .contains("--tamper-checked"),
         "{again}"
     );
+    // A person's check opens it again: the run fetches and syncs as usual (the item itself
+    // stays escalated, so the queue is empty).
+    let (ok, checked) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run", "--tamper-checked"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+        ],
+    );
+    assert!(ok, "{checked}");
+    assert_eq!(checked["outcome"], "idle", "{checked}");
 }
 
 #[test]

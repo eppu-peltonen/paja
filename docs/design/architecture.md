@@ -106,7 +106,8 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
   and never into a `.git`, `.cargo`, `.github` or `.claude` directory, a `rust-toolchain` or `.gitattributes` file or
   a rustfmt or clippy configuration file at any depth, in any letter case (reading them is fine). A file tool path may
-  not hold `..`. `git rm` takes plain files only, and `git commit` needs `-m`.
+  not hold `..`. `git rm` takes plain files only, and `git commit` needs `-m`. These rules cover paths an agent names;
+  a file its code writes can still be staged by `git add -A`, and then makes the change high risk.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
@@ -139,17 +140,18 @@ file-system monitor, and no git Paja starts honours replacement refs or grafts, 
 the owner's global git configuration, before each agent and check run. Those files include every file git reads
 configuration from and the worktree's links to the repository. If they changed, it parks the item, records
 `run.tampered` and stops with an error naming the changed files (a `--every` loop included) without running git or gh
-there again, not even to clean up or comment on the issue. Later runs on that repository refuse to start until a person
-has checked it and runs `paja run --tamper-checked`. Configuration files are compared by the entries git reads, leaving
-out `branch.*`, which ordinary git work writes; every other file byte for byte. The hook's copy is checked again after
-each agent run, and a copy that changed counts as a run the hook never saw. Each phase takes its own snapshot, so a
-change made between phases (by a process the code left running, say) is not caught, nor is a relative include resolved
-against a file other than the repository's or the owner's main configuration. The guardrail's limit stays: code that
-runs as the owner can still change things none of these checks look at, and only the sandbox closes that. Reviewers run
-the hook with `--read-only`: no file edits, no `cargo fmt` without `--check` and no git command that changes the branch;
-after the review, the branch and worktree are put back where it started, whatever the code its builds ran did. Because
-no settings file loads, agents authenticate the way `claude` does without one (a signed-in subscription or
-`ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider settings.
+there again, not even to clean up or comment on the issue. The guard also notices another environment's links and
+configuration changing. Later runs on that repository (found by its shared git directory, however its path is spelled)
+refuse to start until a person has checked it and runs `paja run --tamper-checked`. Configuration files are compared by
+the entries git reads, leaving out `branch.*`, which ordinary git work writes; every other file byte for byte. The
+hook's copy is checked again after each agent run, and a copy that changed counts as a run the hook never saw. Each
+phase takes its own snapshot, so a change made between phases (by a process the code left running, say) is not caught,
+nor is a relative include resolved against a file other than the repository's or the owner's main configuration. The
+guardrail's limit stays: code that runs as the owner can still change things none of these checks look at, and only the
+sandbox closes that. Reviewers run the hook with `--read-only`: no file edits, no `cargo fmt` without `--check` and no
+git command that changes the branch; after the review, the branch and worktree are put back where it started, whatever
+the code its builds ran did. Because no settings file loads, agents authenticate the way `claude` does without one (a
+signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider settings.
 
 ## MCP server
 

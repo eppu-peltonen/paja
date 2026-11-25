@@ -83,7 +83,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let repo = std::path::absolute(opts.repo)?;
     // A repository whose configuration was tampered with gets no git, not even a fetch, until
     // a person says it was checked.
-    let key = repo.display().to_string();
+    // One key per repository, however its path was spelled: the shared git directory, which
+    // rev-parse finds without running any program from the configuration.
+    let common = git(
+        &repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .with_context(|| format!("finding the git repository at {}", repo.display()))?;
+    let key = std::fs::canonicalize(&common)
+        .unwrap_or_else(|_| PathBuf::from(&common))
+        .display()
+        .to_string();
     if opts.tamper_checked {
         record(home, EV_TAMPER_CHECKED, json!({ "repo": key }))?;
     }
@@ -1363,6 +1373,11 @@ struct GitGuard {
     raw: Vec<PathBuf>,
     hooks: Vec<PathBuf>,
     snapshot: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// Every other worktree's links and configuration: code here could repoint another
+    /// environment's git. Those come and go as other runs work, so only a file that still
+    /// exists and now differs counts.
+    others: Vec<PathBuf>,
+    others_snapshot: Vec<Option<Vec<u8>>>,
 }
 
 impl GitGuard {
@@ -1427,6 +1442,8 @@ impl GitGuard {
             raw: Vec::new(),
             hooks,
             snapshot: Vec::new(),
+            others: Vec::new(),
+            others_snapshot: Vec::new(),
         };
         guard.files.extend(global);
         guard.raw = guard
@@ -1508,6 +1525,23 @@ impl GitGuard {
                 }
             }
         }
+        if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                for name in ["gitdir", "commondir", "config.worktree"] {
+                    guard.others.push(dir.join(name));
+                }
+                // `gitdir` names the worktree's `.git` file, which points back here.
+                if let Some(link) = read_regular(&dir.join("gitdir")) {
+                    let link = String::from_utf8_lossy(&link).trim().to_string();
+                    if !link.is_empty() {
+                        guard.others.push(PathBuf::from(link));
+                    }
+                }
+            }
+        }
+        guard.others.retain(|path| !guard.files.contains(path));
+        guard.others_snapshot = guard.others.iter().map(|p| read_regular(p)).collect();
         guard.snapshot = guard.read();
         Ok(guard)
     }
@@ -1541,12 +1575,23 @@ impl GitGuard {
     /// Fails, before Mestari runs git again, when anything changed since the snapshot.
     fn check(&self, what: &str) -> Result<()> {
         let now = self.read();
-        if now != self.snapshot {
+        let others: Vec<String> = self
+            .others
+            .iter()
+            .zip(&self.others_snapshot)
+            .filter(|(path, before)| {
+                let after = read_regular(path);
+                after.is_some() && after != **before
+            })
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        if now != self.snapshot || !others.is_empty() {
             let mut changed: Vec<String> = now
                 .iter()
                 .filter(|entry| !self.snapshot.contains(entry))
                 .chain(self.snapshot.iter().filter(|entry| !now.contains(entry)))
                 .map(|(path, _)| path.display().to_string())
+                .chain(others)
                 .collect();
             changed.sort();
             changed.dedup();
