@@ -77,6 +77,14 @@ environment `work-<issue>` from `main` (resuming the branch an earlier run kept)
    An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
    or the name with an extension, at any depth, in any letter case.
 
+Each agent runs on the model `.paja/models` names for its role, read from `main` like the checks, so a change can't
+pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
+build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
+the fix) and `review-2` (the second high-risk reviewer). Mestari passes `--model` and, when given, `--effort`; a role
+with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
+(left out where it is the role's own model), so a busy model doesn't fail the round. An unknown role, effort or a
+malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`.
+
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
 for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch

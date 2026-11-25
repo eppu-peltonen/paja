@@ -35,8 +35,8 @@ the real repository, to the smoke tests.
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
 - `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues labelled `paja` (`gh`, or `$PAJA_GH`).
 - `crates/paja/src/mestari.rs`: `paja run`, the build, check, review and land loop for one work item.
-- `.paja/checks`, `.paja/high-risk`: Vasara's check commands and the high-risk path prefixes. `paja run` reads both
-  from `main`, never from the branch under review.
+- `.paja/checks`, `.paja/high-risk`, `.paja/models`: Vasara's check commands, the high-risk path prefixes and the
+  model per agent role. `paja run` reads them from `main`, never from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It fails closed.
 - `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.
 - `crates/paja/src/platform.rs`: what differs between Windows and Unix. Paja runs natively on both; keep

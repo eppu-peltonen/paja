@@ -23,6 +23,12 @@ pub const MAX_ROUNDS: u32 = 3;
 pub const CHECKS_FILE: &str = ".paja/checks";
 /// Path prefixes that make a change high risk (two reviewers), read from the base commit.
 pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
+/// The model and effort for each agent role, read from the base commit.
+pub const MODELS_FILE: &str = ".paja/models";
+/// The roles `.paja/models` may name, besides `fallback`.
+pub const ROLES: [&str; 5] = ["build", "fix", "review", "re-review", "review-2"];
+/// The effort levels Claude Code takes.
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 pub const EV_STARTED: &str = "run.started";
 pub const EV_ROUND: &str = "run.round";
@@ -78,6 +84,12 @@ pub struct StepUsage {
     /// Which reviewer of the round (1 or 2), for a review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<u32>,
+    /// The role's line in `.paja/models` (`build`, `fix`, `review` and so on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The model `.paja/models` asked for, or None for the account's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// What each model the session used spent, by model name (Claude Code's `modelUsage`).
     #[serde(default)]
     pub models: std::collections::BTreeMap<String, ModelUsage>,
@@ -104,7 +116,13 @@ pub struct ModelUsage {
 
 impl StepUsage {
     /// Read the usage fields from a `claude -p` JSON result.
-    pub fn from_result(step: &str, reviewer: Option<u32>, result: &Value) -> Self {
+    pub fn from_result(
+        step: &str,
+        reviewer: Option<u32>,
+        chosen: &Models,
+        role: &str,
+        result: &Value,
+    ) -> Self {
         let usage = &result["usage"];
         let models = result["modelUsage"]
             .as_object()
@@ -127,6 +145,8 @@ impl StepUsage {
         StepUsage {
             step: step.to_string(),
             reviewer,
+            role: Some(role.to_string()),
+            model: chosen.roles.get(role).map(|m| m.model.clone()),
             models,
             input_tokens: usage["input_tokens"].as_u64(),
             output_tokens: usage["output_tokens"].as_u64(),
@@ -137,6 +157,106 @@ impl StepUsage {
             duration_ms: result["duration_ms"].as_u64(),
             session_id: result["session_id"].as_str().map(str::to_string),
         }
+    }
+}
+
+/// The model, and optionally the effort, one role runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleModel {
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+/// `.paja/models` as it is on main: one line per role, `role model [effort]`, plus an optional
+/// `fallback model` line. A role with no line runs on the account's default model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Models {
+    pub roles: std::collections::BTreeMap<String, RoleModel>,
+    pub fallback: Option<String>,
+}
+
+impl Models {
+    /// Read the file's text. `#` starts a comment line. Anything else that isn't a known role
+    /// with a plain model name (and a known effort) is an error naming the line and the fix.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut models = Models::default();
+        // A leading `-` would reach `claude` as a flag of its own.
+        let plain = |word: &str| {
+            !word.starts_with('-')
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']'))
+        };
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let at = || format!("{MODELS_FILE} on main, line {}: {line:?}", i + 1);
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let (role, rest) = (words[0], &words[1..]);
+            if let Some(bad) = rest.iter().find(|w| !plain(w)) {
+                bail!(
+                    "{}: {bad:?} is not a plain model or effort name; use names such as `sonnet` \
+                     or `claude-opus-4-1` (letters, digits, `.`, `-`, `_`, `[`, `]`)",
+                    at()
+                );
+            }
+            if role == "fallback" {
+                let [model] = rest else {
+                    bail!("{}: write it as `fallback <model>`", at());
+                };
+                if models.fallback.replace(model.to_string()).is_some() {
+                    bail!("{}: `fallback` is named twice; keep one line", at());
+                }
+                continue;
+            }
+            if !ROLES.contains(&role) {
+                bail!(
+                    "{}: unknown role {role:?}; use one of {} or fallback",
+                    at(),
+                    ROLES.join(", ")
+                );
+            }
+            let (model, effort) = match rest {
+                [model] => (model, None),
+                [model, effort] => (model, Some(effort.to_string())),
+                _ => bail!("{}: write it as `{role} <model> [effort]`", at()),
+            };
+            if let Some(effort) = &effort {
+                if !EFFORTS.contains(&effort.as_str()) {
+                    bail!(
+                        "{}: unknown effort {effort:?}; use one of {}",
+                        at(),
+                        EFFORTS.join(", ")
+                    );
+                }
+            }
+            let chosen = RoleModel {
+                model: model.to_string(),
+                effort,
+            };
+            if models.roles.insert(role.to_string(), chosen).is_some() {
+                bail!("{}: the role {role} is named twice; keep one line", at());
+            }
+        }
+        Ok(models)
+    }
+
+    /// The flags `claude -p` gets for a role: none when the file doesn't name it.
+    fn args(&self, role: &str) -> Vec<String> {
+        let Some(chosen) = self.roles.get(role) else {
+            return Vec::new();
+        };
+        let mut args = vec!["--model".to_string(), chosen.model.clone()];
+        if let Some(effort) = &chosen.effort {
+            args.extend(["--effort".to_string(), effort.clone()]);
+        }
+        // Claude Code refuses a fallback that is the main model itself.
+        if let Some(fallback) = self.fallback.as_ref().filter(|f| **f != chosen.model) {
+            args.extend(["--fallback-model".to_string(), fallback.clone()]);
+        }
+        args
     }
 }
 
@@ -283,6 +403,7 @@ fn run_item(
         bail!("{CHECKS_FILE} on main has no commands; add the check commands there");
     }
     let high_risk = lines(&read_from_base(repo, base, HIGH_RISK_FILE)?.unwrap_or_default());
+    let models = Models::parse(&read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default())?;
     let env = environment(home, repo, base, item)?;
     record(
         home,
@@ -299,7 +420,8 @@ fn run_item(
         progress(&format!(
             "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
         ));
-        let mut steps = vec![build(home, &env, item, base, &feedback)?];
+        let role = if round == 1 { "build" } else { "fix" };
+        let mut steps = vec![build(home, &env, item, base, &feedback, &models, role)?];
         commit_leftovers(&env, item)?;
         if git(
             &env.path,
@@ -424,6 +546,8 @@ fn run_item(
                     base,
                     prior.as_ref().filter(|_| !risky),
                     i as u32 + 1,
+                    &models,
+                    review_role(risky, i, prior.is_some()),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -537,7 +661,27 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
     )
 }
 
-fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<StepUsage> {
+/// The `.paja/models` role a review runs as. The first reviewer of a round reads the most and
+/// keeps `review`. A normal-risk review of only the fix, and the second high-risk reviewer (a
+/// second opinion on what the first also reads in full), can run on a cheaper model.
+fn review_role(risky: bool, reviewer: usize, fix_only: bool) -> &'static str {
+    match (risky, reviewer) {
+        (true, 0) => "review",
+        (true, _) => "review-2",
+        (false, _) if fix_only => "re-review",
+        (false, _) => "review",
+    }
+}
+
+fn build(
+    home: &Home,
+    env: &Env,
+    item: &WorkItem,
+    base: &str,
+    feedback: &str,
+    models: &Models,
+    role: &str,
+) -> Result<StepUsage> {
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
@@ -575,10 +719,20 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
         "Bash(wc *)",
         "Bash(pwd)",
     ];
-    let out = claude(home, env, base, &prompt, &tools, None, false)?;
-    Ok(StepUsage::from_result("build", None, &out))
+    let out = claude(
+        home,
+        env,
+        base,
+        &prompt,
+        &tools,
+        None,
+        false,
+        &models.args(role),
+    )?;
+    Ok(StepUsage::from_result("build", None, models, role, &out))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn review(
     home: &Home,
     env: &Env,
@@ -586,6 +740,8 @@ fn review(
     base: &str,
     prior: Option<&Prior>,
     reviewer: u32,
+    models: &Models,
+    role: &str,
 ) -> Result<(Review, StepUsage)> {
     // A first review reads the whole change; a later one judges only the fix for the blockers
     // an earlier review named, so review rounds converge instead of starting over.
@@ -655,7 +811,16 @@ fn review(
         "Bash(git show*)",
     ];
     let before = git(&env.path, &["rev-parse", "HEAD"])?;
-    let out = claude(home, env, base, &prompt, &tools, Some(&schema), true);
+    let out = claude(
+        home,
+        env,
+        base,
+        &prompt,
+        &tools,
+        Some(&schema),
+        true,
+        &models.args(role),
+    );
     let out = match out {
         // No git at all now, not even to reset: a planted filter would run.
         Err(err) if is_tampered(&err) => return Err(err),
@@ -687,13 +852,12 @@ fn review(
     if review.question.trim().is_empty() {
         review.question = review.summary.clone();
     }
-    Ok((
-        review,
-        StepUsage::from_result("review", Some(reviewer), &out),
-    ))
+    let used = StepUsage::from_result("review", Some(reviewer), models, role, &out);
+    Ok((review, used))
 }
 
 /// Run headless Claude Code in the environment and return its JSON result.
+#[allow(clippy::too_many_arguments)]
 fn claude(
     home: &Home,
     env: &Env,
@@ -702,6 +866,7 @@ fn claude(
     tools: &[&str],
     schema: Option<&Value>,
     read_only: bool,
+    model_args: &[String],
 ) -> Result<Value> {
     let program = claude_program();
     let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
@@ -738,6 +903,9 @@ fn claude(
     .args(["--append-system-prompt", &harness])
     // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
     .arg("--strict-mcp-config")
+    // The model and effort come from `.paja/models` on main, so a change can't pick the models
+    // that judge it.
+    .args(model_args)
     .arg("--allowedTools")
     .args(tools);
     if let Some(schema) = schema {
@@ -2159,5 +2327,61 @@ mod tests {
         let long = "é".repeat(3000);
         let clipped = clip(&long);
         assert!(clipped.starts_with('…') && clipped.len() <= 4004);
+    }
+
+    #[test]
+    fn models_file_names_a_model_per_role() {
+        use super::Models;
+        let models =
+            Models::parse("# comment\n\nbuild sonnet\nreview opus high\nfallback sonnet\n")
+                .unwrap();
+        assert_eq!(models.args("build"), ["--model", "sonnet"]);
+        assert_eq!(
+            models.args("review"),
+            [
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--fallback-model",
+                "sonnet"
+            ]
+        );
+        // A role with no line keeps the account's default: no flags at all.
+        assert!(models.args("fix").is_empty());
+        assert_eq!(Models::parse("").unwrap(), Models::default());
+        for (text, says) in [
+            ("reviewer opus", "line 1: \"reviewer opus\": unknown role"),
+            ("build", "write it as `build <model> [effort]`"),
+            (
+                "build sonnet high extra",
+                "write it as `build <model> [effort]`",
+            ),
+            ("build sonnet loud", "unknown effort \"loud\""),
+            ("build sonnet\nbuild opus", "line 2"),
+            ("fallback", "write it as `fallback <model>`"),
+            ("fallback a\nfallback b", "`fallback` is named twice"),
+            ("build $(x)", "not a plain model or effort name"),
+            (
+                "build --dangerously-skip-permissions",
+                "not a plain model or effort name",
+            ),
+        ] {
+            let err = format!("{:#}", Models::parse(text).unwrap_err());
+            assert!(err.contains(".paja/models on main"), "{err}");
+            assert!(err.contains(says), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn each_review_takes_its_role() {
+        use super::review_role;
+        assert_eq!(review_role(false, 0, false), "review");
+        assert_eq!(review_role(false, 0, true), "re-review");
+        assert_eq!(review_role(true, 0, false), "review");
+        assert_eq!(review_role(true, 1, false), "review-2");
+        // High-risk reviewers read the whole change every round, so never `re-review`.
+        assert_eq!(review_role(true, 0, true), "review");
+        assert_eq!(review_role(true, 1, true), "review-2");
     }
 }
