@@ -23,3 +23,4 @@ Cargo.toml
 build.rs
 crates/paja/src/ahjo.rs
 .gitattributes
+Cargo.lock

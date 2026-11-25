@@ -159,7 +159,12 @@ fn run_item(
         // The checks run the branch's code, which could change the tree or even commit. Put it
         // back, and fail the round, so nothing lands that the checks didn't judge.
         let mut failed = result;
+        // Files marked assume-unchanged or skip-worktree would hide from `git status`.
+        let hidden = git(&env.path, &["ls-files", "-v"])?
+            .lines()
+            .any(|line| line.starts_with(|c: char| c.is_ascii_lowercase() || c == 'S'));
         let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
+            || hidden
             || !git(&env.path, &["status", "--porcelain"])?.is_empty();
         if moved {
             git(
@@ -720,25 +725,27 @@ fn hook_copy_intact(exe: &Path) -> bool {
         .is_some_and(|bytes| read_regular(exe).as_deref() == Some(bytes.as_slice()))
 }
 
-/// A git configuration file without its `[branch "..."]` sections: ordinary git work (`push
-/// -u`, `checkout -b`) writes those, and they run no program. Other files pass unchanged.
-fn without_branches(content: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(content);
-    let mut kept = String::new();
-    let mut in_branch = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
-            in_branch = trimmed
-                .strip_prefix('[')
-                .is_some_and(|rest| rest.trim_start().to_lowercase().starts_with("branch"));
-        }
-        if !in_branch {
-            kept.push_str(line);
-            kept.push('\n');
+/// A git configuration file's entries as git itself reads them, leaving out `branch.*`:
+/// ordinary git work (`push -u`, `checkout -b`) writes those, and they run no program. `None`
+/// when git can't parse the file, which is then compared byte for byte. Includes are watched
+/// as files of their own, so they aren't followed here. Only called on plain files.
+fn config_entries(path: &Path) -> Option<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("config")
+        .arg("--file")
+        .arg(path)
+        .args(["--no-includes", "--list", "--null"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let mut kept = Vec::new();
+    for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        if !entry.to_ascii_lowercase().starts_with(b"branch.") {
+            kept.extend_from_slice(entry);
+            kept.push(0);
         }
     }
-    kept.into_bytes()
+    Some(kept)
 }
 
 /// A file's contents, read only when it is a plain file: opening a FIFO someone planted
@@ -1325,6 +1332,8 @@ pub fn is_tampered(err: &anyhow::Error) -> bool {
 /// such code runs and checks it before it runs git there again.
 struct GitGuard {
     files: Vec<PathBuf>,
+    /// Watched files that are not git configuration, compared byte for byte.
+    raw: Vec<PathBuf>,
     hooks: Vec<PathBuf>,
     snapshot: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
@@ -1387,11 +1396,23 @@ impl GitGuard {
                 worktree.join(".git"),
                 own.join("commondir"),
                 own.join("gitdir"),
+                common.join("info/exclude"),
             ],
+            raw: Vec::new(),
             hooks,
             snapshot: Vec::new(),
         };
         guard.files.extend(global);
+        guard.raw = guard
+            .files
+            .iter()
+            .filter(|path| {
+                !(path.ends_with("config")
+                    || path.ends_with("config.worktree")
+                    || path.ends_with(".gitconfig"))
+            })
+            .cloned()
+            .collect();
         // A global attributes file the owner chose, wherever it is.
         let attributes = Command::new("git")
             .arg("-C")
@@ -1403,7 +1424,8 @@ impl GitGuard {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default();
         if !attributes.is_empty() {
-            guard.files.push(worktree.join(attributes));
+            guard.files.push(worktree.join(&attributes));
+            guard.raw.push(worktree.join(attributes));
         }
         // Every file git reads configuration from here, includes and the system file among
         // them, and every file an include names, read or not: one that doesn't exist yet
@@ -1478,10 +1500,13 @@ impl GitGuard {
             .iter()
             .chain(&hooks)
             .map(|path| {
-                (
-                    path.clone(),
-                    read_regular(path).map(|c| without_branches(&c)),
-                )
+                let raw = read_regular(path);
+                let content = if self.raw.contains(path) || !self.files.contains(path) {
+                    raw
+                } else {
+                    raw.map(|bytes| config_entries(path).unwrap_or(bytes))
+                };
+                (path.clone(), content)
             })
             .collect()
     }
@@ -1543,10 +1568,25 @@ mod tests {
         assert!(super::is_high_risk("docs/CLAUDE.md", &prefixes));
         let names: Vec<String> = ["rust-toolchain", ".paja/"].map(String::from).to_vec();
         assert!(super::is_high_risk("rust-toolchain.toml", &names));
-        let config = b"[core]\n\tbare = false\n[branch \"x\"]\n\tremote = origin\n[credential]\n\thelper = y\n";
-        let kept = String::from_utf8(super::without_branches(config)).unwrap();
-        assert!(!kept.contains("remote = origin"), "{kept}");
-        assert!(kept.contains("helper = y"), "{kept}");
+        let dir = std::env::temp_dir().join(format!("paja-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config");
+        std::fs::write(
+            &file,
+            "[core]\n\tbare = false\n[branch \"x\"]\n\tremote = origin\n",
+        )
+        .unwrap();
+        let plain = super::config_entries(&file).unwrap();
+        std::fs::write(&file, "[core]\n\tbare = false\n").unwrap();
+        assert_eq!(super::config_entries(&file).unwrap(), plain);
+        // A section started on the same line as a branch header still counts.
+        std::fs::write(
+            &file,
+            "[core]\n\tbare = false\n[branch \"x\"][credential]\n\thelper = y\n",
+        )
+        .unwrap();
+        assert_ne!(super::config_entries(&file).unwrap(), plain);
+        std::fs::remove_dir_all(&dir).unwrap();
         assert!(!super::is_high_risk("src/.pajarc", &names));
         assert!(super::is_high_risk("crates/paja/src/hook.rs", &prefixes));
         assert!(!super::is_high_risk("crates/paja/src/jono.rs", &prefixes));
