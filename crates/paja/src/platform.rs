@@ -105,6 +105,9 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         match create_private_dir(dir) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
