@@ -277,6 +277,8 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
         if input.tool_name == "Bash" || (input.tool_name == "Grep" && key == "pattern") {
             continue;
         }
+        // Patterns hold wildcards, which no name may; they get their own rule below.
+        let pattern = matches!(key, "pattern" | "glob");
         if let Some(path) = t[key].as_str() {
             if path.starts_with('~') {
                 return Ok(Some(format!(
@@ -299,7 +301,12 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 )));
             }
             // Windows spellings the file system reads differently from how they look.
-            if let Some(why) = crate::platform::path_problem(path, false) {
+            let problem = if pattern {
+                crate::platform::pattern_problem(path)
+            } else {
+                crate::platform::path_problem(path, false)
+            };
+            if let Some(why) = problem {
                 return Ok(Some(why));
             }
         }
@@ -349,13 +356,6 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 "pattern"
             };
             if let Some(pattern) = t[key].as_str() {
-                // On Windows `\\` and `C:` would start a path the split below doesn't see.
-                if cfg!(windows) && pattern.contains(['\\', ':']) {
-                    return Ok(Some(format!(
-                        "the pattern `{pattern}` uses `\\` or a drive; write it with `/`, \
-                         relative to the worktree"
-                    )));
-                }
                 // The literal start of the pattern may be a symlink out of the worktree.
                 let start = if pattern.starts_with('/') {
                     PathBuf::from("/")
@@ -571,7 +571,7 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
             "{} is outside the worktree; agents read only the worktree, {}dependency sources \
              ($CARGO_HOME/registry, $CARGO_HOME/git, $RUSTUP_HOME)",
             full.display(),
-            if cfg!(windows) { "" } else { "/usr and " }
+            crate::platform::SYSTEM_READS
         ));
     }
     None
@@ -747,7 +747,11 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
         // stops the rest.
         "cd" if first => match args {
             [target]
-                if crate::platform::path_problem(target, false).is_none()
+                if crate::platform::path_problem(
+                    &crate::platform::shell_path(target).to_string_lossy(),
+                    false,
+                )
+                .is_none()
                     && crate::platform::shell_path(target).is_absolute()
                     && resolve(&crate::platform::shell_path(target)) == b.root =>
             {
@@ -1515,6 +1519,7 @@ mod windows_tests {
     struct Env {
         _tmp: tempfile::TempDir,
         root: PathBuf,
+        home: PathBuf,
         bounds: Bounds,
     }
 
@@ -1525,10 +1530,11 @@ mod windows_tests {
         let root = home.join("envs").join("work-1");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src").join("lib.rs"), "").unwrap();
-        let bounds = Bounds::new(Some(root.clone()), Some(home)).unwrap();
+        let bounds = Bounds::new(Some(root.clone()), Some(home.clone())).unwrap();
         Env {
             _tmp: tmp,
             root,
+            home,
             bounds,
         }
     }
@@ -1578,6 +1584,7 @@ mod windows_tests {
             "NUL",
             "src\\con.txt",
             "a?b",
+            "COM¹",
         ] {
             assert!(e.write(&e.at(path)).is_some(), "{path} was allowed");
         }
@@ -1613,10 +1620,11 @@ mod windows_tests {
                 "{path} was allowed"
             );
         }
-        let state = e.bounds.home.join("events.jsonl");
-        assert!(e
+        let state = e.home.join("events.jsonl");
+        let why = e
             .decide("Read", json!({"file_path": state.display().to_string()}))
-            .is_some());
+            .unwrap();
+        assert!(why.contains("factory's own state"), "{why}");
     }
 
     #[test]
@@ -1635,6 +1643,7 @@ mod windows_tests {
     fn git_paths_stay_inside_and_revisions_keep_their_colons() {
         let e = env();
         assert_eq!(e.bash("git show HEAD:src/lib.rs"), None);
+        assert_eq!(e.bash("git log main.."), None);
         assert!(e.bash("git add .gitattributes.").is_some());
         assert!(e.bash("git diff C:/Windows/win.ini").is_some());
         assert!(e.bash("git diff /c/Windows/win.ini").is_some());
@@ -1656,7 +1665,7 @@ mod windows_tests {
     #[test]
     fn a_junction_out_of_the_worktree_blocks_searches() {
         let e = env();
-        let outside = e.bounds.home.join("outside");
+        let outside = e.home.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])

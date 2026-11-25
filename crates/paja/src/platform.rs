@@ -96,34 +96,41 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         std::fs::create_dir(dir)?;
-        restrict_to_owner(dir).inspect_err(|_| {
+        // Until the ACL is set, the parent's applies: refuse anything planted in that gap.
+        let restricted =
+            restrict_to_owner(dir).and_then(|()| match std::fs::read_dir(dir)?.next() {
+                None => Ok(()),
+                Some(_) => Err(std::io::Error::other(format!(
+                    "{} was not empty right after it was created; something else is writing \
+                     there, so it can't be trusted",
+                    dir.display()
+                ))),
+            });
+        restricted.inspect_err(|_| {
             let _ = std::fs::remove_dir(dir);
         })
     }
 }
 
 /// On Windows, replace `dir`'s ACL with one that lets only the current user in, for it and
-/// everything created in it; a new directory otherwise inherits its parent's, which is not
-/// private under, say, `C:\paja`. Unix needs nothing: Paja creates such directories 0700.
+/// everything created in it, and check that no other account is left with access (`icacls`
+/// keeps other accounts' explicit entries). A new directory otherwise inherits its parent's
+/// ACL, which is not private under, say, `C:\paja`. Each directory is done once per process.
+/// Unix needs nothing: Paja creates such directories 0700.
 pub fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
     if !cfg!(windows) {
         return Ok(());
     }
-    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let system32 = PathBuf::from(system).join("System32");
-    let failed = |what: &str| std::io::Error::other(format!("{what} for {}", dir.display()));
-    // The current user's SID, from `whoami /user /fo csv /nh`: "DOMAIN\user","S-1-5-...".
-    let who = Command::new(system32.join("whoami.exe"))
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()?;
-    let sid = String::from_utf8_lossy(&who.stdout)
-        .trim()
-        .rsplit(',')
-        .next()
-        .map(|field| field.trim_matches('"').to_string())
-        .filter(|sid| sid.starts_with("S-1-"))
-        .ok_or_else(|| failed("`whoami /user` gave no SID"))?;
-    let status = Command::new(system32.join("icacls.exe"))
+    use std::sync::{Mutex, OnceLock};
+    static DONE: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    let done = DONE.get_or_init(|| Mutex::new(Vec::new()));
+    if done.lock().unwrap().iter().any(|d| d == dir) {
+        return Ok(());
+    }
+    let failed = |what: String| std::io::Error::other(format!("{what} for {}", dir.display()));
+    let (account, sid) = current_user()?;
+    let icacls = || Command::new(system32().join("icacls.exe"));
+    let status = icacls()
         .arg(dir)
         .args([
             "/inheritance:r",
@@ -134,9 +141,59 @@ pub fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
         .stdout(std::process::Stdio::null())
         .status()?;
     if !status.success() {
-        return Err(failed("`icacls` could not make an owner-only ACL"));
+        return Err(failed("`icacls` could not make an owner-only ACL".into()));
     }
+    // `icacls <dir>` prints `<dir> ACCOUNT:(rights)` and then one `ACCOUNT:(rights)` per line.
+    let listing = icacls().arg(dir).output()?;
+    let text = String::from_utf8_lossy(&listing.stdout).replace(&*dir.to_string_lossy(), "");
+    let others: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains(":("))
+        .filter_map(|line| line.split(":(").next())
+        .filter(|name| !name.eq_ignore_ascii_case(&account) && !name.eq_ignore_ascii_case(&sid))
+        .collect();
+    if !listing.status.success() || !others.is_empty() {
+        return Err(failed(format!(
+            "other accounts ({}) still have access; remove their entries with `icacls` or use \
+             another PAJA_HOME",
+            others.join(", ")
+        )));
+    }
+    done.lock().unwrap().push(dir.to_path_buf());
     Ok(())
+}
+
+fn system32() -> PathBuf {
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    PathBuf::from(system).join("System32")
+}
+
+/// The current user's account name and SID, from `whoami /user /fo csv /nh`, which prints
+/// `"DOMAIN\user","S-1-5-..."`.
+fn current_user() -> std::io::Result<(String, String)> {
+    use std::sync::OnceLock;
+    static USER: OnceLock<(String, String)> = OnceLock::new();
+    if let Some(user) = USER.get() {
+        return Ok(user.clone());
+    }
+    let who = Command::new(system32().join("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()?;
+    let text = String::from_utf8_lossy(&who.stdout);
+    let fields: Vec<String> = text
+        .trim()
+        .split("\",\"")
+        .map(|f| f.trim_matches('"').to_string())
+        .collect();
+    match fields.as_slice() {
+        [account, sid] if sid.starts_with("S-1-") => {
+            Ok(USER.get_or_init(|| (account.clone(), sid.clone())).clone())
+        }
+        _ => Err(std::io::Error::other(format!(
+            "`whoami /user` gave no account and SID (got {text:?})"
+        ))),
+    }
 }
 
 /// Create `path`, which must not exist yet, as a file only this user can read, write or run
@@ -271,7 +328,9 @@ pub fn path_problem(text: &str, colons: bool) -> Option<String> {
         if name == "." || name == ".." {
             continue;
         }
-        if name.ends_with(['.', ' ']) {
+        // In git's words `main..` is a range, not a name.
+        let range = colons && name.contains("..");
+        if name.ends_with(['.', ' ']) && !range {
             return refuse("has a name ending in a dot or space, which Windows drops");
         }
         if name.contains(':') && !colons {
@@ -286,18 +345,40 @@ pub fn path_problem(text: &str, colons: bool) -> Option<String> {
             .unwrap_or(name)
             .trim_end()
             .to_ascii_uppercase();
+        let chars: Vec<char> = stem.chars().collect();
         let reserved = matches!(
             stem.as_str(),
             "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-        ) || (stem.len() == 4
+        ) || (chars.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit());
+            && (chars[3].is_ascii_digit() || "¹²³".contains(chars[3])));
         if reserved {
             return refuse("names a device");
         }
     }
     None
 }
+
+/// Why a search pattern (Glob's `pattern`, Grep's `glob`) can't be judged here, if it can't:
+/// on Windows `\\` and `C:` would start a path the hook's `/` split doesn't see.
+pub fn pattern_problem(pattern: &str) -> Option<String> {
+    (cfg!(windows) && pattern.contains(['\\', ':'])).then(|| {
+        format!(
+            "the pattern `{pattern}` uses `\\` or a drive; write it with `/`, relative to the \
+             worktree"
+        )
+    })
+}
+
+/// What agents may read outside the worktree besides dependency sources, for messages.
+pub const SYSTEM_READS: &str = if cfg!(windows) { "" } else { "/usr and " };
+
+/// What to add to "install Claude Code" on this platform.
+pub const CLAUDE_HINT: &str = if cfg!(windows) {
+    "; on Windows Paja needs its native claude.exe, not the npm claude.cmd"
+} else {
+    ""
+};
 
 /// Quote `path` as one word of a hook command line. Claude Code runs hooks with the system
 /// shell: `sh` on Unix, `cmd.exe` on Windows (or Git Bash, in some versions). On Windows the
