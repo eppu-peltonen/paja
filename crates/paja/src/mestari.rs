@@ -722,7 +722,17 @@ static RUNNING: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 fn hook_copy_intact(exe: &Path) -> bool {
     RUNNING
         .get()
-        .is_some_and(|bytes| std::fs::read(exe).ok().as_deref() == Some(bytes.as_slice()))
+        .is_some_and(|bytes| read_regular(exe).as_deref() == Some(bytes.as_slice()))
+}
+
+/// A file's contents, read only when it is a plain file: opening a FIFO someone planted
+/// would hang. Anything else reads as a marker that differs from every real content.
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => std::fs::read(path).ok(),
+        Ok(_) => Some(b"\0not a regular file\0".to_vec()),
+        Err(_) => None,
+    }
 }
 
 fn hook_binary(home: &Home) -> Result<PathBuf> {
@@ -878,12 +888,15 @@ fn tempfile_dir(near: &Path) -> Result<PathBuf> {
         COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::create_dir_all(std::env::temp_dir());
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&dir)
         .with_context(|| {
             format!(
-                "creating a scratch home for the agent in {}",
+                "creating a scratch home {} for work in {}; check that the temporary \
+                 directory (TMPDIR) exists and is writable",
+                dir.display(),
                 near.display()
             )
         })?;
@@ -924,6 +937,8 @@ fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&st
         }
     }
     cmd.env("PAJA_HOME", scratch)
+        // Replacement refs would let code show the reviewer a different history.
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -974,12 +989,14 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     };
     let cargo_home = dir_of("CARGO_HOME", ".cargo");
     let rustup_home = dir_of("RUSTUP_HOME", ".rustup");
+    // Read before any check runs: later, the branch's code may have changed the configuration.
+    let identity = git_identity(dir);
     let scratch = tempfile_dir(dir)?;
     let result = (|| {
         for check in checks {
             let mut cmd = Command::new("sh");
             cmd.args(["-c", check]).current_dir(dir);
-            without_credentials(&mut cmd, &scratch, git_identity(dir));
+            without_credentials(&mut cmd, &scratch, identity.clone());
             // The checks don't need the owner's home either, and it holds credential files,
             // such as the `.netrc` git reads on its own. Cargo and rustup keep their real
             // directories, so cargo's own `credentials.toml` stays reachable.
@@ -1292,10 +1309,19 @@ impl GitGuard {
         // The repository's hooks, and wherever the owner's `core.hooksPath` points: gh runs
         // git without Paja's overrides.
         let mut hooks = vec![common.join("hooks")];
-        if let Ok(path) = git(worktree, &["config", "--path", "core.hooksPath"]) {
-            if !path.is_empty() {
-                hooks.push(worktree.join(path));
-            }
+        // Asked without Paja's own override, which would answer `/dev/null`. Reading the
+        // configuration runs no hook.
+        let owner_hooks = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["config", "--path", "core.hooksPath"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !owner_hooks.is_empty() {
+            hooks.push(worktree.join(owner_hooks));
         }
         // The owner's global configuration, which Mestari's own git reads.
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -1402,7 +1428,7 @@ impl GitGuard {
             .flat_map(|path| {
                 [
                     Some(path.as_os_str().as_encoded_bytes().to_vec()),
-                    std::fs::read(path).ok(),
+                    read_regular(path),
                 ]
             })
             .collect()

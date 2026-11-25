@@ -1285,6 +1285,10 @@ mod tests {
         )
         .is_some());
         assert_eq!(bash("git commit -m 'read my.sshconfig.txt'"), None);
+        assert_eq!(
+            bash("git add -A && git commit -q -m 'x' -m 'Document .ssh/config support'"),
+            None
+        );
         assert!(decide("Read", json!({"file_path": "~/.paja/events.jsonl"})).is_some());
         assert!(decide("Write", json!({"file_path": "~/.bashrc"})).is_some());
         assert!(decide("Read", json!({"file_path": "/proc/self/environ"})).is_some());

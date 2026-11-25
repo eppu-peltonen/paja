@@ -134,18 +134,19 @@ same branch code, so they run with the same environment and a throwaway `HOME` a
 in, so code they run can still read credential files there (such as `.netrc`), and a token written into the remote's URL
 is not covered: closing those is the sandbox's job. That code could also change the git configuration, hooks or
 attributes the worktree shares with the repository, to make Mestari's own git run a program with Mestari's credentials.
-So Paja's own git never runs hooks or a file-system monitor, and Mestari snapshots those files, and the owner's global
-git configuration, before each agent and check run. Those files include every file git reads configuration from and the
-worktree's links to the repository. If they changed, it parks the item and stops with an error for the person (a
-`--every` loop included) without running git or gh there again, not even to clean up or comment on the issue. The hook's
-copy is checked again after each agent run, and a copy that changed counts as a run the hook never saw. Each phase takes
-its own snapshot, so a change made between phases (by a process the code left running, say) is not caught, nor is a
-relative include resolved against a file other than the repository's or the owner's main configuration. The guardrail's
-limit stays: code that runs as the owner can still change things none of these checks look at, and only the sandbox
-closes that. Reviewers run the hook with `--read-only`: no file edits, no `cargo fmt` without `--check` and no git
-command that changes the branch; after the review, the branch and worktree are put back where it started, whatever the
-code its builds ran did. Because no settings file loads, agents authenticate the way `claude` does without one (a
-signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider settings.
+So Paja's own git never runs hooks or a file-system monitor, and no git Paja starts honours replacement refs, and
+Mestari snapshots those files, and the owner's global git configuration, before each agent and check run. Those files
+include every file git reads configuration from and the worktree's links to the repository. If they changed, it parks
+the item and stops with an error for the person (a `--every` loop included) without running git or gh there again, not
+even to clean up or comment on the issue. The hook's copy is checked again after each agent run, and a copy that changed
+counts as a run the hook never saw. Each phase takes its own snapshot, so a change made between phases (by a process the
+code left running, say) is not caught, nor is a relative include resolved against a file other than the repository's or
+the owner's main configuration. The guardrail's limit stays: code that runs as the owner can still change things none of
+these checks look at, and only the sandbox closes that. Reviewers run the hook with `--read-only`: no file edits, no
+`cargo fmt` without `--check` and no git command that changes the branch; after the review, the branch and worktree are
+put back where it started, whatever the code its builds ran did. Because no settings file loads, agents authenticate the
+way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider
+settings.
 
 ## MCP server
 
