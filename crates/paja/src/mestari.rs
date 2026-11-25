@@ -30,10 +30,8 @@ pub const EV_LANDED: &str = "run.landed";
 pub const EV_ESCALATED: &str = "run.escalated";
 /// A non-blocking review finding filed as a `paja-follow-up` issue after landing.
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
-/// Branch code changed git's configuration in `repo`; Paja runs no git there until a person
-/// has checked it and recorded [`EV_TAMPER_CHECKED`].
-pub const EV_TAMPERED: &str = "run.tampered";
-pub const EV_TAMPER_CHECKED: &str = "run.tamper_checked";
+/// The tamper lock lives in Ahjo, next to the git every command runs.
+pub use crate::ahjo::{Tampered, EV_TAMPERED, EV_TAMPER_CHECKED};
 
 /// How a run ended.
 #[derive(Debug, Clone, Serialize)]
@@ -140,33 +138,10 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let repo = std::path::absolute(opts.repo)?;
     // A repository whose configuration was tampered with gets no git, not even a fetch, until
     // a person says it was checked.
-    // One key per repository, however its path was spelled: the shared git directory, which
-    // rev-parse finds without running any program from the configuration.
-    let common = git(
-        &repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .with_context(|| format!("finding the git repository at {}", repo.display()))?;
-    let key = std::fs::canonicalize(&common)
-        .unwrap_or_else(|_| PathBuf::from(&common))
-        .display()
-        .to_string();
     if opts.tamper_checked {
-        record(home, EV_TAMPER_CHECKED, json!({ "repo": key }))?;
+        ahjo::clear_tampered(home, &repo)?;
     }
-    let last =
-        home.events().read_all()?.into_iter().rev().find(|e| {
-            (e.kind == EV_TAMPERED || e.kind == EV_TAMPER_CHECKED) && e.data["repo"] == key
-        });
-    if let Some(event) = last.filter(|e| e.kind == EV_TAMPERED) {
-        return Err(Tampered(format!(
-            "Paja stopped on {key} because git's configuration changed during a run ({}); it \
-             runs no git there until a person has checked and restored those files and runs \
-             `paja run --tamper-checked`",
-            event.data["error"].as_str().unwrap_or("see the event log")
-        ))
-        .into());
-    }
+    let key = ahjo::ensure_untampered(home, &repo)?;
     git(&repo, &["fetch", "-q", "origin", "main"]).context(
         "fetching origin/main; check the network and that `origin` is the GitHub repository",
     )?;
@@ -1659,19 +1634,6 @@ fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
 fn git_command() -> Command {
     ahjo::git_command()
 }
-
-/// The error a [`GitGuard`] raises. Nothing may run git in that repository afterwards, not
-/// even to clean up, until a person has looked.
-#[derive(Debug)]
-pub struct Tampered(String);
-
-impl std::fmt::Display for Tampered {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Tampered {}
 
 /// Whether a long-running loop must stop on `err`: today only a tampered repository.
 pub fn is_fatal(err: &anyhow::Error) -> bool {

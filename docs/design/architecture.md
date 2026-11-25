@@ -160,8 +160,10 @@ the owner's global git configuration, before each agent and check run. Those fil
 configuration from and the worktree's links to the repository. If they changed, it parks the item, records
 `run.tampered` and stops with an error naming the changed files (a `--every` loop included) without running git or gh
 there again, not even to clean up or comment on the issue. The guard also notices another environment's links and
-configuration changing. Later runs on that repository (found by its shared git directory, however its path is spelled)
-refuse to start until a person has checked it and runs `paja run --tamper-checked`. Configuration files are compared by
+configuration changing. Until a person has checked that repository (found by its shared git directory, however its
+path is spelled) and runs `paja run --tamper-checked`, every command and MCP tool that runs git or gh there refuses:
+later runs, `work sync`, `env create` and `env remove`. The check lives in Ahjo, so a new command gets it by calling
+`ahjo::ensure_untampered` before its first git or gh. Configuration files are compared by
 the entries git reads, leaving out `branch.*`, which ordinary git work writes; every other file byte for byte. The
 hook's copy is checked again after each agent run, and a copy that changed counts as a run the hook never saw. Each
 phase takes its own snapshot, so a change made between phases (by a process the code left running, say) is not caught,
