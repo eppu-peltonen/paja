@@ -913,7 +913,8 @@ fn agents_run_on_the_models_main_names() {
     std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
     f.on_main(
         ".paja/models",
-        "# role model [effort]\nbuild sonnet\nfix haiku low\nreview opus high\nfallback sonnet\n",
+        "# role model [effort]\nbuild sonnet\nfix haiku low\nreview opus high\n\
+         re-review sonnet medium\nfallback sonnet\n",
     );
     // The builder's branch names other models; main's file still decides.
     std::fs::write(f.tmp.path().join("cheat"), "").unwrap();
@@ -941,13 +942,19 @@ fn agents_run_on_the_models_main_names() {
         "{}",
         builds[1]
     );
-    for review in &reviews {
-        assert!(
-            review.contains("--model opus --effort high --fallback-model sonnet"),
-            "{review}"
-        );
-        assert!(!review.contains("haiku"), "{review}");
-    }
+    assert_eq!(reviews.len(), 2, "{calls:?}");
+    assert!(
+        reviews[0].contains("--model opus --effort high --fallback-model sonnet"),
+        "{}",
+        reviews[0]
+    );
+    // The second round's normal-risk review judges only the fix, as `re-review`.
+    assert!(
+        reviews[1].contains("--model sonnet --effort medium --allowedTools"),
+        "{}",
+        reviews[1]
+    );
+    assert!(!reviews.iter().any(|r| r.contains("haiku")), "{reviews:?}");
     // The step records name the role and model.
     let (_, log) = paja(&f.home, &f.repo, &["log"]);
     let steps: Vec<Value> = log
@@ -963,6 +970,34 @@ fn agents_run_on_the_models_main_names() {
     assert_eq!(steps[1]["model"], "opus");
     assert_eq!(steps[2]["role"], "fix");
     assert_eq!(steps[2]["model"], "haiku");
+    assert_eq!(steps[3]["role"], "re-review");
+    assert_eq!(steps[3]["model"], "sonnet");
+}
+
+#[test]
+fn the_second_high_risk_reviewer_runs_as_review_2() {
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    f.on_main(".paja/models", "review opus\nreview-2 sonnet medium\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let calls = f.claude_calls();
+    let reviews: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.contains("--json-schema"))
+        .collect();
+    assert_eq!(reviews.len(), 2, "{calls:?}");
+    assert!(
+        reviews[0].contains("--model opus --allowedTools"),
+        "{}",
+        reviews[0]
+    );
+    assert!(
+        reviews[1].contains("--model sonnet --effort medium --allowedTools"),
+        "{}",
+        reviews[1]
+    );
 }
 
 #[test]

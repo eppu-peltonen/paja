@@ -180,9 +180,12 @@ impl Models {
     /// with a plain model name (and a known effort) is an error naming the line and the fix.
     pub fn parse(text: &str) -> Result<Self> {
         let mut models = Models::default();
+        // A leading `-` would reach `claude` as a flag of its own.
         let plain = |word: &str| {
-            word.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']'))
+            !word.starts_with('-')
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']'))
         };
         for (i, line) in text.lines().enumerate() {
             let line = line.trim();
@@ -544,7 +547,7 @@ fn run_item(
                     prior.as_ref().filter(|_| !risky),
                     i as u32 + 1,
                     &models,
-                    "review",
+                    review_role(risky, i, prior.is_some()),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -656,6 +659,18 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
             base: if resume { None } else { Some(base) },
         },
     )
+}
+
+/// The `.paja/models` role a review runs as. The first reviewer of a round reads the most and
+/// keeps `review`. A normal-risk review of only the fix, and the second high-risk reviewer (a
+/// second opinion on what the first also reads in full), can run on a cheaper model.
+fn review_role(risky: bool, reviewer: usize, fix_only: bool) -> &'static str {
+    match (risky, reviewer) {
+        (true, 0) => "review",
+        (true, _) => "review-2",
+        (false, _) if fix_only => "re-review",
+        (false, _) => "review",
+    }
 }
 
 fn build(
@@ -2345,11 +2360,28 @@ mod tests {
             ("build sonnet loud", "unknown effort \"loud\""),
             ("build sonnet\nbuild opus", "line 2"),
             ("fallback", "write it as `fallback <model>`"),
+            ("fallback a\nfallback b", "`fallback` is named twice"),
             ("build $(x)", "not a plain model or effort name"),
+            (
+                "build --dangerously-skip-permissions",
+                "not a plain model or effort name",
+            ),
         ] {
             let err = format!("{:#}", Models::parse(text).unwrap_err());
             assert!(err.contains(".paja/models on main"), "{err}");
             assert!(err.contains(says), "{text:?}: {err}");
         }
+    }
+
+    #[test]
+    fn each_review_takes_its_role() {
+        use super::review_role;
+        assert_eq!(review_role(false, 0, false), "review");
+        assert_eq!(review_role(false, 0, true), "re-review");
+        assert_eq!(review_role(true, 0, false), "review");
+        assert_eq!(review_role(true, 1, false), "review-2");
+        // High-risk reviewers read the whole change every round, so never `re-review`.
+        assert_eq!(review_role(true, 0, true), "review");
+        assert_eq!(review_role(true, 1, true), "review-2");
     }
 }

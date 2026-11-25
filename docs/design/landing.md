@@ -29,6 +29,11 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
   builder without a review. High-risk changes are the exception: both
   reviewers read the whole change every round, since they must agree on all of it.
+- **Cheaper models where the review reads less.** The first reviewer of a round runs as the `review` role in
+  `.paja/models` (Opus here). A normal-risk re-review, which judges only the fix against a fixed list of blockers, runs
+  as `re-review`, and the second high-risk reviewer, a second opinion on a change the first also reads in full, runs as
+  `review-2` (both Sonnet at medium effort here). A second reviewer on a different model also tends to disagree for
+  different reasons than a copy of the first would.
 - **Each review is a fresh, short session.** Reviewers never share context with the builder or with each other, which
   keeps them independent and keeps each session small.
 
