@@ -140,7 +140,14 @@ pub fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
         ])
         .stdout(std::process::Stdio::null())
         .status()?;
-    if !status.success() {
+    // New directories also get explicit entries for SYSTEM and Administrators (who can take
+    // any file anyway); drop them by SID, which every Windows language spells the same.
+    let removed = icacls()
+        .arg(dir)
+        .args(["/remove:g", "*S-1-5-18", "*S-1-5-32-544", "/q"])
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if !status.success() || !removed.success() {
         return Err(failed("`icacls` could not make an owner-only ACL".into()));
     }
     // `icacls <dir>` prints `<dir> ACCOUNT:(rights)` and then one `ACCOUNT:(rights)` per line.
