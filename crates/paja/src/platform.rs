@@ -353,7 +353,8 @@ mod tests {
         let plain = tmp.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
         let why = ensure_private_dir(&plain).unwrap_err().to_string();
-        assert!(why.contains("inherits"), "{why}");
+        // Refused for inheriting, or for its owner when the tests run elevated.
+        assert!(why.contains("Paja recreates it"), "{why}");
     }
 
     #[test]
