@@ -332,7 +332,13 @@ pub fn shown(path: &Path) -> String {
 /// word is double-quoted with forward slashes, which both of those read the same way, and
 /// paths holding characters either would expand are refused.
 pub fn quote_hook_word(path: &Path) -> Result<String> {
-    let text = path.to_string_lossy();
+    let Some(text) = path.to_str() else {
+        bail!(
+            "the path {} is not valid UTF-8, so Claude Code's hook command can't name it; move \
+             it (or PAJA_HOME) to a path that is",
+            path.display()
+        );
+    };
     if cfg!(windows) {
         if let Some(c) = text
             .chars()
@@ -367,6 +373,15 @@ mod tests {
                 r"'/a/it'\''s'"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_word_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/a/\xff"));
+        let why = quote_hook_word(path).unwrap_err().to_string();
+        assert!(why.contains("not valid UTF-8"), "{why}");
     }
 
     #[cfg(windows)]
