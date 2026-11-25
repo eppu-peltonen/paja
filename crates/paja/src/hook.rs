@@ -102,12 +102,6 @@ pub fn run(
     if let Some(stamp) = &stamp {
         let _ = std::fs::write(stamp, b"");
     }
-    if let Some(why) = crate::platform::unguarded() {
-        // Read the call first, so the caller's write never meets a closed pipe.
-        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
-        eprintln!("Blocked: {why}");
-        return ExitCode::from(2);
-    }
     // A hook that runs past Claude Code's timeout counts as "allow"; block well before it.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(HOOK_DEADLINE_SECS));
@@ -119,6 +113,13 @@ pub fn run(
         eprintln!("Blocked: Paja's deny-list hook crashed ({info}), so it fails closed");
         std::process::exit(2);
     }));
+    // After the deadline and the panic hook, so a stalled read or a closed stderr still blocks.
+    if let Some(why) = crate::platform::unguarded() {
+        // Read the call first, so the caller's write never meets a closed pipe.
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        eprintln!("Blocked: {why}");
+        return ExitCode::from(2);
+    }
     let decision = (|| -> Result<Option<String>> {
         // Read the call first, so the caller's write never meets a closed pipe.
         let mut input = String::new();

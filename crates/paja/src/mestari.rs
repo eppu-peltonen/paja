@@ -97,7 +97,7 @@ fn claude_program() -> String {
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     if let Some(why) = crate::platform::unguarded() {
-        bail!("paja run can't start: {why}");
+        return Err(Unguarded(why).into());
     }
     let repo = std::path::absolute(opts.repo)?;
     // A repository whose configuration was tampered with gets no git, not even a fetch, until
@@ -841,11 +841,8 @@ fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, P
 /// keys would silently drop Mestari's hook. Refuse to start agents on such a machine.
 fn refuse_hook_policies() -> Result<()> {
     let mut paths = Vec::new();
-    for dir in [
-        "/etc/claude-code",
-        "/Library/Application Support/ClaudeCode",
-    ] {
-        let dir = Path::new(dir);
+    for dir in crate::platform::managed_settings_dirs() {
+        let dir = dir.as_path();
         paths.push(dir.join("managed-settings.json"));
         // Drop-in files next to it carry the same keys.
         if let Ok(entries) = std::fs::read_dir(dir.join("managed-settings.d")) {
@@ -958,11 +955,8 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
             }
         }
     }
-    // On Linux /proc/self/exe still reads the running binary after a rebuild replaced it.
-    let running = match Path::new("/proc/self/exe") {
-        p if p.exists() => p.to_path_buf(),
-        _ => std::env::current_exe().context("finding the paja binary for the deny-list hook")?,
-    };
+    let running =
+        crate::platform::running_exe().context("finding the paja binary for the deny-list hook")?;
     let bytes = match RUNNING.get() {
         Some(bytes) => bytes,
         None => {
@@ -1009,11 +1003,8 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
                 )
             })?;
     }
-    // Keep the copy fresh so another run's cleanup leaves it alone. Opened read-only: the
-    // copy may be running, and a running binary can't be opened for writing.
-    if let Ok(file) = std::fs::File::open(&exe) {
-        let _ = file.set_modified(std::time::SystemTime::now());
-    }
+    // Keep the copy fresh so another run's cleanup leaves it alone.
+    crate::platform::touch(&exe);
     Ok(exe)
 }
 
@@ -1566,6 +1557,24 @@ impl std::fmt::Display for Tampered {
 }
 
 impl std::error::Error for Tampered {}
+
+/// `paja run` can't start agents on this platform at all, so retrying is pointless.
+#[derive(Debug)]
+pub struct Unguarded(&'static str);
+
+impl std::fmt::Display for Unguarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "paja run can't start: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unguarded {}
+
+/// Whether a long-running loop must stop on `err`: a tampered repository, or a platform
+/// where no run can start.
+pub fn is_fatal(err: &anyhow::Error) -> bool {
+    is_tampered(err) || err.chain().any(|e| e.is::<Unguarded>())
+}
 
 /// Whether `err` is, or was caused by, a [`Tampered`] repository.
 pub fn is_tampered(err: &anyhow::Error) -> bool {

@@ -10,16 +10,60 @@ use anyhow::{bail, Context, Result};
 /// The owner's home directory: `HOME`, or on Windows `USERPROFILE` when `HOME` is unset (Git
 /// for Windows reads them in the same order).
 pub fn home_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
-    var("HOME")
-        .or_else(|| {
-            if cfg!(windows) {
-                var("USERPROFILE")
-            } else {
-                None
-            }
-        })
-        .map(PathBuf::from)
+    // A Unix-style HOME such as `/c/Users/me` isn't absolute on Windows: skip it.
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|v| v.is_absolute())
+    };
+    var("HOME").or_else(|| {
+        if cfg!(windows) {
+            var("USERPROFILE")
+        } else {
+            None
+        }
+    })
+}
+
+/// Where Claude Code reads managed (administrator) settings on this platform.
+pub fn managed_settings_dirs() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        let program_files =
+            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+        vec![
+            PathBuf::from(program_files).join("ClaudeCode"),
+            PathBuf::from(r"C:\ProgramData\ClaudeCode"),
+        ]
+    } else {
+        vec![
+            PathBuf::from("/etc/claude-code"),
+            PathBuf::from("/Library/Application Support/ClaudeCode"),
+        ]
+    }
+}
+
+/// The running paja binary. On Linux `/proc/self/exe` still reads it after a rebuild replaced
+/// the file on disk.
+pub fn running_exe() -> std::io::Result<PathBuf> {
+    let proc = Path::new("/proc/self/exe");
+    if cfg!(target_os = "linux") && proc.exists() {
+        return Ok(proc.to_path_buf());
+    }
+    std::env::current_exe()
+}
+
+/// Set `path`'s modification time to now, ignoring failure. On Unix the file is opened
+/// read-only, since a running binary can't be opened for writing; Windows needs write access
+/// to change the time, and allows it on a running binary.
+pub fn touch(path: &Path) {
+    let file = if cfg!(windows) {
+        std::fs::OpenOptions::new().write(true).open(path)
+    } else {
+        std::fs::File::open(path)
+    };
+    if let Ok(file) = file {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// Create `dir`, which must not exist yet, so that only this user can enter it. On Windows
@@ -145,9 +189,9 @@ mod tests {
 
     #[test]
     fn private_dirs_refuse_a_name_that_is_taken() {
-        let dir = std::env::temp_dir().join(format!("paja-private-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private");
         create_private_dir(&dir).unwrap();
         assert!(create_private_dir(&dir).is_err());
-        std::fs::remove_dir(&dir).unwrap();
     }
 }

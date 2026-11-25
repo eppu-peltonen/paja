@@ -255,10 +255,6 @@ fn run(cli: &Cli) -> Result<()> {
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
-            // A refusal that no later pass can lift stops `--every` too.
-            if let Some(why) = paja::platform::unguarded() {
-                anyhow::bail!("paja run can't start: {why}");
-            }
             loop {
                 let outcome = mestari::run_once(
                     &home,
@@ -282,9 +278,9 @@ fn run(cli: &Cli) -> Result<()> {
                         });
                         matches!(report, mestari::RunReport::Idle)
                     }
-                    // Except when git's configuration was tampered with: then running git again is
-                    // the danger, so the loop stops for a person.
-                    Err(err) if mestari::is_tampered(&err) => return Err(err),
+                    // Except when git's configuration was tampered with (running git again is the
+                    // danger) or no later pass could start either: the loop stops for a person.
+                    Err(err) if mestari::is_fatal(&err) => return Err(err),
                     Err(err) => {
                         emit(cli, json!({ "error": format!("{err:#}") }), || {
                             format!("error: {err:#}")
