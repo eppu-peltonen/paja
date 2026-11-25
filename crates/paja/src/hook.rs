@@ -405,10 +405,20 @@ fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
     if depth > 32 {
         return Some(dir.to_path_buf());
     }
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    // What can't be listed can't be checked, so it counts as a link out. A worktree that
+    // doesn't exist has nothing to search.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(dir.to_path_buf()),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Some(dir.to_path_buf());
+        };
         let path = entry.path();
         let Ok(kind) = entry.file_type() else {
-            continue;
+            return Some(path);
         };
         if kind.is_symlink() {
             if !resolve(&path).starts_with(&b.root) {
@@ -528,7 +538,16 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
     let readable = if let Some(dep) = b.deps.iter().find(|d| full.starts_with(d)) {
         !touches_secret(&full.strip_prefix(dep).unwrap_or(&full).to_string_lossy())
     } else {
+        // Cargo's home outside its dependency roots holds its registry token, wherever it is
+        // (`/usr/local/cargo` in some images).
+        let in_cargo_home = b
+            .deps
+            .iter()
+            .filter(|d| d.file_name().is_some_and(|n| n == "registry" || n == "git"))
+            .filter_map(|d| d.parent())
+            .any(|home| full.starts_with(home));
         full.starts_with("/usr")
+            && !in_cargo_home
             && !touches_secret(&text)
             && !full
                 .components()
@@ -1259,6 +1278,24 @@ mod tests {
         assert!(decide("Write", json!({"file_path": "rust-toolchain.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "rustfmt.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": "src/.gitattributes"})).is_some());
+        let usr_cargo = Bounds {
+            deps: vec![
+                "/usr/local/cargo/registry".into(),
+                "/usr/local/cargo/git".into(),
+            ],
+            ..bounds()
+        };
+        let read = |path: &str| {
+            let input = HookInput {
+                tool_name: "Read".into(),
+                tool_input: json!({ "file_path": path }),
+                cwd: ROOT.into(),
+            };
+            check(&input, &usr_cargo).unwrap()
+        };
+        assert!(read("/usr/local/cargo/credentials.toml").is_some());
+        assert_eq!(read("/usr/local/cargo/registry/src/x/lib.rs"), None);
+        assert_eq!(read("/usr/include/stdio.h"), None);
         assert!(decide("Write", json!({"file_path": "crates/x/.clippy.toml"})).is_some());
         assert!(decide("Write", json!({"file_path": format!("{ROOT}/src/../x.rs")})).is_some());
         assert_eq!(decide("TaskCreate", json!({"subject": "x"})), None);

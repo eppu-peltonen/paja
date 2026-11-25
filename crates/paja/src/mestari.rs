@@ -580,12 +580,12 @@ fn discard(env: &Env, to: &str) -> Result<()> {
     Ok(())
 }
 
-/// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
-/// Before handing them out, check that the hook really blocks a push and allows a build; an
-/// agent never starts under a hook that doesn't.
 /// Keeps stamp directory names unique within one process.
 static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
+/// Before handing them out, check that the hook really blocks a push and allows a build; an
+/// agent never starts under a hook that doesn't.
 fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
@@ -709,11 +709,6 @@ fn refuse_hook_policies() -> Result<()> {
     Ok(())
 }
 
-/// The paja binary the hook runs from: a copy in the factory home, so an agent's own
-/// `cargo build` can't replace the binary that judges it. Made once per `paja run` from the
-/// binary that is running (on Linux even if the file on disk has been rebuilt since; elsewhere
-/// it is the file on disk when the run first needs it); copies other runs
-/// left behind are removed once they are a day old.
 /// This paja's own bytes, read once per process: what the hook copy must match, whatever later
 /// happens to the file.
 static RUNNING: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
@@ -723,6 +718,27 @@ fn hook_copy_intact(exe: &Path) -> bool {
     RUNNING
         .get()
         .is_some_and(|bytes| read_regular(exe).as_deref() == Some(bytes.as_slice()))
+}
+
+/// A git configuration file without its `[branch "..."]` sections: ordinary git work (`push
+/// -u`, `checkout -b`) writes those, and they run no program. Other files pass unchanged.
+fn without_branches(content: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(content);
+    let mut kept = String::new();
+    let mut in_branch = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_branch = trimmed
+                .strip_prefix('[')
+                .is_some_and(|rest| rest.trim_start().to_lowercase().starts_with("branch"));
+        }
+        if !in_branch {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    kept.into_bytes()
 }
 
 /// A file's contents, read only when it is a plain file: opening a FIFO someone planted
@@ -735,6 +751,11 @@ fn read_regular(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+/// The paja binary the hook runs from: a copy in the factory home, so an agent's own
+/// `cargo build` can't replace the binary that judges it. Made once per `paja run` from the
+/// binary that is running (on Linux even if the file on disk has been rebuilt since; elsewhere
+/// it is the file on disk when the run first needs it); copies other runs
+/// left behind are removed once they are a day old.
 fn hook_binary(home: &Home) -> Result<PathBuf> {
     let _lock = home.lock()?;
     let dir = home.root().join("hook");
@@ -1279,11 +1300,6 @@ fn git_command() -> Command {
     ahjo::git_command()
 }
 
-/// A snapshot of the git configuration, hooks and attributes a worktree's git reads, all of
-/// them outside the worktree and shared with the repository. Code that an agent, Vasara's
-/// checks or a reviewer's build runs could change them to make Mestari's own git run a program
-/// with Mestari's credentials (a credential helper, a filter). Mestari takes the snapshot before
-/// such code runs and checks it before it runs git there again.
 /// The error a [`GitGuard`] raises. Nothing may run git in that repository afterwards, not
 /// even to clean up, until a person has looked.
 #[derive(Debug)]
@@ -1302,10 +1318,15 @@ pub fn is_tampered(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<Tampered>())
 }
 
+/// A snapshot of the git configuration, hooks and attributes a worktree's git reads, all of
+/// them outside the worktree and shared with the repository. Code that an agent, Vasara's
+/// checks or a reviewer's build runs could change them to make Mestari's own git run a program
+/// with Mestari's credentials (a credential helper, a filter). Mestari takes the snapshot before
+/// such code runs and checks it before it runs git there again.
 struct GitGuard {
     files: Vec<PathBuf>,
     hooks: Vec<PathBuf>,
-    snapshot: Vec<Option<Vec<u8>>>,
+    snapshot: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl GitGuard {
@@ -1442,7 +1463,7 @@ impl GitGuard {
         Ok(guard)
     }
 
-    fn read(&self) -> Vec<Option<Vec<u8>>> {
+    fn read(&self) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         let mut hooks: Vec<PathBuf> = self
             .hooks
             .iter()
@@ -1456,25 +1477,33 @@ impl GitGuard {
         self.files
             .iter()
             .chain(&hooks)
-            .flat_map(|path| {
-                [
-                    Some(path.as_os_str().as_encoded_bytes().to_vec()),
-                    read_regular(path),
-                ]
+            .map(|path| {
+                (
+                    path.clone(),
+                    read_regular(path).map(|c| without_branches(&c)),
+                )
             })
             .collect()
     }
 
     /// Fails, before Mestari runs git again, when anything changed since the snapshot.
     fn check(&self, what: &str) -> Result<()> {
-        if self.read() != self.snapshot {
+        let now = self.read();
+        if now != self.snapshot {
+            let mut changed: Vec<String> = now
+                .iter()
+                .filter(|entry| !self.snapshot.contains(entry))
+                .chain(self.snapshot.iter().filter(|entry| !now.contains(entry)))
+                .map(|(path, _)| path.display().to_string())
+                .collect();
+            changed.sort();
+            changed.dedup();
             return Err(Tampered(format!(
-                "git's configuration, hooks or attributes ({}, {} or the owner's global git \
-                 configuration) changed while {what} ran, so Paja stopped before running git \
-                 there again; a person must check and restore those files before running Paja \
-                 again (your own edit to the global configuration during a run also stops it)",
-                self.files[0].display(),
-                self.hooks[0].display()
+                "git's configuration, hooks or attributes changed while {what} ran ({}), so \
+                 Paja stopped before running git there again; a person must check and restore \
+                 those files before running Paja again. Your own edits to them during a run \
+                 stop it too",
+                changed.join(", ")
             ))
             .into());
         }
@@ -1514,6 +1543,10 @@ mod tests {
         assert!(super::is_high_risk("docs/CLAUDE.md", &prefixes));
         let names: Vec<String> = ["rust-toolchain", ".paja/"].map(String::from).to_vec();
         assert!(super::is_high_risk("rust-toolchain.toml", &names));
+        let config = b"[core]\n\tbare = false\n[branch \"x\"]\n\tremote = origin\n[credential]\n\thelper = y\n";
+        let kept = String::from_utf8(super::without_branches(config)).unwrap();
+        assert!(!kept.contains("remote = origin"), "{kept}");
+        assert!(kept.contains("helper = y"), "{kept}");
         assert!(!super::is_high_risk("src/.pajarc", &names));
         assert!(super::is_high_risk("crates/paja/src/hook.rs", &prefixes));
         assert!(!super::is_high_risk("crates/paja/src/jono.rs", &prefixes));
