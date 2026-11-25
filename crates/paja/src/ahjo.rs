@@ -371,7 +371,8 @@ fn validate_name(name: &str) -> Result<()> {
 pub(crate) fn git_command() -> Command {
     let mut cmd = Command::new("git");
     // Replacement refs would let code in a worktree change the history Paja judges.
-    cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
+    cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null");
     cmd.args([
         "-c",
         "core.hooksPath=/dev/null",

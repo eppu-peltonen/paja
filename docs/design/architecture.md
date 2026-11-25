@@ -70,14 +70,15 @@ environment `work-<issue>` from `main` (resuming the branch an earlier run kept)
 3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
    answers `land`, `changes` or `escalate`. It may read, run cargo and use read-only git, and changes nothing. A change
    touching a path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
-   An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also at any depth, in
-   any letter case.
+   An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
+   or the name with an extension, at any depth, in any letter case.
 
-On `land`, Mestari pushes the branch, opens a pull request, waits for CI with `gh pr checks --watch`, squash-merges it
-and marks the item landed. On `escalate`, three failed rounds, a red CI or an error it can't fix, it comments on the
-issue with the question and marks the item escalated; the branch keeps the work. Agents run with a throwaway
-`PAJA_HOME`, so they never touch the factory's own state. Each step is recorded as `run.started`, `run.round`,
-`run.landed` or `run.escalated`. `paja run --every 5` keeps going, checking an empty queue every five minutes.
+On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
+for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
+red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
+keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
+recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`. `paja run --every 5` keeps going, checking an
+empty queue every five minutes.
 
 ## The deny-list hook
 
@@ -109,7 +110,7 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
-  followed, and are blocked while the directory searched holds a symlink out of the worktree. A file tool path may not
+  followed, and are blocked while the worktree holds a symlink out of the worktree. A file tool path may not
   start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
   (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
@@ -134,19 +135,19 @@ same branch code, so they run with the same environment and a throwaway `HOME` a
 in, so code they run can still read credential files there (such as `.netrc`), and a token written into the remote's URL
 is not covered: closing those is the sandbox's job. That code could also change the git configuration, hooks or
 attributes the worktree shares with the repository, to make Mestari's own git run a program with Mestari's credentials.
-So Paja's own git never runs hooks or a file-system monitor, and no git Paja starts honours replacement refs, and
-Mestari snapshots those files, and the owner's global git configuration, before each agent and check run. Those files
-include every file git reads configuration from and the worktree's links to the repository. If they changed, it parks
-the item and stops with an error for the person (a `--every` loop included) without running git or gh there again, not
-even to clean up or comment on the issue. The hook's copy is checked again after each agent run, and a copy that changed
-counts as a run the hook never saw. Each phase takes its own snapshot, so a change made between phases (by a process the
-code left running, say) is not caught, nor is a relative include resolved against a file other than the repository's or
-the owner's main configuration. The guardrail's limit stays: code that runs as the owner can still change things none of
-these checks look at, and only the sandbox closes that. Reviewers run the hook with `--read-only`: no file edits, no
-`cargo fmt` without `--check` and no git command that changes the branch; after the review, the branch and worktree are
-put back where it started, whatever the code its builds ran did. Because no settings file loads, agents authenticate the
-way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider
-settings.
+So Paja's own git never runs hooks or a file-system monitor, and no git Paja starts honours replacement refs or grafts,
+and Mestari snapshots those files, and the owner's global git configuration, before each agent and check run. Those
+files include every file git reads configuration from and the worktree's links to the repository. If they changed, it
+parks the item and stops with an error for the person (a `--every` loop included) without running git or gh there again,
+not even to clean up or comment on the issue. The hook's copy is checked again after each agent run, and a copy that
+changed counts as a run the hook never saw. Each phase takes its own snapshot, so a change made between phases (by a
+process the code left running, say) is not caught, nor is a relative include resolved against a file other than the
+repository's or the owner's main configuration. The guardrail's limit stays: code that runs as the owner can still
+change things none of these checks look at, and only the sandbox closes that. Reviewers run the hook with `--read-only`:
+no file edits, no `cargo fmt` without `--check` and no git command that changes the branch; after the review, the branch
+and worktree are put back where it started, whatever the code its builds ran did. Because no settings file loads, agents
+authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
+`apiKeyHelper` or provider settings.
 
 ## MCP server
 

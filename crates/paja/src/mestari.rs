@@ -209,7 +209,7 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            return land(home, repo, &env, item, round);
+            return land(home, repo, &env, item, round, &checked);
         }
         if risky && verdicts.contains(&"land") {
             // High-risk reviewers must agree; a split is a question, not another round.
@@ -939,6 +939,7 @@ fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&st
     cmd.env("PAJA_HOME", scratch)
         // Replacement refs would let code show the reviewer a different history.
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -963,8 +964,9 @@ fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&st
 }
 
 /// Whether a changed path is high risk: it starts with one of `prefixes`, or, for a prefix
-/// that is a single name (`.cargo/`, `CLAUDE.md`), any directory or file in it starts with
-/// that name, in any letter case, since nested configuration counts as much as the top level.
+/// that is a single name (`.cargo/`, `CLAUDE.md`), any directory or file in it is that name,
+/// or that name with an extension (`rust-toolchain.toml`), in any letter case, since nested
+/// configuration counts as much as the top level.
 fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|prefix| {
         let name = prefix.trim_end_matches('/').to_lowercase();
@@ -972,7 +974,8 @@ fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
             || !name.contains('/')
                 && path
                     .split('/')
-                    .any(|part| part.to_lowercase().starts_with(&name))
+                    .map(str::to_lowercase)
+                    .any(|part| part == name || part.starts_with(&format!("{name}.")))
     })
 }
 
@@ -1021,7 +1024,17 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     result
 }
 
-fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Result<RunReport> {
+/// Push `judged`, the commit Vasara's checks and the reviewers saw, as the environment's
+/// branch, and land it. Not whatever the branch points at now: code run in the worktree could
+/// have moved it.
+fn land(
+    home: &Home,
+    repo: &Path,
+    env: &Env,
+    item: &WorkItem,
+    rounds: u32,
+    judged: &str,
+) -> Result<RunReport> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
     git(
@@ -1032,8 +1045,8 @@ fn land(home: &Home, repo: &Path, env: &Env, item: &WorkItem, rounds: u32) -> Re
             // No `-u`: that would write the branch into the shared git configuration, which
             // other runs' guards watch.
             "origin",
-            &format!("{branch}:{branch}"),
-            "--force-with-lease",
+            &format!("{judged}:refs/heads/{branch}"),
+            &format!("--force-with-lease=refs/heads/{branch}"),
         ],
     )?;
     let title = format!("{} (#{})", item.title, item.number);
@@ -1348,6 +1361,8 @@ impl GitGuard {
                 common.join("config.worktree"),
                 own.join("config.worktree"),
                 common.join("info/attributes"),
+                common.join("info/grafts"),
+                common.join("shallow"),
                 worktree.join(".git"),
                 own.join("commondir"),
                 own.join("gitdir"),
@@ -1356,6 +1371,19 @@ impl GitGuard {
             snapshot: Vec::new(),
         };
         guard.files.extend(global);
+        // A global attributes file the owner chose, wherever it is.
+        let attributes = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["config", "--path", "core.attributesFile"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !attributes.is_empty() {
+            guard.files.push(worktree.join(attributes));
+        }
         // Every file git reads configuration from here, includes and the system file among
         // them, and every file an include names, read or not: one that doesn't exist yet
         // could be created.
@@ -1484,6 +1512,9 @@ mod tests {
             &prefixes
         ));
         assert!(super::is_high_risk("docs/CLAUDE.md", &prefixes));
+        let names: Vec<String> = ["rust-toolchain", ".paja/"].map(String::from).to_vec();
+        assert!(super::is_high_risk("rust-toolchain.toml", &names));
+        assert!(!super::is_high_risk("src/.pajarc", &names));
         assert!(super::is_high_risk("crates/paja/src/hook.rs", &prefixes));
         assert!(!super::is_high_risk("crates/paja/src/jono.rs", &prefixes));
         assert!(!super::is_high_risk(

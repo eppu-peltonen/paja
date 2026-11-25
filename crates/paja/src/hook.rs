@@ -368,8 +368,9 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                     )));
                 }
             }
-            // A wildcard can walk into a symlink the literal prefix never names.
-            if let Some(link) = link_out(&resolve(&base), bounds, 0) {
+            // A wildcard can walk into a symlink the literal prefix never names, and an absolute
+            // pattern can start anywhere in the worktree, so the whole worktree is checked.
+            if let Some(link) = link_out(&bounds.root, bounds, 0) {
                 return Ok(Some(format!(
                     "{} is a symlink out of the worktree (or nested too deep to check), and \
                      searches here could follow it; search a directory without it, or Read \
