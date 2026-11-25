@@ -27,18 +27,28 @@ pub fn home_dir() -> Option<PathBuf> {
         .find(|p| p.is_absolute())
 }
 
-/// Where Claude Code reads managed (administrator) settings on this platform.
+/// Where Claude Code reads managed (administrator) settings on this platform. On Windows it
+/// reads files only, not the registry (checked against Claude Code's own lookup).
 pub fn managed_settings_dirs() -> Vec<PathBuf> {
     if cfg!(windows) {
-        let program_files =
-            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
-        vec![
-            PathBuf::from(program_files).join("ClaudeCode"),
-            PathBuf::from(
-                std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()),
-            )
-            .join("ClaudeCode"),
-        ]
+        // Claude Code names these two literally; the environment's spelling is checked too, in
+        // case it differs.
+        let mut dirs = vec![
+            PathBuf::from(r"C:\Program Files\ClaudeCode"),
+            PathBuf::from(r"C:\ProgramData\ClaudeCode"),
+        ];
+        for var in ["ProgramFiles", "ProgramData"] {
+            if let Some(dir) = std::env::var_os(var) {
+                let dir = PathBuf::from(dir).join("ClaudeCode");
+                if !dirs
+                    .iter()
+                    .any(|d| d.as_os_str().eq_ignore_ascii_case(dir.as_os_str()))
+                {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
     } else {
         vec![
             PathBuf::from("/etc/claude-code"),
@@ -76,10 +86,8 @@ pub fn touch(path: &Path) {
     }
 }
 
-/// Create `dir`, which must not exist yet, so that only this user can enter it. On Windows
-/// the directory only inherits its parent's ACL, which is private under the user's own
-/// temporary or profile directory but not under, say, `C:\paja`; owner-only ACLs come with
-/// the hook's Windows port (#23), and Paja starts no agents on Windows before that.
+/// Create `dir`, which must not exist yet, so that only this user can enter it: mode 0700 on
+/// Unix; on Windows a protected, owner-only ACL set as it is created, so nobody gets in first.
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -87,11 +95,41 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         std::fs::DirBuilder::new().mode(0o700).create(dir)
     }
     #[cfg(not(unix))]
-    std::fs::create_dir(dir)
+    win::create_owner_only(dir)
+}
+
+/// Make sure `dir` exists and only this user can change it. On Unix create it 0700 if needed
+/// (an existing one is left as it is). On Windows create it owner-only, or, if it exists, check that this user
+/// owns it and that its ACL is protected and lets no other account in; checked on every call,
+/// so a later change is caught.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match create_private_dir(dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                win::check_owner_only(dir)
+            }
+            Err(err) => Err(err),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(any(unix, windows)))]
+    std::fs::create_dir_all(dir)
 }
 
 /// Create `path`, which must not exist yet, as a file only this user can read, write or run
-/// (on Windows: with its parent's ACL, as `create_private_dir` says).
+/// (on Windows: inside a directory `create_private_dir` or `ensure_private_dir` made).
 pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = std::fs::OpenOptions::new();
@@ -112,7 +150,8 @@ pub fn shell(script: &str) -> Result<Command> {
     Ok(cmd)
 }
 
-fn posix_shell() -> Result<PathBuf> {
+/// The POSIX shell: `sh` on Unix, Git for Windows' `sh.exe` on Windows.
+pub fn posix_shell() -> Result<PathBuf> {
     if !cfg!(windows) {
         return Ok(PathBuf::from("sh"));
     }
@@ -151,14 +190,141 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// Why `paja run` and `paja hook` refuse to work here, if they do. On Windows the deny-list
-/// hook doesn't yet understand Windows paths (drive letters, `\\` separators, case-insensitive
-/// names), so it can't guard an agent; until it does, both refuse rather than run unguarded.
-pub fn unguarded() -> Option<&'static str> {
-    cfg!(windows).then_some(
-        "the deny-list hook doesn't understand Windows paths yet, so Paja won't start agents \
-         on Windows (they would run unguarded); that port is the next step of issue #23",
-    )
+/// Where cargo and rustup look for their homes when `CARGO_HOME` and `RUSTUP_HOME` are unset:
+/// `HOME` on Unix, the user profile on Windows (they don't read `HOME` there).
+pub fn tool_home() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(home_dir)
+    } else {
+        home_dir()
+    }
+}
+
+/// A path written in a shell command, as the program it is passed to will see it. Git Bash
+/// turns `/c/Users/me` into `C:\Users\me` for Windows programs; elsewhere a path is itself.
+pub fn shell_path(word: &str) -> PathBuf {
+    if cfg!(windows) {
+        let mut chars = word.chars();
+        if let (Some('/'), Some(drive), rest) = (chars.next(), chars.next(), chars.as_str()) {
+            if drive.is_ascii_alphabetic() && (rest.is_empty() || rest.starts_with('/')) {
+                return PathBuf::from(
+                    format!(
+                        "{}:\\{}",
+                        drive.to_ascii_uppercase(),
+                        rest.trim_start_matches('/')
+                    )
+                    .replace('/', "\\"),
+                );
+            }
+        }
+    }
+    PathBuf::from(word)
+}
+
+/// Why the hook can't judge `text` as a path here, if it can't. On Windows the file system
+/// reads some spellings differently from how they look: device and UNC paths (`\\?\`,
+/// `\\server\share`), drive-relative paths (`C:foo`), paths rooted without a drive (`\x`,
+/// which a tool may map to another drive or Git's own directory), names with a trailing dot
+/// or space (`.git.` is `.git`), alternate data streams (`a:stream`), reserved device names (`NUL`, `COM1`) and characters
+/// Windows forbids in names. All are refused rather than interpreted. `revisions` lifts only
+/// the stream and trailing-dot rules, for git's revision forms (`HEAD:path`, `main..`). (An 8.3 short name such
+/// as `GIT~1` only names something that exists, and the hook resolves existing paths to their
+/// long names, so it needs no rule.)
+/// Nothing is refused on Unix.
+pub fn path_problem(text: &str, revisions: bool) -> Option<String> {
+    if !cfg!(windows) || text.is_empty() {
+        return None;
+    }
+    let refuse = |why: &str| {
+        Some(format!(
+            "`{text}` {why}; give a plain path such as C:\\dir\\file or dir\\file"
+        ))
+    };
+    let bytes = text.as_bytes();
+    let sep = |b: u8| b == b'/' || b == b'\\';
+    if sep(bytes[0]) && bytes.get(1).copied().is_some_and(sep) {
+        return refuse("is a device or network path");
+    }
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if drive && !bytes.get(2).copied().is_some_and(sep) {
+        return refuse("is relative to a drive's current directory");
+    }
+    if sep(bytes[0]) {
+        return refuse("is rooted without a drive letter");
+    }
+    let rest = if drive { &text[2..] } else { text };
+    for name in rest.split(['/', '\\']).filter(|n| !n.is_empty()) {
+        if name == "." || name == ".." {
+            continue;
+        }
+        // In git's words `main..` is a range, not a name.
+        let range = revisions && name.contains("..");
+        if name.ends_with(['.', ' ']) && !range {
+            return refuse("has a name ending in a dot or space, which Windows drops");
+        }
+        if name.contains(':') && !revisions {
+            return refuse("names an alternate data stream");
+        }
+        if name.contains(['<', '>', '"', '|', '?', '*']) || name.chars().any(|c| c.is_control()) {
+            return refuse("holds a character Windows doesn't allow in names");
+        }
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or(name)
+            .trim_end()
+            .to_ascii_uppercase();
+        let chars: Vec<char> = stem.chars().collect();
+        let reserved = matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || (chars.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && (chars[3].is_ascii_digit() || "¹²³".contains(chars[3])));
+        if reserved {
+            return refuse("names a device");
+        }
+    }
+    None
+}
+
+/// Why a search pattern (Glob's `pattern`, Grep's `glob`) can't be judged here, if it can't:
+/// on Windows `\\` and `C:` would start a path the hook's `/` split doesn't see.
+pub fn pattern_problem(pattern: &str) -> Option<String> {
+    (cfg!(windows) && pattern.contains(['\\', ':'])).then(|| {
+        format!(
+            "the pattern `{pattern}` uses `\\` or a drive; write it with `/`, relative to the \
+             worktree"
+        )
+    })
+}
+
+/// What agents may read outside the worktree besides dependency sources, for messages.
+pub const SYSTEM_READS: &str = if cfg!(windows) { "" } else { "/usr and " };
+
+/// What to add to "install Claude Code" on this platform.
+pub const CLAUDE_HINT: &str = if cfg!(windows) {
+    "; on Windows Paja needs its native claude.exe, not the npm claude.cmd"
+} else {
+    ""
+};
+
+/// `path` for a message: as the user would type it. On Windows that drops the `\\?\` prefix
+/// `canonicalize` adds (`\\?\UNC\` becomes `\\`), which the hook itself refuses in a path.
+pub fn shown(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    text
 }
 
 /// Quote `path` as one word of a hook command line. Claude Code runs hooks with the system
@@ -203,11 +369,213 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_private_dir_is_owner_only_and_an_inheriting_one_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let private = tmp.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        // Checked again when it exists.
+        ensure_private_dir(&private).unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let why = ensure_private_dir(&plain).unwrap_err().to_string();
+        // Refused for inheriting, or for its owner when the tests run elevated.
+        assert!(why.contains("Paja recreates it"), "{why}");
+    }
+
     #[test]
     fn private_dirs_refuse_a_name_that_is_taken() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("private");
         create_private_dir(&dir).unwrap();
         assert!(create_private_dir(&dir).is_err());
+    }
+}
+
+/// Windows security calls: owner-only directories made in one step, and checked later.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use std::io::{Error, Result};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+        GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
+        text.encode_wide().chain(Some(0)).collect()
+    }
+
+    /// The current user, as a `TOKEN_USER` buffer kept in u64s so it is aligned; its SID
+    /// points into it, so it must outlive any use of that SID.
+    fn token_user() -> Result<Vec<u64>> {
+        // SAFETY: Win32 calls with a buffer of the size the API reports; the token handle is
+        // closed before returning.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(Error::last_os_error());
+            }
+            let mut len = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+            let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+            let err = Error::last_os_error();
+            CloseHandle(token);
+            if ok == 0 {
+                return Err(err);
+            }
+            Ok(buf)
+        }
+    }
+
+    /// The current user's SID as text (`S-1-5-...`).
+    fn user_sid_string() -> Result<String> {
+        let user = token_user()?;
+        // SAFETY: `user` holds the TOKEN_USER filled above; ConvertSidToStringSidW allocates
+        // the string, which is freed with LocalFree.
+        unsafe {
+            let sid = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+            let mut text: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut text) == 0 {
+                return Err(Error::last_os_error());
+            }
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            Ok(out)
+        }
+    }
+
+    /// Create `dir` with a protected ACL that gives this user full control, of it and of what
+    /// is created in it, and nobody else anything.
+    pub fn create_owner_only(dir: &Path) -> Result<()> {
+        // Owned by this user too: an elevated process would otherwise give it to Administrators.
+        let sid = user_sid_string()?;
+        let sddl = format!("O:{sid}D:P(A;OICI;FA;;;{sid})");
+        let sddl = wide(std::ffi::OsStr::new(&sddl));
+        let path = wide(dir.as_os_str());
+        // SAFETY: the conversion allocates the descriptor, which CreateDirectoryW copies and
+        // LocalFree then frees.
+        unsafe {
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(Error::last_os_error());
+            }
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            let ok = CreateDirectoryW(path.as_ptr(), &attributes);
+            let err = Error::last_os_error();
+            LocalFree(sd);
+            if ok == 0 {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail unless this user owns `dir` and its ACL is protected and allows only this user.
+    pub fn check_owner_only(dir: &Path) -> Result<()> {
+        let user = token_user()?;
+        let path = wide(dir.as_os_str());
+        let refuse = |why: &str| {
+            Error::other(format!(
+                "{} {why}, so another account could change what's in it; delete it and Paja \
+                 recreates it for this user only (on a drive without permissions, such as FAT32 \
+                 or exFAT, set PAJA_HOME to a folder on an NTFS drive instead)",
+                dir.display()
+            ))
+        };
+        // SAFETY: GetNamedSecurityInfoW allocates the descriptor that `owner` and `dacl` point
+        // into; it is freed with LocalFree after the last use of either. `user` outlives `me`.
+        unsafe {
+            let me = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let code = GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            if code != 0 {
+                return Err(Error::from_raw_os_error(code as i32));
+            }
+            let verdict = (|| {
+                if EqualSid(owner, me) == 0 {
+                    return Err(refuse("is owned by another account"));
+                }
+                let (mut control, mut revision) = (0u16, 0u32);
+                if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
+                    return Err(Error::last_os_error());
+                }
+                if control & SE_DACL_PROTECTED == 0 || dacl.is_null() {
+                    return Err(refuse("inherits its parent's permissions"));
+                }
+                let mut size = ACL_SIZE_INFORMATION {
+                    AceCount: 0,
+                    AclBytesInUse: 0,
+                    AclBytesFree: 0,
+                };
+                if GetAclInformation(
+                    dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ) == 0
+                {
+                    return Err(Error::last_os_error());
+                }
+                for index in 0..size.AceCount {
+                    let mut ace: *mut c_void = std::ptr::null_mut();
+                    if GetAce(dacl, index, &mut ace) == 0 {
+                        return Err(Error::last_os_error());
+                    }
+                    let ace = ace as *const ACCESS_ALLOWED_ACE;
+                    // Deny entries only take access away; every other kind must be this user's.
+                    let kind = (*ace).Header.AceType;
+                    if kind == ACCESS_DENIED_ACE_TYPE {
+                        continue;
+                    }
+                    let sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
+                    if kind != ACCESS_ALLOWED_ACE_TYPE || EqualSid(sid, me) == 0 {
+                        return Err(refuse("lets another account in"));
+                    }
+                }
+                Ok(())
+            })();
+            LocalFree(sd);
+            verdict
+        }
     }
 }

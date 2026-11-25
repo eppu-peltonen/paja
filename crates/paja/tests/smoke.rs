@@ -553,60 +553,51 @@ fn the_mcp_server_serves_the_same_core() {
     assert!(child.wait().unwrap().success());
 }
 
-// The fakes below are shell scripts and the hook cases use Unix paths; both come to Windows
-// with the deny-list hook's Windows port (#23). Until then `paja run` refuses on Windows.
-#[cfg(windows)]
-#[test]
-fn run_refuses_on_windows_until_the_hook_is_ported() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
-    init_repo(&repo);
-    let (ok, out) = paja(&home, &repo, &["run"]);
-    assert!(!ok, "{out}");
-    assert!(
-        out["error"].as_str().unwrap().contains("Windows paths"),
-        "{out}"
-    );
-    // The hook itself blocks every call, so no agent runs unguarded even if started by hand.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
-        .args(["hook", "--root"])
-        .arg(&repo)
-        .arg("--home")
-        .arg(&home)
-        .stdin(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::io::Write::write_all(
-        child.stdin.as_mut().unwrap(),
-        br#"{"tool_name":"Read","tool_input":{"file_path":"x"},"cwd":"."}"#,
-    )
-    .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Windows paths"));
+/// Install `body` as the program `name` in `dir`: a shell script, which on Windows the
+/// `fake_tool` example runs (Windows can't run a script as a program).
+fn program(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    let script = dir.join(name);
+    std::fs::write(&script, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+    #[cfg(windows)]
+    {
+        let tool = Path::new(env!("CARGO_BIN_EXE_paja"))
+            .parent()
+            .unwrap()
+            .join("examples")
+            .join("fake_tool.exe");
+        let exe = dir.join(format!("{name}.exe"));
+        std::fs::copy(&tool, &exe).unwrap_or_else(|e| {
+            panic!("copying {} (run all of `cargo test`): {e}", tool.display())
+        });
+        exe
+    }
+}
+
+/// `path` as a shell script can name it: with `/`, which Git Bash on Windows reads too.
+fn slash(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 /// A fake `gh` that prints the issues in `issues.json` next to it, and logs its arguments.
-#[cfg(unix)]
 fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::write(dir.join("issues.json"), issues).unwrap();
-    let script = dir.join("gh");
-    std::fs::write(
-        &script,
-        format!(
+    program(
+        dir,
+        "gh",
+        &format!(
             "#!/bin/sh\necho \"$@\" >> {log}\ncat {issues}\n",
-            log = dir.join("gh.log").display(),
-            issues = dir.join("issues.json").display()
+            log = slash(&dir.join("gh.log")),
+            issues = slash(&dir.join("issues.json"))
         ),
     )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    script
 }
 
-#[cfg(unix)]
 #[test]
 fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     let tmp = tempfile::tempdir().unwrap();
@@ -682,7 +673,6 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn work_sync_says_what_to_do_when_gh_fails() {
     let tmp = tempfile::tempdir().unwrap();
@@ -705,7 +695,6 @@ fn work_sync_says_what_to_do_when_gh_fails() {
 /// A repo with a bare `origin`, `.paja/checks` on main, and fake `gh` and `claude` programs.
 /// The fake reviewer's verdict is read from `verdict.txt`; the fake builder writes
 /// `feature.txt` and commits it.
-#[cfg(unix)]
 struct Factory {
     tmp: tempfile::TempDir,
     repo: std::path::PathBuf,
@@ -714,10 +703,8 @@ struct Factory {
     claude: std::path::PathBuf,
 }
 
-#[cfg(unix)]
 impl Factory {
     fn new(checks: &str, verdict: &str) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
         let origin = tmp.path().join("origin.git");
@@ -741,13 +728,8 @@ impl Factory {
         )
         .unwrap();
         std::fs::write(dir.join("verdict.txt"), verdict).unwrap();
-        let script = |name: &str, body: String| {
-            let path = dir.join(name);
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
-        };
-        let d = dir.display();
+        let script = |name: &str, body: String| program(dir, name, &body);
+        let d = slash(dir);
         let gh = script(
             "gh",
             format!(
@@ -770,7 +752,7 @@ impl Factory {
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
                  *) echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
-                 stamp=$(echo \"$*\" | sed -n \"s/.*--stamp '\\([^']*\\)'.*/\\1/p\")\n\
+                 stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
@@ -805,7 +787,6 @@ impl Factory {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn run_builds_reviews_and_lands_an_issue() {
     // Vasara's checks run the branch's code, so they get no GitHub access either: Mestari's
@@ -869,7 +850,6 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(idle["outcome"], "idle");
 }
 
-#[cfg(unix)]
 #[test]
 fn run_escalates_when_the_reviewer_asks_a_question() {
     let f = Factory::new("true\n", "escalate");
@@ -888,7 +868,6 @@ fn run_escalates_when_the_reviewer_asks_a_question() {
     assert_eq!(item["note"], "Which API?");
 }
 
-#[cfg(unix)]
 #[test]
 fn run_gives_up_after_three_failed_rounds_and_asks() {
     let f = Factory::new("test -f never.txt\n", "land");
@@ -910,7 +889,6 @@ fn run_gives_up_after_three_failed_rounds_and_asks() {
     assert_eq!(rounds, 3);
 }
 
-#[cfg(unix)]
 #[test]
 fn run_checks_come_from_main_not_the_branch() {
     // The builder can't make its change pass by editing .paja/checks on its branch.
@@ -925,7 +903,6 @@ fn run_checks_come_from_main_not_the_branch() {
     assert!(!f.gh_log().contains("pr merge"));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     let f = Factory::new("true\n", "land");
@@ -950,7 +927,6 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_second_review_judges_only_the_fix() {
     // Round one asks for changes; round two's reviewer sees the earlier blockers and the fix's
@@ -976,7 +952,6 @@ fn a_second_review_judges_only_the_fix() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_fix_round_without_commits_is_not_reviewed() {
     // After a review asks for changes, a round that commits nothing goes back to the builder
@@ -1000,7 +975,6 @@ fn a_fix_round_without_commits_is_not_reviewed() {
     assert!(rereview.contains("Tidy the helper"), "{args}");
 }
 
-#[cfg(unix)]
 #[test]
 fn checks_that_change_the_worktree_fail_and_are_put_back() {
     // Branch code run by the checks must not leave files or commits for the reviewer to miss.
@@ -1012,7 +986,6 @@ fn checks_that_change_the_worktree_fail_and_are_put_back() {
     assert!(log.contains("changed the worktree or its commits"), "{log}");
 }
 
-#[cfg(unix)]
 #[test]
 fn checks_that_change_git_configuration_stop_the_run() {
     // Branch code run by the checks could plant a credential helper for Mestari's own git.
@@ -1060,7 +1033,6 @@ fn checks_that_change_git_configuration_stop_the_run() {
     assert_eq!(checked["outcome"], "idle", "{checked}");
 }
 
-#[cfg(unix)]
 #[test]
 fn work_from_an_agent_the_hook_never_saw_does_not_land() {
     // A run with tool turns but no hook call means something switched the hook off.
@@ -1090,7 +1062,6 @@ fn work_from_an_agent_the_hook_never_saw_does_not_land() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn an_empty_checks_file_is_an_error_not_a_pass() {
     let f = Factory::new("# nothing yet\n", "land");
@@ -1104,13 +1075,20 @@ fn an_empty_checks_file_is_an_error_not_a_pass() {
     assert!(!f.gh_log().contains("pr merge"));
 }
 
-/// Run `paja hook` with a tool call on stdin; returns its exit code and stderr.
-#[cfg(unix)]
-fn hook(input: &str) -> (Option<i32>, String) {
-    hook_with(&["--root", "/w/env", "--home", "/w/home"], input)
+/// `path` (`/w/...`) as an absolute path on this platform: on a drive on Windows.
+fn w(path: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", path.replace('/', "\\"))
+    } else {
+        path.to_string()
+    }
 }
 
-#[cfg(unix)]
+/// Run `paja hook` with a tool call on stdin; returns its exit code and stderr.
+fn hook(input: &str) -> (Option<i32>, String) {
+    hook_with(&["--root", &w("/w/env"), "--home", &w("/w/home")], input)
+}
+
 fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
     use std::io::Write;
     use std::process::Stdio;
@@ -1134,18 +1112,17 @@ fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
     )
 }
 
-#[cfg(unix)]
 #[test]
 fn the_deny_list_hook_blocks_and_fails_closed() {
     let call = |cmd: &str| {
-        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": "/w/env"})
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": w("/w/env")})
             .to_string()
     };
     let (code, why) = hook(&call("cargo test && git push origin main"));
     assert_eq!(code, Some(2), "{why}");
     assert!(why.contains("git push"), "{why}");
     assert_eq!(hook(&call("cargo test")).0, Some(0));
-    let write = serde_json::json!({"tool_name": "Write", "tool_input": {"file_path": "/etc/x"}, "cwd": "/w/env"});
+    let write = serde_json::json!({"tool_name": "Write", "tool_input": {"file_path": w("/etc/x")}, "cwd": w("/w/env")});
     assert_eq!(hook(&write.to_string()).0, Some(2));
     // Anything it can't read blocks too.
     let (code, why) = hook("not json");
@@ -1157,13 +1134,17 @@ fn the_deny_list_hook_blocks_and_fails_closed() {
     assert!(why.contains("--root"), "{why}");
     // The factory's own state is off limits, the environment inside it is not.
     let read = |path: &str| {
-        serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": path}, "cwd": "/w/home/envs/a"})
+        serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": path}, "cwd": w("/w/home/envs/a")})
             .to_string()
     };
-    let inside = ["--root", "/w/home/envs/a", "--home", "/w/home"];
-    assert_eq!(hook_with(&inside, &read("/w/home/events.jsonl")).0, Some(2));
+    let (a, h) = (w("/w/home/envs/a"), w("/w/home"));
+    let inside = ["--root", a.as_str(), "--home", h.as_str()];
     assert_eq!(
-        hook_with(&inside, &read("/w/home/envs/a/src/lib.rs")).0,
+        hook_with(&inside, &read(&w("/w/home/events.jsonl"))).0,
+        Some(2)
+    );
+    assert_eq!(
+        hook_with(&inside, &read(&w("/w/home/envs/a/src/lib.rs"))).0,
         Some(0)
     );
 }

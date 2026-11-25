@@ -13,8 +13,7 @@ fleet. Claude Code is also the worker that writes the code, so Paja never reimpl
 - **Runs natively on Windows.** Windows is a first-class platform, as are Linux and macOS: Paja builds, tests and
   runs on each without WSL or a VM, and CI runs on Windows and Linux. Platform differences (home directory, private
   files, the shell for checks, hook quoting) live in one module, `platform.rs`; the rest of the core is the same
-  everywhere. Until the deny-list hook understands Windows paths, `paja run` and `paja hook` refuse on Windows rather
-  than run agents unguarded; issue #23 tracks that port. Shell commands use the POSIX shell that Git for Windows brings, which Claude Code on Windows needs too.
+  everywhere. Shell commands use the POSIX shell that Git for Windows brings, which Claude Code on Windows needs too.
 - **One core, many front ends.** The core has no UI of its own. A CLI with JSON output, an MCP server and an HTTP API
   are three doors to the same functions, so Claude Code, scripts and Paja Desk all see the same state.
 - **Claude Code does the coding; the core does the plumbing.** Workers are Claude Code runs started headless

@@ -96,9 +96,6 @@ fn claude_program() -> String {
 
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
-    if let Some(why) = crate::platform::unguarded() {
-        return Err(Unguarded(why).into());
-    }
     let repo = std::path::absolute(opts.repo)?;
     // A repository whose configuration was tampered with gets no git, not even a fetch, until
     // a person says it was checked.
@@ -646,8 +643,12 @@ fn claude(
             exe.display()
         );
     }
-    let output =
-        output.with_context(|| format!("running `{program}` (install Claude Code and sign in)"))?;
+    let output = output.with_context(|| {
+        format!(
+            "running `{program}` (install Claude Code and sign in{})",
+            crate::platform::CLAUDE_HINT
+        )
+    })?;
     if !output.status.success() {
         bail!(
             "`{program} -p` failed in {}: {}",
@@ -940,7 +941,13 @@ fn read_regular(path: &Path) -> Option<Vec<u8>> {
 fn hook_binary(home: &Home) -> Result<PathBuf> {
     let _lock = home.lock()?;
     let dir = home.root().join("hook");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Nobody else may swap the hook's binary: the directory is this user's alone.
+    crate::platform::ensure_private_dir(&dir).with_context(|| {
+        format!(
+            "making {} private to this user for the deny-list hook",
+            dir.display()
+        )
+    })?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let day = std::time::Duration::from_secs(24 * 60 * 60);
         for entry in entries.flatten() {
@@ -1558,22 +1565,9 @@ impl std::fmt::Display for Tampered {
 
 impl std::error::Error for Tampered {}
 
-/// `paja run` can't start agents on this platform at all, so retrying is pointless.
-#[derive(Debug)]
-pub struct Unguarded(&'static str);
-
-impl std::fmt::Display for Unguarded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "paja run can't start: {}", self.0)
-    }
-}
-
-impl std::error::Error for Unguarded {}
-
-/// Whether a long-running loop must stop on `err`: a tampered repository, or a platform
-/// where no run can start.
+/// Whether a long-running loop must stop on `err`: today only a tampered repository.
 pub fn is_fatal(err: &anyhow::Error) -> bool {
-    is_tampered(err) || err.chain().any(|e| e.is::<Unguarded>())
+    is_tampered(err)
 }
 
 /// Whether `err` is, or was caused by, a [`Tampered`] repository.

@@ -73,7 +73,7 @@ fn dependency_roots() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
-    let home = crate::platform::home_dir().filter(|p| p.is_absolute());
+    let home = crate::platform::tool_home().filter(|p| p.is_absolute());
     let cargo = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo")));
     let rustup = var("RUSTUP_HOME").or_else(|| home.as_ref().map(|h| h.join(".rustup")));
     let mut roots: Vec<PathBuf> = cargo
@@ -109,13 +109,6 @@ pub fn run(
         eprintln!("Blocked: Paja's deny-list hook crashed ({info}), so it fails closed");
         std::process::exit(2);
     }));
-    // After the deadline and the panic hook, so a stalled read or a closed stderr still blocks.
-    if let Some(why) = crate::platform::unguarded() {
-        // Read the call first, so the caller's write never meets a closed pipe.
-        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
-        eprintln!("Blocked: {why}");
-        return ExitCode::from(2);
-    }
     // Proof for Mestari that Claude Code called the hook and it judged the call.
     if let Some(stamp) = &stamp {
         let _ = std::fs::write(stamp, b"");
@@ -254,6 +247,8 @@ const SECRET_PATHS: &[&str] = &[
     ".cargo/credentials",
     ".npmrc",
     ".docker",
+    // gh's login on Windows: %APPDATA%\GitHub CLI.
+    "appdata/roaming/github",
 ];
 
 /// Tools that touch nothing outside the session. Any tool not named here or handled in
@@ -282,6 +277,8 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
         if input.tool_name == "Bash" || (input.tool_name == "Grep" && key == "pattern") {
             continue;
         }
+        // Patterns hold wildcards, which no name may; they get their own rule below.
+        let pattern = matches!(key, "pattern" | "glob");
         if let Some(path) = t[key].as_str() {
             if path.starts_with('~') {
                 return Ok(Some(format!(
@@ -302,6 +299,15 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 return Ok(Some(format!(
                     "`{path}` names a credential path; agents never touch those"
                 )));
+            }
+            // Windows spellings the file system reads differently from how they look.
+            let problem = if pattern {
+                crate::platform::pattern_problem(path)
+            } else {
+                crate::platform::path_problem(path, false)
+            };
+            if let Some(why) = problem {
+                return Ok(Some(why));
             }
         }
     }
@@ -382,7 +388,7 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                     "{} is a symlink out of the worktree (or nested too deep to check), and \
                      searches here could follow it; search a directory without it, or Read \
                      files by path",
-                    link.display()
+                    crate::platform::shown(&link)
                 )));
             }
             Ok(None)
@@ -448,43 +454,45 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     }
     // Git and cargo read configuration from these at any depth.
     let inner = full.strip_prefix(&b.root).unwrap_or(&full);
-    // Compared without case, for case-insensitive filesystems such as macOS's default.
+    // Compared without case, for case-insensitive file systems (macOS's default, NTFS), and
+    // with Unicode's upper case, as NTFS folds names: `ſ` is `S` there.
+    let upper = |text: &str| text.to_uppercase();
     let named = |name: &str| {
         inner
             .components()
-            .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(name))
+            .any(|c| upper(&c.as_os_str().to_string_lossy()) == upper(name))
     };
     if named(".git") {
         return Some(format!(
             "{} is git's own data or link to the repository; agents never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".github") {
         return Some(format!(
             "{} is CI configuration, which runs with the repository's secrets; agents never \
              change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".claude") {
         return Some(format!(
             "{} is Claude Code configuration for later sessions; agents never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".cargo") || named("rust-toolchain") || named("rust-toolchain.toml") {
         return Some(format!(
             "{} is cargo or toolchain configuration, which could change how cargo runs; agents \
              never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if named(".gitattributes") {
         return Some(format!(
             "{} decides how git shows and stores files, so it could hide a change from the \
              reviewer; agents never change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if [
@@ -499,7 +507,7 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
         return Some(format!(
             "{} configures the format and lint checks that judge the change; agents never \
              change it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     None
@@ -511,8 +519,8 @@ fn within_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     (!full.starts_with(&b.root)).then(|| {
         format!(
             "agents {what} only inside their own worktree ({}), not {}",
-            b.root.display(),
-            full.display()
+            crate::platform::shown(&b.root),
+            crate::platform::shown(&full)
         )
     })
 }
@@ -530,13 +538,13 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
     {
         return Some(format!(
             "{} exposes processes and devices; agents don't read it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     if full.starts_with(&b.home) {
         return Some(format!(
             "{} is the factory's own state; agents never touch it",
-            full.display()
+            crate::platform::shown(&full)
         ));
     }
     let text = full.to_string_lossy();
@@ -562,9 +570,10 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
     };
     if !readable {
         return Some(format!(
-            "{} is outside the worktree; agents read only the worktree, /usr and dependency \
-             sources ($CARGO_HOME/registry, $CARGO_HOME/git, $RUSTUP_HOME)",
-            full.display()
+            "{} is outside the worktree; agents read only the worktree, {}dependency sources \
+             ($CARGO_HOME/registry, $CARGO_HOME/git, $RUSTUP_HOME)",
+            crate::platform::shown(&full),
+            crate::platform::SYSTEM_READS
         ));
     }
     None
@@ -727,9 +736,9 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
     // Cargo and git act on the directory they run in, which must be the worktree.
     if matches!(*program, "cargo" | "git") && !here.starts_with(&b.root) {
         return Some(format!(
-            "the shell is in {}, outside the worktree; start with `cd {} &&`",
-            here.display(),
-            b.root.display()
+            "the shell is in {}, outside the worktree; start with `cd '{}' &&`",
+            crate::platform::shown(here),
+            crate::platform::shown(&b.root)
         ));
     }
     match *program {
@@ -739,13 +748,21 @@ fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> 
         // Only into the worktree's root, and only as a step of its own, so a failed `cd`
         // stops the rest.
         "cd" if first => match args {
-            [target] if target.starts_with('/') && resolve(Path::new(target)) == b.root => {
+            [target]
+                if crate::platform::path_problem(
+                    &crate::platform::shell_path(target).to_string_lossy(),
+                    false,
+                )
+                .is_none()
+                    && crate::platform::shell_path(target).is_absolute()
+                    && resolve(&crate::platform::shell_path(target)) == b.root =>
+            {
                 *here = b.root.clone();
                 None
             }
             _ => Some(format!(
-                "`cd` only goes to the worktree's root, {}",
-                b.root.display()
+                "`cd` only goes to the worktree's root: `cd '{}'`",
+                crate::platform::shown(&b.root)
             )),
         },
         "cd" => Some("`cd` may only be the first step of a command, on its own".into()),
@@ -900,8 +917,12 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
             // `main...HEAD` or `HEAD:src/lib.rs` does, while one that leaves it would let git
             // read a file outside the worktree (two outside paths make `git diff` compare
             // files directly).
-            let target = here.join(arg);
             let reads = matches!(sub, "diff" | "show" | "log" | "status");
+            // Reads take revisions (`HEAD:path`, `main..`); add, rm and commit take only paths.
+            if let Some(why) = crate::platform::path_problem(arg, reads) {
+                return Some(why);
+            }
+            let target = here.join(arg);
             // Only reads take revisions; add, rm and commit paths get the full write check.
             let reason = if reads {
                 within_root("use git", &target, b)
@@ -987,18 +1008,20 @@ fn is_assignment(word: &str) -> bool {
 /// Whether `text` names a credential path as whole path components, so `.ssh/id_rsa` matches
 /// and `my.sshconfig.txt` does not.
 fn touches_secret(text: &str) -> bool {
+    // Without case, and with `\\` as a separator, for Windows and macOS file systems.
     let path: String = text
         .chars()
         .map(|c| {
-            if c.is_whitespace() || "'\"=:;|&<>()`$".contains(c) {
-                '/'
+            if c.is_whitespace() || "'\"=:;|&<>()`$\\".contains(c) {
+                "/".to_string()
             } else {
-                c
+                c.to_uppercase().collect()
             }
         })
         .collect();
     let path = format!("/{path}/");
     SECRET_PATHS.iter().any(|secret| {
+        let secret = secret.to_uppercase();
         path.contains(&format!("/{secret}/")) || path.contains(&format!("/{secret}."))
     })
 }
@@ -1022,6 +1045,8 @@ fn resolve_within(path: &Path, depth: u32) -> PathBuf {
                 }
                 out.pop();
             }
+            // A drive on its own (`C:`) is that drive's current directory; don't resolve it.
+            prefix @ Component::Prefix(_) => out.push(prefix),
             other => {
                 out.push(other);
                 if let Ok(real) = out.canonicalize() {
@@ -1062,7 +1087,7 @@ pub fn self_test_inputs(root: &Path, read_only: bool) -> (String, String) {
     (call(blocked), call("cargo test"))
 }
 
-// The cases use Unix paths; Windows ones come with the hook's Windows port (#23).
+// The cases use Unix paths; `windows_tests` below covers the Windows spellings.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1485,5 +1510,182 @@ mod tests {
         let (commit, _) = self_test_inputs(Path::new(ROOT), true);
         let commit: HookInput = serde_json::from_str(&commit).unwrap();
         assert!(check(&commit, &bounds()).unwrap().is_none());
+    }
+}
+
+// The same rules on Windows spellings: drive letters, `\` separators, case-insensitive names
+// and the forms the file system reads differently from how they look.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Env {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        home: PathBuf,
+        bounds: Bounds,
+    }
+
+    /// A real worktree directory, so the hook's path resolution sees what Windows sees.
+    fn env() -> Env {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("paja");
+        let root = home.join("envs").join("work-1");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "").unwrap();
+        let bounds = Bounds::new(Some(root.clone()), Some(home.clone())).unwrap();
+        Env {
+            _tmp: tmp,
+            root,
+            home,
+            bounds,
+        }
+    }
+
+    impl Env {
+        fn decide(&self, tool: &str, input: Value) -> Option<String> {
+            let input = HookInput {
+                tool_name: tool.into(),
+                tool_input: input,
+                cwd: self.root.clone(),
+            };
+            check(&input, &self.bounds).unwrap()
+        }
+        fn write(&self, path: &str) -> Option<String> {
+            self.decide("Write", json!({"file_path": path, "content": ""}))
+        }
+        fn at(&self, rest: &str) -> String {
+            format!("{}\\{rest}", self.root.display())
+        }
+        fn bash(&self, command: &str) -> Option<String> {
+            self.decide("Bash", json!({ "command": command }))
+        }
+    }
+
+    #[test]
+    fn plain_windows_paths_inside_the_worktree_are_allowed() {
+        let e = env();
+        assert_eq!(e.write(&e.at("src\\new.rs")), None);
+        assert_eq!(e.write(&e.at("src/new.rs")), None);
+        assert_eq!(e.write("src\\new.rs"), None);
+        assert_eq!(
+            e.decide("Read", json!({"file_path": e.at("src\\lib.rs")})),
+            None
+        );
+    }
+
+    #[test]
+    fn protected_names_are_matched_without_case_or_tricks() {
+        let e = env();
+        for path in [
+            ".GIT\\config",
+            ".Github\\workflows\\ci.yml",
+            ".gitattributes.",
+            ".gitattributes ",
+            ".gitattributes::$DATA",
+            "src\\lib.rs:hidden",
+            "NUL",
+            "src\\con.txt",
+            "a?b",
+            "COM¹",
+            ".gitattributeſ",
+        ] {
+            assert!(e.write(&e.at(path)).is_some(), "{path} was allowed");
+        }
+    }
+
+    #[test]
+    fn device_unc_and_driveless_paths_are_refused() {
+        let e = env();
+        let verbatim = format!("\\\\?\\{}", e.at("src\\lib.rs"));
+        for path in [
+            verbatim.as_str(),
+            "\\\\server\\share\\x",
+            "//server/share/x",
+            "C:foo",
+            "\\Windows\\x",
+            "/c/Windows/x",
+        ] {
+            assert!(e.write(path).is_some(), "{path} was allowed");
+        }
+    }
+
+    #[test]
+    fn reads_outside_the_worktree_and_credentials_are_refused() {
+        let e = env();
+        for path in [
+            "C:\\Windows\\win.ini",
+            "C:\\Users\\me\\.ssh\\id_rsa",
+            "C:\\Users\\me\\.SSH\\id_rsa",
+            "C:\\Users\\me\\AppData\\Roaming\\GitHub CLI\\hosts.yml",
+        ] {
+            assert!(
+                e.decide("Read", json!({ "file_path": path })).is_some(),
+                "{path} was allowed"
+            );
+        }
+        let state = e.home.join("events.jsonl");
+        let why = e
+            .decide("Read", json!({"file_path": state.display().to_string()}))
+            .unwrap();
+        assert!(why.contains("factory's own state"), "{why}");
+    }
+
+    #[test]
+    fn cd_takes_the_root_in_windows_or_git_bash_spelling() {
+        let e = env();
+        let windows = e.root.display().to_string();
+        assert_eq!(e.bash(&format!("cd '{windows}' && cargo test")), None);
+        let drive = windows.chars().next().unwrap().to_ascii_lowercase();
+        let msys = format!("/{drive}{}", windows[2..].replace('\\', "/"));
+        assert_eq!(e.bash(&format!("cd {msys} && cargo test")), None);
+        assert!(e.bash("cd C:\\Windows && cargo test").is_some());
+        assert!(e.bash("cd /c/Windows && cargo test").is_some());
+        // The advice can be followed as given: a plain, quoted path, no `\\?\`.
+        let why = e.bash("cd /c/Windows && cargo test").unwrap();
+        let advice = why.split('`').nth(3).unwrap();
+        assert!(!advice.contains(r"\\?\"), "{why}");
+        assert_eq!(e.bash(&format!("{advice} && cargo test")), None, "{why}");
+    }
+
+    #[test]
+    fn git_paths_stay_inside_and_revisions_keep_their_colons() {
+        let e = env();
+        assert_eq!(e.bash("git show HEAD:src/lib.rs"), None);
+        assert_eq!(e.bash("git log main.."), None);
+        assert!(e.bash("git add .gitattributes.").is_some());
+        assert!(e.bash("git add .gitattributes..").is_some());
+        assert!(e.bash("git diff C:/Windows/win.ini").is_some());
+        assert!(e.bash("git diff /c/Windows/win.ini").is_some());
+    }
+
+    #[test]
+    fn searches_with_backslashes_or_drives_are_refused() {
+        let e = env();
+        assert_eq!(e.decide("Glob", json!({"pattern": "src/**/*.rs"})), None);
+        assert!(e
+            .decide("Glob", json!({"pattern": "C:\\Users\\*"}))
+            .is_some());
+        assert!(e.decide("Glob", json!({"pattern": "..\\*"})).is_some());
+        assert!(e
+            .decide("Grep", json!({"pattern": "x", "glob": "C:/Users/**"}))
+            .is_some());
+    }
+
+    #[test]
+    fn a_junction_out_of_the_worktree_blocks_searches() {
+        let e = env();
+        let outside = e.home.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(e.root.join("out"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        assert!(e.decide("Glob", json!({"pattern": "**/*.rs"})).is_some());
+        assert!(e.write(&e.at("out\\x.rs")).is_some());
     }
 }

@@ -42,7 +42,8 @@ the real repository, to the smoke tests.
 - `crates/paja/src/platform.rs`: what differs between Windows and Unix. Paja runs natively on both; keep
   `std::os::unix`, `/`-only paths and `sh` assumptions out of the other modules' non-test code.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
-- `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary.
+- `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary. Its fake `gh` and `claude` are shell
+  scripts; on Windows `crates/paja/examples/fake_tool.rs` runs them, so run the whole `cargo test`, which builds it.
 - `evals/`: harness evals that run headless Claude Code (need a signed-in `claude`; not run in CI).
 - `docs/`: the design and operator docs, routed from `docs/index.md`.
 
