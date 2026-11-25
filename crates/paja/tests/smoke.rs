@@ -758,7 +758,7 @@ impl Factory {
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
-                 echo '{{\"is_error\": false, \"result\": \"done\"}}' ;;\nesac\n"
+                 echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4, \"duration_ms\": 900, \"session_id\": \"s-1\", \"total_cost_usd\": 0.25, \"usage\": {{\"input_tokens\": 100, \"output_tokens\": 20, \"cache_read_input_tokens\": 3000, \"cache_creation_input_tokens\": 400}}, \"modelUsage\": {{\"claude-test\": {{\"inputTokens\": 100, \"outputTokens\": 20, \"cacheReadInputTokens\": 3000, \"cacheCreationInputTokens\": 400, \"costUSD\": 0.25}}}}}}' ;;\nesac\n"
             ),
         );
         Factory {
@@ -848,6 +848,47 @@ fn run_builds_reviews_and_lands_an_issue() {
     let (ok, idle) = f.run();
     assert!(ok);
     assert_eq!(idle["outcome"], "idle");
+}
+
+#[test]
+fn run_records_what_each_agent_step_spent() {
+    // The fake builder reports usage; the fake reviewer doesn't, like an older Claude Code.
+    let f = Factory::new("true\n", "land");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let round = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "run.round")
+        .unwrap()
+        .clone();
+    let steps = round["data"]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2, "{round}");
+    assert_eq!(steps[0]["step"], "build");
+    assert_eq!(steps[0]["input_tokens"], 100);
+    assert_eq!(steps[0]["cache_read_input_tokens"], 3000);
+    assert_eq!(steps[0]["session_id"], "s-1");
+    assert_eq!(steps[0]["models"]["claude-test"]["cost_usd"], 0.25);
+    assert_eq!(steps[1]["step"], "review");
+    assert_eq!(steps[1]["reviewer"], 1);
+    // Unknown is recorded as unknown, never as zero.
+    assert_eq!(steps[1]["input_tokens"], Value::Null, "{round}");
+
+    // The per-item total is derived from the log; the MCP work tools return the same items.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    let usage = &item["usage"];
+    assert_eq!(usage["steps"], 2, "{item}");
+    assert_eq!(usage["unknown_steps"], 1, "{item}");
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["output_tokens"], 20);
+    assert_eq!(usage["cache_read_input_tokens"], 3000);
+    assert_eq!(usage["cache_creation_input_tokens"], 400);
+    assert_eq!(usage["num_turns"], 4);
+    assert_eq!(usage["cost_usd"], 0.25);
+    let (_, listed) = paja(&f.home, &f.repo, &["work", "list"]);
+    assert_eq!(listed[0]["usage"], *usage);
 }
 
 #[test]

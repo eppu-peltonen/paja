@@ -82,7 +82,12 @@ for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. 
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`, plus a `run.follow_up` for each non-blocking
-review finding. While it works, `paja run` prints one progress line per step on stderr (the issue it picked, each build
+review finding. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or
+`review` with its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and
+cache-creation tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p`
+result. A field the result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying
+those events gives each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching
+MCP tools; steps with missing fields count in its `unknown_steps` and add nothing. While it works, `paja run` prints one progress line per step on stderr (the issue it picked, each build
 round, the checks, each review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so
 stdout keeps its JSON. `paja run --every 5` keeps going, checking an empty queue every five minutes.
 

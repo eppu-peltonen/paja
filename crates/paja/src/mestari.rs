@@ -69,6 +69,77 @@ pub struct Review {
     pub follow_ups: Vec<String>,
 }
 
+/// What one agent step spent, kept from the `claude -p` result. A field the result doesn't
+/// have (an older Claude Code, a fake in tests) stays `None`: unknown, never zero.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StepUsage {
+    /// `build` or `review`.
+    pub step: String,
+    /// Which reviewer of the round (1 or 2), for a review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<u32>,
+    /// What each model the session used spent, by model name (Claude Code's `modelUsage`).
+    #[serde(default)]
+    pub models: std::collections::BTreeMap<String, ModelUsage>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Claude Code's estimate of the step's cost in US dollars.
+    pub cost_usd: Option<f64>,
+    pub num_turns: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub session_id: Option<String>,
+}
+
+/// One model's share of a step, from Claude Code's `modelUsage`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
+impl StepUsage {
+    /// Read the usage fields from a `claude -p` JSON result.
+    pub fn from_result(step: &str, reviewer: Option<u32>, result: &Value) -> Self {
+        let usage = &result["usage"];
+        let models = result["modelUsage"]
+            .as_object()
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|(name, m)| {
+                        let used = ModelUsage {
+                            input_tokens: m["inputTokens"].as_u64(),
+                            output_tokens: m["outputTokens"].as_u64(),
+                            cache_read_input_tokens: m["cacheReadInputTokens"].as_u64(),
+                            cache_creation_input_tokens: m["cacheCreationInputTokens"].as_u64(),
+                            cost_usd: m["costUSD"].as_f64(),
+                        };
+                        (name.clone(), used)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        StepUsage {
+            step: step.to_string(),
+            reviewer,
+            models,
+            input_tokens: usage["input_tokens"].as_u64(),
+            output_tokens: usage["output_tokens"].as_u64(),
+            cache_read_input_tokens: usage["cache_read_input_tokens"].as_u64(),
+            cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64(),
+            cost_usd: result["total_cost_usd"].as_f64(),
+            num_turns: result["num_turns"].as_u64(),
+            duration_ms: result["duration_ms"].as_u64(),
+            session_id: result["session_id"].as_str().map(str::to_string),
+        }
+    }
+}
+
 /// What an earlier round's reviewers asked for, so the next review judges only the fix.
 struct Prior {
     /// The commit those reviewers judged.
@@ -228,7 +299,7 @@ fn run_item(
         progress(&format!(
             "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
         ));
-        build(home, &env, item, base, &feedback)?;
+        let mut steps = vec![build(home, &env, item, base, &feedback)?];
         commit_leftovers(&env, item)?;
         if git(
             &env.path,
@@ -237,7 +308,7 @@ fn run_item(
         {
             feedback = "The previous round made no commits. Make the change and commit it.".into();
             progress("the builder committed nothing; asking again");
-            record_round(home, item, round, "no_change", &feedback)?;
+            record_round(home, item, round, "no_change", &feedback, &steps)?;
             continue;
         }
         // A round after a review must commit a fix; an empty fix is never reviewed.
@@ -248,7 +319,7 @@ fn run_item(
                     prior.blockers
                 );
                 progress("the builder committed no fix; asking again");
-                record_round(home, item, round, "no_change", &feedback)?;
+                record_round(home, item, round, "no_change", &feedback, &steps)?;
                 continue;
             }
         }
@@ -297,7 +368,7 @@ fn run_item(
                 ));
             }
             progress("the checks failed; sending the failure back to the builder");
-            record_round(home, item, round, "checks_failed", &failure)?;
+            record_round(home, item, round, "checks_failed", &failure, &steps)?;
             continue;
         }
         // --no-renames lists both sides of a rename, so moving a high-risk file keeps it high risk.
@@ -346,9 +417,23 @@ fn run_item(
                         ""
                     }
                 ));
-                review(home, &env, item, base, prior.as_ref().filter(|_| !risky))
+                review(
+                    home,
+                    &env,
+                    item,
+                    base,
+                    prior.as_ref().filter(|_| !risky),
+                    i as u32 + 1,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
+        let reviews: Vec<Review> = reviews
+            .into_iter()
+            .map(|(review, used)| {
+                steps.push(used);
+                review
+            })
+            .collect();
         // Only the round that lands files its follow-ups: an earlier round's may be about code
         // the fix has since changed.
         follow_ups.clear();
@@ -361,7 +446,14 @@ fn run_item(
         }
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
         progress(&format!("review verdict: {}", verdicts.join(", ")));
-        record_round(home, item, round, &verdicts.join(","), &summaries(&reviews))?;
+        record_round(
+            home,
+            item,
+            round,
+            &verdicts.join(","),
+            &summaries(&reviews),
+            &steps,
+        )?;
 
         if let Some(esc) = reviews.iter().find(|r| r.verdict == "escalate") {
             return escalated(home, repo, &env, item, &esc.question, round);
@@ -445,7 +537,7 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
     )
 }
 
-fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<()> {
+fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) -> Result<StepUsage> {
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
@@ -483,7 +575,8 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
         "Bash(wc *)",
         "Bash(pwd)",
     ];
-    claude(home, env, base, &prompt, &tools, None, false).map(|_| ())
+    let out = claude(home, env, base, &prompt, &tools, None, false)?;
+    Ok(StepUsage::from_result("build", None, &out))
 }
 
 fn review(
@@ -492,7 +585,8 @@ fn review(
     item: &WorkItem,
     base: &str,
     prior: Option<&Prior>,
-) -> Result<Review> {
+    reviewer: u32,
+) -> Result<(Review, StepUsage)> {
     // A first review reads the whole change; a later one judges only the fix for the blockers
     // an earlier review named, so review rounds converge instead of starting over.
     let scope = match prior {
@@ -593,7 +687,10 @@ fn review(
     if review.question.trim().is_empty() {
         review.question = review.summary.clone();
     }
-    Ok(review)
+    Ok((
+        review,
+        StepUsage::from_result("review", Some(reviewer), &out),
+    ))
 }
 
 /// Run headless Claude Code in the environment and return its JSON result.
@@ -1554,11 +1651,18 @@ fn record_round(
     round: u32,
     verdict: &str,
     detail: &str,
+    steps: &[StepUsage],
 ) -> Result<()> {
     record(
         home,
         EV_ROUND,
-        json!({ "number": item.number, "round": round, "verdict": verdict, "detail": clip(detail) }),
+        json!({
+            "number": item.number,
+            "round": round,
+            "verdict": verdict,
+            "detail": clip(detail),
+            "steps": steps,
+        }),
     )
 }
 
