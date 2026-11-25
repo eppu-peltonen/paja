@@ -81,8 +81,8 @@ red CI or an error it can't fix, it comments on the issue with the question and 
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`, plus a `run.follow_up` for each non-blocking
 review finding. While it works, `paja run` prints one progress line per step on stderr (the issue it picked, each build
-round, the checks, each review and its verdict, waiting for CI, landed or asked, and when the queue is empty), so stdout
-keeps its JSON. `paja run --every 5` keeps going, checking an empty queue every five minutes.
+round, the checks, each review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so
+stdout keeps its JSON. `paja run --every 5` keeps going, checking an empty queue every five minutes.
 
 ## The deny-list hook
 

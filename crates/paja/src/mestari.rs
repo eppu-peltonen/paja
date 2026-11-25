@@ -100,14 +100,33 @@ fn claude_program() -> String {
 /// that would fake or rewrite earlier lines, so control characters become spaces and a long
 /// message is cut.
 pub fn progress(message: &str) {
-    eprintln!("paja: {}", shown_line(message));
+    use std::io::Write;
+    // A closed stderr must never abort a run halfway, for example between merge and record.
+    let _ = writeln!(std::io::stderr(), "paja: {}", shown_line(message));
+}
+
+/// Characters that can break, reorder or hide text on a terminal: controls, line and
+/// paragraph separators, bidi overrides and isolates, and zero-width marks.
+fn unsafe_on_a_terminal(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
 }
 
 fn shown_line(message: &str) -> String {
     const MAX: usize = 300;
     let mut line: String = message
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if unsafe_on_a_terminal(c) { ' ' } else { c })
         .take(MAX)
         .collect();
     if message.chars().count() > MAX {
@@ -186,14 +205,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 )?;
                 return Err(err);
             }
-            let asked = comment(&repo, &item, &question).is_ok();
+            let asked = comment(&repo, &item, &question);
             progress(&format!(
                 "#{} stopped on an error and was parked; {}",
                 item.number,
-                if asked {
-                    "see the question on the issue"
-                } else {
-                    "couldn't comment on the issue, so see `paja work show` for the question"
+                match &asked {
+                    Ok(()) => "see the question on the issue".to_string(),
+                    Err(err) => format!(
+                        "couldn't comment on the issue ({err:#}), so see `paja work show {}` for \
+                         the question",
+                        item.number
+                    ),
                 }
             ));
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
@@ -1326,7 +1348,6 @@ fn land(
     ahjo::remove(home, &env.name, true)?;
     run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
         .with_context(|| format!("{gh} pr merge {pr}"))?;
-    progress(&format!("landed #{} ({pr})", item.number));
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, item.number, Status::Landed, Some(&pr));
     let _ = record(
@@ -1334,6 +1355,7 @@ fn land(
         EV_LANDED,
         json!({ "number": item.number, "pr": pr, "rounds": rounds }),
     );
+    progress(&format!("landed #{} ({pr})", item.number));
     Ok(RunReport::Landed {
         number: item.number,
         pr,
@@ -1969,8 +1991,8 @@ mod tests {
 
     #[test]
     fn progress_lines_cannot_carry_terminal_controls() {
-        let line = shown_line("Fix\r\x1b[2Kpaja: landed #5\nnext");
-        assert!(!line.chars().any(char::is_control), "{line:?}");
+        let line = shown_line("Fix\r\x1b[2Kpaja: landed #5\nnext\u{2028}\u{202E}x\u{2067}y");
+        assert!(!line.chars().any(unsafe_on_a_terminal), "{line:?}");
         assert!(shown_line(&"x".repeat(1000)).chars().count() <= 303);
     }
 
