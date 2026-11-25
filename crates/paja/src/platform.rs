@@ -22,9 +22,10 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Create `dir`, which must not exist yet, so that only this user can enter it. On Windows a
-/// new directory under the user's own temporary or profile directory inherits an ACL that
-/// already limits it to that user.
+/// Create `dir`, which must not exist yet, so that only this user can enter it. On Windows
+/// the directory only inherits its parent's ACL, which is private under the user's own
+/// temporary or profile directory but not under, say, `C:\paja`; owner-only ACLs come with
+/// the hook's Windows port (#23), and Paja starts no agents on Windows before that.
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -35,7 +36,8 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir(dir)
 }
 
-/// Create `path`, which must not exist yet, as a file only this user can read, write or run.
+/// Create `path`, which must not exist yet, as a file only this user can read, write or run
+/// (on Windows: with its parent's ACL, as `create_private_dir` says).
 pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = std::fs::OpenOptions::new();
@@ -69,7 +71,8 @@ fn posix_shell() -> Result<PathBuf> {
     }
     // Then the Git for Windows that runs as `git`: <root>\cmd\git.exe or <root>\bin\git.exe.
     if let Some(git) = find_on_path("git.exe") {
-        if let Some(root) = git.parent().and_then(Path::parent) {
+        // Or <root>\mingw64\bin\git.exe, one level deeper.
+        for root in git.ancestors().skip(2).take(2) {
             candidates.push(root.join("bin").join("sh.exe"));
             candidates.push(root.join("usr").join("bin").join("sh.exe"));
         }

@@ -975,7 +975,12 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
     let digest = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
     });
-    let exe = dir.join(format!("paja-{}-{digest:016x}", bytes.len()));
+    // `.exe` on Windows, which runs nothing without it.
+    let exe = dir.join(format!(
+        "paja-{}-{digest:016x}{}",
+        bytes.len(),
+        std::env::consts::EXE_SUFFIX
+    ));
     // The copy sits in the factory home, which code an agent runs could reach. Use it only
     // while it still matches this paja byte for byte; otherwise copy again.
     if !hook_copy_intact(&exe) {
@@ -1091,7 +1096,7 @@ fn tempfile_dir(near: &Path) -> Result<PathBuf> {
     crate::platform::create_private_dir(&dir).with_context(|| {
         format!(
             "creating a scratch home {} for work in {}; check that the temporary \
-                 directory (TMPDIR) exists and is writable",
+                 directory (TMPDIR, or TEMP on Windows) exists and is writable",
             dir.display(),
             near.display()
         )

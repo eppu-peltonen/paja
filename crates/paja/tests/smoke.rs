@@ -553,7 +553,6 @@ fn the_mcp_server_serves_the_same_core() {
     assert!(child.wait().unwrap().success());
 }
 
-/// A fake `gh` that prints the issues in `issues.json` next to it, and logs its arguments.
 // The fakes below are shell scripts and the hook cases use Unix paths; both come to Windows
 // with the deny-list hook's Windows port (#23). Until then `paja run` refuses on Windows.
 #[cfg(windows)]
@@ -568,8 +567,27 @@ fn run_refuses_on_windows_until_the_hook_is_ported() {
         out["error"].as_str().unwrap().contains("Windows paths"),
         "{out}"
     );
+    // The hook itself blocks every call, so no agent runs unguarded even if started by hand.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .args(["hook", "--root"])
+        .arg(&repo)
+        .arg("--home")
+        .arg(&home)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        child.stdin.as_mut().unwrap(),
+        br#"{"tool_name":"Read","tool_input":{"file_path":"x"},"cwd":"."}"#,
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Windows paths"));
 }
 
+/// A fake `gh` that prints the issues in `issues.json` next to it, and logs its arguments.
 #[cfg(unix)]
 fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;

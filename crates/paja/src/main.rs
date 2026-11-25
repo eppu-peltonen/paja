@@ -255,6 +255,10 @@ fn run(cli: &Cli) -> Result<()> {
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
+            // A refusal that no later pass can lift stops `--every` too.
+            if let Some(why) = paja::platform::unguarded() {
+                anyhow::bail!("paja run can't start: {why}");
+            }
             loop {
                 let outcome = mestari::run_once(
                     &home,

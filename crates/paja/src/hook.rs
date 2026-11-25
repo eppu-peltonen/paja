@@ -103,6 +103,8 @@ pub fn run(
         let _ = std::fs::write(stamp, b"");
     }
     if let Some(why) = crate::platform::unguarded() {
+        // Read the call first, so the caller's write never meets a closed pipe.
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
         eprintln!("Blocked: {why}");
         return ExitCode::from(2);
     }
