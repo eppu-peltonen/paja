@@ -1,0 +1,9 @@
+# The model, and optionally the effort, each agent role runs on: `role model [effort]`.
+# Mestari reads this file from main, never from the branch under review.
+# Roles: build (first build round), fix (later build rounds), review (first full review),
+# re-review (normal-risk fix-only review), review-2 (second high-risk reviewer).
+# A `fallback <model>` line names a model to use when the chosen one is busy.
+# A role with no line runs on the account's default model.
+build sonnet
+fix sonnet
+review opus

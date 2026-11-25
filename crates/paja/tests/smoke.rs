@@ -756,6 +756,7 @@ impl Factory {
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
+                 if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
                  echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4, \"duration_ms\": 900, \"session_id\": \"s-1\", \"total_cost_usd\": 0.25, \"usage\": {{\"input_tokens\": 100, \"output_tokens\": 20, \"cache_read_input_tokens\": 3000, \"cache_creation_input_tokens\": 400}}, \"modelUsage\": {{\"claude-test\": {{\"inputTokens\": 100, \"outputTokens\": 20, \"cacheReadInputTokens\": 3000, \"cacheCreationInputTokens\": 400, \"costUSD\": 0.25}}}}}}' ;;\nesac\n"
@@ -780,6 +781,20 @@ impl Factory {
                 ("PAJA_CLAUDE", self.claude.as_path()),
             ],
         )
+    }
+
+    /// Commit `text` as `path` on main and push it, as a person changing the factory would.
+    fn on_main(&self, path: &str, text: &str) {
+        std::fs::write(self.repo.join(path), text).unwrap();
+        git(&self.repo, &["add", "."]);
+        git(&self.repo, &["commit", "-q", "-m", path]);
+        git(&self.repo, &["push", "-q", "origin", "main"]);
+    }
+
+    /// Each `claude` call the fake logged, in order.
+    fn claude_calls(&self) -> Vec<String> {
+        let log = std::fs::read_to_string(self.tmp.path().join("claude-args.log")).unwrap();
+        log.split("\n-p ").map(str::to_string).collect()
     }
 
     fn gh_log(&self) -> String {
@@ -889,6 +904,79 @@ fn run_records_what_each_agent_step_spent() {
     assert_eq!(usage["cost_usd"], 0.25);
     let (_, listed) = paja(&f.home, &f.repo, &["work", "list"]);
     assert_eq!(listed[0]["usage"], *usage);
+}
+
+#[test]
+fn agents_run_on_the_models_main_names() {
+    // Round one asks for changes, so the second build is a fix round.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    f.on_main(
+        ".paja/models",
+        "# role model [effort]\nbuild sonnet\nfix haiku low\nreview opus high\nfallback sonnet\n",
+    );
+    // The builder's branch names other models; main's file still decides.
+    std::fs::write(f.tmp.path().join("cheat"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    let reviews: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(
+        builds[0].contains("--model sonnet --allowedTools"),
+        "{}",
+        builds[0]
+    );
+    // The fallback is left out where it is the role's own model.
+    assert!(!builds[0].contains("--fallback-model"), "{}", builds[0]);
+    assert!(
+        builds[1].contains("--model haiku --effort low --fallback-model sonnet"),
+        "{}",
+        builds[1]
+    );
+    for review in &reviews {
+        assert!(
+            review.contains("--model opus --effort high --fallback-model sonnet"),
+            "{review}"
+        );
+        assert!(!review.contains("haiku"), "{review}");
+    }
+    // The step records name the role and model.
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let steps: Vec<Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .flat_map(|e| e["data"]["steps"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(steps[0]["role"], "build");
+    assert_eq!(steps[0]["model"], "sonnet");
+    assert_eq!(steps[1]["role"], "review");
+    assert_eq!(steps[1]["model"], "opus");
+    assert_eq!(steps[2]["role"], "fix");
+    assert_eq!(steps[2]["model"], "haiku");
+}
+
+#[test]
+fn a_bad_models_file_says_which_line_to_fix() {
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/models", "build sonnet\nreviewer opus\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains(".paja/models on main, line 2") && question.contains("unknown role"),
+        "{question}"
+    );
 }
 
 #[test]
