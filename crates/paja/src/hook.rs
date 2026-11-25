@@ -73,7 +73,7 @@ fn dependency_roots() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
-    let home = var("HOME");
+    let home = crate::platform::home_dir().filter(|p| p.is_absolute());
     let cargo = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo")));
     let rustup = var("RUSTUP_HOME").or_else(|| home.as_ref().map(|h| h.join(".rustup")));
     let mut roots: Vec<PathBuf> = cargo
@@ -98,10 +98,6 @@ pub fn run(
     stamp: Option<PathBuf>,
     read_only: bool,
 ) -> ExitCode {
-    // Proof for Mestari that Claude Code called the hook at all.
-    if let Some(stamp) = &stamp {
-        let _ = std::fs::write(stamp, b"");
-    }
     // A hook that runs past Claude Code's timeout counts as "allow"; block well before it.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(HOOK_DEADLINE_SECS));
@@ -113,6 +109,17 @@ pub fn run(
         eprintln!("Blocked: Paja's deny-list hook crashed ({info}), so it fails closed");
         std::process::exit(2);
     }));
+    // After the deadline and the panic hook, so a stalled read or a closed stderr still blocks.
+    if let Some(why) = crate::platform::unguarded() {
+        // Read the call first, so the caller's write never meets a closed pipe.
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        eprintln!("Blocked: {why}");
+        return ExitCode::from(2);
+    }
+    // Proof for Mestari that Claude Code called the hook and it judged the call.
+    if let Some(stamp) = &stamp {
+        let _ = std::fs::write(stamp, b"");
+    }
     let decision = (|| -> Result<Option<String>> {
         // Read the call first, so the caller's write never meets a closed pipe.
         let mut input = String::new();
@@ -1055,7 +1062,8 @@ pub fn self_test_inputs(root: &Path, read_only: bool) -> (String, String) {
     (call(blocked), call("cargo test"))
 }
 
-#[cfg(test)]
+// The cases use Unix paths; Windows ones come with the hook's Windows port (#23).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -7,7 +7,12 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Windows is the owner's platform, so it is a first-class target, not an extra.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

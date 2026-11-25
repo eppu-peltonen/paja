@@ -25,8 +25,11 @@ impl Home {
         let root = match std::env::var_os("PAJA_HOME") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
             _ => {
-                let home = std::env::var_os("HOME").context("neither PAJA_HOME nor HOME is set")?;
-                PathBuf::from(home).join(".paja")
+                let home = crate::platform::home_dir().context(
+                    "PAJA_HOME is unset and no home directory was found (HOME, or on Windows an \
+                     absolute HOME, HOMEDRIVE and HOMEPATH, or USERPROFILE); set PAJA_HOME",
+                )?;
+                home.join(".paja")
             }
         };
         Self::at(root)
