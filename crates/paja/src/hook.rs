@@ -454,11 +454,13 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     }
     // Git and cargo read configuration from these at any depth.
     let inner = full.strip_prefix(&b.root).unwrap_or(&full);
-    // Compared without case, for case-insensitive filesystems such as macOS's default.
+    // Compared without case, for case-insensitive file systems (macOS's default, NTFS), and
+    // with Unicode's upper case, as NTFS folds names: `ſ` is `S` there.
+    let upper = |text: &str| text.to_uppercase();
     let named = |name: &str| {
         inner
             .components()
-            .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(name))
+            .any(|c| upper(&c.as_os_str().to_string_lossy()) == upper(name))
     };
     if named(".git") {
         return Some(format!(
@@ -915,11 +917,12 @@ fn check_git(args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
             // `main...HEAD` or `HEAD:src/lib.rs` does, while one that leaves it would let git
             // read a file outside the worktree (two outside paths make `git diff` compare
             // files directly).
-            if let Some(why) = crate::platform::path_problem(arg, true) {
+            let reads = matches!(sub, "diff" | "show" | "log" | "status");
+            // Reads take revisions (`HEAD:path`, `main..`); add, rm and commit take only paths.
+            if let Some(why) = crate::platform::path_problem(arg, reads) {
                 return Some(why);
             }
             let target = here.join(arg);
-            let reads = matches!(sub, "diff" | "show" | "log" | "status");
             // Only reads take revisions; add, rm and commit paths get the full write check.
             let reason = if reads {
                 within_root("use git", &target, b)
@@ -1010,14 +1013,15 @@ fn touches_secret(text: &str) -> bool {
         .chars()
         .map(|c| {
             if c.is_whitespace() || "'\"=:;|&<>()`$\\".contains(c) {
-                '/'
+                "/".to_string()
             } else {
-                c.to_ascii_lowercase()
+                c.to_uppercase().collect()
             }
         })
         .collect();
     let path = format!("/{path}/");
     SECRET_PATHS.iter().any(|secret| {
+        let secret = secret.to_uppercase();
         path.contains(&format!("/{secret}/")) || path.contains(&format!("/{secret}."))
     })
 }
@@ -1585,6 +1589,7 @@ mod windows_tests {
             "src\\con.txt",
             "a?b",
             "COM¹",
+            ".gitattributeſ",
         ] {
             assert!(e.write(&e.at(path)).is_some(), "{path} was allowed");
         }
@@ -1645,6 +1650,7 @@ mod windows_tests {
         assert_eq!(e.bash("git show HEAD:src/lib.rs"), None);
         assert_eq!(e.bash("git log main.."), None);
         assert!(e.bash("git add .gitattributes.").is_some());
+        assert!(e.bash("git add .gitattributes..").is_some());
         assert!(e.bash("git diff C:/Windows/win.ini").is_some());
         assert!(e.bash("git diff /c/Windows/win.ini").is_some());
     }

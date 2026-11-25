@@ -941,17 +941,13 @@ fn read_regular(path: &Path) -> Option<Vec<u8>> {
 fn hook_binary(home: &Home) -> Result<PathBuf> {
     let _lock = home.lock()?;
     let dir = home.root().join("hook");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Nobody else may swap the hook's binary, or rename its directory away: the factory home
-    // and the hook directory are this user's alone.
-    for private in [home.root(), dir.as_path()] {
-        crate::platform::restrict_to_owner(private).with_context(|| {
-            format!(
-                "making {} private to this user for the deny-list hook",
-                private.display()
-            )
-        })?;
-    }
+    // Nobody else may swap the hook's binary: the directory is this user's alone.
+    crate::platform::ensure_private_dir(&dir).with_context(|| {
+        format!(
+            "making {} private to this user for the deny-list hook",
+            dir.display()
+        )
+    })?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let day = std::time::Duration::from_secs(24 * 60 * 60);
         for entry in entries.flatten() {

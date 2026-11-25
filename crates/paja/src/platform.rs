@@ -86,7 +86,7 @@ pub fn touch(path: &Path) {
 }
 
 /// Create `dir`, which must not exist yet, so that only this user can enter it: mode 0700 on
-/// Unix, an owner-only ACL on Windows.
+/// Unix; on Windows a protected, owner-only ACL set as it is created, so nobody gets in first.
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -94,117 +94,30 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         std::fs::DirBuilder::new().mode(0o700).create(dir)
     }
     #[cfg(not(unix))]
+    win::create_owner_only(dir)
+}
+
+/// Make sure `dir` exists and only this user can change it. On Unix create it if needed, as
+/// Paja always has. On Windows create it owner-only, or, if it exists, check that this user
+/// owns it and that its ACL is protected and lets no other account in; checked on every call,
+/// so a later change is caught.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
     {
-        std::fs::create_dir(dir)?;
-        // Until the ACL is set, the parent's applies: refuse anything planted in that gap.
-        let restricted =
-            restrict_to_owner(dir).and_then(|()| match std::fs::read_dir(dir)?.next() {
-                None => Ok(()),
-                Some(_) => Err(std::io::Error::other(format!(
-                    "{} was not empty right after it was created; something else is writing \
-                     there, so it can't be trusted",
-                    dir.display()
-                ))),
-            });
-        restricted.inspect_err(|_| {
-            let _ = std::fs::remove_dir(dir);
-        })
-    }
-}
-
-/// On Windows, replace `dir`'s ACL with one that lets only the current user in, for it and
-/// everything created in it, and check that no other account is left with access (`icacls`
-/// keeps other accounts' explicit entries). A new directory otherwise inherits its parent's
-/// ACL, which is not private under, say, `C:\paja`. Each directory is done once per process.
-/// Unix needs nothing: Paja creates such directories 0700.
-pub fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
-    if !cfg!(windows) {
-        return Ok(());
-    }
-    use std::sync::{Mutex, OnceLock};
-    static DONE: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-    let done = DONE.get_or_init(|| Mutex::new(Vec::new()));
-    if done.lock().unwrap().iter().any(|d| d == dir) {
-        return Ok(());
-    }
-    let failed = |what: String| std::io::Error::other(format!("{what} for {}", dir.display()));
-    let (account, sid) = current_user()?;
-    let icacls = || Command::new(system32().join("icacls.exe"));
-    let status = icacls()
-        .arg(dir)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            &format!("*{sid}:(OI)(CI)F"),
-            "/q",
-        ])
-        .stdout(std::process::Stdio::null())
-        .status()?;
-    // New directories also get explicit entries for SYSTEM and Administrators (who can take
-    // any file anyway); drop them by SID, which every Windows language spells the same.
-    let removed = icacls()
-        .arg(dir)
-        .args(["/remove:g", "*S-1-5-18", "*S-1-5-32-544", "/q"])
-        .stdout(std::process::Stdio::null())
-        .status()?;
-    if !status.success() || !removed.success() {
-        return Err(failed("`icacls` could not make an owner-only ACL".into()));
-    }
-    // `icacls <dir>` prints `<dir> ACCOUNT:(rights)` and then one `ACCOUNT:(rights)` per line.
-    let listing = icacls().arg(dir).output()?;
-    let text = String::from_utf8_lossy(&listing.stdout).replace(&*dir.to_string_lossy(), "");
-    let others: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.contains(":("))
-        .filter_map(|line| line.split(":(").next())
-        .filter(|name| !name.eq_ignore_ascii_case(&account) && !name.eq_ignore_ascii_case(&sid))
-        .collect();
-    if !listing.status.success() || !others.is_empty() {
-        return Err(failed(format!(
-            "other accounts ({}) still have access; remove their entries with `icacls` or use \
-             another PAJA_HOME",
-            others.join(", ")
-        )));
-    }
-    done.lock().unwrap().push(dir.to_path_buf());
-    Ok(())
-}
-
-fn system32() -> PathBuf {
-    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    PathBuf::from(system).join("System32")
-}
-
-/// The current user's account name and SID, from `whoami /user /fo csv /nh`, which prints
-/// `"DOMAIN\user","S-1-5-..."`.
-fn current_user() -> std::io::Result<(String, String)> {
-    use std::sync::OnceLock;
-    static USER: OnceLock<(String, String)> = OnceLock::new();
-    if let Some(user) = USER.get() {
-        return Ok(user.clone());
-    }
-    let who = Command::new(system32().join("whoami.exe"))
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()?;
-    let text = String::from_utf8_lossy(&who.stdout);
-    let fields: Vec<String> = text
-        .trim()
-        .split("\",\"")
-        .map(|f| f.trim_matches('"').to_string())
-        .collect();
-    match fields.as_slice() {
-        [account, sid] if sid.starts_with("S-1-") => {
-            Ok(USER.get_or_init(|| (account.clone(), sid.clone())).clone())
+        match create_private_dir(dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                win::check_owner_only(dir)
+            }
+            Err(err) => Err(err),
         }
-        _ => Err(std::io::Error::other(format!(
-            "`whoami /user` gave no account and SID (got {text:?})"
-        ))),
     }
+    #[cfg(not(windows))]
+    std::fs::create_dir_all(dir)
 }
 
 /// Create `path`, which must not exist yet, as a file only this user can read, write or run
-/// (on Windows: inside a directory `create_private_dir` or `restrict_to_owner` made).
+/// (on Windows: inside a directory `create_private_dir` or `ensure_private_dir` made).
 pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = std::fs::OpenOptions::new();
@@ -303,13 +216,13 @@ pub fn shell_path(word: &str) -> PathBuf {
 /// reads some spellings differently from how they look: device and UNC paths (`\\?\`,
 /// `\\server\share`), drive-relative paths (`C:foo`), paths rooted without a drive (`\x`,
 /// which a tool may map to another drive or Git's own directory), names with a trailing dot
-/// or space (`.git.` is `.git`), alternate data streams (`a:stream`, unless `colons` allows
-/// colons, as in git's `HEAD:path`), reserved device names (`NUL`, `COM1`) and characters
+/// or space (`.git.` is `.git`), alternate data streams (`a:stream`), unless `revisions`
+/// allows git's revision forms (`HEAD:path`, `main..`), reserved device names (`NUL`, `COM1`) and characters
 /// Windows forbids in names. All are refused rather than interpreted. (An 8.3 short name such
 /// as `GIT~1` only names something that exists, and the hook resolves existing paths to their
 /// long names, so it needs no rule.)
 /// Nothing is refused on Unix.
-pub fn path_problem(text: &str, colons: bool) -> Option<String> {
+pub fn path_problem(text: &str, revisions: bool) -> Option<String> {
     if !cfg!(windows) || text.is_empty() {
         return None;
     }
@@ -336,11 +249,11 @@ pub fn path_problem(text: &str, colons: bool) -> Option<String> {
             continue;
         }
         // In git's words `main..` is a range, not a name.
-        let range = colons && name.contains("..");
+        let range = revisions && name.contains("..");
         if name.ends_with(['.', ' ']) && !range {
             return refuse("has a name ending in a dot or space, which Windows drops");
         }
-        if name.contains(':') && !colons {
+        if name.contains(':') && !revisions {
             return refuse("names an alternate data stream");
         }
         if name.contains(['<', '>', '"', '|', '?', '*']) || name.chars().any(|c| c.is_control()) {
@@ -429,11 +342,209 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_private_dir_is_owner_only_and_an_inheriting_one_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let private = tmp.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        // Checked again when it exists.
+        ensure_private_dir(&private).unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let why = ensure_private_dir(&plain).unwrap_err().to_string();
+        assert!(why.contains("inherits"), "{why}");
+    }
+
     #[test]
     fn private_dirs_refuse_a_name_that_is_taken() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("private");
         create_private_dir(&dir).unwrap();
         assert!(create_private_dir(&dir).is_err());
+    }
+}
+
+/// Windows security calls: owner-only directories made in one step, and checked later.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use std::io::{Error, Result};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+        GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
+        text.encode_wide().chain(Some(0)).collect()
+    }
+
+    /// The current user, as a `TOKEN_USER` buffer kept in u64s so it is aligned; its SID
+    /// points into it, so it must outlive any use of that SID.
+    fn token_user() -> Result<Vec<u64>> {
+        // SAFETY: Win32 calls with a buffer of the size the API reports; the token handle is
+        // closed before returning.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(Error::last_os_error());
+            }
+            let mut len = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+            let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+            let err = Error::last_os_error();
+            CloseHandle(token);
+            if ok == 0 {
+                return Err(err);
+            }
+            Ok(buf)
+        }
+    }
+
+    /// The current user's SID as text (`S-1-5-...`).
+    fn user_sid_string() -> Result<String> {
+        let user = token_user()?;
+        // SAFETY: `user` holds the TOKEN_USER filled above; ConvertSidToStringSidW allocates
+        // the string, which is freed with LocalFree.
+        unsafe {
+            let sid = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+            let mut text: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut text) == 0 {
+                return Err(Error::last_os_error());
+            }
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            Ok(out)
+        }
+    }
+
+    /// Create `dir` with a protected ACL that gives this user full control, of it and of what
+    /// is created in it, and nobody else anything.
+    pub fn create_owner_only(dir: &Path) -> Result<()> {
+        let sddl = format!("D:P(A;OICI;FA;;;{})", user_sid_string()?);
+        let sddl = wide(std::ffi::OsStr::new(&sddl));
+        let path = wide(dir.as_os_str());
+        // SAFETY: the conversion allocates the descriptor, which CreateDirectoryW copies and
+        // LocalFree then frees.
+        unsafe {
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(Error::last_os_error());
+            }
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            let ok = CreateDirectoryW(path.as_ptr(), &attributes);
+            let err = Error::last_os_error();
+            LocalFree(sd);
+            if ok == 0 {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail unless this user owns `dir` and its ACL is protected and allows only this user.
+    pub fn check_owner_only(dir: &Path) -> Result<()> {
+        let user = token_user()?;
+        let path = wide(dir.as_os_str());
+        let refuse = |why: &str| {
+            Error::other(format!(
+                "{} {why}, so another account could change what's in it; delete it and Paja \
+                 recreates it for this user only",
+                dir.display()
+            ))
+        };
+        // SAFETY: GetNamedSecurityInfoW allocates the descriptor that `owner` and `dacl` point
+        // into; it is freed with LocalFree after the last use of either. `user` outlives `me`.
+        unsafe {
+            let me = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let code = GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            if code != 0 {
+                return Err(Error::from_raw_os_error(code as i32));
+            }
+            let verdict = (|| {
+                if EqualSid(owner, me) == 0 {
+                    return Err(refuse("is owned by another account"));
+                }
+                let (mut control, mut revision) = (0u16, 0u32);
+                if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
+                    return Err(Error::last_os_error());
+                }
+                if control & SE_DACL_PROTECTED == 0 || dacl.is_null() {
+                    return Err(refuse("inherits its parent's permissions"));
+                }
+                let mut size = ACL_SIZE_INFORMATION {
+                    AceCount: 0,
+                    AclBytesInUse: 0,
+                    AclBytesFree: 0,
+                };
+                if GetAclInformation(
+                    dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                ) == 0
+                {
+                    return Err(Error::last_os_error());
+                }
+                for index in 0..size.AceCount {
+                    let mut ace: *mut c_void = std::ptr::null_mut();
+                    if GetAce(dacl, index, &mut ace) == 0 {
+                        return Err(Error::last_os_error());
+                    }
+                    let ace = ace as *const ACCESS_ALLOWED_ACE;
+                    // Deny entries only take access away; every other kind must be this user's.
+                    let kind = (*ace).Header.AceType;
+                    if kind == ACCESS_DENIED_ACE_TYPE {
+                        continue;
+                    }
+                    let sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
+                    if kind != ACCESS_ALLOWED_ACE_TYPE || EqualSid(sid, me) == 0 {
+                        return Err(refuse("lets another account in"));
+                    }
+                }
+                Ok(())
+            })();
+            LocalFree(sd);
+            verdict
+        }
     }
 }

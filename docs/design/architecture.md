@@ -123,8 +123,11 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   streams (`a:stream`), reserved device names (`NUL`, `COM1`) and characters Windows forbids in names. Names and
   credential paths compare without case and with `\` as a separator. A `cd` may name the root as `C:\...` or in Git
   Bash's `/c/...` form. Search patterns use `/` and stay relative. Junctions count as symlinks. Reads outside the
-  worktree are limited to dependency sources (there is no `/usr`). The factory's hook directory and Paja's scratch
-  and stamp directories get owner-only ACLs. Hook command lines are quoted so `cmd.exe`, which Claude Code uses for
+  worktree are limited to dependency sources (there is no `/usr`). Paja's scratch and stamp directories are created
+  with a protected, owner-only ACL in one step (no window where the parent's applies), and the factory's hook
+  directory is created that way or, if it exists, checked before every run to be owned by this user and closed to
+  everyone else. Keep `PAJA_HOME` under the user profile (the default), so nobody else can rename the hook directory
+  away. Hook command lines are quoted so `cmd.exe`, which Claude Code uses for
   hooks on Windows, and Git Bash read them the same way.
 
 It fails closed: unreadable input, missing bounds, a crash and running past its own 20-second deadline all block, and

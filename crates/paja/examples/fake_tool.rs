@@ -14,5 +14,11 @@ fn main() -> ExitCode {
         .args(std::env::args_os().skip(1))
         .status()
         .expect("running the script");
-    ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8)
+    // A crash's NTSTATUS (negative, or above 255) must still read as a failure.
+    ExitCode::from(
+        status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1),
+    )
 }
