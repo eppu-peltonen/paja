@@ -79,7 +79,7 @@ code.
   options and a recommendation. Details: `docs/design/landing.md`.
 - **Review converges.** At most three review rounds per change. Only blockers (a bug in what the issue asks for, a
   security hole the change opens, a broken rule, missing tests) need another round; every other finding becomes a
-  `paja-follow-up` issue for the person to queue. A re-review reads only the fix (high risk: the whole change). Each review runs in its own fresh session. Details:
-  `docs/design/landing.md`.
+  `paja-follow-up` issue for the person to queue. A re-review reads only the fix (high risk: the whole change). Each
+  review runs in its own fresh session. Details: `docs/design/landing.md`.
 - **Until Paja's own reviewer runs (build step 3)**, Claude does the review and landing for these hand-built seed
   pull requests under the same rules.
