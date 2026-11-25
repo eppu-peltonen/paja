@@ -841,31 +841,8 @@ static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
-    let mut args: Vec<std::ffi::OsString> = vec![
-        "hook".into(),
-        "--root".into(),
-        root.as_os_str().to_owned(),
-        "--home".into(),
-        home.root().as_os_str().to_owned(),
-    ];
-    if read_only {
-        args.push("--read-only".into());
-    }
-    let (blocked, build) = crate::hook::self_test_inputs(root, read_only);
-    let (code, stderr) = run_hook_once(&exe, &args, &blocked)?;
-    let blocked = code == Some(2) && stderr.contains("Blocked by Paja's deny-list");
-    let (code, _) = run_hook_once(&exe, &args, &build)?;
-    if !blocked || code != Some(0) {
-        bail!(
-            "the deny-list hook {} failed its self-test (it must block `{}` and allow \
-             `cargo test`), so no agent will start; rebuild paja from main",
-            exe.display(),
-            if read_only { "git commit" } else { "git push" }
-        );
-    }
-    // The self-test leaves no stamp: the hook only gets `--stamp` from Claude Code. The stamp
-    // sits in a fresh directory only this user can enter, so nobody can plant it beforehand;
-    // creating the directory fails if the name is already taken.
+    // The stamp sits in a fresh directory only this user can enter, so nobody can plant it
+    // beforehand; creating the directory fails if the name is already taken.
     let private = std::env::temp_dir().join(format!(
         "paja-stamp-{}-{}-{}",
         std::process::id(),
@@ -875,16 +852,17 @@ fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, P
     crate::platform::create_private_dir(&private)
         .with_context(|| format!("creating the hook's stamp directory {}", private.display()))?;
     let stamp = private.join("stamp");
-    // Claude Code only blocks on exit 2. A hook that can't start (127), is killed or fails
-    // in any other way must block too.
-    let command = format!(
-        "{} hook --root {} --home {} --stamp {}{} || exit 2",
-        crate::platform::quote_hook_word(&exe)?,
-        crate::platform::quote_hook_word(root)?,
-        crate::platform::quote_hook_word(home.root())?,
-        crate::platform::quote_hook_word(&stamp)?,
-        if read_only { " --read-only" } else { "" }
-    );
+    // Test the very command Claude Code will run, with a throwaway stamp of its own, so a
+    // path the shell reads differently fails here and not on every tool call.
+    let trial = private.join("self-test");
+    let tested = hook_command(&exe, root, home.root(), &trial, read_only)
+        .and_then(|command| self_test_hook(&command, root, read_only));
+    let _ = std::fs::remove_file(&trial);
+    if let Err(err) = tested {
+        let _ = std::fs::remove_dir(&private);
+        return Err(err);
+    }
+    let command = hook_command(&exe, root, home.root(), &stamp, read_only)?;
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
     let settings = json!({
@@ -897,6 +875,43 @@ fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, P
     })
     .to_string();
     Ok((settings, stamp, exe))
+}
+
+/// The shell command Claude Code runs for every tool call. It only blocks on exit 2, so a
+/// hook that can't start (127), is killed or fails in any other way must block too.
+fn hook_command(
+    exe: &Path,
+    root: &Path,
+    home: &Path,
+    stamp: &Path,
+    read_only: bool,
+) -> Result<String> {
+    Ok(format!(
+        "{} hook --root {} --home {} --stamp {}{} || exit 2",
+        crate::platform::quote_hook_word(exe)?,
+        crate::platform::quote_hook_word(root)?,
+        crate::platform::quote_hook_word(home)?,
+        crate::platform::quote_hook_word(stamp)?,
+        if read_only { " --read-only" } else { "" }
+    ))
+}
+
+/// Run the hook `command` through the shell, as Claude Code does, and check that it blocks a
+/// push (a commit when `read_only`) and allows a build.
+fn self_test_hook(command: &str, root: &Path, read_only: bool) -> Result<()> {
+    let (blocked, build) = crate::hook::self_test_inputs(root, read_only);
+    let (code, stderr) = run_hook_once(command, &blocked)?;
+    let blocks = code == Some(2) && stderr.contains("Blocked by Paja's deny-list");
+    let (code, _) = run_hook_once(command, &build)?;
+    if !blocks || code != Some(0) {
+        bail!(
+            "the deny-list hook command `{command}` failed its self-test (it must block `{}` \
+             and allow `cargo test`), so no agent will start; rebuild paja from main, and \
+             check that every path in the command exists as written",
+            if read_only { "git commit" } else { "git push" }
+        );
+    }
+    Ok(())
 }
 
 /// Managed (administrator) settings load whatever `--setting-sources` says, and two of their
@@ -1076,18 +1091,13 @@ fn hook_binary(home: &Home) -> Result<PathBuf> {
     Ok(exe)
 }
 
-fn run_hook_once(
-    exe: &Path,
-    args: &[std::ffi::OsString],
-    input: &str,
-) -> Result<(Option<i32>, String)> {
-    let mut child = Command::new(exe)
-        .args(args)
+fn run_hook_once(command: &str, input: &str) -> Result<(Option<i32>, String)> {
+    let mut child = crate::platform::shell(command)?
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .with_context(|| format!("starting the deny-list hook {}", exe.display()))?;
+        .with_context(|| format!("starting the deny-list hook command `{command}`"))?;
     // A hook that exits without reading its input is judged by its exit code, not the pipe.
     if let Err(err) = std::io::Write::write_all(
         child.stdin.as_mut().context("the hook's stdin")?,
@@ -1098,8 +1108,8 @@ fn run_hook_once(
             let _ = child.wait();
             return Err(err).with_context(|| {
                 format!(
-                    "sending the self-test to the deny-list hook {}; rebuild paja from main",
-                    exe.display()
+                    "sending the self-test to the deny-list hook command `{command}`; rebuild \
+                     paja from main"
                 )
             });
         }
@@ -1120,23 +1130,22 @@ fn run_hook_once(
         .inspect_err(|_| {
             let _ = child.kill();
         })
-        .with_context(|| format!("waiting for the deny-list hook {}", exe.display()))?
+        .with_context(|| format!("waiting for the deny-list hook command `{command}`"))?
         .is_none()
     {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
             bail!(
-                "the deny-list hook {} hung in its self-test, so no agent will start; rebuild \
-                 paja from main",
-                exe.display()
+                "the deny-list hook command `{command}` hung in its self-test, so no agent \
+                 will start; rebuild paja from main"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let code = child
         .wait()
-        .with_context(|| format!("waiting for the deny-list hook {}", exe.display()))?
+        .with_context(|| format!("waiting for the deny-list hook command `{command}`"))?
         .code();
     Ok((code, reader.join().unwrap_or_default()))
 }
@@ -1961,6 +1970,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_broken_hook_command_fails_the_self_test_and_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The command Claude Code would run, pointing at a hook binary that isn't there.
+        let command = hook_command(
+            &tmp.path().join("no-such-paja"),
+            tmp.path(),
+            tmp.path(),
+            &tmp.path().join("stamp"),
+            false,
+        )
+        .unwrap();
+        let why = self_test_hook(&command, tmp.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("failed its self-test"), "{why}");
+        assert!(why.contains(&command), "{why}");
+    }
 
     #[test]
     fn lines_skip_blanks_and_comments() {
