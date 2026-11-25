@@ -728,10 +728,12 @@ impl Factory {
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
                  *--json-schema*) v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\"}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
                  *) echo built >> feature.txt\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp '\\([^']*\\)'.*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
@@ -796,6 +798,12 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]));
+    // A finding that didn't block landing becomes an issue for a person to queue, not queued
+    // work.
+    assert!(
+        log.contains("issue create --label paja-follow-up --title Tidy the helper"),
+        "{log}"
+    );
     // Every agent runs under the deny-list hook, bounded to its environment, and with no
     // settings files that could switch the hook off.
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
@@ -890,6 +898,60 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     assert_eq!(item["status"], "escalated", "never left active");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]), "the worktree is freed");
+    // The reviewer's follow-up isn't filed, but it isn't lost either.
+    let log = std::fs::read_to_string(f.home.join("events.jsonl")).unwrap();
+    assert!(
+        log.contains("run.follow_up") && log.contains("not filed: the change did not land"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_second_review_judges_only_the_fix() {
+    // Round one asks for changes; round two's reviewer sees the earlier blockers and the fix's
+    // own diff, and lands it.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    // Each logged call starts with `-p`; the reviewer's carries `--json-schema`.
+    let rereview = args
+        .split("\n-p ")
+        .filter(|call| call.contains("--json-schema"))
+        .nth(1)
+        .unwrap_or_default();
+    assert!(rereview.contains("found these blockers"), "{args}");
+    assert!(rereview.contains("add more"), "{args}");
+    assert!(
+        rereview.contains("Judge only the fix: `git diff "),
+        "{args}"
+    );
+}
+
+#[test]
+fn a_fix_round_without_commits_is_not_reviewed() {
+    // After a review asks for changes, a round that commits nothing goes back to the builder
+    // instead of letting the reviewer land the unchanged branch.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    std::fs::write(f.tmp.path().join("lazy"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 3, "{report}");
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert_eq!(args.matches("--json-schema").count(), 2, "{args}");
+    assert!(args.contains("made no new commits"), "{args}");
+    // The earlier round's follow-ups reach the re-reviewer.
+    let rereview = args
+        .split("\n-p ")
+        .filter(|call| call.contains("--json-schema"))
+        .nth(1)
+        .unwrap_or_default();
+    assert!(rereview.contains("Tidy the helper"), "{args}");
 }
 
 #[test]

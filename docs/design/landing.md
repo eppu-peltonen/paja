@@ -12,6 +12,26 @@ No human reviews pull requests. People set intent, approve specs and answer esca
 Automation sets the tier from the files and areas a change touches. A tier earns more autonomy only while its revert
 rate stays low. Every landed change is re-verified on `main` and reverted automatically if it turns `main` red.
 
+## Review rounds
+
+Review has to converge, or a fresh reviewer finding one more edge case each time keeps a change open forever.
+
+- **At most three rounds.** A change gets at most three build, check and review rounds. After the third it lands only if
+  the reviewers say `land`; otherwise it is escalated.
+- **Only blockers hold a change up.** A blocker is a bug in what the issue asks for, a security hole the change opens, a
+  broken `CLAUDE.md` rule, or missing tests for the new behaviour. Every other finding (hardening ideas, edge cases
+  outside the issue, nits) is a follow-up: once the change lands, Mestari files the landing round's follow-ups (at most
+  five) as `paja-follow-up` issues. Jono doesn't import that label, so a person queues one by relabelling it `paja`:
+  reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and repeats the ones
+  that still apply. If the change doesn't land after all (CI fails), the follow-ups stay in the event log unfiled.
+  Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them.
+- **A re-review judges the fix.** After a round of changes, the next reviewer gets the earlier blockers and reads only
+  the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
+  builder without a review. High-risk changes are the exception: both
+  reviewers read the whole change every round, since they must agree on all of it.
+- **Each review is a fresh, short session.** Reviewers never share context with the builder or with each other, which
+  keeps them independent and keeps each session small.
+
 ## When a person is asked
 
 A person hears about a chunk only through Posti, and only when:

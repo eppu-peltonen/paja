@@ -28,6 +28,8 @@ pub const EV_STARTED: &str = "run.started";
 pub const EV_ROUND: &str = "run.round";
 pub const EV_LANDED: &str = "run.landed";
 pub const EV_ESCALATED: &str = "run.escalated";
+/// A non-blocking review finding filed as a `paja-follow-up` issue after landing.
+pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// Branch code changed git's configuration in `repo`; Paja runs no git there until a person
 /// has checked it and recorded [`EV_TAMPER_CHECKED`].
 pub const EV_TAMPERED: &str = "run.tampered";
@@ -63,6 +65,20 @@ pub struct Review {
     /// The intent question for a person, when the verdict is `escalate`.
     #[serde(default)]
     pub question: String,
+    /// Findings that don't block landing. Mestari files each as a `paja-follow-up` issue once
+    /// the change lands, for a person to queue, instead of holding this change up.
+    #[serde(default)]
+    pub follow_ups: Vec<String>,
+}
+
+/// What an earlier round's reviewers asked for, so the next review judges only the fix.
+struct Prior {
+    /// The commit those reviewers judged.
+    reviewed: String,
+    /// The blockers they named.
+    blockers: String,
+    /// Their non-blocking findings, for the next reviewer to keep or drop.
+    follow_ups: Vec<String>,
 }
 
 pub struct RunOptions<'a> {
@@ -181,6 +197,8 @@ fn run_item(
     )?;
 
     let mut feedback = String::new();
+    let mut prior: Option<Prior> = None;
+    let mut follow_ups: Vec<String> = Vec::new();
     for round in 1..=MAX_ROUNDS {
         *rounds = round;
         build(home, &env, item, base, &feedback)?;
@@ -193,6 +211,17 @@ fn run_item(
             feedback = "The previous round made no commits. Make the change and commit it.".into();
             record_round(home, item, round, "no_change", &feedback)?;
             continue;
+        }
+        // A round after a review must commit a fix; an empty fix is never reviewed.
+        if let Some(prior) = &prior {
+            if git(&env.path, &["rev-parse", "HEAD"])? == prior.reviewed {
+                feedback = format!(
+                    "The previous round made no new commits. Fix these blockers and commit:\n\n{}",
+                    prior.blockers
+                );
+                record_round(home, item, round, "no_change", &feedback)?;
+                continue;
+            }
         }
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
         let guard = GitGuard::new(&env.path)?;
@@ -222,6 +251,12 @@ fn run_item(
         if let Some(failure) = failed {
             feedback =
                 format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
+            if let Some(prior) = &prior {
+                feedback.push_str(&format!(
+                    "\n\nThe review's blockers still need fixing too:\n\n{}",
+                    prior.blockers
+                ));
+            }
             record_round(home, item, round, "checks_failed", &failure)?;
             continue;
         }
@@ -242,9 +277,37 @@ fn run_item(
             .filter(|path| !path.is_empty())
             .any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
+        // A fix that merged or rewrote history isn't a plain diff on what was reviewed: read it all.
+        if let Some(p) = &prior {
+            let plain = git(
+                &env.path,
+                &["merge-base", "--is-ancestor", &p.reviewed, "HEAD"],
+            )
+            .is_ok()
+                && git(
+                    &env.path,
+                    &["rev-list", "--merges", &format!("{}..HEAD", p.reviewed)],
+                )?
+                .is_empty();
+            if !plain {
+                prior = None;
+            }
+        }
         let reviews = (0..reviewers)
-            .map(|_| review(home, &env, item, base))
+            // High-risk reviewers read the whole change every round: the two must agree on all
+            // of it, not only on the fix.
+            .map(|_| review(home, &env, item, base, prior.as_ref().filter(|_| !risky)))
             .collect::<Result<Vec<_>>>()?;
+        // Only the round that lands files its follow-ups: an earlier round's may be about code
+        // the fix has since changed.
+        follow_ups.clear();
+        for review in &reviews {
+            for finding in &review.follow_ups {
+                if !finding.trim().is_empty() && !follow_ups.contains(finding) {
+                    follow_ups.push(finding.clone());
+                }
+            }
+        }
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
         record_round(home, item, round, &verdicts.join(","), &summaries(&reviews))?;
 
@@ -252,7 +315,25 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            return land(home, repo, &env, item, round, &checked);
+            let report = land(home, repo, &env, item, round, &checked);
+            match &report {
+                Ok(RunReport::Landed { pr, .. }) => {
+                    file_follow_ups(home, repo, item, pr, &follow_ups)
+                }
+                // Not landed after all: keep the findings in the log, for later.
+                _ => {
+                    for finding in &follow_ups {
+                        record_follow_up(
+                            home,
+                            item,
+                            finding,
+                            None,
+                            "not filed: the change did not land",
+                        );
+                    }
+                }
+            }
+            return report;
         }
         if risky && verdicts.contains(&"land") {
             // High-risk reviewers must agree; a split is a question, not another round.
@@ -262,15 +343,27 @@ fn run_item(
             );
             return escalated(home, repo, &env, item, &question, round);
         }
-        feedback = format!(
-            "A reviewer asked for changes:\n\n{}",
-            reviews
-                .iter()
-                .filter(|r| r.verdict == "changes")
-                .map(|r| r.comments.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        );
+        // A `changes` verdict without comments still names something: its summary.
+        let blockers = reviews
+            .iter()
+            .filter(|r| r.verdict == "changes")
+            .map(|r| {
+                if r.comments.trim().is_empty() {
+                    r.summary.as_str()
+                } else {
+                    r.comments.as_str()
+                }
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        feedback = format!("A reviewer asked for changes:\n\n{blockers}");
+        // Without named blockers there is nothing to narrow the next review to.
+        prior = (!blockers.is_empty()).then(|| Prior {
+            reviewed: checked,
+            blockers,
+            follow_ups: follow_ups.clone(),
+        });
     }
     let question = format!(
         "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
@@ -341,16 +434,49 @@ fn build(home: &Home, env: &Env, item: &WorkItem, base: &str, feedback: &str) ->
     claude(home, env, base, &prompt, &tools, None, false).map(|_| ())
 }
 
-fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review> {
+fn review(
+    home: &Home,
+    env: &Env,
+    item: &WorkItem,
+    base: &str,
+    prior: Option<&Prior>,
+) -> Result<Review> {
+    // A first review reads the whole change; a later one judges only the fix for the blockers
+    // an earlier review named, so review rounds converge instead of starting over.
+    let scope = match prior {
+        None => format!(
+            "The change is `git diff {base}...HEAD`. Read it cold against the issue below."
+        ),
+        Some(prior) => format!(
+            "An earlier review of this change (at {reviewed}) found these blockers:\n\n{blockers}\n\n\
+             Judge only the fix: `git diff {reviewed}..HEAD`. Land it if it resolves those \
+             blockers and adds none. That review read the whole change and named every blocker it \
+             found, so don't reopen the rest. It also noted these \
+             follow-ups; repeat in your `follow_ups` the ones that still apply:\n\n{follow_ups}\n",
+            reviewed = prior.reviewed,
+            blockers = prior.blockers,
+            follow_ups = if prior.follow_ups.is_empty() {
+                "(none)".to_string()
+            } else {
+                prior.follow_ups.join("\n\n")
+            }
+        ),
+    };
     let prompt = format!(
-        "You are an independent reviewer for Paja. You did not write this change. Read it cold \
-         and decide whether it lands.\n\nThe change is `git diff {base}...HEAD`. Judge it against \
-         the issue below and the rules in CLAUDE.md as they are on main (`git show {base}:CLAUDE.md`), \
-         not the branch's copy. Verdicts: `land` if it does what the issue asks, is correct and \
-         tested, and breaks no rule; `changes` with concrete comments if it needs work; `escalate` \
-         with a question only when the issue's intent is unclear or the change would weaken a check \
-         (a person must decide). Nits alone are not a reason for `changes`. You may run cargo \
-         and read-only git; you can't change files.\n\n\
+        "You are an independent reviewer for Paja. You did not write this change; decide \
+         whether it lands.\n\n{scope} Judge it by the rules in CLAUDE.md as they are on main \
+         (`git show {base}:CLAUDE.md`), not the branch's copy.\n\n\
+         Verdicts: `land` if it does what the issue asks and has no blocker; `changes` only for \
+         blockers, naming every blocker in the whole diff in `comments` (a later review reads \
+         only the fix); `escalate` with a question only when the issue's \
+         intent is unclear or the change would weaken a check (a person must decide). A blocker \
+         is a bug in what the issue asks for, a security hole the change opens, a broken \
+         CLAUDE.md rule, or missing tests for the new behaviour. Anything else, including \
+         hardening ideas, edge cases outside the issue and nits, goes in `follow_ups`, one \
+         finding each, starting with a short title line, at most five; Paja files them as public \
+         issues after landing, so never copy secrets, environment details or run output into \
+         them. They never hold the change up. You may run cargo and read-only git; you \
+         can't change files.\n\n\
          Issue #{number}: {title}\n\n{body}\n",
         number = item.number,
         title = item.title,
@@ -362,7 +488,8 @@ fn review(home: &Home, env: &Env, item: &WorkItem, base: &str) -> Result<Review>
             "verdict": {"type": "string", "enum": ["land", "changes", "escalate"]},
             "summary": {"type": "string"},
             "comments": {"type": "string"},
-            "question": {"type": "string"}
+            "question": {"type": "string"},
+            "follow_ups": {"type": "array", "items": {"type": "string"}}
         },
         "required": ["verdict", "summary"]
     });
@@ -1201,6 +1328,98 @@ fn escalate(home: &Home, repo: &Path, item: &WorkItem, question: &str, rounds: u
         );
     }
     Ok(())
+}
+
+/// The label follow-up issues get. Jono imports only `paja`, so a follow-up waits until a
+/// person relabels it: reviewers suggest work, people set intent.
+pub const FOLLOW_UP_LABEL: &str = "paja-follow-up";
+
+/// At most this many follow-up issues per change; the rest are folded into the last one.
+const MAX_FOLLOW_UPS: usize = 5;
+
+/// File each non-blocking review finding as a `paja-follow-up` issue, once the change has
+/// landed. A failure here is recorded, never turned into an escalation: the change is already
+/// merged.
+fn file_follow_ups(home: &Home, repo: &Path, item: &WorkItem, pr: &str, findings: &[String]) {
+    // Review text came from an agent that read untrusted code: keep each finding short, and
+    // never let it mention anyone.
+    let mut findings: Vec<String> = findings
+        .iter()
+        .map(|finding| {
+            let mut text: String = finding.chars().take(4000).collect();
+            if text.len() < finding.len() {
+                text.push_str("\n\n(cut short)");
+            }
+            text.replace('@', "@\u{200b}")
+        })
+        .collect();
+    if findings.len() > MAX_FOLLOW_UPS {
+        let rest = findings.split_off(MAX_FOLLOW_UPS - 1);
+        findings.push(format!(
+            "More review follow-ups for #{}\n\n{}",
+            item.number,
+            rest.join("\n\n---\n\n")
+        ));
+    }
+    for finding in &findings {
+        let title: String = finding
+            .lines()
+            .map(|line| {
+                line.trim()
+                    .trim_matches(['#', '-', '*', '_', '`', ' '])
+                    .trim()
+            })
+            .find(|line| !line.is_empty())
+            .unwrap_or("Review follow-up")
+            .chars()
+            .take(100)
+            .collect();
+        let body = format!(
+            "{finding}\n\nA reviewer found this while reviewing #{number} ({pr}). It did not \
+             block landing. Relabel it `paja` to queue it.",
+            number = item.number
+        );
+        let filed = run_gh(
+            repo,
+            &[
+                "issue",
+                "create",
+                "--label",
+                FOLLOW_UP_LABEL,
+                "--title",
+                &title,
+                "--body",
+                &body,
+            ],
+        );
+        match &filed {
+            Ok(issue) => record_follow_up(home, item, finding, Some(issue.as_str()), ""),
+            Err(err) => record_follow_up(
+                home,
+                item,
+                finding,
+                None,
+                &format!(
+                    "{err:#}; if the label is missing, create it with `gh label create \
+                     {FOLLOW_UP_LABEL}` and file this finding by hand"
+                ),
+            ),
+        }
+    }
+}
+
+/// Keep a follow-up in the log, filed or not, so no finding is lost.
+fn record_follow_up(home: &Home, item: &WorkItem, finding: &str, issue: Option<&str>, error: &str) {
+    let _ = record(
+        home,
+        EV_FOLLOW_UP,
+        json!({
+            "number": item.number,
+            "finding": finding,
+            "issue": issue,
+            "error": (!error.is_empty()).then_some(error),
+        }),
+    );
 }
 
 /// Ask the person on the issue.
