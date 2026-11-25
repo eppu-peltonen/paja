@@ -74,6 +74,27 @@ pub struct SetArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct AnswerArgs {
+    /// The GitHub issue number of an escalated item.
+    number: u64,
+    /// The answer, posted as a comment on the issue.
+    text: String,
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct FileArgs {
+    /// The issue's title.
+    title: String,
+    /// The issue's body: what to build and the acceptance criteria.
+    #[serde(default)]
+    body: String,
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
     /// Only the last N events.
     limit: Option<usize>,
@@ -196,6 +217,43 @@ impl PajaMcp {
                 args.number,
                 status,
                 args.note.as_deref(),
+            )?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Jono: answer an escalated item. Posts the answer as a comment on its GitHub issue (uses gh) and queues the item again."
+    )]
+    async fn work_answer(
+        &self,
+        Parameters(args): Parameters<AnswerArgs>,
+    ) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let repo = std::path::absolute(PathBuf::from(args.repo.unwrap_or_else(|| ".".into())))?;
+            Ok(serde_json::to_value(jono::answer(
+                &home,
+                &repo,
+                args.number,
+                &args.text,
+            )?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Jono: file a new GitHub issue labelled paja (uses gh), for example an approved spec. The next sync queues it. Returns its url."
+    )]
+    async fn work_file(&self, Parameters(args): Parameters<FileArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let repo = std::path::absolute(PathBuf::from(args.repo.unwrap_or_else(|| ".".into())))?;
+            Ok(serde_json::to_value(jono::file(
+                &home,
+                &repo,
+                &args.title,
+                &args.body,
             )?)?)
         })
         .await

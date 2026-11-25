@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "paja": {
+      "command": "paja",
+      "args": ["mcp"]
+    }
+  }
+}

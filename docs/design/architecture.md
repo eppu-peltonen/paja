@@ -39,7 +39,7 @@ flowchart TB
 | **Vasara** (verifier) | Load rules and scenarios from `main`, never from the branch; boot the environment and run deterministic and end-to-end checks; an independent, skeptical evaluator agent grades the running app against the acceptance criteria and held-out scenarios; after landing, re-run on `main` and revert on failure | The app's own test commands, Playwright |
 | **Posti** (inbox) | Collect every agent question and escalation; send one digest, each item with options and a recommendation; mirror status to the issue | Issue comments, event log |
 | Interface | One set of core functions exposed three ways, all reading from the event log | CLI (`paja ... --json`), MCP server (official Rust MCP SDK), HTTP API |
-| Claude Code plugin | Skills such as `/paja-spec`, `/paja-status` and `/paja-answer`, a skill that turns a pairing session into a spec, a deny-list hook, and the MCP server config | Claude Code plugin |
+| Claude Code plugin | `plugin/`: the MCP server config (`paja mcp`) and the skills `/paja:status` (the queue, latest events, open questions), `/paja:answer` (answer an escalation and requeue it) and `/paja:spec` (turn a conversation into a `paja` issue after the person approves it). The skills change Paja's state only through its MCP tools. Agents Mestari starts load no plugins; their deny-list hook is set by Mestari itself | Claude Code plugin, installed from this repository's marketplace |
 | **Paja Desk** | Board of chunks, Posti inbox, outcome metrics, spend and history, usable from a phone | Web app over the HTTP API, TypeScript types generated from the core |
 
 ## State
@@ -57,7 +57,9 @@ Jono's items are GitHub issues labelled `paja`. `paja work sync` reads the open 
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the oldest
 open, queued item and marks it active under the home lock, so two runs never share one. A sync that reads its full limit
-of issues refuses to close anything rather than drop work it could not see.
+of issues refuses to close anything rather than drop work it could not see. `paja work answer <issue> <text>` posts a person's
+answer to an escalated item as a comment on its issue and queues it again, and `paja work file --title --body` opens a
+new issue labelled `paja`; both use `gh`, and the MCP tools `work_answer` and `work_file` do the same.
 
 ## The run loop
 

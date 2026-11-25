@@ -478,6 +478,8 @@ fn the_mcp_server_serves_the_same_core() {
         "work_next",
         "work_claim",
         "work_set",
+        "work_answer",
+        "work_file",
     ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
@@ -531,6 +533,19 @@ fn the_mcp_server_serves_the_same_core() {
     assert!(ok);
     assert!(next.is_null(), "{next}");
     let (ok, missing) = call(&mut request, "work_show", serde_json::json!({"number": 1}));
+    assert!(!ok);
+    assert!(
+        missing["error"]
+            .as_str()
+            .unwrap()
+            .contains("paja work sync"),
+        "{missing}"
+    );
+    let (ok, missing) = call(
+        &mut request,
+        "work_answer",
+        serde_json::json!({"number": 1, "text": "Use v2"}),
+    );
     assert!(!ok);
     assert!(
         missing["error"]
@@ -670,6 +685,75 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
             .unwrap()
             .contains("paja work sync"),
         "{missing}"
+    );
+}
+
+#[test]
+fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let d = slash(tmp.path());
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        r#"[{"number": 3, "title": "Add a plugin", "body": "", "url": "https://example.com/3"}]"#,
+    )
+    .unwrap();
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"issue list\") cat {d}/issues.json ;;\n\
+             \"issue create\") echo https://example.com/9 ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+
+    // Only an escalated item has a question to answer.
+    let (ok, err) = paja_with(&home, &repo, &["work", "answer", "3", "Use v2"], &with_gh);
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("not escalated"),
+        "{err}"
+    );
+    paja(
+        &home,
+        &repo,
+        &["work", "set", "3", "escalated", "--note", "Which API?"],
+    );
+    let (ok, item) = paja_with(&home, &repo, &["work", "answer", "3", "Use v2"], &with_gh);
+    assert!(ok, "{item}");
+    assert_eq!(item["status"], "queued");
+    assert_eq!(item["note"], Value::Null);
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("issue comment 3 --body **Answer to Paja's question.**"),
+        "{log}"
+    );
+    assert!(log.contains("Use v2"), "{log}");
+
+    let (ok, filed) = paja_with(
+        &home,
+        &repo,
+        &[
+            "work",
+            "file",
+            "--title",
+            "Add a status page",
+            "--body",
+            "What to build.",
+        ],
+        &with_gh,
+    );
+    assert!(ok, "{filed}");
+    assert_eq!(filed["url"], "https://example.com/9");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("issue create --label paja --title Add a status page --body What to build."),
+        "{log}"
     );
 }
 
