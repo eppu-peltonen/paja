@@ -30,15 +30,24 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Where Claude Code reads managed (administrator) settings on this platform.
 pub fn managed_settings_dirs() -> Vec<PathBuf> {
     if cfg!(windows) {
-        let program_files =
-            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
-        vec![
-            PathBuf::from(program_files).join("ClaudeCode"),
-            PathBuf::from(
-                std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()),
-            )
-            .join("ClaudeCode"),
-        ]
+        // Claude Code names these two literally; the environment's spelling is checked too, in
+        // case it differs.
+        let mut dirs = vec![
+            PathBuf::from(r"C:\Program Files\ClaudeCode"),
+            PathBuf::from(r"C:\ProgramData\ClaudeCode"),
+        ];
+        for var in ["ProgramFiles", "ProgramData"] {
+            if let Some(dir) = std::env::var_os(var) {
+                let dir = PathBuf::from(dir).join("ClaudeCode");
+                if !dirs
+                    .iter()
+                    .any(|d| d.as_os_str().eq_ignore_ascii_case(dir.as_os_str()))
+                {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
     } else {
         vec![
             PathBuf::from("/etc/claude-code"),
@@ -76,10 +85,8 @@ pub fn touch(path: &Path) {
     }
 }
 
-/// Create `dir`, which must not exist yet, so that only this user can enter it. On Windows
-/// the directory only inherits its parent's ACL, which is private under the user's own
-/// temporary or profile directory but not under, say, `C:\paja`; owner-only ACLs come with
-/// the hook's Windows port (#23), and Paja starts no agents on Windows before that.
+/// Create `dir`, which must not exist yet, so that only this user can enter it: mode 0700 on
+/// Unix, an owner-only ACL on Windows.
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -87,11 +94,53 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         std::fs::DirBuilder::new().mode(0o700).create(dir)
     }
     #[cfg(not(unix))]
-    std::fs::create_dir(dir)
+    {
+        std::fs::create_dir(dir)?;
+        restrict_to_owner(dir).inspect_err(|_| {
+            let _ = std::fs::remove_dir(dir);
+        })
+    }
+}
+
+/// On Windows, replace `dir`'s ACL with one that lets only the current user in, for it and
+/// everything created in it; a new directory otherwise inherits its parent's, which is not
+/// private under, say, `C:\paja`. Unix needs nothing: Paja creates such directories 0700.
+pub fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let system32 = PathBuf::from(system).join("System32");
+    let failed = |what: &str| std::io::Error::other(format!("{what} for {}", dir.display()));
+    // The current user's SID, from `whoami /user /fo csv /nh`: "DOMAIN\user","S-1-5-...".
+    let who = Command::new(system32.join("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()?;
+    let sid = String::from_utf8_lossy(&who.stdout)
+        .trim()
+        .rsplit(',')
+        .next()
+        .map(|field| field.trim_matches('"').to_string())
+        .filter(|sid| sid.starts_with("S-1-"))
+        .ok_or_else(|| failed("`whoami /user` gave no SID"))?;
+    let status = Command::new(system32.join("icacls.exe"))
+        .arg(dir)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("*{sid}:(OI)(CI)F"),
+            "/q",
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(failed("`icacls` could not make an owner-only ACL"));
+    }
+    Ok(())
 }
 
 /// Create `path`, which must not exist yet, as a file only this user can read, write or run
-/// (on Windows: with its parent's ACL, as `create_private_dir` says).
+/// (on Windows: inside a directory `create_private_dir` or `restrict_to_owner` made).
 pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = std::fs::OpenOptions::new();
@@ -112,7 +161,8 @@ pub fn shell(script: &str) -> Result<Command> {
     Ok(cmd)
 }
 
-fn posix_shell() -> Result<PathBuf> {
+/// The POSIX shell: `sh` on Unix, Git for Windows' `sh.exe` on Windows.
+pub fn posix_shell() -> Result<PathBuf> {
     if !cfg!(windows) {
         return Ok(PathBuf::from("sh"));
     }
@@ -151,14 +201,102 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// Why `paja run` and `paja hook` refuse to work here, if they do. On Windows the deny-list
-/// hook doesn't yet understand Windows paths (drive letters, `\\` separators, case-insensitive
-/// names), so it can't guard an agent; until it does, both refuse rather than run unguarded.
-pub fn unguarded() -> Option<&'static str> {
-    cfg!(windows).then_some(
-        "the deny-list hook doesn't understand Windows paths yet, so Paja won't start agents \
-         on Windows (they would run unguarded); that port is the next step of issue #23",
-    )
+/// Where cargo and rustup look for their homes when `CARGO_HOME` and `RUSTUP_HOME` are unset:
+/// `HOME` on Unix, the user profile on Windows (they don't read `HOME` there).
+pub fn tool_home() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(home_dir)
+    } else {
+        home_dir()
+    }
+}
+
+/// A path written in a shell command, as the program it is passed to will see it. Git Bash
+/// turns `/c/Users/me` into `C:\Users\me` for Windows programs; elsewhere a path is itself.
+pub fn shell_path(word: &str) -> PathBuf {
+    if cfg!(windows) {
+        let mut chars = word.chars();
+        if let (Some('/'), Some(drive), rest) = (chars.next(), chars.next(), chars.as_str()) {
+            if drive.is_ascii_alphabetic() && (rest.is_empty() || rest.starts_with('/')) {
+                return PathBuf::from(
+                    format!(
+                        "{}:\\{}",
+                        drive.to_ascii_uppercase(),
+                        rest.trim_start_matches('/')
+                    )
+                    .replace('/', "\\"),
+                );
+            }
+        }
+    }
+    PathBuf::from(word)
+}
+
+/// Why the hook can't judge `text` as a path here, if it can't. On Windows the file system
+/// reads some spellings differently from how they look: device and UNC paths (`\\?\`,
+/// `\\server\share`), drive-relative paths (`C:foo`), paths rooted without a drive (`\x`,
+/// which a tool may map to another drive or Git's own directory), names with a trailing dot
+/// or space (`.git.` is `.git`), alternate data streams (`a:stream`, unless `colons` allows
+/// colons, as in git's `HEAD:path`), reserved device names (`NUL`, `COM1`) and characters
+/// Windows forbids in names. All are refused rather than interpreted. (An 8.3 short name such
+/// as `GIT~1` only names something that exists, and the hook resolves existing paths to their
+/// long names, so it needs no rule.)
+/// Nothing is refused on Unix.
+pub fn path_problem(text: &str, colons: bool) -> Option<String> {
+    if !cfg!(windows) || text.is_empty() {
+        return None;
+    }
+    let refuse = |why: &str| {
+        Some(format!(
+            "`{text}` {why}; give a plain path such as C:\\dir\\file or dir\\file"
+        ))
+    };
+    let bytes = text.as_bytes();
+    let sep = |b: u8| b == b'/' || b == b'\\';
+    if sep(bytes[0]) && bytes.get(1).copied().is_some_and(sep) {
+        return refuse("is a device or network path");
+    }
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if drive && !bytes.get(2).copied().is_some_and(sep) {
+        return refuse("is relative to a drive's current directory");
+    }
+    if sep(bytes[0]) {
+        return refuse("is rooted without a drive letter");
+    }
+    let rest = if drive { &text[2..] } else { text };
+    for name in rest.split(['/', '\\']).filter(|n| !n.is_empty()) {
+        if name == "." || name == ".." {
+            continue;
+        }
+        if name.ends_with(['.', ' ']) {
+            return refuse("has a name ending in a dot or space, which Windows drops");
+        }
+        if name.contains(':') && !colons {
+            return refuse("names an alternate data stream");
+        }
+        if name.contains(['<', '>', '"', '|', '?', '*']) || name.chars().any(|c| c.is_control()) {
+            return refuse("holds a character Windows doesn't allow in names");
+        }
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or(name)
+            .trim_end()
+            .to_ascii_uppercase();
+        let reserved = matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+        if reserved {
+            return refuse("names a device");
+        }
+    }
+    None
 }
 
 /// Quote `path` as one word of a hook command line. Claude Code runs hooks with the system
