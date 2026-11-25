@@ -733,6 +733,7 @@ impl Factory {
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp '\\([^']*\\)'.*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
@@ -922,6 +923,29 @@ fn a_second_review_judges_only_the_fix() {
         rereview.contains("Judge only the fix: `git diff "),
         "{args}"
     );
+}
+
+#[test]
+fn a_fix_round_without_commits_is_not_reviewed() {
+    // After a review asks for changes, a round that commits nothing goes back to the builder
+    // instead of letting the reviewer land the unchanged branch.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    std::fs::write(f.tmp.path().join("lazy"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 3, "{report}");
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert_eq!(args.matches("--json-schema").count(), 2, "{args}");
+    assert!(args.contains("made no new commits"), "{args}");
+    // The earlier round's follow-ups reach the re-reviewer.
+    let rereview = args
+        .split("\n-p ")
+        .filter(|call| call.contains("--json-schema"))
+        .nth(1)
+        .unwrap_or_default();
+    assert!(rereview.contains("Tidy the helper"), "{args}");
 }
 
 #[test]

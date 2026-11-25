@@ -77,6 +77,8 @@ struct Prior {
     reviewed: String,
     /// The blockers they named.
     blockers: String,
+    /// Their non-blocking findings, for the next reviewer to keep or drop.
+    follow_ups: Vec<String>,
 }
 
 pub struct RunOptions<'a> {
@@ -210,6 +212,17 @@ fn run_item(
             record_round(home, item, round, "no_change", &feedback)?;
             continue;
         }
+        // A round after a review must commit a fix; an empty fix is never reviewed.
+        if let Some(prior) = &prior {
+            if git(&env.path, &["rev-parse", "HEAD"])? == prior.reviewed {
+                feedback = format!(
+                    "The previous round made no new commits. Fix these blockers and commit:\n\n{}",
+                    prior.blockers
+                );
+                record_round(home, item, round, "no_change", &feedback)?;
+                continue;
+            }
+        }
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
         let guard = GitGuard::new(&env.path)?;
         let result = run_checks(&env.path, &checks);
@@ -281,8 +294,23 @@ fn run_item(
         }
         if verdicts.iter().all(|v| *v == "land") {
             let report = land(home, repo, &env, item, round, &checked)?;
-            if let RunReport::Landed { pr, .. } = &report {
-                file_follow_ups(home, repo, item, pr, &follow_ups);
+            match &report {
+                RunReport::Landed { pr, .. } => file_follow_ups(home, repo, item, pr, &follow_ups),
+                // Not landed after all (CI): keep the findings in the log, for later.
+                _ => {
+                    for finding in &follow_ups {
+                        let _ = record(
+                            home,
+                            EV_FOLLOW_UP,
+                            json!({
+                                "number": item.number,
+                                "finding": finding,
+                                "issue": null,
+                                "error": "not filed: the change did not land",
+                            }),
+                        );
+                    }
+                }
             }
             return Ok(report);
         }
@@ -294,16 +322,26 @@ fn run_item(
             );
             return escalated(home, repo, &env, item, &question, round);
         }
+        // A `changes` verdict without comments still names something: its summary.
         let blockers = reviews
             .iter()
             .filter(|r| r.verdict == "changes")
-            .map(|r| r.comments.as_str())
+            .map(|r| {
+                if r.comments.trim().is_empty() {
+                    r.summary.as_str()
+                } else {
+                    r.comments.as_str()
+                }
+            })
+            .filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
         feedback = format!("A reviewer asked for changes:\n\n{blockers}");
-        prior = Some(Prior {
+        // Without named blockers there is nothing to narrow the next review to.
+        prior = (!blockers.is_empty()).then(|| Prior {
             reviewed: checked,
             blockers,
+            follow_ups: follow_ups.clone(),
         });
     }
     let question = format!(
@@ -391,9 +429,15 @@ fn review(
         Some(prior) => format!(
             "An earlier review of this change (at {reviewed}) found these blockers:\n\n{blockers}\n\n\
              Judge only the fix: `git diff {reviewed}..HEAD`. Land it if it resolves those \
-             blockers and adds none; don't reopen what that review accepted.",
+             blockers and adds none; don't reopen what that review accepted. It also noted these \
+             follow-ups; repeat in your `follow_ups` the ones that still apply:\n\n{follow_ups}\n",
             reviewed = prior.reviewed,
-            blockers = prior.blockers
+            blockers = prior.blockers,
+            follow_ups = if prior.follow_ups.is_empty() {
+                "(none)".to_string()
+            } else {
+                prior.follow_ups.join("\n\n")
+            }
         ),
     };
     let prompt = format!(
@@ -406,8 +450,9 @@ fn review(
          is a bug in what the issue asks for, a security hole the change opens, a broken \
          CLAUDE.md rule, or missing tests for the new behaviour. Anything else, including \
          hardening ideas, edge cases outside the issue and nits, goes in `follow_ups`, one \
-         finding each, starting with a short title line, at most five; Paja files them as issues \
-         after landing, and they never hold the change up. You may run cargo and read-only git; you \
+         finding each, starting with a short title line, at most five; Paja files them as public \
+         issues after landing, so never copy secrets, environment details or run output into \
+         them. They never hold the change up. You may run cargo and read-only git; you \
          can't change files.\n\n\
          Issue #{number}: {title}\n\n{body}\n",
         number = item.number,
@@ -1283,9 +1328,15 @@ fn file_follow_ups(home: &Home, repo: &Path, item: &WorkItem, pr: &str, findings
         ));
     }
     for finding in &findings {
+        // Review text came from an agent that read untrusted code; keep each issue short.
+        let finding: String = finding.chars().take(4000).collect();
         let title: String = finding
             .lines()
-            .map(|line| line.trim().trim_start_matches(['#', '-', '*', ' ']).trim())
+            .map(|line| {
+                line.trim()
+                    .trim_matches(['#', '-', '*', '_', '`', ' '])
+                    .trim()
+            })
             .find(|line| !line.is_empty())
             .unwrap_or("Review follow-up")
             .chars()

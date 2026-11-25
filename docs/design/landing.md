@@ -22,9 +22,12 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   broken `CLAUDE.md` rule, or missing tests for the new behaviour. Every other finding (hardening ideas, edge cases
   outside the issue, nits) is a follow-up: once the change lands, Mestari files the landing round's follow-ups (at most
   five) as `paja-follow-up` issues. Jono doesn't import that label, so a person queues one by relabelling it `paja`:
-  reviewers suggest work, people set intent.
+  reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and repeats the ones
+  that still apply. If the change doesn't land after all (CI fails), the follow-ups stay in the event log unfiled.
+  Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them.
 - **A re-review judges the fix.** After a round of changes, the next reviewer gets the earlier blockers and reads only
-  the diff since the commit that was reviewed, not the whole change again. High-risk changes are the exception: both
+  the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
+  builder without a review. High-risk changes are the exception: both
   reviewers read the whole change every round, since they must agree on all of it.
 - **Each review is a fresh, short session.** Reviewers never share context with the builder or with each other, which
   keeps them independent and keeps each session small.
