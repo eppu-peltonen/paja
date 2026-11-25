@@ -335,6 +335,87 @@ pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
     Ok(report)
 }
 
+/// Answer an escalated item: post the person's answer as a comment on its issue, then queue it
+/// again so the next run picks it up with the answer on the issue.
+pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkItem> {
+    let item = get(home, number)?;
+    if item.status != Status::Escalated {
+        bail!(
+            "work item #{number} is {}, not escalated, so there is no question to answer; \
+             check `paja work show {number}`",
+            item.status.as_str()
+        );
+    }
+    if text.trim().is_empty() {
+        bail!("the answer for #{number} is empty; say what Paja should do");
+    }
+    // gh runs git in the checkout to find its GitHub repository.
+    crate::ahjo::ensure_untampered(home, repo)?;
+    gh(
+        repo,
+        &[
+            "issue",
+            "comment",
+            &number.to_string(),
+            "--body",
+            &format!("**Answer to Paja's question.**\n\n{text}"),
+        ],
+    )?;
+    set_status(home, number, Status::Queued, None)
+}
+
+/// A GitHub issue filed for Jono.
+#[derive(Debug, Clone, Serialize)]
+pub struct Filed {
+    pub url: String,
+}
+
+/// File a new GitHub issue labelled `paja`, for example a spec a person approved. The next sync
+/// imports it as queued work.
+pub fn file(home: &Home, repo: &Path, title: &str, body: &str) -> Result<Filed> {
+    if title.trim().is_empty() {
+        bail!("the issue needs a title; pass --title");
+    }
+    crate::ahjo::ensure_untampered(home, repo)?;
+    let url = gh(
+        repo,
+        &[
+            "issue", "create", "--label", LABEL, "--title", title, "--body", body,
+        ],
+    )?;
+    Ok(Filed {
+        url: url.lines().last().unwrap_or_default().trim().to_string(),
+    })
+}
+
+fn gh(repo: &Path, args: &[&str]) -> Result<String> {
+    if !repo.is_dir() {
+        bail!(
+            "{} is not a directory; pass --repo with a path inside the checkout",
+            repo.display()
+        );
+    }
+    let gh = gh_program();
+    let output = Command::new(&gh)
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .with_context(|| {
+            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+        })?;
+    if !output.status.success() {
+        bail!(
+            "`{gh} {} {}` failed in {}: {}; check `gh auth status` and that this checkout has a \
+             GitHub remote",
+            args[0],
+            args[1],
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// `gh`, or the program named by `PAJA_GH` (tests point it at a fake).
 pub fn gh_program() -> String {
     std::env::var("PAJA_GH").unwrap_or_else(|_| "gh".to_string())

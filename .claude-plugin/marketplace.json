@@ -1,0 +1,13 @@
+{
+  "name": "paja",
+  "owner": {
+    "name": "Paja"
+  },
+  "plugins": [
+    {
+      "name": "paja",
+      "source": "./plugin",
+      "description": "Paja's core as MCP tools, plus /paja:status, /paja:answer and /paja:spec."
+    }
+  ]
+}

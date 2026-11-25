@@ -101,6 +101,25 @@ enum WorkCommand {
     Next,
     /// Take the next item and mark it active in one step, so two runs never share one.
     Claim,
+    /// Answer an escalated item: comment the answer on its issue and queue it again.
+    Answer {
+        number: u64,
+        /// What Paja should do, posted as a comment on the issue.
+        text: String,
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// File a new GitHub issue labelled `paja` (uses `gh`); the next sync queues it.
+    File {
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Set an item's status: queued, active, landed or escalated.
     Set {
         number: u64,
@@ -343,6 +362,14 @@ fn run(cli: &Cli) -> Result<()> {
                 let status = jono::parse_status(status)?;
                 let item = jono::set_status(&home, *number, status, note.as_deref())?;
                 emit(cli, serde_json::to_value(&item)?, || describe_item(&item));
+            }
+            WorkCommand::Answer { number, text, repo } => {
+                let item = jono::answer(&home, &std::path::absolute(repo)?, *number, text)?;
+                emit(cli, serde_json::to_value(&item)?, || describe_item(&item));
+            }
+            WorkCommand::File { title, body, repo } => {
+                let filed = jono::file(&home, &std::path::absolute(repo)?, title, body)?;
+                emit(cli, serde_json::to_value(&filed)?, || filed.url.clone());
             }
             WorkCommand::Next => {
                 let item = jono::next(&home)?;

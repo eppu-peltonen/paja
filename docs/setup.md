@@ -48,6 +48,21 @@ cargo install --path crates/paja
 paja run --every 5
 ```
 
+## Using Paja from Claude Code
+
+The Claude Code plugin in `plugin/` starts `paja mcp`, so Paja's core shows up as MCP tools, and adds three skills:
+`/paja:status` (what is queued, active or waiting on you), `/paja:answer` (answer a question Paja asked on an issue and
+queue the item again) and `/paja:spec` (turn the conversation into an issue labelled `paja`, shown to you to approve
+first). With `paja` installed on `PATH` as above, install the plugin with one command, the same on Windows, Linux and
+macOS:
+
+```sh
+claude plugin install paja --marketplace eppu-peltonen/paja
+```
+
+Inside Claude Code, `/plugin install paja --marketplace eppu-peltonen/paja` does the same. Start Claude Code from inside
+the repository's checkout, because the MCP tools work on the checkout they run in.
+
 ## What happens next
 
 `paja run --every 5` takes the oldest open issue labelled `paja`. It builds the change, runs Vasara's checks, has it
