@@ -189,10 +189,15 @@ fn run_item(
                 "diff",
                 "--name-only",
                 "--no-renames",
+                // NUL-separated paths are never quoted, whatever characters they hold.
+                "-z",
                 &format!("{base}...HEAD"),
             ],
         )?;
-        let risky = changed.lines().any(|path| is_high_risk(path, &high_risk));
+        let risky = changed
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
         let reviews = (0..reviewers)
             .map(|_| review(home, &env, item, base))
@@ -578,6 +583,9 @@ fn discard(env: &Env, to: &str) -> Result<()> {
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
 /// Before handing them out, check that the hook really blocks a push and allows a build; an
 /// agent never starts under a hook that doesn't.
+/// Keeps stamp directory names unique within one process.
+static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, PathBuf, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
@@ -607,9 +615,10 @@ fn hook_settings(root: &Path, home: &Home, read_only: bool) -> Result<(String, P
     // sits in a fresh directory only this user can enter, so nobody can plant it beforehand;
     // creating the directory fails if the name is already taken.
     let private = std::env::temp_dir().join(format!(
-        "paja-stamp-{}-{}",
+        "paja-stamp-{}-{}-{}",
         std::process::id(),
-        crate::events::now_ms()
+        crate::events::now_ms(),
+        STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -1265,7 +1274,7 @@ pub fn is_tampered(err: &anyhow::Error) -> bool {
 
 struct GitGuard {
     files: Vec<PathBuf>,
-    hooks: PathBuf,
+    hooks: Vec<PathBuf>,
     snapshot: Vec<Option<Vec<u8>>>,
 }
 
@@ -1280,7 +1289,14 @@ impl GitGuard {
             })
         };
         let (own, common) = (dir("--absolute-git-dir")?, dir("--git-common-dir")?);
-        let hooks = common.join("hooks");
+        // The repository's hooks, and wherever the owner's `core.hooksPath` points: gh runs
+        // git without Paja's overrides.
+        let mut hooks = vec![common.join("hooks")];
+        if let Ok(path) = git(worktree, &["config", "--path", "core.hooksPath"]) {
+            if !path.is_empty() {
+                hooks.push(worktree.join(path));
+            }
+        }
         // The owner's global configuration, which Mestari's own git reads.
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let xdg = std::env::var_os("XDG_CONFIG_HOME")
@@ -1370,9 +1386,15 @@ impl GitGuard {
     }
 
     fn read(&self) -> Vec<Option<Vec<u8>>> {
-        let mut hooks: Vec<PathBuf> = std::fs::read_dir(&self.hooks)
-            .map(|entries| entries.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default();
+        let mut hooks: Vec<PathBuf> = self
+            .hooks
+            .iter()
+            .flat_map(|dir| {
+                std::fs::read_dir(dir)
+                    .map(|entries| entries.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
         hooks.sort();
         self.files
             .iter()
@@ -1393,9 +1415,9 @@ impl GitGuard {
                 "git's configuration, hooks or attributes ({}, {} or the owner's global git \
                  configuration) changed while {what} ran, so Paja stopped before running git \
                  there again; a person must check and restore those files before running Paja \
-                 again",
+                 again (your own edit to the global configuration during a run also stops it)",
                 self.files[0].display(),
-                self.hooks.display()
+                self.hooks[0].display()
             ))
             .into());
         }
