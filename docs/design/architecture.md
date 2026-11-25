@@ -103,7 +103,10 @@ stdout keeps its JSON. `paja run --every 5` keeps going, checking an empty queue
 
 ## The deny-list hook
 
-Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config` and settings that send each tool
+Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config`, `--tools` naming only the
+built-in tools its role uses (`Read,Edit,Write,Glob,Grep,Bash` for builders, `Read,Glob,Grep,Bash` for reviewers, so
+no subagent or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the worktree's path and git
+status go in the first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool
 call to `paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file
 and no MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it
 off. Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the

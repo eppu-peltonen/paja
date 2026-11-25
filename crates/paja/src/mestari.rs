@@ -866,6 +866,16 @@ fn review(
     Ok((review, used))
 }
 
+/// The built-in tools an agent gets: reviewers read and run commands, builders also edit.
+/// `--allowedTools` and the deny-list hook still decide what each call may do.
+fn agent_tools(read_only: bool) -> &'static str {
+    if read_only {
+        "Read,Glob,Grep,Bash"
+    } else {
+        "Read,Edit,Write,Glob,Grep,Bash"
+    }
+}
+
 /// Run headless Claude Code in the environment and return its JSON result.
 #[allow(clippy::too_many_arguments)]
 fn claude(
@@ -913,6 +923,13 @@ fn claude(
     .args(["--append-system-prompt", &harness])
     // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
     .arg("--strict-mcp-config")
+    // Only the built-in tools the role uses are defined at all, so no other tool (subagents,
+    // web tools) reaches the agent or spends prompt tokens on its definition.
+    .args(["--tools", agent_tools(read_only)])
+    // Per-machine details (the worktree's path, its git status) go in the first message
+    // instead of the system prompt, so sessions in different environments share a cached
+    // prompt prefix.
+    .arg("--exclude-dynamic-system-prompt-sections")
     // The model and effort come from `.paja/models` on main, so a change can't pick the models
     // that judge it.
     .args(model_args)

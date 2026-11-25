@@ -851,6 +851,28 @@ fn run_builds_reviews_and_lands_an_issue() {
     let builder = args.lines().find(|l| !l.contains("--json-schema")).unwrap();
     assert!(reviewer.contains("--read-only"), "{reviewer}");
     assert!(!builder.contains("--read-only"), "{builder}");
+    // Each role gets only the built-in tools it uses: no subagent or web tool is defined.
+    let calls: Vec<&str> = args.split("\n-p ").collect();
+    let reviewer = calls.iter().find(|c| c.contains("--json-schema")).unwrap();
+    let builder = calls.iter().find(|c| !c.contains("--json-schema")).unwrap();
+    assert!(
+        reviewer.contains("--tools Read,Glob,Grep,Bash --exclude-dynamic-system-prompt-sections"),
+        "{reviewer}"
+    );
+    assert!(
+        builder.contains(
+            "--tools Read,Edit,Write,Glob,Grep,Bash --exclude-dynamic-system-prompt-sections"
+        ),
+        "{builder}"
+    );
+    for call in &calls {
+        let tools = call.split("--tools ").nth(1).unwrap_or_default();
+        let tools = tools.split(' ').next().unwrap_or_default();
+        assert!(
+            !tools.contains("Agent") && !tools.contains("Task"),
+            "{call}"
+        );
+    }
     assert!(
         args.contains("PreToolUse") && args.contains("hook --root") && args.contains("work-5"),
         "{args}"
