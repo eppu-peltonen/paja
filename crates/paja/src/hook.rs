@@ -582,7 +582,12 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
 /// One piece of a command line.
 #[derive(Debug, PartialEq)]
 enum Token {
-    Word(String),
+    /// A word, and whether any part of it was quoted. Bash never reads a word with quotes
+    /// as an assignment: `'RUST_LOG=x' cargo` runs a program named `RUST_LOG=x`.
+    Word {
+        text: String,
+        quoted: bool,
+    },
     And,
     Pipe,
     StderrToStdout,
@@ -594,17 +599,23 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
+    let mut quoted = false;
     let mut chars = command.chars().peekable();
-    let flush = |word: &mut String, in_word: &mut bool, tokens: &mut Vec<Token>| {
-        if *in_word {
-            tokens.push(Token::Word(std::mem::take(word)));
-            *in_word = false;
-        }
-    };
+    let flush =
+        |word: &mut String, in_word: &mut bool, quoted: &mut bool, tokens: &mut Vec<Token>| {
+            if *in_word {
+                tokens.push(Token::Word {
+                    text: std::mem::take(word),
+                    quoted: std::mem::take(quoted),
+                });
+                *in_word = false;
+            }
+        };
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
                 in_word = true;
+                quoted = true;
                 loop {
                     match chars.next() {
                         Some('\'') => break,
@@ -615,6 +626,7 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             }
             '"' => {
                 in_word = true;
+                quoted = true;
                 loop {
                     match chars.next() {
                         Some('"') => break,
@@ -626,14 +638,14 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
                     }
                 }
             }
-            ' ' | '\t' => flush(&mut word, &mut in_word, &mut tokens),
+            ' ' | '\t' => flush(&mut word, &mut in_word, &mut quoted, &mut tokens),
             '&' if chars.peek() == Some(&'&') => {
                 chars.next();
-                flush(&mut word, &mut in_word, &mut tokens);
+                flush(&mut word, &mut in_word, &mut quoted, &mut tokens);
                 tokens.push(Token::And);
             }
             '|' if chars.peek() != Some(&'|') => {
-                flush(&mut word, &mut in_word, &mut tokens);
+                flush(&mut word, &mut in_word, &mut quoted, &mut tokens);
                 tokens.push(Token::Pipe);
             }
             '2' if !in_word && next_is(&mut chars, ">&1") => {
@@ -651,7 +663,7 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             c => return Err(format!("`{c}` outside quotes")),
         }
     }
-    flush(&mut word, &mut in_word, &mut tokens);
+    flush(&mut word, &mut in_word, &mut quoted, &mut tokens);
     Ok(tokens)
 }
 
@@ -680,7 +692,9 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
     // Every word but a commit message may not name a credential path.
     let mut message = false;
     for token in &tokens {
-        let Token::Word(word) = token else { continue };
+        let Token::Word { text: word, .. } = token else {
+            continue;
+        };
         if std::mem::take(&mut message) {
             continue;
         }
@@ -697,15 +711,22 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
         let moves = i == 0 && stages.len() == 1;
         for (j, stage) in stages.into_iter().enumerate() {
             let mut words: Vec<&str> = Vec::new();
+            // Leading unquoted `NAME=value` words, which bash reads as assignments.
+            let mut assignments = 0;
             for (k, token) in stage.iter().enumerate() {
                 match token {
-                    Token::Word(w) => words.push(w),
+                    Token::Word { text, quoted } => {
+                        if words.len() == assignments && !quoted && is_assignment(text) {
+                            assignments += 1;
+                        }
+                        words.push(text);
+                    }
                     Token::StderrToStdout if k == stage.len() - 1 => {}
                     _ => return Some(format!("a misplaced operator; {SHAPE}")),
                 }
             }
             let reason = if j == 0 {
-                check_simple(&words, moves, &mut here, b)
+                check_simple(&words, assignments, moves, &mut here, b)
             } else {
                 check_pipe_target(&words)
             };
@@ -717,11 +738,14 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
     None
 }
 
-fn check_simple(words: &[&str], first: bool, here: &mut PathBuf, b: &Bounds) -> Option<String> {
-    let start = words
-        .iter()
-        .position(|w| !is_assignment(w))
-        .unwrap_or(words.len());
+/// `words[..start]` are the assignments in front of the program.
+fn check_simple(
+    words: &[&str],
+    start: usize,
+    first: bool,
+    here: &mut PathBuf,
+    b: &Bounds,
+) -> Option<String> {
     for assignment in &words[..start] {
         let name = assignment.split_once('=').map_or("", |(n, _)| n);
         if !ALLOWED_VARIABLES.contains(&name) {
@@ -1171,6 +1195,18 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_word_is_never_an_assignment() {
+        assert_eq!(bash("RUST_LOG=debug cargo test"), None);
+        for bad in [
+            "'RUST_LOG=x' cargo test",
+            "\"RUST_LOG=x\" cargo test",
+            "RUST_LOG'=x' cargo test",
+        ] {
+            assert!(bash(bad).is_some(), "{bad}");
+        }
+    }
+
+    #[test]
     fn reaching_outside_is_blocked_even_when_hidden() {
         for bad in [
             "git push origin main",
@@ -1598,6 +1634,15 @@ mod windows_tests {
         }
         fn bash(&self, command: &str) -> Option<String> {
             self.decide("Bash", json!({ "command": command }))
+        }
+    }
+
+    #[test]
+    fn a_quoted_word_is_never_an_assignment() {
+        let e = env();
+        assert_eq!(e.bash("RUST_LOG=debug cargo test"), None);
+        for bad in ["'RUST_LOG=x' cargo test", "\"RUST_LOG=x\" cargo test"] {
+            assert!(e.bash(bad).is_some(), "{bad}");
         }
     }
 
