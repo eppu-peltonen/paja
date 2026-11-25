@@ -206,17 +206,10 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 return Err(err);
             }
             let asked = comment(&repo, &item, &question);
-            progress(&format!(
-                "#{} stopped on an error and was parked; {}",
+            progress(&parked_line(
+                &format!("#{} stopped on an error and was parked", item.number),
                 item.number,
-                match &asked {
-                    Ok(()) => "see the question on the issue".to_string(),
-                    Err(err) => format!(
-                        "couldn't comment on the issue ({err:#}), so see `paja work show {}` for \
-                         the question",
-                        item.number
-                    ),
-                }
+                asked.err(),
             ));
             let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
             Ok(RunReport::Escalated {
@@ -1373,15 +1366,11 @@ fn escalated(
 ) -> Result<RunReport> {
     // The branch keeps the work; the worktree and its ports are freed.
     let _ = ahjo::remove(home, &env.name, true);
-    let asked = escalate(home, repo, item, question, rounds)?;
-    progress(&format!(
-        "#{n} needs a decision; {where_} (then `paja work set {n} queued`)",
-        n = item.number,
-        where_ = if asked {
-            "asked on the issue, answer there"
-        } else {
-            "couldn't comment on the issue, so see `paja work show` for the question"
-        }
+    let failed = escalate(home, repo, item, question, rounds)?;
+    progress(&parked_line(
+        &format!("#{} needs a decision", item.number),
+        item.number,
+        failed,
     ));
     Ok(RunReport::Escalated {
         number: item.number,
@@ -1390,15 +1379,28 @@ fn escalated(
     })
 }
 
-/// Ask the person on the issue, and park the item until they answer. Says whether the comment
-/// reached the issue.
+/// The progress line for a parked item: where the question is and how to retry come first,
+/// so a long gh error at the end can't push them out of the line.
+fn parked_line(what: &str, number: u64, comment_error: Option<anyhow::Error>) -> String {
+    let retry = format!("then `paja work set {number} queued`");
+    match comment_error {
+        None => format!("{what}; asked on the issue, answer there ({retry})"),
+        Some(err) => format!(
+            "{what}; couldn't comment on the issue, so see `paja work show {number}` for the \
+             question ({retry}); gh said: {err:#}"
+        ),
+    }
+}
+
+/// Ask the person on the issue, and park the item until they answer. Returns the comment's
+/// error when it didn't reach the issue.
 fn escalate(
     home: &Home,
     repo: &Path,
     item: &WorkItem,
     question: &str,
     rounds: u32,
-) -> Result<bool> {
+) -> Result<Option<anyhow::Error>> {
     // Park the item first, so it never stays active if the comment fails.
     jono::set_status(home, item.number, Status::Escalated, Some(question))?;
     record(
@@ -1407,14 +1409,8 @@ fn escalate(
         json!({ "number": item.number, "rounds": rounds }),
     )?;
     // The item is parked either way; a failed comment must not escalate it a second time.
-    if let Err(err) = comment(repo, item, question) {
-        eprintln!(
-            "warning: couldn't comment on issue #{}: {err:#}",
-            item.number
-        );
-        return Ok(false);
-    }
-    Ok(true)
+    // The caller reports it, cleaned for the terminal.
+    Ok(comment(repo, item, question).err())
 }
 
 /// The label follow-up issues get. Jono imports only `paja`, so a follow-up waits until a
