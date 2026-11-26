@@ -26,7 +26,10 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   five) as `paja-follow-up` issues. Jono doesn't import that label, so a person queues one by relabelling it `paja`:
   reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and repeats the ones
   that still apply. If the change doesn't land after all (CI fails), the follow-ups stay in the event log unfiled.
-  Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them.
+  Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them, and
+  Mestari checks for itself too: before filing, it replaces tokens that look like GitHub, Anthropic, AWS, Slack or
+  bearer credentials with `<redacted>`, and the factory home, the repository and the user's home directory with
+  `<factory home>`, `<repository>` and `<home>`.
 - **A re-review judges the fix.** After a round of changes, the next reviewer gets the earlier blockers and reads only
   the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
   builder without a review. High-risk changes are the exception: both
