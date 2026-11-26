@@ -1295,7 +1295,7 @@ impl Factory {
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper, which logs ghp_ABCDEFGHIJKLMNOPQRSTuvwx\\\"]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
@@ -1394,6 +1394,11 @@ fn run_builds_reviews_and_lands_an_issue() {
     // work.
     assert!(
         log.contains("issue create --label paja-follow-up --title Tidy the helper"),
+        "{log}"
+    );
+    // A token in a finding never reaches the public issue.
+    assert!(
+        !log.contains("ghp_ABCDEFGHIJKLMNOPQRSTuvwx") && log.contains("logs <redacted>"),
         "{log}"
     );
     // Every agent runs under the deny-list hook, bounded to its environment, and with no
