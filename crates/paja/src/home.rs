@@ -90,6 +90,36 @@ impl Home {
     }
 }
 
+impl Home {
+    /// Take the lock a `paja run` holds while it works on item `number`, without waiting.
+    /// None when another live run holds it. Like the home lock it is an OS file lock, so it is
+    /// free again once that run's process is gone, however it stopped.
+    pub fn try_run_lock(&self, number: u64) -> Result<Option<RunLock>> {
+        let dir = self.root.join("runs");
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(format!("{number}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(RunLock { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(err)) => {
+                Err(err).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+}
+
+/// Held by the `paja run` working on an item, for as long as it works on it.
+#[derive(Debug)]
+pub struct RunLock {
+    _file: File,
+}
+
 /// Held while writing; the lock is released when this is dropped or the process exits.
 #[derive(Debug)]
 pub struct HomeLock {

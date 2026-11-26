@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::events::Event;
-use crate::home::Home;
+use crate::home::{Home, RunLock};
 use crate::mestari::{StepUsage, EV_ROUND};
 
 /// Most issues one sync reads. A sync that hits it refuses to close anything.
@@ -169,6 +169,10 @@ struct StatusChange {
     number: u64,
     status: Status,
     note: Option<String>,
+    /// Set when `paja run` claimed the item, so a run that stopped can be told apart from a
+    /// person's or another worker's claim. Absent in older logs.
+    #[serde(default)]
+    run: bool,
 }
 
 /// The queue, derived by replaying the event log.
@@ -300,6 +304,67 @@ pub fn claim(home: &Home) -> Result<Option<WorkItem>> {
     item.status = Status::Active;
     item.note = None;
     Ok(Some(item))
+}
+
+/// An item `paja run` claimed: the item, the lock that keeps other runs off it while this one
+/// works, and whether it was resumed from a run that stopped before finishing it.
+pub struct RunClaim {
+    pub item: WorkItem,
+    pub lock: RunLock,
+    pub resumed: bool,
+}
+
+/// What `paja run` works on next, under the home lock. An item an earlier `paja run` left
+/// active, and whose run is gone (stopped by Ctrl-C, a closed terminal or a reboot), comes
+/// first, so it is resumed instead of being skipped for good. Otherwise the next queued item is
+/// claimed. Items a person or another worker claimed with `paja work claim` are never taken.
+pub fn claim_for_run(home: &Home) -> Result<Option<RunClaim>> {
+    let lock = home.lock()?;
+    let log = home.events();
+    let events = log.read_all()?;
+    // Which items' latest status change was a run's claim.
+    let mut by_run = BTreeMap::new();
+    // Replaying first refuses a status change it can't read, so every one parses here.
+    let items = replay(&events)?;
+    for event in events.iter().filter(|e| e.kind == EV_STATUS) {
+        if let Ok(change) = serde_json::from_value::<StatusChange>(event.data.clone()) {
+            by_run.insert(change.number, change.run && change.status == Status::Active);
+        }
+    }
+    for item in items.values() {
+        let left =
+            item.open && item.status == Status::Active && by_run.get(&item.number) == Some(&true);
+        if !left {
+            continue;
+        }
+        if let Some(run_lock) = home.try_run_lock(item.number)? {
+            return Ok(Some(RunClaim {
+                item: item.clone(),
+                lock: run_lock,
+                resumed: true,
+            }));
+        }
+    }
+    for item in items.values().filter(|item| is_ready(item)) {
+        // A queued item a live run still holds (set back by hand mid-run) waits for that run.
+        let Some(run_lock) = home.try_run_lock(item.number)? else {
+            continue;
+        };
+        log.append(
+            &lock,
+            EV_STATUS,
+            json!({ "number": item.number, "status": Status::Active, "note": null, "run": true }),
+        )?;
+        let mut item = item.clone();
+        item.status = Status::Active;
+        item.note = None;
+        return Ok(Some(RunClaim {
+            item,
+            lock: run_lock,
+            resumed: false,
+        }));
+    }
+    Ok(None)
 }
 
 /// Read a status name as the CLI and MCP tools take it.
@@ -627,6 +692,30 @@ mod tests {
             set_status(&home, 1, Status::Landed, None).unwrap().status,
             Status::Landed
         );
+    }
+
+    #[test]
+    fn a_run_resumes_only_an_item_whose_run_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        apply(&home, &[issue(1, "a"), issue(2, "b"), issue(3, "c")]).unwrap();
+        // A worker's claim is never taken over by a run.
+        assert_eq!(claim(&home).unwrap().unwrap().number, 1);
+        let first = claim_for_run(&home).unwrap().unwrap();
+        assert_eq!((first.item.number, first.resumed), (2, false));
+        // While its run lives, the item is not handed out again.
+        let next = claim_for_run(&home).unwrap().unwrap();
+        assert_eq!((next.item.number, next.resumed), (3, false));
+        assert!(claim_for_run(&home).unwrap().is_none());
+        // Once that run is gone, its item is resumed.
+        drop(first);
+        let again = claim_for_run(&home).unwrap().unwrap();
+        assert_eq!((again.item.number, again.resumed), (2, true));
+        assert_eq!(again.item.status, Status::Active);
+        // An item that left `active` is never resumed.
+        drop(again);
+        set_status(&home, 2, Status::Escalated, Some("which API?")).unwrap();
+        assert!(claim_for_run(&home).unwrap().is_none());
     }
 
     #[test]

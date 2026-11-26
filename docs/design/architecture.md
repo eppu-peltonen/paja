@@ -75,7 +75,11 @@ escape hatch for an item that needs no answer.
 and `.paja/models` from `main` and checks them, claims the next item and creates an Ahjo environment `work-<issue>`
 from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
 claims anything, with an error naming the file and line, so one fix on `main` is all it takes; a `--every` loop
-reports it and tries again after its wait. Then, for at most three rounds:
+reports it and tries again after its wait. While it works on an item the run holds an OS file lock,
+`runs/<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
+claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
+stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its `work-<issue>` environment, and
+says so on stderr. Items claimed with `paja work claim` are never taken over. Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
    A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own
