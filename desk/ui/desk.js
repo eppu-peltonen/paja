@@ -50,6 +50,14 @@ function itemRow(item) {
   return el("li", {}, children);
 }
 
+// A message that stays until the person dismisses it, whatever the queue does meanwhile.
+function notice(text) {
+  const close = el("button", { type: "button", className: "quiet" }, "Dismiss");
+  const entry = el("li", {}, [el("span", {}, text), close]);
+  close.addEventListener("click", () => entry.remove());
+  document.getElementById("notices").append(entry);
+}
+
 // What the person has typed, by item, so a refresh or an error never loses it.
 const drafts = new Map();
 
@@ -59,12 +67,9 @@ function answerForm(item) {
   text.value = drafts.get(key) ?? "";
   text.addEventListener("input", () => drafts.set(key, text.value));
   const send = el("button", { type: "button" }, "Send answer");
-  const problem = el("p", { className: "error" });
-  problem.hidden = true;
   send.addEventListener("click", async () => {
     if (!text.value.trim()) {
-      problem.textContent = "Write an answer first.";
-      problem.hidden = false;
+      notice(`#${item.number}: write an answer first.`);
       return;
     }
     send.disabled = true;
@@ -75,8 +80,9 @@ function answerForm(item) {
     }).catch((err) => ({ error: String(err) }));
     send.disabled = false;
     if (result && result.error) {
-      problem.textContent = `error: ${result.error}`;
-      problem.hidden = false;
+      // A notice outlives the refresh that may rebuild this item (or, when the answer was
+      // recorded but posting it failed, drop it from "waiting on you").
+      notice(`#${item.number}: error: ${result.error}`);
       return;
     }
     drafts.delete(key);
@@ -85,7 +91,6 @@ function answerForm(item) {
   return el("div", { className: "answer" }, [
     text,
     el("div", { className: "actions" }, [send]),
-    problem,
     el("div", { className: "muted" }, [
       "Or answer with ",
       el("code", {}, `paja work answer ${item.number} "<your answer>"`),
