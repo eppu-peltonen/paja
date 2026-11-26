@@ -328,23 +328,40 @@ fn is_ready(item: &WorkItem) -> bool {
 /// An issue never depends on itself.
 pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
     let mut found = BTreeSet::new();
-    let mut fenced = false;
+    // Lines outside fenced code blocks. An unclosed fence hides nothing: its lines count too,
+    // so a stray fence can't make an item start early.
+    let mut counted: Vec<&str> = Vec::new();
+    // The open fence's character and length, and the lines inside it so far.
+    let mut fence: Option<(char, usize)> = None;
+    let mut inside: Vec<&str> = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
+        let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
+        let run = marker.map_or(0, |m| trimmed.chars().take_while(|c| *c == m).count());
+        match (fence, marker) {
+            (None, Some(m)) if run >= 3 => fence = Some((m, run)),
+            // Closed only by the same character, at least as many times, and nothing else.
+            (Some((open, len)), Some(m))
+                if m == open && run >= len && trimmed[run..].trim().is_empty() =>
+            {
+                fence = None;
+                inside.clear();
+            }
+            (Some(_), _) => inside.push(line),
+            (None, _) => counted.push(line),
         }
-        if fenced {
-            continue;
-        }
-        // Quote, bullet and numbered-list markers, then bold or italics.
-        let line = trimmed
-            .trim_start_matches(['>', '-', '*', '+', ' ', '\t'])
-            .trim_start_matches(|c: char| c.is_ascii_digit());
-        let line = line
-            .trim_start_matches(['.', ')'])
-            .trim_start_matches([' ', '\t', '*', '_']);
+    }
+    counted.extend(inside);
+    for line in counted {
+        let trimmed = line.trim_start();
+        // Quote and bullet markers, a numbered-list marker (`1.`, `2)`), then bold or italics.
+        let line = trimmed.trim_start_matches(['>', '-', '*', '+', ' ', '\t']);
+        let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let line = match line[digits..].chars().next() {
+            Some('.' | ')') if digits > 0 => &line[digits + 1..],
+            _ => line,
+        };
+        let line = line.trim_start_matches([' ', '\t', '*', '_']);
         let lower = line.to_ascii_lowercase();
         let Some(rest) = ["depends on", "blocked by"]
             .iter()
@@ -357,9 +374,21 @@ pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
         let mut parts = rest.split('#');
         let mut before = parts.next().unwrap_or("");
         for part in parts {
-            // `owner/repo#12` names another repository's issue.
-            let other_repo =
-                before.ends_with(|c: char| c.is_ascii_alphanumeric() || "/-_.".contains(c));
+            // `owner/repo#12` names another repository's issue: the word right before the `#`
+            // has a name on both sides of a `/`. `#12/#14` and `#12-#14` are local.
+            let word = before
+                .rsplit(|c: char| c.is_whitespace() || ",;:()[]".contains(c))
+                .next()
+                .unwrap_or("");
+            let named = |side: &str| {
+                !side.is_empty()
+                    && side
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            };
+            let other_repo = word
+                .split_once('/')
+                .is_some_and(|(owner, repo)| named(owner) && named(repo));
             let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
             if let (Ok(n), false) = (digits.parse::<u64>(), other_repo) {
                 if n != number {
@@ -406,6 +435,8 @@ fn cycle(items: &[WorkItem]) -> Option<Vec<u64>> {
     for &start in edges.keys() {
         // Depth first from `start`, keeping the path.
         let mut path = vec![start];
+        // Each item is entered once per start, so the search stays linear in the edges.
+        let mut seen = BTreeSet::from([start]);
         let mut stack = vec![(start, 0usize)];
         while let Some((node, next)) = stack.pop() {
             let deps = edges.get(&node).copied().unwrap_or_default();
@@ -415,7 +446,7 @@ fn cycle(items: &[WorkItem]) -> Option<Vec<u64>> {
                     path.push(start);
                     return Some(path);
                 }
-                if edges.contains_key(&dep) && !path.contains(&dep) {
+                if edges.contains_key(&dep) && seen.insert(dep) {
                     path.push(dep);
                     stack.push((dep, 0));
                 }
@@ -847,6 +878,23 @@ mod tests {
                     depends onboarding #5\n```\nDepends on #8\n```\n\
                     Depends on other/repo#9 and #10, org/r#11";
         assert_eq!(dependencies(1, body), vec![3, 4, 6, 7, 10]);
+        // A range or list written with `/` or `-` is local, not another repository.
+        assert_eq!(
+            dependencies(1, "Depends on #12/#14 and #15-#16"),
+            vec![12, 14, 15, 16]
+        );
+        // An unclosed fence hides nothing, and a `~~~` fence isn't closed by backticks.
+        assert_eq!(dependencies(1, "```\nDepends on #3"), vec![3]);
+        assert_eq!(
+            dependencies(1, "~~~\nDepends on #3\n```\nDepends on #4"),
+            vec![3, 4]
+        );
+        assert_eq!(
+            dependencies(1, "~~~\nDepends on #3\n~~~\nDepends on #4"),
+            vec![4]
+        );
+        // A number that isn't a list marker leaves the line alone.
+        assert!(dependencies(1, "10 depends on #3").is_empty());
     }
 
     #[test]
