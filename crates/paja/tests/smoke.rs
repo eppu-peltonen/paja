@@ -3970,6 +3970,22 @@ fn agents_and_checks_run_through_the_sandbox() {
     );
 }
 
+#[test]
+fn agents_outside_the_sandbox_run_in_auto_mode_too() {
+    let f = Factory::new("true\n", "land");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let calls = f.claude_calls();
+    assert!(calls.len() >= 2, "{calls:?}");
+    for call in calls {
+        assert!(call.contains("--permission-mode auto"), "{call}");
+        assert!(!call.contains("acceptEdits"), "{call}");
+        assert!(!call.contains("bypassPermissions"), "{call}");
+        assert!(!call.contains("dangerously-skip-permissions"), "{call}");
+    }
+}
+
 /// A fake `sbx` for the setup tests: like [`fake_sbx`], but it never touches the host's packages
 /// (the root step is a no-op), "installs Rust" by creating `rust-installed` (which `cc --version`
 /// needs), and keeps the sandbox's home, where Paja records the setup hash, in `home/`.

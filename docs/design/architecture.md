@@ -410,9 +410,12 @@ while it starts.
   running on the host. Without `PAJA_SBX`, `paja run` says on stderr that there is no sandbox, and runs as described
   above, behind the deny-list hook only. Detection is optional by design: Paja has no Docker dependency, and its tests
   use a fake `sbx`.
-- **Permissions.** Claude Code is always started with `--permission-mode auto` in the sandbox; the sandbox image's
-  default, `bypassPermissions`, is never used. The deny-list hook is a host program and does not run in the sandbox, so
-  there the sandbox is the guard; `--allowedTools`, GitGuard and the reset after a review still apply.
+- **Permissions.** Claude Code is always started with `--permission-mode auto`, with or without a sandbox; the sandbox
+  image's default, `bypassPermissions`, and every weaker mode are never used. Auto mode is an extra layer, not a
+  replacement for the deny-list hook, `--tools` or the turn caps. If a Claude Code rejects auto mode headless, the step
+  fails closed with an error that says to update Claude Code and shows the CLI's own message; Paja never falls back to
+  another mode. The deny-list hook is a host program and does not run in the sandbox, so there the sandbox is the
+  guard; `--allowedTools`, GitGuard and the reset after a review still apply.
 - **Toolchain.** The project installs what its checks need in `.paja/setup`, read from the default branch (never from
   the branch under review): a POSIX shell script that Paja runs inside the sandbox as the sandbox user, before any
   agent starts. If the sandbox has no `cc` or `curl`, Paja first installs `build-essential`, `curl`, `ca-certificates`
