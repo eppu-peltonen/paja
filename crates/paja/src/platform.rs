@@ -394,6 +394,32 @@ fn interrupted() {
     INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Open `path` for reading only if it is a plain file, checked on the open handle, so a file
+/// swapped for a FIFO after a check can't make the read wait. On Unix the open itself doesn't
+/// wait for a FIFO's writer; Windows has no named pipes in a directory tree.
+pub fn open_plain_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK, which differs between systems.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const NONBLOCK: i32 = 0o4000;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const NONBLOCK: i32 = 0x0004;
+        options.custom_flags(NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a plain file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
 /// The terminal closed or the process was asked to end: stop now, as a second Ctrl-C does,
 /// so the agents and checks in their own process groups end with Paja.
 #[cfg(unix)]

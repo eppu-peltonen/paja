@@ -500,17 +500,12 @@ const GITIGNORE_LIMIT: u64 = 4096;
 
 /// A file's bytes if it holds at most [`GITIGNORE_LIMIT`] of them, or `None` if it holds more.
 /// Only that much is read, so a huge file can't use up the hook's memory. Anything but a plain
-/// file (a FIFO, a directory) is an error before it is opened, since opening a FIFO would wait.
+/// file (a FIFO, a directory) is an error, judged on the open handle without waiting on a FIFO,
+/// so swapping the file between a check and the open can't make the hook wait.
 fn read_small(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(std::io::Error::other(format!(
-            "{} is not a plain file",
-            path.display()
-        )));
-    }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
+    crate::platform::open_plain_file(path)?
         .take(GITIGNORE_LIMIT + 1)
         .read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= GITIGNORE_LIMIT).then_some(bytes))
