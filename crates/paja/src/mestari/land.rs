@@ -82,6 +82,15 @@ pub(super) fn land(
             ],
         )?,
     };
+    // Someone following the run sees the pull request from here on.
+    record(
+        home,
+        EV_STEP,
+        json!({
+            "repo": item.repo, "number": item.number, "round": rounds,
+            "role": if ci == CiMode::None { "land" } else { "ci" }, "pr": pr,
+        }),
+    )?;
     // CI must be green before landing; a red CI is a failed check, not a merge.
     if ci == CiMode::None {
         progress(&format!("opened {pr}; the repository has no CI, landing"));

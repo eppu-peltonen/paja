@@ -228,7 +228,10 @@ setting to change. On `escalate`, three failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
-`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `run.checked` (`round`, `commit`, `base`)
+`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `run.step` (`round`, `role`, `model`,
+`reviewer`, `pr`) records that a step starts, so the run can be followed from outside its terminal: an agent step under
+its `.paja/models` role, `checks` for Vasara's checks, and `ci` (or `land` with no CI) once the pull request `pr` is
+open; logs from before it replay with no steps. `run.checked` (`round`, `commit`, `base`)
 records that Vasara's checks passed on a commit. A `run.round` of a round after which the loop goes on carries
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
 like `detail`) or null; older events without it stay readable. Each `run.round` event also lists the
@@ -482,6 +485,14 @@ question), active, queued and the latest landed, each linking to its issue (open
 again whenever `events.jsonl` changes, polling its size and time; the commands run off the window's thread, and a
 refresh that finishes late never draws over a newer one. An error from the core shows in the window with the text the
 CLI prints.
+
+An active item has a run view ("Follow run"), filled by `mestari::live` from the item's latest `run.started` on: the run's
+environment, the round of three, the step it is in (role and model) with a clock since its `run.step`, each finished
+round's verdict and what every step spent (tokens, cost, turns, time, from `run.round`), and the pull request once
+`run.step` names it. The view is read again on every refresh, and every five seconds while one is open, since a run that is killed writes no event. An active item that no `paja run` holds (its
+`runs/<repo>@<number>.lock` is free) shows as interrupted, not running; checking takes and lets go of that lock at once,
+holding the home lock that `paja run` claims items under, so a claim never meets it. `paja work show` and its MCP tool add
+the same view as `run` for an active item.
 
 The person's two jobs are answering and writing work, and Desk does both through the core: an escalated item has an
 answer box that calls `jono::answer` (as `paja work answer`: it records `work.answered`, queues the item and posts the

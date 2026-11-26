@@ -537,9 +537,18 @@ fn run(cli: &Cli) -> Result<()> {
             }
             WorkCommand::Show { number, repo } => {
                 let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
-                let item = jono::get(&home, &name, *number)?;
-                emit(cli, serde_json::to_value(&item)?, || {
-                    format!("{}\n  {}\n\n{}", describe_item(&item), item.url, item.body)
+                let shown = jono::show(&home, &name, *number)?;
+                let item: jono::WorkItem = serde_json::from_value(shown.clone())?;
+                emit(cli, shown.clone(), || {
+                    let run = describe_live(&shown["run"])
+                        .map(|r| format!("\n  {r}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{}{run}\n  {}\n\n{}",
+                        describe_item(&item),
+                        item.url,
+                        item.body
+                    )
                 });
             }
             WorkCommand::Claim { repo } => {
@@ -700,6 +709,35 @@ fn describe_init(report: &paja::init::Report) -> String {
         report.pull_request, report.default_branch
     ));
     text
+}
+
+/// An active item's run in one line: `running: round 2 of 3, fix (opus) since 14:02:11 UTC`.
+fn describe_live(run: &serde_json::Value) -> Option<String> {
+    let state = run["state"].as_str()?;
+    let mut line = format!(
+        "{state}: round {} of {}",
+        run["round"].as_u64().unwrap_or(0),
+        run["max_rounds"].as_u64().unwrap_or(0)
+    );
+    if let Some(step) = run["step"].as_object() {
+        line.push_str(&format!(", {}", step["role"].as_str().unwrap_or("a step")));
+        if let Some(model) = step.get("model").and_then(|m| m.as_str()) {
+            line.push_str(&format!(" ({model})"));
+        }
+        if let Some(ms) = step.get("started_ms").and_then(|m| m.as_u64()) {
+            let secs = ms / 1000 % 86_400;
+            line.push_str(&format!(
+                " since {:02}:{:02}:{:02} UTC",
+                secs / 3600,
+                secs / 60 % 60,
+                secs % 60
+            ));
+        }
+    }
+    if let Some(pr) = run["pr"].as_str() {
+        line.push_str(&format!(", {pr}"));
+    }
+    Some(line)
 }
 
 fn describe_item(item: &jono::WorkItem) -> String {

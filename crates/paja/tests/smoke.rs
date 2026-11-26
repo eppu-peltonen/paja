@@ -1483,6 +1483,34 @@ fn work_list_names_the_event_of_a_step_it_cannot_read() {
 }
 
 #[test]
+fn work_show_tells_where_an_active_items_run_is_and_that_it_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.status","data":{"number":3,"status":"active","note":null}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"run.started","data":{"number":3,"env":"app-3"}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":4000,"kind":"run.step","data":{"number":3,"round":1,"role":"build","model":"opus"}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let (ok, item) = paja(&home, &repo, &["work", "show", "3"]);
+    assert!(ok, "{item}");
+    let run = &item["run"];
+    // No `paja run` holds the item, so it shows as interrupted, not running.
+    assert_eq!(run["state"], "interrupted", "{item}");
+    assert_eq!(
+        (&run["round"], &run["max_rounds"]),
+        (&1.into(), &3.into()),
+        "{run}"
+    );
+    assert_eq!(run["step"]["role"], "build", "{run}");
+    assert_eq!(run["step"]["model"], "opus", "{run}");
+    assert_eq!(run["step"]["started_ms"], 4000, "{run}");
+}
+
+#[test]
 fn a_log_written_before_repositories_replays_to_the_same_items() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -1800,6 +1828,30 @@ fn run_escalates_when_the_repository_allows_no_merge_method() {
         "{report}"
     );
     assert!(!f.gh_log().contains("pr merge"), "{}", f.gh_log());
+}
+
+#[test]
+fn run_records_each_step_so_a_run_can_be_followed() {
+    let f = Factory::new("true\n", "land");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let steps: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.step")
+        .map(|e| &e["data"])
+        .collect();
+    let roles: Vec<&str> = steps.iter().map(|d| d["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["build", "checks", "review", "ci"], "{log}");
+    assert!(
+        steps.iter().all(|d| d["number"] == 5 && d["round"] == 1),
+        "{log}"
+    );
+    assert_eq!(steps[2]["reviewer"], 1, "{log}");
+    assert_eq!(steps[3]["pr"], "https://example.com/pull/1", "{log}");
 }
 
 #[test]

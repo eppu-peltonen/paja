@@ -21,6 +21,7 @@ mod agent;
 mod builder;
 mod follow_ups;
 mod land;
+pub mod live;
 mod progress;
 mod usage;
 
@@ -50,6 +51,11 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 pub const EV_STARTED: &str = "run.started";
 pub const EV_ROUND: &str = "run.round";
+/// A step of a round starts: `{repo, number, round, role, model, reviewer, pr}`. The role is a
+/// `.paja/models` role for an agent step, `checks` for Vasara's checks, or `ci` (waiting for
+/// CI) or `land` (no CI) once the pull request `pr` is open. What a finished step spent is
+/// still in `run.round`.
+pub const EV_STEP: &str = "run.step";
 /// A builder session is about to start: its session id, recorded before it runs, so a run
 /// that is killed mid-session can resume it.
 pub const EV_STEP_STARTED: &str = "run.step_started";
@@ -768,6 +774,9 @@ fn run_item(
         let role = if round == 1 { "build" } else { "fix" };
         // An earlier run's session is offered to the first build only.
         let earlier = if skip_build { None } else { carried.take() };
+        if !skip_build {
+            record_step(home, item, round, role, Some(&models), None)?;
+        }
         let built = (!skip_build).then(|| {
             build(
                 home,
@@ -974,6 +983,7 @@ fn run_item(
                 checks.len(),
                 if checks.len() == 1 { "" } else { "s" }
             ));
+            record_step(home, item, round, "checks", None, None)?;
             let result = run_checks(&env.path, &checks);
             guard.check("Vasara's checks")?;
             // The checks run the branch's code, which could change the tree or even commit. Put it
@@ -1075,6 +1085,7 @@ fn run_item(
             ));
             let role = review_role(risky, i, prior.is_some());
             let reviewer = i as u32 + 1;
+            record_step(home, item, round, role, Some(&models), Some(reviewer))?;
             let reviewed = review(
                 home,
                 &env,
@@ -1437,6 +1448,29 @@ fn carried_session(home: &Home, item: &WorkItem, branch: &str) -> Result<Option<
         session_id,
         prompt,
     }))
+}
+
+/// Record that a step of `round` starts, for anyone following the run: an agent step of
+/// `role` (with the model `.paja/models` gives it), or `checks`.
+fn record_step(
+    home: &Home,
+    item: &WorkItem,
+    round: u32,
+    role: &str,
+    models: Option<&Models>,
+    reviewer: Option<u32>,
+) -> Result<()> {
+    let model = models
+        .and_then(|m| m.roles.get(role))
+        .map(|c| c.model.clone());
+    record(
+        home,
+        EV_STEP,
+        json!({
+            "repo": item.repo, "number": item.number, "round": round, "role": role,
+            "model": model, "reviewer": reviewer,
+        }),
+    )
 }
 
 /// Record that a builder session is about to start, before it does.
