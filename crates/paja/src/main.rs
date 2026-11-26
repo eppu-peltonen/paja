@@ -10,9 +10,12 @@ use paja::home::Home;
 use paja::jono;
 use paja::mestari;
 
+/// The version and the commit this binary was built from.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PAJA_COMMIT"), ")");
+
 /// Paja: a software factory. Every command takes --json for machine-readable output.
 #[derive(Parser)]
-#[command(name = "paja", version)]
+#[command(name = "paja", version = VERSION)]
 struct Cli {
     /// Print one JSON value on stdout instead of text; errors become {"error": "..."}.
     #[arg(long, global = true)]
@@ -259,7 +262,13 @@ fn main() -> ExitCode {
                     json!({ "error": "a subcommand is required", "help": text }),
                     ExitCode::from(2),
                 ),
-                ErrorKind::DisplayVersion => (json!({ "version": text }), ExitCode::SUCCESS),
+                ErrorKind::DisplayVersion => (
+                    json!({
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "commit": env!("PAJA_COMMIT"),
+                    }),
+                    ExitCode::SUCCESS,
+                ),
                 _ => (json!({ "error": text }), ExitCode::from(2)),
             };
             println!("{value}");
