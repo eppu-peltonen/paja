@@ -102,8 +102,10 @@ prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, 
 (`progress.rs`), follow-ups (`follow_ups.rs`) and the builder's question and answers (`builder.rs`) are normal risk.
 A unit test keeps the three high-risk files on the list.
 
-`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`
-and `.paja/models` from `main` and checks them, claims the next item of the checkout's repository and creates an Ahjo environment named
+`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`,
+`.paja/models` and `.paja/ci` from `main` and checks them (`.paja/ci` is `required`, the default, or `none` for a
+repository without CI; with `required` a repository with no GitHub Actions workflow stops the pass, and with `none`
+landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and creates an Ahjo environment named
 `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of `owner/name`, so two repositories' item #5
 never share a worktree, branch or port block) from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
 claims anything, with an error naming the file and line, so one fix on `main` is all it takes; a `--every` loop

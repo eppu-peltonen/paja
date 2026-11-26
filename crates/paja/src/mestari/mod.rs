@@ -43,6 +43,7 @@ pub const CHECKS_FILE: &str = ".paja/checks";
 pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
 /// The model and effort for each agent role, read from the base commit.
 pub const MODELS_FILE: &str = ".paja/models";
+pub const CI_FILE: &str = ".paja/ci";
 /// The roles `.paja/models` may name, besides `fallback`.
 pub const ROLES: [&str; 5] = ["build", "fix", "review", "re-review", "review-2"];
 /// The effort levels Claude Code takes.
@@ -312,6 +313,14 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // home are never claimed.
     let name = jono::sync(home, &repo)?.repo;
     let config = read_config(&repo, &base)?;
+    // Before an item is claimed: waiting for CI that will never run fails after the whole build.
+    if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
+        bail!(
+            "this repository has no GitHub Actions workflow, so Paja would wait for CI that never \
+             comes; add a workflow that runs the checks on pull requests, or put `none` in \
+             {CI_FILE} on the default branch to land on Vasara's checks and the reviewers alone"
+        );
+    }
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
@@ -420,8 +429,30 @@ struct Unrecorded {
     steps: Vec<StepUsage>,
 }
 
+/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on `main`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CiMode {
+    /// Wait for the pull request's CI checks to pass (the default).
+    Required,
+    /// No CI: land on Vasara's checks and the reviewers alone.
+    None,
+}
+
+impl CiMode {
+    fn parse(text: Option<&str>) -> Result<CiMode> {
+        let words = lines(text.unwrap_or_default());
+        match words.as_slice() {
+            [] => Ok(CiMode::Required),
+            [w] if w == "required" => Ok(CiMode::Required),
+            [w] if w == "none" => Ok(CiMode::None),
+            _ => bail!("{CI_FILE} on main must hold `required` or `none`; fix it on main"),
+        }
+    }
+}
+
 /// Vasara's check commands, the high-risk paths and the model per role, as `main` has them.
 struct Config {
+    ci: CiMode,
     checks: Vec<String>,
     high_risk: Vec<String>,
     models: Models,
@@ -444,7 +475,9 @@ fn read_config(repo: &Path, base: &str) -> Result<Config> {
     let commands = crate::hook::Commands::parse(
         read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
     )?;
+    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref())?;
     Ok(Config {
+        ci,
         checks,
         high_risk,
         models,
@@ -462,6 +495,7 @@ fn run_item(
     run: &mut Unrecorded,
 ) -> Result<RunReport> {
     let Config {
+        ci,
         checks,
         high_risk,
         models,
@@ -791,7 +825,7 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = land(home, repo, &env, item, round, &checked);
+            let report = land(home, repo, &env, item, round, &checked, ci);
             match &report {
                 Ok(RunReport::Landed { pr, .. }) => {
                     file_follow_ups(home, repo, item, pr, &follow_ups)

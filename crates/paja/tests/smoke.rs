@@ -1277,6 +1277,7 @@ impl Factory {
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
                  \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+                 \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  echo https://example.com/pull/1 ;;\n\
@@ -1446,6 +1447,40 @@ fn run_builds_reviews_and_lands_an_issue() {
     let (ok, idle) = f.run();
     assert!(ok);
     assert_eq!(idle["outcome"], "idle");
+}
+
+#[test]
+fn a_repository_without_workflows_stops_before_claiming() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("no-workflows"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap();
+    assert!(
+        error.contains("add a workflow") && error.contains(".paja/ci") && error.contains("none"),
+        "{error}"
+    );
+    // Nothing was claimed and no agent ran.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(!f.tmp.path().join("claude-args.log").exists());
+}
+
+#[test]
+fn a_repository_without_ci_lands_on_the_checks_alone() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("no-workflows"), "").unwrap();
+    f.on_main(".paja/ci", "# no CI here\nnone\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(!log.contains("pr checks"), "{log}");
+    assert!(
+        log.contains("pr create") && log.contains("has no CI"),
+        "{log}"
+    );
+    assert!(log.contains("pr merge"), "{log}");
 }
 
 #[test]
