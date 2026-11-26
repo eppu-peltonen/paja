@@ -524,6 +524,49 @@ impl Mcp {
     }
 }
 
+/// Every tool a plugin skill tells the agent to call (`Call `name``) is one `paja mcp` provides,
+/// and every skill has a description that says when to use it.
+#[test]
+fn plugin_skills_name_only_tools_the_mcp_server_provides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let mut mcp = Mcp::start(&home, &repo, &[]);
+    mcp.initialize();
+    let tools = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+
+    let skills = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/skills");
+    let mut seen = Vec::new();
+    for entry in std::fs::read_dir(&skills).unwrap() {
+        let file = entry.unwrap().path().join("SKILL.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        seen.push(file.parent().unwrap().file_name().unwrap().to_owned());
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("description: ") && l.contains("Use when")),
+            "{} needs a description that says when to use it",
+            file.display()
+        );
+        for part in text.split("all `").skip(1) {
+            let name = part.split('`').next().unwrap();
+            assert!(
+                names.iter().any(|n| n == name),
+                "{} calls `{name}`, which paja mcp doesn't provide: {names:?}",
+                file.display()
+            );
+        }
+    }
+    for want in ["init", "doctor"] {
+        assert!(seen.iter().any(|s| s == want), "skill {want} missing");
+    }
+}
+
 /// Drive `paja mcp` over stdio: initialize, list tools, then create, list and remove an env.
 #[test]
 fn the_mcp_server_serves_the_same_core() {

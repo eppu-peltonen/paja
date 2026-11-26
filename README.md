@@ -32,7 +32,7 @@ paja work list                   # the queue, imported from issues with the work
 paja log                         # the append-only event log
 ```
 
-To work with Paja from Claude Code (`/paja:status`, `/paja:answer`, `/paja:spec` and the MCP tools), install the plugin:
+To work with Paja from Claude Code (`/paja:init`, `/paja:doctor`, `/paja:status`, `/paja:answer`, `/paja:spec` and the MCP tools), install the plugin:
 
 ```sh
 claude plugin install paja --marketplace eppu-peltonen/paja
