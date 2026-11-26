@@ -195,33 +195,6 @@ pub fn in_sandbox_path(path: &Path) -> Result<String> {
     translate(&path.to_string_lossy())
 }
 
-/// `GIT_DIR` and `GIT_WORK_TREE` for a linked worktree at `dir`, spelled for the sandbox. A
-/// worktree's `.git` file holds the host's gitdir path (`C:/.../.git/worktrees/x`), which doesn't
-/// exist in the sandbox on Windows. Empty when `dir` is not a linked worktree, when the paths need
-/// no translation (not Windows), or when `env` already sets either variable.
-fn git_env(dir: &Path, env: &[(String, String)]) -> Vec<(String, String)> {
-    if !cfg!(windows)
-        || env
-            .iter()
-            .any(|(k, _)| k == "GIT_DIR" || k == "GIT_WORK_TREE")
-    {
-        return Vec::new();
-    }
-    let Ok(text) = std::fs::read_to_string(dir.join(".git")) else {
-        return Vec::new();
-    };
-    let Some(gitdir) = text.lines().next().and_then(|l| l.strip_prefix("gitdir:")) else {
-        return Vec::new();
-    };
-    match (translate(gitdir.trim()), in_sandbox_path(dir)) {
-        (Ok(git_dir), Ok(work_tree)) => vec![
-            ("GIT_DIR".to_string(), git_dir),
-            ("GIT_WORK_TREE".to_string(), work_tree),
-        ],
-        _ => Vec::new(),
-    }
-}
-
 fn translate(path: &str) -> Result<String> {
     if !cfg!(windows) {
         return Ok(path.to_string());
@@ -276,9 +249,6 @@ impl Sbx {
         let mut cmd = Command::new(&self.program);
         cmd.arg("exec").arg("-w").arg(in_sandbox_path(dir)?);
         for (key, value) in env {
-            cmd.arg("-e").arg(format!("{key}={value}"));
-        }
-        for (key, value) in git_env(dir, env) {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
         cmd.arg(&self.name)
