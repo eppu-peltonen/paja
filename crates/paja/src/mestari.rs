@@ -105,6 +105,22 @@ pub struct StepUsage {
     /// The step resumed an earlier session of the same run (a builder's fix round).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resumed: bool,
+    /// The `--fallback-model` the step was given, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// The fallback model served part of the step: it spent something in `models`, so the role
+    /// didn't run only on the model `.paja/models` chose for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fell_back: bool,
+}
+
+/// Whether `fallback` spent anything in a step's `models`. Claude Code names models by their
+/// full id, so an alias such as `sonnet` matches any id that contains it.
+fn served_by(models: &std::collections::BTreeMap<String, ModelUsage>, fallback: &str) -> bool {
+    models.iter().any(|(name, used)| {
+        name.contains(fallback)
+            && (used.output_tokens.is_some_and(|n| n > 0) || used.cost_usd.is_some_and(|c| c > 0.0))
+    })
 }
 
 /// One model's share of a step, from Claude Code's `modelUsage`.
@@ -153,6 +169,11 @@ impl StepUsage {
             used.cost_usd = less(used.cost_usd, before.cost_usd);
         }
         step.resumed = true;
+        // Judged on this step's own share: an earlier round's fallback doesn't carry over.
+        step.fell_back = step
+            .fallback
+            .as_deref()
+            .is_some_and(|f| served_by(&step.models, f));
         step
     }
 
@@ -183,12 +204,12 @@ impl StepUsage {
                     .collect()
             })
             .unwrap_or_default();
+        let fallback = chosen.fallback_for(role).map(str::to_string);
         StepUsage {
             step: step.to_string(),
             reviewer,
             role: Some(role.to_string()),
             model: chosen.roles.get(role).map(|m| m.model.clone()),
-            models,
             input_tokens: usage["input_tokens"].as_u64(),
             output_tokens: usage["output_tokens"].as_u64(),
             cache_read_input_tokens: usage["cache_read_input_tokens"].as_u64(),
@@ -198,6 +219,9 @@ impl StepUsage {
             duration_ms: result["duration_ms"].as_u64(),
             session_id: result["session_id"].as_str().map(str::to_string),
             resumed: false,
+            fell_back: fallback.as_deref().is_some_and(|f| served_by(&models, f)),
+            fallback,
+            models,
         }
     }
 }
@@ -338,11 +362,18 @@ impl Models {
         if let Some(effort) = &chosen.effort {
             args.extend(["--effort".to_string(), effort.clone()]);
         }
-        // Claude Code refuses a fallback that is the main model itself.
-        if let Some(fallback) = self.fallback.as_ref().filter(|f| **f != chosen.model) {
-            args.extend(["--fallback-model".to_string(), fallback.clone()]);
+        if let Some(fallback) = self.fallback_for(role) {
+            args.extend(["--fallback-model".to_string(), fallback.to_string()]);
         }
         args
+    }
+
+    /// The `--fallback-model` a role gets: none for a role without a line (it runs on the
+    /// account's default), and none for a role already on the fallback model, which Claude Code
+    /// refuses.
+    pub fn fallback_for(&self, role: &str) -> Option<&str> {
+        let chosen = self.roles.get(role)?;
+        self.fallback.as_deref().filter(|f| *f != chosen.model)
     }
 }
 
@@ -3012,5 +3043,29 @@ mod tests {
         // An earlier total that is unknown leaves this step's cost unknown, never a guess.
         let unknown = StepUsage::from_result("build", None, &none, "build", &serde_json::json!({}));
         assert_eq!(later.since(&unknown).cost_usd, None);
+    }
+
+    #[test]
+    fn a_step_says_when_the_fallback_model_served_it() {
+        use super::{Models, StepUsage};
+        let models = Models::parse("build opus\nfix sonnet\nfallback sonnet\n").unwrap();
+        let result = |sonnet_cost: f64| {
+            serde_json::json!({"modelUsage": {
+                "claude-opus-x": {"outputTokens": 5, "costUSD": 0.5},
+                "claude-sonnet-x": {"outputTokens": 0, "costUSD": sonnet_cost}}})
+        };
+        let opus_only = StepUsage::from_result("build", None, &models, "build", &result(0.0));
+        assert_eq!(opus_only.fallback.as_deref(), Some("sonnet"));
+        assert!(!opus_only.fell_back);
+        let fell = StepUsage::from_result("build", None, &models, "build", &result(0.1));
+        assert!(fell.fell_back);
+        // A role already on the fallback model gets none, so it never falls back.
+        let fix = StepUsage::from_result("build", None, &models, "fix", &result(0.1));
+        assert_eq!(fix.fallback, None);
+        assert!(!fix.fell_back);
+        // A resumed step is judged on its own share: the earlier fallback doesn't carry over.
+        let later = StepUsage::from_result("build", None, &models, "build", &result(0.1));
+        assert!(!later.since(&fell).fell_back);
+        assert!(later.since(&opus_only).fell_back);
     }
 }

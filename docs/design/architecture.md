@@ -115,7 +115,9 @@ build round), `fix` (later build rounds), `review` (the first full review), `re-
 the fix) and `review-2` (the second high-risk reviewer). Mestari passes `--model` and, when given, `--effort`; a role
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. An unknown role, effort or a
-malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`.
+malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the
+`fallback` it was given; `fell_back: true` marks a step the fallback model spent something in (its name, or an alias
+such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role didn't run only on its model.
 
 Every session also gets `--max-turns`, from `max-turns <role> <turns>` lines in the same file (80 for `build` and
 `fix`, 30 for the reviews when a role has no line), so an agent going in circles can't spend the account's usage

@@ -1173,6 +1173,30 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
 }
 
 #[test]
+fn a_step_records_when_its_fallback_model_served_it() {
+    // The fake builder's `modelUsage` names `claude-test`, so a `fallback test` line served it.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/models", "build opus\nfallback test\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let round = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "run.round")
+        .unwrap()
+        .clone();
+    let steps = round["data"]["steps"].as_array().unwrap();
+    assert_eq!(steps[0]["model"], "opus", "{round}");
+    assert_eq!(steps[0]["fallback"], "test", "{round}");
+    assert_eq!(steps[0]["fell_back"], true, "{round}");
+    // The reviewer's role has no line, so it got no fallback and says nothing about one.
+    assert_eq!(steps[1]["fallback"], Value::Null, "{round}");
+    assert_eq!(steps[1]["fell_back"], Value::Null, "{round}");
+}
+
+#[test]
 fn run_records_what_each_agent_step_spent() {
     // The fake builder reports usage; the fake reviewer doesn't, like an older Claude Code.
     let f = Factory::new("true\n", "land");
