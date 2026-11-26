@@ -411,41 +411,50 @@ pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
 /// Queued items that wait on open dependencies, as `#179 waits on #178`, for a run that found
 /// nothing ready. None when no queued item is waiting.
 pub fn waiting(home: &Home) -> Result<Option<String>> {
-    let items: Vec<WorkItem> = list(home)?
-        .into_iter()
-        .filter(|item| item.open && item.status == Status::Queued && !item.waiting_on.is_empty())
-        .collect();
+    let items = list(home)?;
     let mut waiting: Vec<String> = items
         .iter()
+        .filter(|item| is_waiting(item))
         .map(|item| {
             let on: Vec<String> = item.waiting_on.iter().map(|n| format!("#{n}")).collect();
             format!("#{} waits on {}", item.number, on.join(", "))
         })
         .collect();
-    if let Some(note) = cycle_note(home)? {
-        waiting.push(note);
-    }
+    waiting.extend(cycle_note(&items));
     Ok((!waiting.is_empty()).then(|| waiting.join("; ")))
 }
 
-/// The "nothing can start" line for a dependency cycle among waiting items, for `paja work list`.
-pub fn cycle_note(home: &Home) -> Result<Option<String>> {
-    let items: Vec<WorkItem> = list(home)?
-        .into_iter()
-        .filter(|item| item.open && item.status == Status::Queued && !item.waiting_on.is_empty())
+/// An open, queued item held back by open dependencies.
+fn is_waiting(item: &WorkItem) -> bool {
+    item.open && item.status == Status::Queued && !item.waiting_on.is_empty()
+}
+
+/// The "nothing can start" line for a dependency cycle among the waiting ones of `items` (as
+/// `list` returns them), for `paja work list` and for a run that found nothing ready.
+pub fn cycle_note(items: &[WorkItem]) -> Option<String> {
+    let waiting: Vec<WorkItem> = items
+        .iter()
+        .filter(|item| is_waiting(item))
+        .cloned()
         .collect();
-    Ok(cycle(&items).map(|cycle| {
+    cycle(&waiting).map(|cycle| {
         let shown: Vec<String> = cycle.iter().map(|n| format!("#{n}")).collect();
         format!(
             "{} wait on each other, so none can start; remove one `Depends on` line",
             shown.join(" -> ")
         )
-    }))
+    })
 }
 
 /// A dependency cycle among waiting items, as the numbers along it with the first repeated at
 /// the end (`[3, 5, 3]`), or None.
 fn cycle(items: &[WorkItem]) -> Option<Vec<u64>> {
+    cycle_search(items).0
+}
+
+/// `cycle`, with how many times the search entered an item, so a test can bound the work.
+fn cycle_search(items: &[WorkItem]) -> (Option<Vec<u64>>, usize) {
+    let mut entered = 0;
     let edges: BTreeMap<u64, &[u64]> = items
         .iter()
         .map(|item| (item.number, item.waiting_on.as_slice()))
@@ -462,9 +471,10 @@ fn cycle(items: &[WorkItem]) -> Option<Vec<u64>> {
                 stack.push((node, next + 1));
                 if dep == start {
                     path.push(start);
-                    return Some(path);
+                    return (Some(path), entered);
                 }
                 if edges.contains_key(&dep) && seen.insert(dep) {
+                    entered += 1;
                     path.push(dep);
                     stack.push((dep, 0));
                 }
@@ -473,7 +483,7 @@ fn cycle(items: &[WorkItem]) -> Option<Vec<u64>> {
             }
         }
     }
-    None
+    (None, entered)
 }
 
 /// The next item to work on: the oldest open, queued issue. None when the queue is empty.
@@ -936,8 +946,7 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("#7 waits on #3"), "{shown}");
-        assert!(cycle_note(&home)
-            .unwrap()
+        assert!(cycle_note(&list(&home).unwrap())
             .unwrap()
             .starts_with("#3 -> #5 -> #3"));
     }
@@ -955,9 +964,11 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let started = std::time::Instant::now();
-        assert!(cycle(&items).is_none());
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let (found, entered) = cycle_search(&items);
+        assert!(found.is_none());
+        // Each start enters every other item at most once; a search that followed every path
+        // would enter them exponentially many times.
+        assert!(entered <= 60 * 60, "{entered}");
     }
 
     #[test]
