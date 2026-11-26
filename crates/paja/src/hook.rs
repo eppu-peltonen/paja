@@ -1095,30 +1095,55 @@ fn check_simple(
 /// (the tokenizer saw to that); any that names a path, alone or after `--flag=`, stays inside
 /// the worktree.
 fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
-    for arg in args {
-        let value = match arg.strip_prefix('-') {
-            Some(_) => arg.split_once('=').map_or("", |(_, value)| value),
-            None => arg,
-        };
-        let drive = value.as_bytes().get(1) == Some(&b':')
+    let has_drive = |value: &str| {
+        value.as_bytes().get(1) == Some(&b':')
             && value
                 .as_bytes()
                 .first()
-                .is_some_and(u8::is_ascii_alphabetic);
-        if !(value.contains(['/', '\\']) || value.starts_with('.') || drive) {
-            continue;
+                .is_some_and(u8::is_ascii_alphabetic)
+    };
+    for arg in args {
+        // The words to check as paths: a bare word, the value of `--flag=value`, and for a
+        // short flag both its glued value and what follows its first `=` (`-o=.git`).
+        let mut values = Vec::new();
+        match arg.strip_prefix('-') {
+            Some(rest) if rest.starts_with('-') => {
+                values.extend(rest.split_once('=').map(|(_, v)| v))
+            }
+            // A value glued to a short flag (`-o/tmp/x`, `-C../other`, `-o/tmp/x=1`) is a path
+            // too, `=` and all.
+            Some(rest) => {
+                let glued = rest.char_indices().nth(1).map_or("", |(at, _)| &rest[at..]);
+                let starts_as_path = glued.starts_with(['/', '\\', '.', '~']) || has_drive(glued);
+                // A cluster such as `-xvf/tmp/a` or `-xC..` hides where its path starts, so it
+                // is refused rather than guessed at.
+                if !starts_as_path && (glued.contains(['/', '\\', ':']) || glued.contains("..")) {
+                    return Some(format!(
+                        "`{arg}` glues a path to a short flag; put a space between the flag and \
+                         its value so the hook can check the path"
+                    ));
+                }
+                values.push(glued);
+                values.extend(rest.split_once('=').map(|(_, v)| v));
+            }
+            None => values.push(arg),
         }
-        if let Some(why) = crate::platform::path_problem(value, false) {
-            return Some(why);
-        }
-        let target = here.join(crate::platform::shell_path(value));
-        let reason = if b.read_only {
-            within_root(&format!("use {program}"), &target, b)
-        } else {
-            inside_root(&format!("use {program}"), &target, b)
-        };
-        if reason.is_some() {
-            return reason;
+        for value in values {
+            if !(value.contains(['/', '\\']) || value.starts_with('.') || has_drive(value)) {
+                continue;
+            }
+            if let Some(why) = crate::platform::path_problem(value, false) {
+                return Some(why);
+            }
+            let target = here.join(crate::platform::shell_path(value));
+            let reason = if b.read_only {
+                within_root(&format!("use {program}"), &target, b)
+            } else {
+                inside_root(&format!("use {program}"), &target, b)
+            };
+            if reason.is_some() {
+                return reason;
+            }
         }
     }
     None
@@ -1640,9 +1665,31 @@ mod program_tests {
             "npm test ~/x",
             "npm install ~/.ssh/id_rsa",
             "npm test .git/config",
+            "npm test -o/tmp/x",
+            "npm test -C../other",
+            "npm test -xvf/tmp/a",
+            "npm test -Isrc/../../x",
+            "npm test -o/tmp/x=1",
+            "npm test -C../other=a",
+            "npm test -xC..",
+            "npm test -o=.git",
+            "npm test -Dx=.github",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
+    }
+
+    #[test]
+    fn a_path_glued_to_a_short_flag_is_checked_like_a_bare_one() {
+        let ok = |c: &str| assert_eq!(bash_as(&["npm"], false, c), None, "{c}");
+        ok("npm test -o./out.txt");
+        ok("npm test -j4");
+        ok("npm test -C/h/.paja/envs/work-1/web");
+        let why = bash_as(&["npm"], false, "npm test -Isrc/include").unwrap();
+        assert!(why.contains("put a space between"), "{why}");
+        ok("npm test -I src/include");
+        ok("npm test -Dfeature=on");
+        ok("npm test --out=./build");
     }
 }
 
