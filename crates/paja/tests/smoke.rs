@@ -40,13 +40,13 @@ fn paja(home: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
     paja_with(home, cwd, args, &[("PAJA_GH", gh.as_path())])
 }
 
-/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
 /// A GitHub-token-shaped string for redaction tests, built at run time so the source holds no
 /// literal token for secret scanners to flag.
 fn fake_token() -> String {
     ["ghp", "ABCDEFGHIJKLMNOPQRSTuvwx"].join("_")
 }
 
+/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
 fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(cwd)
