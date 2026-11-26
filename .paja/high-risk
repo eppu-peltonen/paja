@@ -28,3 +28,5 @@ crates/paja/src/sandbox.rs
 crates/paja/src/platform.rs
 .gitattributes
 Cargo.lock
+desk/capabilities/
+desk/tauri.conf.json
