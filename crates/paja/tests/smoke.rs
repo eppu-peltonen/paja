@@ -1446,7 +1446,8 @@ impl Factory {
                  input=$(cat); [ -n \"$input\" ] && : > {d}/prompt-on-stdin; first=$1; shift; set -- \"$first\" \"$input\" \"$@\"\n\
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
-                 *--json-schema*) if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
+                 *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
@@ -1455,6 +1456,7 @@ impl Factory {
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/hang-fix ]; then : > {d}/hanging; while [ -f {d}/hang-fix ]; do sleep 0.1; done; exit 1; fi ;; esac\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
                  if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
                  echo built >> feature.txt\n\
@@ -1835,6 +1837,86 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert!(stderr.contains("resuming #5"), "{stderr}");
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "landed", "{item}");
+}
+
+/// Start `paja run` with its output discarded, wait until the fake agent writes `marker` (it is
+/// then stuck in a step), and kill the run, as a closed terminal or a reboot would.
+fn interrupt_run(f: &Factory, marker: &str) {
+    let dir = f.tmp.path();
+    let _ = std::fs::remove_file(dir.join(marker));
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join(marker).exists() {
+        assert!(started.elapsed().as_secs() < 60, "no step reached {marker}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run.kill().unwrap();
+    run.wait().unwrap();
+}
+
+fn builds(f: &Factory) -> usize {
+    f.claude_calls()
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .count()
+}
+
+#[test]
+fn a_run_stopped_in_its_review_resumes_without_building_again() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("review-hang"), "").unwrap();
+    interrupt_run(&f, "review-hanging");
+    std::fs::remove_file(dir.join("review-hang")).unwrap();
+    assert_eq!(builds(&f), 1);
+
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("resuming #5 in round 1: the review of "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("skipping"), "{stderr}");
+    assert_eq!(builds(&f), 1, "the resumed run built again");
+    assert!(!stderr.contains("Claude is building"), "{stderr}");
+}
+
+#[test]
+fn a_run_stopped_twice_in_a_fix_keeps_its_round_and_its_blockers() {
+    let f = Factory::new("true\n", "changes");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("hang-fix"), "").unwrap();
+    // Stopped in round 2's fix, after round 1's `changes` verdict; then again in the same
+    // fix, before the resumed run recorded anything.
+    interrupt_run(&f, "hanging");
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(dir.join("hang-fix")).unwrap();
+    std::fs::write(dir.join("verdict.txt"), "land").unwrap();
+
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(stderr.contains("resuming #5 in round 2"), "{stderr}");
+    assert!(!stderr.contains("round 1 of 3"), "{stderr}");
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .rfind(|c| !c.contains("--json-schema") && c.contains("another round"))
+        .unwrap();
+    assert!(fix.contains("add more"), "{fix}");
+    // The re-review judges only the fix, against the earlier blockers.
+    let review = calls.iter().rfind(|c| c.contains("--json-schema")).unwrap();
+    assert!(review.contains("Judge only the fix"), "{review}");
+    assert!(review.contains("add more"), "{review}");
 }
 
 /// Start `paja run` in a process group of its own, as a terminal runs it, with the fake
