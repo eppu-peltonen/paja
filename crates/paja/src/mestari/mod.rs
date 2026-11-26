@@ -565,7 +565,10 @@ impl RepoSettings {
         )?;
         let settings = Self::parse(&out);
         settings.with_context(|| {
-            format!("`{gh} repo view` gave no default branch; check `gh auth status`")
+            format!(
+                "`{gh} repo view` gave no default branch: an empty repository has none until its \
+                 first push, so push a first commit; otherwise check `gh auth status`"
+            )
         })
     }
 

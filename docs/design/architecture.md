@@ -36,7 +36,7 @@ flowchart TB
 | **Jono** (queue and scheduler) | Work items with dependencies (`Depends on #N`); lease each chunk to one worker; pick the next one with plain rules; enforce a diff-size budget per chunk; pace work to the account's usage limits | GitHub issues with the work label (`.paja/labels`, `paja` in this repository), event log |
 | **Kaava** (specs and harness) | Versioned specs with acceptance criteria and a risk tier; held-out scenarios the builder never sees; an eval suite of real chunks that tests the harness itself; the domain harness and canon rules, the `CLAUDE.md` and skills each environment reads from the project's default branch rather than from outside the repository | Markdown in the repo |
 | **Mestari** (orchestrator) | Run workflow graphs: spec, plan, build, verify, review, land, post-land verify. Fix loops are capped at three rounds, after which the builder rethinks the approach instead of patching. Planner, builder, reviewer and evaluator are separate roles. A learn step after landing drafts harness rules from failures | YAML graphs; `claude -p` subprocesses |
-| **Vasara** (verifier) | Load rules and scenarios from `main`, never from the branch; boot the environment and run deterministic and end-to-end checks; an independent, skeptical evaluator agent grades the running app against the acceptance criteria and held-out scenarios; after landing, re-run on `main` and revert on failure | The app's own test commands, Playwright |
+| **Vasara** (verifier) | Load rules and scenarios from the default branch, never from the branch under review; boot the environment and run deterministic and end-to-end checks; an independent, skeptical evaluator agent grades the running app against the acceptance criteria and held-out scenarios; after landing, re-run on `main` and revert on failure | The app's own test commands, Playwright |
 | **Posti** (inbox) | Collect every agent question and escalation; send one digest, each item with options and a recommendation; mirror status to the issue | Issue comments, event log |
 | Interface | One set of core functions exposed three ways, all reading from the event log | CLI (`paja ... --json`), MCP server (official Rust MCP SDK), HTTP API |
 | Claude Code plugin | `plugin/`: the MCP server config (`paja mcp`) and the skills `/paja:status` (the queue, latest events, open questions), `/paja:answer` (answer an escalation and requeue it) and `/paja:spec` (turn a conversation into a `paja` issue after the person approves it). The skills change Paja's state only through its MCP tools. Agents Mestari starts load no plugins; their deny-list hook is set by Mestari itself | Claude Code plugin, installed from this repository's marketplace |
@@ -140,7 +140,7 @@ most three rounds:
    when the run resumes an interrupted item ("Your earlier session was interrupted. Check `git status` and `git log`,
    finish the issue, and commit.") or runs it again after `paja work answer` (the person's question and answer, and
    "Continue with that."). That needs the work still on its `paja/<environment>` branch: an environment made again from
-   `main` starts fresh, and so does a session whose work was thrown away because the hook never ran (recorded as
+   the default branch starts fresh, and so does a session whose work was thrown away because the hook never ran (recorded as
    `run.step_discarded`). In the sandbox the transcript must still be in the sandbox's home; if it isn't, the run says
    so on stderr and starts fresh. A resumed step's spend is only its own share: the recorded steps of that session
    come off Claude Code's running totals, or none do when none were recorded. When
@@ -154,22 +154,24 @@ most three rounds:
    nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
    and its recommendation. Mestari then escalates at once with that question: no checks run and no more rounds are
    spent, and the round is recorded with verdict `question`.
-2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
+2. Vasara runs each command in `.paja/checks`, read from the default
+   branch. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
    fresh index, so the only assume-unchanged or skip-worktree flags left are the ones sparse checkout gives; a check
    run that changes those flags changed the index.
-3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
+3. A fresh reviewer agent reads `git diff <default branch>...HEAD` cold against the issue and `CLAUDE.md` as it is
+   on the default branch, and
    answers `land`, `changes` (blockers only) or `escalate`, plus non-blocking follow-ups that Mestari files as
    follow-up issues (the `follow-up` label of `.paja/labels`) once the change lands. A later round's reviewer judges only the fix for the earlier
    blockers, except on high-risk changes. It may read, run cargo and use read-only git, and changes nothing. Its
    prompt names the commit Vasara's checks passed at, which the run loop passes in and the review refuses to judge
    if `HEAD` has moved from it, and tells it not to re-run formatting, lints or the full test suite; to probe a
    behaviour it runs one named test or the CLI, with long output piped through `tail` or `grep`. A change touching a
-   path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
+   path in `.paja/high-risk` (read from the default branch) gets two reviewers, who must agree; a split is escalated.
    An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
    or the name with an extension, at any depth, in any letter case.
 
-Each agent runs on the model `.paja/models` names for its role, read from `main` like the checks, so a change can't
+Each agent runs on the model `.paja/models` names for its role, read from the default branch like the checks, so a change can't
 pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
 build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
 the fix) and `review-2` (the second high-risk reviewer). Mestari passes `--model` and, when given, `--effort`; a role
@@ -228,7 +230,7 @@ or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the 
 first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool call
 to `paja hook --root <environment> --home <factory home> --programs <list>` as a Claude Code `PreToolUse` hook. No settings file and no
 MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it off.
-Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the branch
+Because that also skips `CLAUDE.md`, Mestari passes the default branch's `CLAUDE.md` with `--append-system-prompt`, so the branch
 under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read from
 the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
