@@ -909,11 +909,17 @@ fn check_simple(
         // Only into the worktree's root, and only as a step of its own, so a failed `cd`
         // stops the rest. No `.` or `..` parts: bash's `cd` drops `..` as text before it
         // follows links, so `link/..` would land beside the link, not where `resolve` says.
+        // No leading `//` either: MSYS, Cygwin and POSIX may read it as a network path.
+        // A link or junction that is itself the root (no `..` after it) is fine: the shell
+        // then sits in the root, and cargo and git act on where they physically run.
         "cd" if first => match args {
             [target]
                 if !target
-                    .split(['/', '\\'])
-                    .any(|part| part == "." || part == "..")
+                    .get(..2)
+                    .is_some_and(|two| two.chars().all(|c| c == '/' || c == '\\'))
+                    && !target
+                        .split(['/', '\\'])
+                        .any(|part| part == "." || part == "..")
                     && crate::platform::path_problem(
                         &crate::platform::shell_path(target).to_string_lossy(),
                         false,
@@ -1856,6 +1862,17 @@ mod tests {
         }
         assert_eq!(bash(format!("cd {root} && git status")), None);
         assert_eq!(bash(format!("cd {root}/ && git status")), None);
+        // A leading `//` may name a network path (MSYS, Cygwin, POSIX), so it is refused.
+        for blocked in [format!("cd /{root}"), format!("cd /{root}/ && git status")] {
+            assert!(bash(blocked.clone()).is_some(), "{blocked} was allowed");
+        }
+        // A link that is itself the root is allowed on purpose: the shell then sits in the
+        // root, and cargo and git act on where they physically run. A change to a text-only
+        // match should change this line on purpose.
+        std::os::unix::fs::symlink(&root, tmp.join("R")).unwrap();
+        let alias = tmp.join("R").display().to_string();
+        assert_eq!(bash(format!("cd {alias} && git status")), None);
+        assert!(bash(format!("cd {alias}/sub/.. && git status")).is_some());
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -2065,6 +2082,37 @@ mod windows_tests {
             .decide("Read", json!({"file_path": state.display().to_string()}))
             .unwrap();
         assert!(why.contains("factory's own state"), "{why}");
+    }
+
+    #[test]
+    fn cd_through_a_junction_follows_the_unix_rules() {
+        let e = env();
+        let junction = |link: &Path, target: &Path| {
+            let made = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        };
+        // A junction outside the worktree to a directory inside it: bash's `cd` drops `..`
+        // as text, so `J\..` lands beside the junction, not in the root.
+        let into = e._tmp.path().join("J");
+        junction(&into, &e.root.join("src"));
+        let into = into.display().to_string();
+        assert!(e.bash(&format!("cd '{into}\\..' && cargo test")).is_some());
+        assert!(e.bash(&format!("cd '{into}/..' && cargo test")).is_some());
+        // A junction that is itself the root is allowed, as a symlink is on Unix.
+        let alias = e._tmp.path().join("R");
+        junction(&alias, &e.root);
+        let alias = alias.display().to_string();
+        assert_eq!(e.bash(&format!("cd '{alias}' && cargo test")), None);
+        assert!(e
+            .bash(&format!("cd '{alias}\\src\\..' && cargo test"))
+            .is_some());
     }
 
     #[test]
