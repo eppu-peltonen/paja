@@ -237,7 +237,16 @@ pub(super) fn escalate(
     )?;
     // The item is parked either way; a failed comment must not escalate it a second time.
     // The caller reports it, cleaned for the terminal.
-    Ok(comment(repo, item, question).err())
+    let asked = comment(repo, item, question).err();
+    tell(home, repo, item);
+    Ok(asked)
+}
+
+/// Tell the person the item needs them (Posti), next to the comment on the issue, which
+/// GitHub doesn't notify them about when it is posted with their own token.
+pub(super) fn tell(home: &Home, repo: &Path, item: &WorkItem) {
+    let notice = crate::posti::Notice::escalated(&item.repo, item.number, &item.title);
+    crate::posti::send(home, repo, &notice);
 }
 
 /// Ask the person on the issue. The question can quote CI logs or review text, so it is

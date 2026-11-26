@@ -546,6 +546,26 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
     )
 }
 
+/// A file as it is on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
+/// remote's default branch, whatever its name), else `origin/main`, else a local `main`. None
+/// when the file isn't there, or when there is none of these. Never the branch checked out,
+/// which may be the change under review.
+pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
+    for rev in ["origin/HEAD", "origin/main", "main"] {
+        let spec = format!("{rev}^{{commit}}");
+        let found = git_command()
+            .arg("-C")
+            .arg(ok.path())
+            .args(["rev-parse", "--verify", "-q", &spec])
+            .output()
+            .context("running git (is it installed?)")?;
+        if found.status.success() {
+            return show_at(ok.path(), rev, path);
+        }
+    }
+    Ok(None)
+}
+
 /// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
 /// trimmed stdout, or an error carrying git's stderr. Taking the proof means no command can
 /// run git here without the check.

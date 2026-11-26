@@ -126,6 +126,15 @@ repository with no GitHub Actions workflow (`gh workflow list` is empty) stops t
 error that names the two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the
 default branch. With `none`, Paja lands on Vasara's checks and the reviewers alone, and says so in the pull request body.
 
+## Notifications
+
+Paja tells you when an item needs your answer, a pass of `paja run --every` fails, or the loop stops. Run in a terminal,
+it shows a desktop notification; set `PAJA_NOTIFIER=desktop` to get one without a terminal, `PAJA_NOTIFIER=none` to
+turn them off, or point it at a program of your own, which gets the title and the text as two arguments. To hear about
+it on your phone, put an `https://` URL, such as an ntfy topic, in `PAJA_NOTIFY` or as the one line of `.paja/notify`
+on the default branch; Paja POSTs a short text there with `curl`, without the question or any local detail. A notice
+that can't be shown is reported once on stderr and the run carries on.
+
 ## What happens next
 
 `paja run --once` takes the oldest open issue with the work label (`.paja/labels`, `paja` in this repository; or the one named with `--item <number>`) and exits when

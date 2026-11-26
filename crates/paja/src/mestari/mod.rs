@@ -500,6 +500,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 return Err(err);
             }
             let asked = comment(&repo, &item, &question);
+            tell(home, &repo, &item);
             progress(&parked_line(
                 &format!("#{} stopped on an error and was parked", item.number),
                 item.number,

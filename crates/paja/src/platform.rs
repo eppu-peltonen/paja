@@ -609,6 +609,74 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// The command that shows `title` and `text` as a desktop notification: a Windows toast through
+/// Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere. The texts travel as
+/// environment variables or arguments, never inside a script, so nothing in them is run.
+pub fn desktop_notification(title: &str, text: &str) -> Command {
+    if cfg!(windows) {
+        const TOAST: &str = "$ErrorActionPreference = 'Stop'; \
+            [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
+            $t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+            $x = $t.GetElementsByTagName('text'); \
+            $x.Item(0).AppendChild($t.CreateTextNode($env:PAJA_TOAST_TITLE)) | Out-Null; \
+            $x.Item(1).AppendChild($t.CreateTextNode($env:PAJA_TOAST_TEXT)) | Out-Null; \
+            $app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'; \
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($t))";
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", TOAST])
+            .env("PAJA_TOAST_TITLE", title)
+            .env("PAJA_TOAST_TEXT", text);
+        cmd
+    } else if cfg!(target_os = "macos") {
+        let mut cmd = Command::new("osascript");
+        cmd.args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display notification (item 2 of argv) with title (item 1 of argv)",
+            "-e",
+            "end run",
+            title,
+            text,
+        ]);
+        cmd
+    } else {
+        let mut cmd = Command::new("notify-send");
+        cmd.args(["--app-name=Paja", "--", title, text]);
+        cmd
+    }
+}
+
+/// Run `cmd` with no input or output, and wait at most `limit` for it: a notifier that hangs
+/// must not hold up the run. An error names what went wrong.
+pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<()> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("it exited with {status}")))
+            };
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(format!(
+                "it was still running after {} seconds, so Paja stopped it",
+                limit.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
