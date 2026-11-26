@@ -1854,34 +1854,104 @@ fn a_real_sandbox_hides_the_owners_files() {
         return;
     };
     /// Removes the sandbox `paja` when dropped, pass or fail, and once up front in case an
-    /// earlier run left one whose mounts no longer exist.
+    /// earlier run left one whose mounts no longer exist. Each removal is verified with
+    /// `sbx ls`: if the sandbox is still listed, the test fails (or, while already failing,
+    /// says so on stderr).
     struct RemoveSandbox(std::ffi::OsString);
     impl RemoveSandbox {
-        fn remove(&self) {
-            let _ = Command::new(&self.0)
-                .args(["rm", "paja"])
+        fn listed(&self) -> bool {
+            let out = Command::new(&self.0)
+                .arg("ls")
                 .stdin(std::process::Stdio::null())
                 .output();
+            match out {
+                Ok(out) => String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .any(|word| word == "paja"),
+                Err(_) => false,
+            }
+        }
+        /// Try the ways `sbx rm` is spelled (some ask for confirmation) until it is gone.
+        fn remove(&self) -> bool {
+            use std::io::Write;
+            for args in [
+                &["rm", "--force", "paja"][..],
+                &["rm", "-f", "paja"][..],
+                &["rm", "paja"][..],
+            ] {
+                if !self.listed() {
+                    return true;
+                }
+                let child = Command::new(&self.0)
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+                if let Ok(mut child) = child {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(b"y\n");
+                    }
+                    let _ = child.wait_with_output();
+                }
+            }
+            !self.listed()
         }
     }
     impl Drop for RemoveSandbox {
         fn drop(&mut self) {
-            self.remove();
+            if !self.remove() {
+                let message = "the test's sandbox `paja` is still listed by `sbx ls`; remove it with `sbx rm paja`";
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
         }
     }
     let cleanup = RemoveSandbox(sbx.clone());
-    cleanup.remove();
+    assert!(
+        cleanup.remove(),
+        "an earlier sandbox `paja` can't be removed; run `sbx rm paja`"
+    );
     let secrets = tempfile::tempdir().unwrap();
     let planted = secrets.path().join(".netrc");
     std::fs::write(&planted, "machine example.com password hunter2\n").unwrap();
     let outside = secrets.path().join("written-by-a-check");
+    // The sandbox is Linux: the checks name these host files the way it spells them, and they
+    // are in no mount.
+    let spell = |p: &Path| paja::sandbox::in_sandbox_path(p).unwrap();
     // The write outside must fail without failing the check; the host is asserted below.
     let checks = format!(
         "test ! -e {}\ntouch {} || true\n",
-        slash(&planted),
-        slash(&outside)
+        spell(&planted),
+        spell(&outside)
     );
     let f = Factory::new(&checks, "land");
+    // The fake `claude` is a POSIX-shell script in a directory the sandbox mounts (the
+    // repository's `.git`, which is neither tracked nor the worktree), run by its in-sandbox path.
+    let bin = f.repo.join(".git").join("paja-test-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         *--json-schema*) echo '{\"is_error\": false, \"structured_output\": {\"verdict\": \"land\", \"summary\": \"fake review\", \"comments\": \"\", \"question\": \"\", \"follow_ups\": []}}' ;;\n\
+         *) echo built >> feature.txt\n\
+         git add feature.txt\n\
+         git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
+         echo '{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4}' ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let claude_in_sandbox = std::path::PathBuf::from(spell(&claude));
     let sbx = std::path::PathBuf::from(sbx);
     let (ok, report) = paja_with(
         &f.home,
@@ -1889,7 +1959,7 @@ fn a_real_sandbox_hides_the_owners_files() {
         &["run"],
         &[
             ("PAJA_GH", f.gh.as_path()),
-            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_CLAUDE", claude_in_sandbox.as_path()),
             ("PAJA_SBX", sbx.as_path()),
         ],
     );
