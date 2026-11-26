@@ -780,18 +780,20 @@ fn work_waits_on_open_dependencies_until_they_close() {
     let d = slash(tmp.path());
     std::fs::write(
         tmp.path().join("issues.json"),
-        r#"[{"number": 2, "title": "Desk feature", "body": "Depends on #9", "url": "https://example.com/2"},
-            {"number": 4, "title": "Other", "body": "", "url": "https://example.com/4"}]"#,
+        r#"[{"number": 2, "title": "Desk feature", "body": "Blocked by #9", "url": "https://example.com/2"},
+            {"number": 4, "title": "Other", "body": "", "url": "https://example.com/4"},
+            {"number": 6, "title": "Typo", "body": "Depends on #11", "url": "https://example.com/6"}]"#,
     )
     .unwrap();
-    std::fs::write(tmp.path().join("state-9"), "OPEN").unwrap();
+    // #11 can't be read (no state file, so the fake fails): it counts as open.
+    std::fs::write(tmp.path().join("state-9"), "open").unwrap();
     let gh = program(
         tmp.path(),
         "gh",
         &format!(
             "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
-             \"issue view\") printf '{{\"state\": \"%s\"}}' \"$(cat {d}/state-$3)\" ;;\n\
+             \"api repos/{{owner}}/{{repo}}/issues/\"*) cat {d}/state-${{2##*/}} ;;\n\
              *) ;;\nesac\n"
         ),
     );
@@ -800,19 +802,24 @@ fn work_waits_on_open_dependencies_until_they_close() {
     let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
     assert!(ok, "{report}");
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
-    assert!(log.contains("issue view 9 --json state"), "{log}");
+    assert!(
+        log.contains("api repos/{owner}/{repo}/issues/9 --jq .state"),
+        "{log}"
+    );
     let (_, shown) = paja(&home, &repo, &["work", "show", "2"]);
     assert_eq!(shown["waiting_on"], serde_json::json!([9]));
     // #2 is older but waits on #9, so #4 comes first.
     let (_, next) = paja(&home, &repo, &["work", "next"]);
     assert_eq!(next["number"], 4);
 
-    std::fs::write(tmp.path().join("state-9"), "CLOSED").unwrap();
+    std::fs::write(tmp.path().join("state-9"), "closed").unwrap();
     paja_with(&home, &repo, &["work", "sync"], &with_gh);
     let (_, shown) = paja(&home, &repo, &["work", "show", "2"]);
     assert_eq!(shown["waiting_on"], serde_json::json!([]));
     let (_, next) = paja(&home, &repo, &["work", "next"]);
     assert_eq!(next["number"], 2);
+    let (_, shown) = paja(&home, &repo, &["work", "show", "6"]);
+    assert_eq!(shown["waiting_on"], serde_json::json!([11]));
 }
 
 #[test]

@@ -59,11 +59,15 @@ survives the issue closing and reopening; a landed issue that reopens is queued 
 oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
 
 An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed by
-issue numbers (`Depends on #12, #14`). Each sync records a `work.waiting` event when the set of those still open
-changes: a dependency in the queue is open until it closes or Paja lands it, and one outside the queue is asked about
-with `gh issue view` (one that can't be read counts as open). An item with open dependencies is never claimed; `paja
-work list` shows them as `waiting_on`, and `paja run` says which items wait on what when nothing else is ready. A sync
-that reads its full limit of issues refuses to close anything rather than drop work it could not see.
+issue numbers (`Depends on #12, #14`), after optional quote, list or number markers. Lines in fenced code blocks don't
+count, and neither do references to another repository (`other/repo#12`), which Jono can't check. Each sync records a
+`work.waiting` event when the set of those still open changes: a dependency in the queue is open until it closes or Paja
+lands it, and one outside the queue, an issue or a pull request (merged counts as closed), is asked about with `gh api`
+(one that can't be read counts as open). A dependency Paja landed counts as done until the same sync sees it reopened.
+An item with open dependencies is never claimed; `paja work list` shows them as `waiting_on`, and `paja run` says which
+items wait on what when nothing else is ready, naming a dependency cycle as one. An item imported before Jono read
+dependencies waits on every one its body names until a sync judges it. A sync that reads its full limit of issues
+refuses to close anything rather than drop work it could not see.
 
 `paja work answer <issue> <text>` records a person's answer to an escalated item (`work.answered`, with the question it
 answers) and queues the item again under the home lock, then posts the answer as a comment on the issue. Each item
