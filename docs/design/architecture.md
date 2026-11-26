@@ -65,6 +65,8 @@ Jono's items are GitHub issues with the work label (`.paja/labels`, `paja` in th
 repository. `.paja/labels`, read from the default branch like `.paja/checks` and never from the branch under review,
 has two lines: `work <label>`, which Jono imports, and `follow-up <label>`, which Mestari files non-blocking findings
 with. Without the file they are `factory` and `factory-follow-up`; this repository keeps `paja` and `paja-follow-up`.
+Changing the work label closes the queue as it was: the next sync no longer sees issues with the old label and closes
+every item it imported with it, so relabel the open issues to the new label in the same change.
 `paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
 events; it never touches another repository's items, even when their issue numbers are the same. `paja work
 list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
