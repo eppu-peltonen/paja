@@ -563,7 +563,7 @@ fn run_item(
             role,
             builder.as_ref(),
         );
-        let (step, raw) = match built {
+        let (step, raw, asked) = match built {
             Ok(built) => built,
             Err(err) => {
                 let Some(limit) = turn_limit(&err) else {
@@ -606,6 +606,14 @@ fn run_item(
         };
         builder = Some(raw);
         let mut steps = vec![step];
+        // A question goes to the person at once: no checks run and no rounds are spent on it.
+        if let Some(asked) = asked {
+            progress("the builder asked for a decision");
+            record_round(home, item, round, "question", &asked, &steps)?;
+            let question =
+                format!("Paja's builder needs a decision before it can go on:\n\n{asked}");
+            return escalated(home, repo, &env, item, &question, round);
+        }
         commit_leftovers(&env, item)?;
         if git(
             &env.path,
@@ -914,6 +922,25 @@ fn review_role(risky: bool, reviewer: usize, fix_only: bool) -> &'static str {
     }
 }
 
+/// How the builder asks the person for a decision: a line of its final message starting with
+/// this, followed by the question.
+const ASK: &str = "PAJA-QUESTION:";
+
+/// The question the builder asked in its final message, if it asked one.
+fn builder_question(out: &Value) -> Option<String> {
+    let text = out["result"].as_str()?;
+    let start = text
+        .match_indices(ASK)
+        .find(|(at, _)| *at == 0 || text[..*at].ends_with('\n'))?
+        .0;
+    let question = text[start + ASK.len()..].trim();
+    (!question.is_empty()).then(|| question.to_string())
+}
+
+/// What one build step gave: its usage this round, its running totals (for a later resume),
+/// and the question it asked instead of building, if any.
+type Built = (StepUsage, StepUsage, Option<String>);
+
 #[allow(clippy::too_many_arguments)]
 fn build(
     home: &Home,
@@ -924,7 +951,7 @@ fn build(
     models: &Models,
     role: &str,
     resume: Option<&StepUsage>,
-) -> Result<(StepUsage, StepUsage)> {
+) -> Result<Built> {
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
          CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
@@ -932,7 +959,12 @@ fn build(
          with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
          that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
          only for cargo and local git, and Paja's deny-list hook blocks anything else (no `$(`, \
-         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`.\n\nIssue #{number}: {title}\n\n{body}\n{answers}",
+         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`. If the \
+         issue leaves a decision only the person can make (what to build or what is out of scope, \
+         not how to build it), don't put the question in code, tests or commits: commit nothing, \
+         and end your final message with a line that starts with `{ASK}` followed by the \
+         question, the options and your recommendation. Paja then asks the person on the \
+         issue.\n\nIssue #{number}: {title}\n\n{body}\n{answers}",
         number = item.number,
         title = item.title,
         body = item.body,
@@ -975,7 +1007,7 @@ fn build(
             Ok(out) => {
                 let raw = StepUsage::from_result("build", None, models, role, &out);
                 let step = resume.map_or_else(|| raw.clone(), |earlier| raw.since(earlier));
-                return Ok((step, raw));
+                return Ok((step, raw, builder_question(&out)));
             }
             Err(err) if err.chain().any(|e| e.is::<ClaudeFailed>()) => progress(&format!(
                 "resuming the builder's session failed ({}); starting a fresh one",
@@ -997,7 +1029,7 @@ fn build(
         &models.args(role),
     )?;
     let raw = StepUsage::from_result("build", None, models, role, &out);
-    Ok((raw.clone(), raw))
+    Ok((raw.clone(), raw, builder_question(&out)))
 }
 
 /// What a reviewer is asked. `checked` is the commit Vasara's checks passed at, which is the
@@ -2712,6 +2744,19 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_builder_asks_only_on_a_line_of_its_own() {
+        let ask = |text: &str| builder_question(&json!({ "result": text }));
+        assert_eq!(
+            ask("Stuck.\nPAJA-QUESTION: A or B? I'd pick A.\nThanks").as_deref(),
+            Some("A or B? I'd pick A.\nThanks")
+        );
+        assert_eq!(ask("PAJA-QUESTION: Which?").as_deref(), Some("Which?"));
+        assert_eq!(ask("Done. No PAJA-QUESTION: here."), None);
+        assert_eq!(ask("PAJA-QUESTION:   \n"), None);
+        assert_eq!(builder_question(&json!({})), None);
     }
 
     #[test]
