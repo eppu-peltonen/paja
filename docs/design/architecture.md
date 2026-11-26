@@ -227,6 +227,46 @@ git command that changes the branch; after the review, the branch and worktree a
 the code its builds ran did. Because no settings file loads, agents authenticate the way `claude` does without one (a
 signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider settings.
 
+The limits above (credential files in `HOME`, the shared git configuration, the hook's copy, the stamp) are what the
+sandbox below closes when it is on.
+
+### The sandbox
+
+The sandbox is optional and off by default. It is a [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`)
+backend: set `PAJA_SBX` to the `sbx` program (`PAJA_SBX=sbx`) and `paja run` runs every agent session and every
+check command of Vasara inside one long-lived sandbox named `paja`, which every run reuses.
+
+- **What the code can reach.** Only what is mounted: the factory's `envs/` directory (the worktrees) and the
+  repository's own `.git` directory, which commits in a worktree need. The owner's `HOME`, its credential files, git's
+  global and system configuration, the factory's event log, the hook's copy of the binary and the stamp are not in the
+  sandbox. Code in it gets a throwaway `PAJA_HOME` in the sandbox's own `/tmp` and the same stripped git environment as
+  on the host, and none of the host's environment variables.
+- **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If `PAJA_SBX` is
+  set and the sandbox can't start, it stops with an error that says what to install or set up. It never falls back to
+  running on the host. Without `PAJA_SBX`, `paja run` says on stderr that there is no sandbox, and runs as described
+  above, behind the deny-list hook only. Detection is optional by design: Paja has no Docker dependency, and its tests
+  use a fake `sbx`.
+- **Permissions.** Claude Code is always started with `--permission-mode auto` in the sandbox; the sandbox image's
+  default, `bypassPermissions`, is never used. The deny-list hook is a host program and does not run in the sandbox, so
+  there the sandbox is the guard; `--allowedTools`, GitGuard and the reset after a review still apply.
+- **Toolchain.** Vasara's checks need Rust and a C compiler. On first start Paja checks for `cc`, `cargo` and `rustfmt`
+  in the sandbox and installs what is missing (`build-essential` through `apt`, Rust through rustup, minimal profile
+  with `rustfmt` and `clippy`). If that fails, the error says to open `sbx exec -it paja sh` and install them by hand.
+- **Signing in.** Sign in once, inside the sandbox: `sbx exec -it paja claude`, then `/login`. When Claude Code in the
+  sandbox reports it is not signed in, the item is parked with that command in the question, rather than failing as a
+  check.
+- **Why `sbx`.** Docker Sandboxes gives each sandbox a micro-VM with its own kernel, and works on Windows Home and Pro,
+  macOS and Linux with one installer and no administrator account setup. A dedicated low-privilege user with ACLs, an
+  AppContainer or a restricted token each need per-machine administrator setup on Windows that differs between Home
+  and Pro, and none of them hides the owner's files from a process the way a separate VM does; bubblewrap and
+  `sandbox-exec` don't exist on every platform Paja runs on. So Paja has one backend, and the owner opts in.
+- **Assumptions about `sbx`.** Everything Paja assumes about it is in `crates/paja/src/sandbox.rs`: `sbx exec`
+  with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, and that a mounted path has the same absolute
+  path inside the sandbox.
+- **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
+  Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The
+  other worktrees under `envs/` are mounted too, so code in one worktree can reach another.
+
 ## MCP server
 
 `paja mcp` serves the core as MCP tools over stdio (`env_*`, `work_*` and `log`), built on

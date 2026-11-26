@@ -8,3 +8,4 @@ pub mod jono;
 pub mod mcp;
 pub mod mestari;
 pub mod platform;
+pub mod sandbox;
