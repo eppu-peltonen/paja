@@ -98,29 +98,43 @@ function spent(step) {
 // read arrives instead of flashing.
 const lastRun = new Map();
 
+// The open run views on the page, by `repo#number`: the box and its item.
+const runBoxes = new Map();
+
 // The run view of an active item: filled by `work_run`, read again on every refresh (each
 // refresh rebuilds the rows), and its step clock ticks every second.
 function runView(item) {
   const key = `${item.repo}#${item.number}`;
   const box = el("div", { className: "run" });
-  const show = (run) => box.replaceChildren(...runParts(run));
-  if (lastRun.has(key)) show(lastRun.get(key));
+  if (lastRun.has(key)) box.replaceChildren(...runParts(lastRun.get(key)));
   else box.append(el("p", { className: "muted" }, "Reading the run..."));
+  runBoxes.set(key, { box, item });
+  readRun(key, item, box);
+  return box;
+}
+
+function readRun(key, item, box) {
   invoke("work_run", { repo: item.repo, number: item.number })
     .then((run) => {
       if (run && run.error) throw new Error(run.error);
       lastRun.set(key, run);
-      show(run);
+      box.replaceChildren(...runParts(run));
     })
     .catch((err) => box.replaceChildren(el("p", { className: "error" }, `error: ${err?.message ?? err}`)));
-  return box;
 }
 
-// A run that is killed writes no event, so while a run view is open Desk also reads the queue
-// again every few seconds: its run lock comes free, and the view turns to interrupted.
+// A run that is killed writes no event, so while a run view is open Desk reads that run again
+// every few seconds: its run lock comes free, and the view turns to interrupted. Only the open
+// run views are read again, not the whole queue, so an answer being typed keeps its focus.
 const FOLLOW_EVERY_MS = 5000;
 setInterval(() => {
-  if (following.size > 0) refresh().catch(showError);
+  for (const [key, { box, item }] of runBoxes) {
+    if (!box.isConnected || !following.has(key)) {
+      runBoxes.delete(key);
+      continue;
+    }
+    readRun(key, item, box);
+  }
 }, FOLLOW_EVERY_MS);
 
 function runParts(run) {
@@ -214,6 +228,15 @@ function answerForm(item) {
 let knownRepos = [];
 
 function render(items) {
+  // A run view stays open only while its item is active: one that landed or was parked is let go.
+  const active = new Set(items.filter((i) => i.status === "active").map((i) => `${i.repo}#${i.number}`));
+  for (const key of [...following]) {
+    if (!active.has(key)) {
+      following.delete(key);
+      lastRun.delete(key);
+    }
+  }
+  runBoxes.clear();
   const queue = document.getElementById("queue");
   queue.replaceChildren();
   const repos = [...new Set(items.map((i) => i.repo))].sort();

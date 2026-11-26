@@ -541,7 +541,9 @@ CLI prints.
 An active item has a run view ("Follow run"), filled by `mestari::live` from the item's latest `run.started` on: the run's
 environment, the round of three, the step it is in (role and model) with a clock since its `run.step`, each finished
 round's verdict and what every step spent (tokens, cost, turns, time, from `run.round`), and the pull request once
-`run.step` names it. The view is read again on every refresh, and every five seconds while one is open, since a run that is killed writes no event. An active item that no `paja run` holds (its
+`run.step` names it. The view is read again on every refresh, and every five seconds while one is open, since a run that is killed writes no event;
+the timer reads only the open run views, so an answer being typed elsewhere keeps its focus, and a view closes once its
+item is no longer active. An active item that no `paja run` holds (its
 `runs/<repo>@<number>.lock` is free) shows as interrupted, not running; checking takes and lets go of that lock at once,
 holding the home lock that `paja run` claims items under, so a claim never meets it. `paja work show` and its MCP tool add
 the same view as `run` for an active item.
