@@ -496,17 +496,24 @@ fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
 }
 
 /// The largest `.gitignore` the Grep skip reads.
-const SMALL_FILE: u64 = 4096;
+const GITIGNORE_LIMIT: u64 = 4096;
 
-/// A file's bytes if it holds at most [`SMALL_FILE`] of them, or `None` if it holds more. Only
-/// that much is read, so a huge file can't use up the hook's memory.
+/// A file's bytes if it holds at most [`GITIGNORE_LIMIT`] of them, or `None` if it holds more.
+/// Only that much is read, so a huge file can't use up the hook's memory. Anything but a plain
+/// file (a FIFO, a directory) is an error before it is opened, since opening a FIFO would wait.
 fn read_small(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a plain file",
+            path.display()
+        )));
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
-        .take(SMALL_FILE + 1)
+        .take(GITIGNORE_LIMIT + 1)
         .read_to_end(&mut bytes)?;
-    Ok((bytes.len() as u64 <= SMALL_FILE).then_some(bytes))
+    Ok((bytes.len() as u64 <= GITIGNORE_LIMIT).then_some(bytes))
 }
 
 /// The first symlink out of the worktree, leaving out the directories in `skip`. If the walk
@@ -1303,6 +1310,26 @@ mod scan_tests {
         assert_eq!(read_small(&path).unwrap(), None);
         let missing = read_small(&tmp.path().join("none")).unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        // Not a plain file: an error, and not "missing", so the Grep skip treats it as unknown.
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        assert_ne!(
+            read_small(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        #[cfg(unix)]
+        {
+            let fifo = tmp.path().join("fifo");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            assert_ne!(
+                read_small(&fifo).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
     }
 
     #[test]
@@ -2315,7 +2342,10 @@ mod windows_tests {
         }
         // Globs override ignores, so the whole worktree is checked.
         assert!(grep(json!({"pattern": "x", "glob": "*.rs"})).is_some());
-        // A junction elsewhere in the worktree into `target` reaches it by another name.
+        // With `target` clean again, only a junction elsewhere into it can block the search: it
+        // reaches `target` by another name, so the walk must take it in.
+        std::fs::remove_dir(e.root.join("target").join("debug").join("out")).unwrap();
+        assert_eq!(grep(json!({"pattern": "x"})), None);
         junction(&e.root.join("src").join("via"), &e.root.join("target"));
         assert!(
             grep(json!({"pattern": "x"})).is_some(),
