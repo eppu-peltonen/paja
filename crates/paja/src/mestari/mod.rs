@@ -3,7 +3,7 @@
 //! reviewer agents read the diff cold, then land it or loop back, and escalate when stuck.
 //!
 //! Every step is a fresh headless `claude -p` run. The checks and the high-risk paths are read
-//! from the base commit on `main`, never from the branch under review, so a change can't
+//! from the base commit on the default branch, never from the branch under review, so a change can't
 //! loosen the checks that judge it.
 
 use std::path::{Path, PathBuf};
@@ -53,6 +53,8 @@ pub const EV_ROUND: &str = "run.round";
 /// A builder session is about to start: its session id, recorded before it runs, so a run
 /// that is killed mid-session can resume it.
 pub const EV_STEP_STARTED: &str = "run.step_started";
+/// Vasara's checks passed on a commit: `{repo, number, round, commit, base}`.
+pub const EV_CHECKED: &str = "run.checked";
 /// A builder session's work was thrown away (the hook never ran), so it is never resumed.
 pub const EV_STEP_DISCARDED: &str = "run.step_discarded";
 pub const EV_LANDED: &str = "run.landed";
@@ -116,10 +118,11 @@ pub struct Review {
     /// The intent question for a person, when the verdict is `escalate`.
     #[serde(default)]
     pub question: String,
-    /// Findings that don't block landing. Mestari files each as a `paja-follow-up` issue once
-    /// the change lands, for a person to queue, instead of holding this change up.
+    /// Findings that don't block landing, each marked `bug`, `risk` or `nit`. Once the change
+    /// lands, Mestari files its bugs and risks together as one follow-up issue, for a person to
+    /// queue, instead of holding this change up; nits are never filed.
     #[serde(default)]
-    pub follow_ups: Vec<String>,
+    pub follow_ups: Vec<Finding>,
 }
 
 /// The model, and optionally the effort, one role runs on.
@@ -129,7 +132,7 @@ pub struct RoleModel {
     pub effort: Option<String>,
 }
 
-/// `.paja/models` as it is on main: one line per role, `role model [effort]`, plus an optional
+/// `.paja/models` as it is on the default branch: one line per role, `role model [effort]`, plus an optional
 /// `fallback model` line. A role with no line runs on the account's default model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Models {
@@ -142,7 +145,13 @@ pub struct Models {
 impl Models {
     /// Read the file's text. `#` starts a comment line. Anything else that isn't a known role
     /// with a plain model name (and a known effort) is an error naming the line and the fix.
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_on(text, "main")
+    }
+
+    /// [`Models::parse`], with errors naming the default branch the file was read from.
+    pub fn parse_on(text: &str, branch: &str) -> Result<Self> {
         let mut models = Models::default();
         // A leading `-` would reach `claude` as a flag of its own.
         let plain = |word: &str| {
@@ -156,7 +165,7 @@ impl Models {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let at = || format!("{MODELS_FILE} on main, line {}: {line:?}", i + 1);
+            let at = || format!("{MODELS_FILE} on {branch}, line {}: {line:?}", i + 1);
             let words: Vec<&str> = line.split_whitespace().collect();
             let (role, rest) = (words[0], &words[1..]);
             if let Some(bad) = rest.iter().find(|w| !plain(w)) {
@@ -274,13 +283,14 @@ impl Models {
 }
 
 /// What an earlier round's reviewers asked for, so the next review judges only the fix.
+#[derive(Deserialize)]
 struct Prior {
     /// The commit those reviewers judged.
     reviewed: String,
     /// The blockers they named.
     blockers: String,
     /// Their non-blocking findings, for the next reviewer to keep or drop.
-    follow_ups: Vec<String>,
+    follow_ups: Vec<Finding>,
 }
 
 pub struct RunOptions<'a> {
@@ -308,10 +318,19 @@ impl std::fmt::Display for Declined {
 impl std::error::Error for Declined {}
 
 /// What a run is about to do, on stderr, before the first agent starts.
-fn summary(item: &jono::WorkItem, ci: CiMode, sandbox: bool) {
+fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bool) {
     progress(&format!("repository: {}", item.repo));
     progress(&format!("item: #{} {}", item.number, item.title));
-    progress("merges into: main (default branch), by squash");
+    let method = match target.merge_flag() {
+        Some("--squash") => "by squash",
+        Some("--rebase") => "by rebase",
+        Some(_) => "by a merge commit",
+        None => "no merge method allowed, so landing escalates",
+    };
+    progress(&format!(
+        "merges into: {} (default branch), {method}",
+        target.branch
+    ));
     progress(&match ci {
         CiMode::Required => "CI: required before landing".to_string(),
         CiMode::None => format!(
@@ -345,9 +364,15 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         ahjo::clear_tampered(home, &repo)?;
     }
     let key = ahjo::ensure_untampered(home, &repo)?;
-    git(&repo, &["fetch", "-q", "origin", "main"]).context(
-        "fetching origin/main; check the network and that `origin` is the GitHub repository",
-    )?;
+    // Once per pass: the default branch and the merge methods the repository allows.
+    let target = RepoSettings::read(&repo)?;
+    let branch = target.branch.as_str();
+    git(&repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+        format!(
+            "fetching origin/{branch}; check the network and that `origin` is the GitHub \
+             repository"
+        )
+    })?;
     let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
@@ -361,7 +386,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
     let name = jono::sync_with(home, &repo, Some(&labels))?.repo;
-    let config = read_config(&repo, &base, labels)?;
+    let config = read_config(&repo, &base, labels, target)?;
     // Before an item is claimed: waiting for CI that will never run fails after the whole build.
     if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
         bail!(
@@ -388,7 +413,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
-    summary(&item, config.ci, crate::sandbox::active().is_some());
+    summary(
+        &item,
+        &config.target,
+        config.ci,
+        crate::sandbox::active().is_some(),
+    );
     if opts.confirm && !confirmed()? {
         // Put the item back, so declining leaves the queue as it was. A resumed item was
         // active already and stays so.
@@ -503,7 +533,8 @@ struct Unrecorded {
     steps: Vec<StepUsage>,
 }
 
-/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on `main`).
+/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on the default
+/// branch).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CiMode {
     /// Wait for the pull request's CI checks to pass (the default).
@@ -513,18 +544,78 @@ enum CiMode {
 }
 
 impl CiMode {
-    fn parse(text: Option<&str>) -> Result<CiMode> {
+    fn parse(text: Option<&str>, branch: &str) -> Result<CiMode> {
         let words = lines(text.unwrap_or_default());
         match words.as_slice() {
             [] => Ok(CiMode::Required),
             [w] if w == "required" => Ok(CiMode::Required),
             [w] if w == "none" => Ok(CiMode::None),
-            _ => bail!("{CI_FILE} on main must hold `required` or `none`; fix it on main"),
+            _ => bail!("{CI_FILE} on {branch} must hold `required` or `none`; fix it on {branch}"),
         }
     }
 }
 
-/// Vasara's check commands, the high-risk paths and the model per role, as `main` has them.
+/// The repository's default branch and the merge methods it allows, from `gh repo view`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoSettings {
+    branch: String,
+    squash: bool,
+    merge_commit: bool,
+    rebase: bool,
+}
+
+impl RepoSettings {
+    fn read(repo: &Path) -> Result<Self> {
+        let gh = jono::gh_program();
+        let out = run_gh(
+            repo,
+            &[
+                "repo",
+                "view",
+                "--json",
+                "defaultBranchRef,squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed",
+            ],
+        )?;
+        let settings = Self::parse(&out);
+        settings.with_context(|| {
+            format!("`{gh} repo view` gave no default branch; check `gh auth status`")
+        })
+    }
+
+    /// A field `gh` leaves out is not taken to forbid anything: the branch is then `main` and
+    /// squash merging is allowed.
+    fn parse(json: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(json).ok()?;
+        let branch = match v["defaultBranchRef"]["name"].as_str() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ if v.get("defaultBranchRef").is_none() => "main".to_string(),
+            _ => return None,
+        };
+        let flag = |key: &str, default: bool| v[key].as_bool().unwrap_or(default);
+        Some(RepoSettings {
+            branch,
+            squash: flag("squashMergeAllowed", true),
+            merge_commit: flag("mergeCommitAllowed", false),
+            rebase: flag("rebaseMergeAllowed", false),
+        })
+    }
+
+    /// The `gh pr merge` flag to land with: squash, else rebase, else a merge commit.
+    fn merge_flag(&self) -> Option<&'static str> {
+        if self.squash {
+            Some("--squash")
+        } else if self.rebase {
+            Some("--rebase")
+        } else if self.merge_commit {
+            Some("--merge")
+        } else {
+            None
+        }
+    }
+}
+
+/// Vasara's check commands, the high-risk paths and the model per role, as the default branch
+/// has them.
 struct Config {
     ci: CiMode,
     checks: Vec<String>,
@@ -532,25 +623,36 @@ struct Config {
     models: Models,
     commands: crate::hook::Commands,
     labels: jono::Labels,
+    target: RepoSettings,
 }
 
-/// Read and check `main`'s configuration once, before an item is claimed: a mistake there is
-/// one fix on `main`, so it stops the pass instead of parking every item in turn.
-fn read_config(repo: &Path, base: &str, labels: jono::Labels) -> Result<Config> {
+/// Read and check the default branch's configuration once, before an item is claimed: a
+/// mistake there is one fix on that branch, so it stops the pass instead of parking every item
+/// in turn.
+fn read_config(
+    repo: &Path,
+    base: &str,
+    labels: jono::Labels,
+    target: RepoSettings,
+) -> Result<Config> {
+    let branch = target.branch.as_str();
     let checks = read_from_base(repo, base, CHECKS_FILE)?.with_context(|| {
-        format!("{CHECKS_FILE} is missing on main; add the check commands there")
+        format!("{CHECKS_FILE} is missing on {branch}; add the check commands there")
     })?;
     let checks: Vec<String> = lines(&checks);
     if checks.is_empty() {
-        // An empty gate would pass everything; that is never what main meant.
-        bail!("{CHECKS_FILE} on main has no commands; add the check commands there");
+        // An empty gate would pass everything; that is never what the branch meant.
+        bail!("{CHECKS_FILE} on {branch} has no commands; add the check commands there");
     }
     let high_risk = lines(&read_from_base(repo, base, HIGH_RISK_FILE)?.unwrap_or_default());
-    let models = Models::parse(&read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default())?;
+    let models = Models::parse_on(
+        &read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default(),
+        branch,
+    )?;
     let commands = crate::hook::Commands::parse(
         read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
     )?;
-    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref())?;
+    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref(), branch)?;
     Ok(Config {
         ci,
         checks,
@@ -558,6 +660,7 @@ fn read_config(repo: &Path, base: &str, labels: jono::Labels) -> Result<Config> 
         models,
         commands,
         labels,
+        target,
     })
 }
 
@@ -577,10 +680,14 @@ fn run_item(
         models,
         commands,
         labels,
+        target,
     } = config;
     let (env, kept) = environment(home, repo, base, item)?;
+    // The default branch the change is judged against: it moves forward when the branch is
+    // brought up to date with it.
+    let mut base = base.to_string();
     // An earlier run's builder session is resumed only for work still on its branch: an
-    // environment made again from `main` starts a fresh one.
+    // environment made again from the default branch starts a fresh one.
     let mut carried = if kept && (resumed || !item.answers.is_empty()) {
         carried_session(home, item, &env.branch)?
     } else {
@@ -594,7 +701,30 @@ fn run_item(
 
     let mut feedback = String::new();
     let mut prior: Option<Prior> = None;
-    let mut follow_ups: Vec<String> = Vec::new();
+    let mut follow_ups: Vec<Finding> = Vec::new();
+    // A resumed item goes on in the round that was cut off, with what that round was given.
+    let mut start = 1;
+    let mut reuse: Option<(String, String)> = None;
+    if resumed && kept {
+        let point = resume_point(&home.events().read_all()?, &item.repo, item.number);
+        start = point.round;
+        feedback = point.feedback;
+        prior = point.prior;
+        reuse = point.checked;
+        let was = match (&reuse, &prior) {
+            (Some((commit, _)), _) => format!("the review of {} was interrupted", short(commit)),
+            (None, Some(p)) => format!(
+                "the fix for the review of {} was interrupted",
+                short(&p.reviewed)
+            ),
+            (None, None) if start > 1 => format!("{} before it", point.stopped_in),
+            (None, None) => "the build was interrupted".to_string(),
+        };
+        progress(&format!(
+            "resuming #{} in round {start}: {was}",
+            item.number
+        ));
+    }
     // The builder's last result in this run: its session is resumed for a fix round, and its
     // running totals come off the next step's. Not kept across runs: an earlier run's session
     // comes from the event log instead (`carried`).
@@ -602,34 +732,50 @@ fn run_item(
     // How often each kind of step hit its turn limit in this run: a second hit escalates.
     let (mut builder_limits, mut review_limits) = (0u32, 0u32);
     progress(&format!("working in {}", env.path.display()));
-    for round in 1..=MAX_ROUNDS {
+    for round in start..=MAX_ROUNDS {
         run.round = round;
         stop_point()?;
         let steps = &mut run.steps;
         steps.clear();
-        progress(&format!(
-            "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
-        ));
+        // Only the round that was cut off may reuse what it had: the build, and the checks if
+        // nothing has changed since they passed.
+        let reused = if round == start { reuse.take() } else { None };
+        let skip_build = match &reused {
+            Some((commit, _)) => untouched_at(&env, commit)?,
+            None => false,
+        };
+        if skip_build {
+            progress(&format!(
+                "round {round} of {MAX_ROUNDS}: the build is already committed; skipping it"
+            ));
+        } else {
+            progress(&format!(
+                "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
+            ));
+        }
         let role = if round == 1 { "build" } else { "fix" };
         // An earlier run's session is offered to the first build only.
-        let earlier = carried.take();
-        let built = build(
-            home,
-            &env,
-            item,
-            base,
-            &feedback,
-            &models,
-            role,
-            round,
-            builder.as_ref(),
-            earlier.as_ref(),
-            steps,
-            &commands.builder,
-        );
-        let (step, raw, asked) = match built {
-            Ok(built) => built,
-            Err(err) => {
+        let earlier = if skip_build { None } else { carried.take() };
+        let built = (!skip_build).then(|| {
+            build(
+                home,
+                &env,
+                item,
+                &base,
+                &feedback,
+                &models,
+                role,
+                round,
+                builder.as_ref(),
+                earlier.as_ref(),
+                steps,
+                &commands.builder,
+            )
+        });
+        let built = match built {
+            None => None,
+            Some(Ok(built)) => Some(built),
+            Some(Err(err)) => {
                 let Some(limit) = turn_limit(&err) else {
                     return Err(err);
                 };
@@ -653,8 +799,8 @@ fn run_item(
                 );
                 builder_limits += 1;
                 steps.push(step);
-                record_round(home, item, round, "turn_limit", &note, steps)?;
                 if builder_limits > 1 {
+                    record_round(home, item, round, "turn_limit", &note, steps)?;
                     return turn_limit_twice(home, repo, &env, item, &note, round);
                 }
                 progress(&format!("{note}; asking it to finish smaller"));
@@ -669,18 +815,41 @@ fn run_item(
                         p.blockers
                     ));
                 }
+                let next = Next {
+                    feedback: &feedback,
+                    prior: prior.as_ref(),
+                };
+                record_round_next(home, item, round, "turn_limit", &note, steps, Some(next))?;
                 continue;
             }
         };
-        builder = Some(raw);
-        steps.push(step);
-        // A question goes to the person at once: no checks run and no rounds are spent on it.
-        if let Some(asked) = asked {
-            progress("the builder asked for a decision");
-            record_round(home, item, round, "question", &asked, steps)?;
-            let question =
-                format!("Paja's builder needs a decision before it can go on:\n\n{asked}");
-            return escalated(home, repo, &env, item, &question, round);
+        if let Some((step, raw, asked)) = built {
+            builder = Some(raw);
+            steps.push(step);
+            // A question goes to the person at once: no checks run and no rounds are spent on it.
+            if let Some(asked) = asked {
+                progress("the builder asked for a decision");
+                record_round(home, item, round, "question", &asked, steps)?;
+                let question =
+                    format!("Paja's builder needs a decision before it can go on:\n\n{asked}");
+                return escalated(home, repo, &env, item, &question, round);
+            }
+        }
+        // A merge Paja handed over must be finished, not committed with its conflicts.
+        if merging(&env.path) && !unmerged(&env.path)?.is_empty() {
+            git(&env.path, &["merge", "--abort"])?;
+            feedback = format!(
+                "The merge of {} was left with conflicts, so Paja undid it. Resolve every \
+                 conflicted file, `git add` it and `git commit -m '<message>'`.",
+                target.branch
+            );
+            progress("the builder left the merge unfinished; asking again");
+            let next = Next {
+                feedback: &feedback,
+                prior: prior.as_ref(),
+            };
+            record_round_next(home, item, round, "conflict", &feedback, steps, Some(next))?;
+            continue;
         }
         commit_leftovers(&env, item)?;
         if git(
@@ -690,7 +859,11 @@ fn run_item(
         {
             feedback = "The previous round made no commits. Make the change and commit it.".into();
             progress("the builder committed nothing; asking again");
-            record_round(home, item, round, "no_change", &feedback, steps)?;
+            let next = Next {
+                feedback: &feedback,
+                prior: prior.as_ref(),
+            };
+            record_round_next(home, item, round, "no_change", &feedback, steps, Some(next))?;
             continue;
         }
         // A round after a review must commit a fix; an empty fix is never reviewed.
@@ -701,58 +874,126 @@ fn run_item(
                     prior.blockers
                 );
                 progress("the builder committed no fix; asking again");
-                record_round(home, item, round, "no_change", &feedback, steps)?;
+                let next = Next {
+                    feedback: &feedback,
+                    prior: Some(prior),
+                };
+                record_round_next(home, item, round, "no_change", &feedback, steps, Some(next))?;
+                continue;
+            }
+        }
+        // Judge the change as it would land: on the latest default branch.
+        match catch_up(repo, &env, &target.branch)? {
+            // The builder may have finished a merge Paja handed over: diffs start from there.
+            CatchUp::Current(tip) => base = tip,
+            CatchUp::Merged(tip) => {
+                progress(&format!(
+                    "{} moved on; merged it into the branch",
+                    target.branch
+                ));
+                base = tip;
+            }
+            CatchUp::Conflict(files) => {
+                let branch = &target.branch;
+                feedback = format!(
+                    "{branch} moved on since this branch was made, and merging it conflicts in: \
+                     {}. Paja started the merge: the conflicted files hold conflict markers. \
+                     Resolve each one, keeping what both sides meant, then `git add` the files \
+                     and `git commit -m '<message>'` to finish the merge.",
+                    files.join(", ")
+                );
+                if let Some(prior) = &prior {
+                    feedback.push_str(&format!(
+                        "\n\nThe review's blockers still need fixing too:\n\n{}",
+                        prior.blockers
+                    ));
+                }
+                progress(&format!(
+                    "the branch conflicts with {branch}; sending the merge to the builder"
+                ));
+                let next = Next {
+                    feedback: &feedback,
+                    prior: prior.as_ref(),
+                };
+                let detail = files.join(", ");
+                record_round_next(home, item, round, "conflict", &detail, steps, Some(next))?;
                 continue;
             }
         }
         let checked = git(&env.path, &["rev-parse", "HEAD"])?;
+        // The checks passed on this very commit, against this very default branch tip, in the
+        // run that stopped, and nothing in the worktree has changed since: not run again.
+        let skip_checks = match &reused {
+            Some((commit, at)) => {
+                *commit == checked && *at == base && untouched_at(&env, &checked)?
+            }
+            None => false,
+        };
+        if skip_checks {
+            progress("Vasara's checks already passed on this commit; skipping them");
+        }
         // Files marked assume-unchanged or skip-worktree hide from `git status`. Sparse
         // checkout marks every file outside its cone skip-worktree, so the checks are judged
         // by whether they changed the flags. Any flag the builder's code set goes first: a
         // fresh index keeps only the ones sparse checkout gives.
-        let mut flags = git(&env.path, &["ls-files", "-v"])?;
-        if has_index_flags(&flags) {
-            put_back(&env, &checked)?;
-            flags = git(&env.path, &["ls-files", "-v"])?;
-        }
-        stop_point()?;
-        let guard = GitGuard::new(&env.path)?;
-        progress(&format!(
-            "running Vasara's checks ({} command{})",
-            checks.len(),
-            if checks.len() == 1 { "" } else { "s" }
-        ));
-        let result = run_checks(&env.path, &checks);
-        guard.check("Vasara's checks")?;
-        // The checks run the branch's code, which could change the tree or even commit. Put it
-        // back, and fail the round, so nothing lands that the checks didn't judge.
-        let mut failed = result;
-        let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
-            || git(&env.path, &["ls-files", "-v"])? != flags
-            || !git(&env.path, &["status", "--porcelain"])?.is_empty();
-        if moved {
-            put_back(&env, &checked)?;
-            if let Ok(failure) = &mut failed {
-                failure.get_or_insert_with(|| {
+        if !skip_checks {
+            let mut flags = git(&env.path, &["ls-files", "-v"])?;
+            if has_index_flags(&flags) {
+                put_back(&env, &checked)?;
+                flags = git(&env.path, &["ls-files", "-v"])?;
+            }
+            stop_point()?;
+            let guard = GitGuard::new(&env.path)?;
+            progress(&format!(
+                "running Vasara's checks ({} command{})",
+                checks.len(),
+                if checks.len() == 1 { "" } else { "s" }
+            ));
+            let result = run_checks(&env.path, &checks);
+            guard.check("Vasara's checks")?;
+            // The checks run the branch's code, which could change the tree or even commit. Put it
+            // back, and fail the round, so nothing lands that the checks didn't judge.
+            let mut failed = result;
+            let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
+                || git(&env.path, &["ls-files", "-v"])? != flags
+                || !git(&env.path, &["status", "--porcelain"])?.is_empty();
+            if moved {
+                put_back(&env, &checked)?;
+                if let Ok(failure) = &mut failed {
+                    failure.get_or_insert_with(|| {
                     "Running the checks changed the worktree or its commits; the change was put \
                  back. Tests and builds must not write to the source tree or commit."
                         .into()
                 });
+                }
             }
-        }
-        let failed = failed?;
-        if let Some(failure) = failed {
-            feedback =
-                format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
-            if let Some(prior) = &prior {
-                feedback.push_str(&format!(
-                    "\n\nThe review's blockers still need fixing too:\n\n{}",
-                    prior.blockers
-                ));
+            let failed = failed?;
+            if let Some(failure) = failed {
+                feedback =
+                    format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
+                if let Some(prior) = &prior {
+                    feedback.push_str(&format!(
+                        "\n\nThe review's blockers still need fixing too:\n\n{}",
+                        prior.blockers
+                    ));
+                }
+                progress("the checks failed; sending the failure back to the builder");
+                let next = Next {
+                    feedback: &feedback,
+                    prior: prior.as_ref(),
+                };
+                record_round_next(
+                    home,
+                    item,
+                    round,
+                    "checks_failed",
+                    &failure,
+                    steps,
+                    Some(next),
+                )?;
+                continue;
             }
-            progress("the checks failed; sending the failure back to the builder");
-            record_round(home, item, round, "checks_failed", &failure, steps)?;
-            continue;
+            record_checked(home, item, round, &checked, &base)?;
         }
         // --no-renames lists both sides of a rename, so moving a high-risk file keeps it high risk.
         let changed = git(
@@ -813,7 +1054,7 @@ fn run_item(
                 home,
                 &env,
                 item,
-                base,
+                &base,
                 &checked,
                 prior.as_ref().filter(|_| !risky),
                 reviewer,
@@ -858,8 +1099,8 @@ fn run_item(
         }
         if let Some(note) = limited {
             review_limits += 1;
-            record_round(home, item, round, "turn_limit", &note, steps)?;
             if review_limits > 1 {
+                record_round(home, item, round, "turn_limit", &note, steps)?;
                 return turn_limit_twice(home, repo, &env, item, &note, round);
             }
             progress(&format!(
@@ -875,6 +1116,11 @@ fn run_item(
                     p.blockers
                 ));
             }
+            let next = Next {
+                feedback: &feedback,
+                prior: prior.as_ref(),
+            };
+            record_round_next(home, item, round, "turn_limit", &note, steps, Some(next))?;
             continue;
         }
         // Only the round that lands files its follow-ups: an earlier round's may be about code
@@ -882,27 +1128,51 @@ fn run_item(
         follow_ups.clear();
         for review in &reviews {
             for finding in &review.follow_ups {
-                if !finding.trim().is_empty() && !follow_ups.contains(finding) {
+                if !finding.text.trim().is_empty() && !follow_ups.contains(finding) {
                     follow_ups.push(finding.clone());
                 }
             }
         }
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
         progress(&format!("review verdict: {}", verdicts.join(", ")));
-        record_round(
-            home,
-            item,
-            round,
-            &verdicts.join(","),
-            &summaries(&reviews),
-            steps,
-        )?;
+        // A round that goes on is recorded below, with what the next one starts from.
+        let ends = verdicts.iter().all(|v| *v == "land")
+            || verdicts.contains(&"escalate")
+            || (risky && verdicts.contains(&"land"));
+        if ends {
+            record_round(
+                home,
+                item,
+                round,
+                &verdicts.join(","),
+                &summaries(&reviews),
+                steps,
+            )?;
+        }
 
         if let Some(esc) = reviews.iter().find(|r| r.verdict == "escalate") {
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = land(home, repo, &env, item, round, &checked, ci);
+            let report = match land(home, repo, &env, item, round, &checked, ci, &target) {
+                Ok(Landing::Retry(why)) => {
+                    progress("CI failed; sending the failure back to the builder");
+                    feedback = why.clone();
+                    prior = Some(Prior {
+                        reviewed: checked,
+                        blockers: why.clone(),
+                        follow_ups: follow_ups.clone(),
+                    });
+                    let next = Next {
+                        feedback: &feedback,
+                        prior: prior.as_ref(),
+                    };
+                    record_round_next(home, item, round, "ci_failed", &why, steps, Some(next))?;
+                    continue;
+                }
+                Ok(Landing::Done(report)) => Ok(report),
+                Err(err) => Err(err),
+            };
             match &report {
                 Ok(RunReport::Landed { pr, .. }) => {
                     file_follow_ups(home, repo, item, pr, &follow_ups, &labels)
@@ -913,7 +1183,7 @@ fn run_item(
                         record_follow_up(
                             home,
                             item,
-                            finding,
+                            &finding.shown(),
                             None,
                             "not filed: the change did not land",
                         );
@@ -945,12 +1215,39 @@ fn run_item(
             .collect::<Vec<_>>()
             .join("\n\n");
         feedback = format!("A reviewer asked for changes:\n\n{blockers}");
+        // Another round runs anyway, so a nit that takes a line or two is fixed now rather
+        // than filed; a nit not fixed is simply dropped.
+        let nits: Vec<&str> = follow_ups
+            .iter()
+            .filter(|f| f.kind == FindingKind::Nit)
+            .map(|f| f.text.as_str())
+            .collect();
+        if !nits.is_empty() {
+            feedback.push_str(&format!(
+                "\n\nThe reviewers also noted these nits. Fix one only if it takes a line or \
+                 two; otherwise leave it:\n\n{}",
+                nits.join("\n\n")
+            ));
+        }
         // Without named blockers there is nothing to narrow the next review to.
         prior = (!blockers.is_empty()).then(|| Prior {
             reviewed: checked,
             blockers,
             follow_ups: follow_ups.clone(),
         });
+        let next = Next {
+            feedback: &feedback,
+            prior: prior.as_ref(),
+        };
+        record_round_next(
+            home,
+            item,
+            round,
+            &verdicts.join(","),
+            &summaries(&reviews),
+            steps,
+            Some(next),
+        )?;
     }
     let question = format!(
         "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
@@ -972,7 +1269,7 @@ fn turn_limit_twice(
     let question = format!(
         "In this run {note}, the second time that step stopped at its turn limit. The issue may \
          be too big for one change: split it into smaller issues, or raise the limit with a \
-         `max-turns` line in `{MODELS_FILE}` on main, then answer with what you changed."
+         `max-turns` line in `{MODELS_FILE}` on the default branch, then answer with what you changed."
     );
     escalated(home, repo, env, item, &question, round)
 }
@@ -1360,7 +1657,12 @@ fn review_prompt(
             follow_ups = if prior.follow_ups.is_empty() {
                 "(none)".to_string()
             } else {
-                prior.follow_ups.join("\n\n")
+                prior
+                    .follow_ups
+                    .iter()
+                    .map(Finding::shown)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
             }
         ),
     };
@@ -1370,19 +1672,22 @@ fn review_prompt(
         "Issue #{number}: {title}\n\n{body}\n{answers}\n{diff}\n\n\
          You are an independent reviewer for this project. You did not write this change; decide \
          whether it lands.\n\n{scope} You already have the diff, so read only the surrounding \
-         code you need. Judge it by the rules in CLAUDE.md as they are on main: the CLAUDE.md in \
-         your system prompt is main's copy, not the branch's, so don't read it again.\n\n\
+         code you need. Judge it by the rules in CLAUDE.md as they are on the default branch: the CLAUDE.md in \
+         your system prompt is the default branch's copy, not the branch's, so don't read it again.\n\n\
          Verdicts: `land` if it does what the issue asks and has no blocker; `changes` only for \
          blockers, naming every blocker in the whole diff in `comments` (a later review reads \
          only the fix); `escalate` with a question only when the issue's \
          intent is unclear or the change would weaken a check (a person must decide). A blocker \
          is a bug in what the issue asks for, a security hole the change opens, a broken \
-         CLAUDE.md rule, or missing tests for the new behaviour. Anything else, including \
-         hardening ideas, edge cases outside the issue and nits, goes in `follow_ups`, one \
-         finding each, starting with a short title line, at most five; Paja files them as public \
-         issues after landing, so never copy secrets, environment details or run output into \
-         them. They never hold the change up.\n\n\
-         Vasara's checks (every command in `.paja/checks` on main: {checks}) already passed at \
+         CLAUDE.md rule, or missing tests for the new behaviour. Anything else goes in \
+         `follow_ups`, one finding each, starting with a short title line, at most five, each \
+         marked with its `kind`: `bug` for a wrong result outside what the issue asks, `risk` \
+         for a security or data-loss risk or a missing test for behaviour that could break, \
+         `nit` for style, naming, comment wording or a small refactor. Leave out ideas that are \
+         neither. Paja files the bugs and risks together as one public issue after landing \
+         (so never copy secrets, environment details or run output into them) and never files \
+         nits. They never hold the change up.\n\n\
+         Vasara's checks (every command in `.paja/checks` on the default branch: {checks}) already passed at \
          {checked}, the commit you are judging, so don't run them again. To probe a behaviour, \
          run one named test or the project itself, with Bash limited to {programs} and long \
          output piped through `tail -n 80` or `grep`. Read-only git is fine; you can't change \
@@ -1504,7 +1809,17 @@ fn review(
             "summary": {"type": "string"},
             "comments": {"type": "string"},
             "question": {"type": "string"},
-            "follow_ups": {"type": "array", "items": {"type": "string"}}
+            "follow_ups": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["bug", "risk", "nit"]},
+                        "finding": {"type": "string"}
+                    },
+                    "required": ["kind", "finding"]
+                }
+            }
         },
         "required": ["verdict", "summary"]
     });
@@ -1640,6 +1955,16 @@ fn record(home: &Home, kind: &str, data: Value) -> Result<()> {
     Ok(())
 }
 
+/// What the round after this one starts from, recorded in `run.round` so a run that stops can
+/// be resumed there.
+struct Next<'a> {
+    /// What the builder is asked to address.
+    feedback: &'a str,
+    /// What the reviewers asked for, which the next review narrows itself to.
+    prior: Option<&'a Prior>,
+}
+
+/// A round that ended without a next round: a question, a landing, an error or a stop.
 fn record_round(
     home: &Home,
     item: &WorkItem,
@@ -1648,20 +1973,138 @@ fn record_round(
     detail: &str,
     steps: &mut Vec<StepUsage>,
 ) -> Result<()> {
+    record_round_next(home, item, round, verdict, detail, steps, None)
+}
+
+/// A round after which the loop goes on: `next` is what the following round needs.
+fn record_round_next(
+    home: &Home,
+    item: &WorkItem,
+    round: u32,
+    verdict: &str,
+    detail: &str,
+    steps: &mut Vec<StepUsage>,
+    next: Option<Next>,
+) -> Result<()> {
     // Recorded once: an error later in the run must not count these steps again.
     let steps = std::mem::take(steps);
+    let mut data = json!({
+        "repo": item.repo,
+        "number": item.number,
+        "round": round,
+        "verdict": verdict,
+        "detail": clip(detail),
+        "steps": steps,
+    });
+    if let Some(next) = next {
+        data["next"] = json!({
+            "feedback": clip(next.feedback),
+            "prior": next.prior.map(|p| json!({
+                "reviewed": p.reviewed,
+                "blockers": clip(&p.blockers),
+                "follow_ups": p.follow_ups,
+            })),
+        });
+    }
+    record(home, EV_ROUND, data)
+}
+
+/// Vasara's checks passed on `commit`, with the default branch at `base`: recorded before the
+/// review, so a run that stops in it can go straight to the review again.
+fn record_checked(
+    home: &Home,
+    item: &WorkItem,
+    round: u32,
+    commit: &str,
+    base: &str,
+) -> Result<()> {
     record(
         home,
-        EV_ROUND,
+        EV_CHECKED,
         json!({
-            "repo": item.repo,
-            "number": item.number,
-            "round": round,
-            "verdict": verdict,
-            "detail": clip(detail),
-            "steps": steps,
+            "repo": item.repo, "number": item.number, "round": round,
+            "commit": commit, "base": base,
         }),
     )
+}
+
+/// Where a run that stopped left an item, rebuilt from the item's events.
+struct ResumePoint {
+    /// The round to go on in: the one that was cut off.
+    round: u32,
+    /// What the builder is asked to address in it.
+    feedback: String,
+    prior: Option<Prior>,
+    /// The commit the checks passed on in that round, and the default branch's tip they ran
+    /// against.
+    checked: Option<(String, String)>,
+    /// Where the run left off, in words.
+    stopped_in: String,
+}
+
+/// The resume point of an item whose run stopped: every run event of the item since it was
+/// last queued, claimed or answered counts, not only the last run's, so an item that is
+/// interrupted again before it records a round keeps its round count and its blockers.
+fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> ResumePoint {
+    let mut point = ResumePoint {
+        round: 1,
+        feedback: String::new(),
+        prior: None,
+        checked: None,
+        stopped_in: String::new(),
+    };
+    for event in jono::item_events(events, repo, number) {
+        let data = &event.data;
+        match event.kind.as_str() {
+            jono::EV_STATUS | jono::EV_ANSWERED | jono::EV_REOPENED | EV_LANDED | EV_ESCALATED => {
+                point = ResumePoint {
+                    round: 1,
+                    feedback: String::new(),
+                    prior: None,
+                    checked: None,
+                    stopped_in: String::new(),
+                };
+            }
+            EV_ROUND => {
+                let round = data["round"].as_u64().unwrap_or(0) as u32;
+                match data.get("next").filter(|n| n.is_object()) {
+                    Some(next) => {
+                        point.round = round + 1;
+                        point.feedback = next["feedback"].as_str().unwrap_or_default().to_string();
+                        point.prior = serde_json::from_value(next["prior"].clone()).ok();
+                        point.checked = None;
+                        point.stopped_in = format!(
+                            "round {round} ended with {}",
+                            data["verdict"].as_str().unwrap_or("no verdict")
+                        );
+                    }
+                    None => point.round = point.round.max(round),
+                }
+            }
+            EV_CHECKED if data["round"].as_u64() == Some(point.round as u64) => {
+                if let (Some(commit), Some(base)) = (data["commit"].as_str(), data["base"].as_str())
+                {
+                    point.checked = Some((commit.to_string(), base.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    point
+}
+
+/// The first characters of a commit id, to name it in a progress line.
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+/// Whether the worktree is exactly `commit`: that commit checked out, nothing changed or
+/// untracked, no merge under way and no index flag hiding a file.
+fn untouched_at(env: &Env, commit: &str) -> Result<bool> {
+    Ok(git(&env.path, &["rev-parse", "HEAD"])? == commit
+        && git(&env.path, &["status", "--porcelain"])?.is_empty()
+        && !merging(&env.path)
+        && !has_index_flags(&git(&env.path, &["ls-files", "-v"])?))
 }
 
 fn summaries(reviews: &[Review]) -> String {
@@ -1722,6 +2165,71 @@ fn tail(output: &Output) -> String {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     clip(text.trim())
+}
+
+/// What bringing a branch up to date with the default branch found.
+enum CatchUp {
+    /// The branch already holds the default branch's tip, given here.
+    Current(String),
+    /// The default branch merged in cleanly; its tip, the new base.
+    Merged(String),
+    /// The merge conflicts in these files. It is left in progress for the builder to finish.
+    Conflict(Vec<String>),
+}
+
+/// Merge the latest `branch` into the environment's branch, so Vasara's checks, the
+/// reviewers and CI judge the change as it would land, and a stale branch never reaches the
+/// pull request.
+fn catch_up(repo: &Path, env: &Env, branch: &str) -> Result<CatchUp> {
+    // A merge an earlier round left unfinished starts over.
+    if merging(&env.path) {
+        git(&env.path, &["merge", "--abort"])?;
+    }
+    git(repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+        format!("fetching origin/{branch}; check the network and that `origin` is the GitHub repository")
+    })?;
+    let tip = git(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    if git(&env.path, &["merge-base", "--is-ancestor", &tip, "HEAD"]).is_ok() {
+        return Ok(CatchUp::Current(tip));
+    }
+    // The person's identity when git has one, so the merge commit is theirs like the build.
+    let mut args: Vec<&str> = Vec::new();
+    if git(&env.path, &["config", "user.email"]).is_err() {
+        args.extend([
+            "-c",
+            "user.name=Paja",
+            "-c",
+            "user.email=paja@example.invalid",
+        ]);
+    }
+    let message = format!("Merge {branch} into {}", env.branch);
+    args.extend(["merge", "-q", "--no-edit", "-m", &message, &tip]);
+    match git(&env.path, &args) {
+        Ok(_) => Ok(CatchUp::Merged(tip)),
+        Err(err) => {
+            let files = unmerged(&env.path)?;
+            if files.is_empty() {
+                if merging(&env.path) {
+                    let _ = git(&env.path, &["merge", "--abort"]);
+                }
+                return Err(err.context(format!("merging origin/{branch} into {}", env.branch)));
+            }
+            Ok(CatchUp::Conflict(files))
+        }
+    }
+}
+
+/// Whether a merge is in progress in `dir`.
+fn merging(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
+}
+
+/// The files with unresolved merge conflicts in `dir`.
+fn unmerged(dir: &Path) -> Result<Vec<String>> {
+    Ok(lines(&git(
+        dir,
+        &["diff", "--name-only", "--diff-filter=U"],
+    )?))
 }
 
 fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
@@ -1995,14 +2503,17 @@ mod tests {
 
         assert!(prompt.contains("DIFF-TEXT"), "{prompt}");
         assert!(!prompt.contains("git show base1:CLAUDE.md"), "{prompt}");
-        assert!(prompt.contains("CLAUDE.md in your system prompt is main's copy"));
+        assert!(prompt.contains("CLAUDE.md in your system prompt is the default branch's copy"));
         assert!(prompt.find("Issue #9").unwrap() < prompt.find("independent reviewer").unwrap());
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         // A re-review judges only the fix, at the checked commit, against the earlier blockers.
         let prior = super::Prior {
             reviewed: "old456".into(),
             blockers: "Fix the parser.".into(),
-            follow_ups: vec!["Tidy the helper".into()],
+            follow_ups: vec![Finding {
+                kind: FindingKind::Risk,
+                text: "Tidy the helper".into(),
+            }],
         };
         let prompt = review_prompt(&item, Some(&prior));
         assert!(prompt.contains("already passed at abc123"), "{prompt}");

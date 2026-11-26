@@ -407,11 +407,11 @@ fn run(cli: &Cli) -> Result<()> {
                 });
             }
             WorkCommand::List { all, repo } => {
-                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let checkout = std::path::absolute(repo)?;
                 let items = if *all {
-                    jono::list_all(&home, &name)?
+                    jono::list_all_from(&home, &checkout)?
                 } else {
-                    jono::list(&home, &name)?
+                    jono::list(&home, &jono::repo_name(&home, &checkout)?)?
                 };
                 emit(cli, serde_json::to_value(&items)?, || {
                     if items.is_empty() {
