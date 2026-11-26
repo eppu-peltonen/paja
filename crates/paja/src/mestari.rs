@@ -2173,11 +2173,17 @@ fn config_entries(path: &Path) -> Option<Vec<u8>> {
     Some(kept)
 }
 
+/// What [`GitGuard`] keeps, in front of the raw bytes, for a configuration file git can't parse.
+const UNPARSED: &[u8] = b"\0unparsed\0";
+
 /// The entries that differ between two [`config_entries`] listings, as `name: old -> new`,
 /// `name added (value)` or `name removed`. Values show only in sections that hold no URLs or
 /// credentials (`core.`, `extensions.` and the like), never when they look like a URL with a user
 /// or a header, and are cut when long; a name with a URL in it shows only its section and key.
 fn config_changes(before: &[u8], after: &[u8]) -> Vec<String> {
+    if before.starts_with(UNPARSED) || after.starts_with(UNPARSED) {
+        return Vec::new();
+    }
     fn entries(raw: &[u8]) -> Vec<(String, String)> {
         raw.split(|b| *b == 0)
             .filter(|e| !e.is_empty())
@@ -2221,7 +2227,11 @@ fn config_changes(before: &[u8], after: &[u8]) -> Vec<String> {
         if !plain || risky {
             return "(value hidden)".into();
         }
-        let mut cut: String = value.chars().take(80).collect();
+        let mut cut: String = value
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .replace('\n', "\\n");
         if value.chars().count() > 80 {
             cut.push('…');
         }
@@ -3165,7 +3175,12 @@ impl GitGuard {
                 let content = if self.raw.contains(path) || !self.files.contains(path) {
                     raw
                 } else {
-                    raw.map(|bytes| config_entries(path).unwrap_or(bytes))
+                    // A file git can't parse is kept whole, behind a marker no listing starts
+                    // with, so the message never reads its text as entries.
+                    raw.map(|bytes| {
+                        config_entries(path)
+                            .unwrap_or_else(|| [UNPARSED, bytes.as_slice()].concat())
+                    })
                 };
                 (path.clone(), content)
             })
@@ -3383,6 +3398,10 @@ mod tests {
             changes.contains("url.(hidden).insteadof added"),
             "{changes}"
         );
+        // A file git can't parse is named, not read as entries.
+        let unparsed = [UNPARSED, b"[core]\n\teditor = x\n[broken\n".as_slice()].concat();
+        assert!(config_changes(&before, &unparsed).is_empty());
+        assert!(config_changes(&unparsed, &before).is_empty());
         assert!(config_changes(&before, &before).is_empty());
         let long = listing(&[("core.editor", &"x".repeat(200))]);
         let cut = config_changes(&[], &long);
@@ -3426,6 +3445,19 @@ mod tests {
         let err = format!("{:#}", guard.check("the agent").unwrap_err());
         assert!(err.contains("extensions.example added (`true`)"), "{err}");
         assert!(!err.contains("branch.x"), "{err}");
+        // A configuration git can't parse is named, and none of its text is shown.
+        let guard = GitGuard::new(&worktree).unwrap();
+        let config = git(&worktree, &["rev-parse", "--git-common-dir"]).unwrap();
+        let config = worktree.join(config).join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[broken\n");
+        std::fs::write(&config, text).unwrap();
+        let err = format!("{:#}", guard.check("the agent").unwrap_err());
+        assert!(err.contains("config"), "{err}");
+        assert!(
+            !err.contains("repositoryformatversion") && !err.contains("[core]"),
+            "{err}"
+        );
     }
 
     #[test]
