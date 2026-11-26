@@ -79,6 +79,15 @@ the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.sta
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
 oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
 
+When no work item is ready, Jono takes follow-ups. A sync also imports the open issues with the follow-up label as items
+whose `priority` is `follow-up` (recorded in `work.imported` and `work.changed`; every other item has priority `work`).
+An issue with both labels is a work item. `paja work list`, `work next`, `work claim`, `paja run` and the MCP tools order
+the queue by priority and then age, so every ready work item goes before any follow-up, and a work item that becomes
+ready wins at the next pick. A follow-up passes through the same loop, risk tier and `Depends on` rules as any item.
+`.paja/queue`, read from the default branch like `.paja/labels`, turns this off with `follow-ups = off` (`on` is the
+default); a sync with it off doesn't list the follow-up label, so the follow-ups already imported close like any item
+whose label went away. A line Jono can't read is an error naming the line.
+
 An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed by
 issue numbers (`Depends on #12, #14`), after optional quote, list or number markers. Lines in fenced code blocks don't
 count (an unclosed fence hides nothing), and neither do references to another repository (`other/repo#12`), which Jono

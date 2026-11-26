@@ -28,5 +28,10 @@ flowchart TB
     class approve,posti human
 ```
 
+The issue is usually one with the work label. When no such item is ready, `paja run` takes the oldest open issue with
+the follow-up label instead (the non-blocking findings reviewers leave behind), and it goes through the same loop,
+risk tier and `Depends on` rules. Work items always come first: a work item that becomes ready is picked before any
+follow-up at the next pick. `follow-ups = off` in `.paja/queue` on the default branch turns this off.
+
 After landing, the learn step turns any revert, escalation or human fix into a proposed harness rule or check. It is
 adopted when the eval suite shows it helps, and it appears in the next Posti digest.

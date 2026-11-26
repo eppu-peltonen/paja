@@ -1113,6 +1113,95 @@ fn a_repository_names_its_own_work_and_follow_up_labels() {
     assert!(!log.contains("factory"), "{log}");
 }
 
+/// A `gh` that lists one work issue (#4) and one follow-up issue (#2, older) by label, and
+/// counts a follow-up listed under both labels once.
+fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
+    let d = slash(dir);
+    program(
+        dir,
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             \"issue list\") case \"$*\" in \
+             *\"--label factory-follow-up \"*) echo '[{{\"number\": 2, \"title\": \"Tidy\", \"body\": \"\", \"url\": \"https://example.com/2\"}}]' ;; \
+             *\"--label factory \"*) echo '[{{\"number\": 4, \"title\": \"Build\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; \
+             *) echo '[]' ;; esac ;;\n\
+             *) ;;\nesac\n"
+        ),
+    )
+}
+
+#[test]
+fn work_next_takes_a_follow_up_only_when_no_work_item_is_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["imported"], serde_json::json!([4, 2]));
+    // The list shows Jono's order: the work item, then the older follow-up.
+    let (_, items) = paja_with(&home, &repo, &["work", "list"], &with_gh);
+    assert_eq!(items[0]["number"], 4, "{items}");
+    assert_eq!(items[1]["number"], 2, "{items}");
+    assert_eq!(items[1]["priority"], "follow-up", "{items}");
+    assert_eq!(items[0]["priority"], "work", "{items}");
+    let (_, next) = paja_with(&home, &repo, &["work", "next"], &with_gh);
+    assert_eq!(next["number"], 4, "{next}");
+    let (ok, set) = paja_with(&home, &repo, &["work", "set", "4", "landed"], &with_gh);
+    assert!(ok, "{set}");
+    let (_, next) = paja_with(&home, &repo, &["work", "next"], &with_gh);
+    assert_eq!(next["number"], 2, "{next}");
+}
+
+#[test]
+fn follow_ups_off_in_the_queue_file_never_picks_a_follow_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/queue"), "# queue\nfollow-ups = off\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "queue"]);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["imported"], serde_json::json!([4]));
+    let (_, set) = paja_with(&home, &repo, &["work", "set", "4", "landed"], &with_gh);
+    assert_eq!(set["status"], "landed", "{set}");
+    let (_, next) = paja_with(&home, &repo, &["work", "next"], &with_gh);
+    assert!(next.is_null(), "{next}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(!log.contains("--label factory-follow-up"), "{log}");
+}
+
+#[test]
+fn a_bad_queue_file_says_which_line_to_fix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/queue"), "follow-ups = maybe\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "queue"]);
+    let gh = queue_gh(tmp.path());
+    let (ok, err) = paja_with(
+        &home,
+        &repo,
+        &["work", "sync"],
+        &[("PAJA_GH", gh.as_path())],
+    );
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains(".paja/queue") && msg.contains("line 1"),
+        "{msg}"
+    );
+}
+
 #[test]
 fn work_sync_reads_the_labels_from_a_default_branch_not_called_main() {
     let tmp = tempfile::tempdir().unwrap();
