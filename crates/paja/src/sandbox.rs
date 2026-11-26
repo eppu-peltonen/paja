@@ -28,12 +28,15 @@ pub const SCRATCH: &str = "/tmp/paja-home";
 /// Puts rustup's directory on `PATH`, then runs the command it is given.
 const WRAP: &str = r#"PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec "$@""#;
 
-/// Installs a C toolchain and Rust (what Vasara's checks need) when the sandbox lacks them.
-const SETUP: &str = r#"set -e
-S=""; [ "$(id -u)" = 0 ] || S="sudo -n"
-if ! command -v cc >/dev/null 2>&1; then
-  $S apt-get update && $S apt-get install -y build-essential curl ca-certificates git
-fi
+/// Installs a C toolchain when the sandbox lacks one. Runs as root (`sbx exec -u root`): the
+/// agent user has no working `sudo` in the sandbox.
+const SETUP_ROOT: &str = r#"set -e
+if ! command -v cc >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+  apt-get update && apt-get install -y build-essential curl ca-certificates git
+fi"#;
+
+/// Installs Rust (what Vasara's checks need) for the agent user, when the sandbox lacks it.
+const SETUP_USER: &str = r#"set -e
 if [ ! -x "$HOME/.cargo/bin/cargo" ] && ! command -v cargo >/dev/null 2>&1; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt,clippy
 fi"#;
@@ -104,13 +107,15 @@ pub fn start(mounts: &[PathBuf]) -> Result<Option<Sbx>> {
         })?;
     }
     if sbx.exec_ok(TOOLCHAIN_CHECK).is_err() {
-        sbx.exec_ok(SETUP).with_context(|| {
-            format!(
-                "setting up Rust and a C toolchain in the sandbox `{}` failed; run \
+        sbx.exec_as(Some("root"), SETUP_ROOT)
+            .and_then(|()| sbx.exec_as(None, SETUP_USER))
+            .with_context(|| {
+                format!(
+                    "setting up Rust and a C toolchain in the sandbox `{}` failed; run \
                  `{} exec -it {} sh` and install `cc`, `cargo` and `rustfmt` there",
-                sbx.name, sbx.program, sbx.name
-            )
-        })?;
+                    sbx.name, sbx.program, sbx.name
+                )
+            })?;
         sbx.exec_ok(TOOLCHAIN_CHECK).with_context(|| {
             format!(
                 "the sandbox `{}` still has no Rust or C toolchain after setup; run \
@@ -164,8 +169,19 @@ impl Sbx {
     }
 
     fn exec_ok(&self, script: &str) -> Result<()> {
-        let out = self
-            .script(Path::new("/"), &[], script)
+        self.exec_as(None, script)
+    }
+
+    /// Run `script` in the sandbox as `user` (the sandbox's default user when `None`).
+    fn exec_as(&self, user: Option<&str>, script: &str) -> Result<()> {
+        let mut cmd = Command::new(&self.program);
+        cmd.arg("exec").args(["-w", "/"]);
+        if let Some(user) = user {
+            cmd.args(["-u", user]);
+        }
+        cmd.arg(&self.name)
+            .args(["--", "sh", "-c", WRAP, "sh", "sh", "-c", script]);
+        let out = cmd
             .stdin(Stdio::null())
             .output()
             .with_context(|| self.unavailable())?;

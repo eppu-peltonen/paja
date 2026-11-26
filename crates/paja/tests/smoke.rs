@@ -1808,7 +1808,12 @@ fn a_real_sandbox_hides_the_owners_files() {
     let planted = secrets.path().join(".netrc");
     std::fs::write(&planted, "machine example.com password hunter2\n").unwrap();
     let outside = secrets.path().join("written-by-a-check");
-    let checks = format!("test ! -e {}\ntouch {}\n", slash(&planted), slash(&outside));
+    // The write outside must fail without failing the check; the host is asserted below.
+    let checks = format!(
+        "test ! -e {}\ntouch {} || true\n",
+        slash(&planted),
+        slash(&outside)
+    );
     let f = Factory::new(&checks, "land");
     let sbx = std::path::PathBuf::from(sbx);
     let (ok, report) = paja_with(
@@ -1824,6 +1829,7 @@ fn a_real_sandbox_hides_the_owners_files() {
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
     assert!(!outside.exists(), "a check wrote outside its sandbox");
+    assert!(planted.exists(), "the planted file should be untouched");
 }
 
 /// `path` (`/w/...`) as an absolute path on this platform: on a drive on Windows.
