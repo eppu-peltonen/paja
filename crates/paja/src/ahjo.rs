@@ -87,12 +87,13 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     validate_name(opts.name)?;
     // Under the lock, so a tamper stop recorded meanwhile is seen before any more git runs.
     let lock = home.lock()?;
-    ensure_untampered(home, opts.repo)?;
+    let log = home.events();
+    let events = log.read_all()?;
+    untampered_in(&events, opts.repo)?;
     let repo = main_repo(opts.repo)?;
     let branch = format!("paja/{}", opts.name);
 
-    let log = home.events();
-    let envs = replay(&log.read_all()?)?;
+    let envs = replay(&events)?;
     if envs.contains_key(opts.name) {
         bail!(
             "an environment named {:?} already exists; pick another name or run `paja env remove {}` first",
@@ -213,7 +214,8 @@ impl From<&Env> for RemoveReport {
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
-    let env = replay(&log.read_all()?)?.remove(name).with_context(|| {
+    let events = log.read_all()?;
+    let env = replay(&events)?.remove(name).with_context(|| {
         format!("no environment named {name:?}; run `paja env list` to see them")
     })?;
     let path = env
@@ -221,7 +223,7 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
         .to_str()
         .with_context(|| format!("environment path {} is not UTF-8", env.path.display()))?;
     if env.repo.exists() {
-        ensure_untampered(home, &env.repo)?;
+        untampered_in(&events, &env.repo)?;
     }
 
     if !env.repo.exists() {
@@ -331,11 +333,17 @@ pub fn repo_key(path: &Path) -> Result<String> {
 /// event for it is [`EV_TAMPERED`]. Every command that runs git or gh in a repository calls
 /// this first. Returns the repository's key.
 pub fn ensure_untampered(home: &Home, path: &Path) -> Result<String> {
+    untampered_in(&home.events().read_all()?, path)
+}
+
+/// [`ensure_untampered`] on events the caller has already read, so a command that replays the
+/// log anyway reads it once.
+pub fn untampered_in(events: &[Event], path: &Path) -> Result<String> {
     let key = repo_key(path)?;
-    let last =
-        home.events().read_all()?.into_iter().rev().find(|e| {
-            (e.kind == EV_TAMPERED || e.kind == EV_TAMPER_CHECKED) && e.data["repo"] == key
-        });
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| (e.kind == EV_TAMPERED || e.kind == EV_TAMPER_CHECKED) && e.data["repo"] == key);
     if let Some(event) = last.filter(|e| e.kind == EV_TAMPERED) {
         return Err(Tampered(format!(
             "Paja stopped on {key} because git's configuration changed during a run ({}); it \
@@ -495,6 +503,48 @@ mod tests {
             port_count: PORT_BLOCK,
             created_ms: 0,
         }
+    }
+
+    #[test]
+    fn only_the_last_tamper_event_for_the_same_repository_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            git(&path, &["init", "-q"]).unwrap();
+            path
+        };
+        let (a, b) = (repo("a"), repo("b"));
+        let (key_a, key_b) = (repo_key(&a).unwrap(), repo_key(&b).unwrap());
+        assert_ne!(key_a, key_b);
+        let mut seq = 0;
+        let mut event = |kind: &str, key: &str| {
+            seq += 1;
+            Event {
+                v: 1,
+                seq,
+                ts_ms: 0,
+                kind: kind.into(),
+                data: serde_json::json!({ "repo": key, "error": "config changed" }),
+            }
+        };
+        let tampered =
+            |e: anyhow::Result<String>| e.is_err_and(|err| err.chain().any(|c| c.is::<Tampered>()));
+        let mut events = vec![event(EV_TAMPERED, &key_a)];
+        assert!(tampered(untampered_in(&events, &a)));
+        // Another repository's events never lock this one, nor clear it.
+        assert_eq!(untampered_in(&events, &b).unwrap(), key_b);
+        events.push(event(EV_TAMPER_CHECKED, &key_b));
+        assert!(tampered(untampered_in(&events, &a)));
+        // Checked, then tampered again: the last one for the key decides each time.
+        events.push(event(EV_TAMPER_CHECKED, &key_a));
+        assert_eq!(untampered_in(&events, &a).unwrap(), key_a);
+        events.push(event(EV_TAMPERED, &key_a));
+        assert!(tampered(untampered_in(&events, &a)));
+        events.push(event(EV_TAMPERED, &key_b));
+        events.push(event(EV_TAMPER_CHECKED, &key_a));
+        assert_eq!(untampered_in(&events, &a).unwrap(), key_a);
+        assert!(tampered(untampered_in(&events, &b)));
     }
 
     #[test]
