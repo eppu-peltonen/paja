@@ -92,32 +92,70 @@ pub(super) fn file_follow_ups(
     }
 }
 
-/// Tokens that look like GitHub, Anthropic, AWS or bearer credentials become `<redacted>`, and
-/// each path in `places` (and anything under it) becomes its label. Longer paths go first, so
-/// a worktree under the factory home is named as the factory home, not cut in half.
+/// Tokens that look like credentials become `<redacted>`, and each path in `places` (and
+/// anything under it) becomes its label. Longer paths go first, so a worktree under the factory
+/// home is named as the factory home, not cut in half. A path is matched only where no letter
+/// or digit follows it, so `/home/me` leaves `/home/meg` alone. A place under the user's
+/// home (the last entry labelled `<home>`) is also matched in its `~/...` spelling.
 pub(super) fn redact(text: &str, places: &[(&Path, &str)]) -> String {
-    let mut places: Vec<(String, &str)> = places
+    let user_homes: Vec<String> = places
         .iter()
-        .flat_map(|(path, label)| {
-            let shown = path
-                .to_string_lossy()
-                .trim_end_matches(['/', '\\'])
-                .to_string();
-            // Both separators, since a finding may quote either spelling of a Windows path.
-            [shown.replace('\\', "/"), shown.replace('/', "\\"), shown]
-                .into_iter()
-                .map(move |spelling| (spelling, *label))
-        })
-        // A path of one or two characters (`/`, `C:`) would redact far too much.
-        .filter(|(spelling, _)| spelling.len() > 2)
+        .filter(|(_, label)| *label == "<home>")
+        .map(|(path, _)| spelling(path))
         .collect();
-    places.sort_by_key(|(spelling, _)| std::cmp::Reverse(spelling.len()));
-    places.dedup();
+    let mut spellings: Vec<(String, &str)> = Vec::new();
+    for (path, label) in places {
+        let shown = spelling(path);
+        let mut forms = vec![shown.clone()];
+        for user_home in &user_homes {
+            if let Some(rest) = shown.strip_prefix(user_home.as_str()) {
+                if rest.starts_with(['/', '\\']) {
+                    forms.push(format!("~{rest}"));
+                }
+            }
+        }
+        for form in forms {
+            // Both separators, since a finding may quote either spelling of a Windows path.
+            for each in [form.replace('\\', "/"), form.replace('/', "\\"), form] {
+                // A path of one or two characters (`/`, `C:`) would redact far too much.
+                if each.len() > 2 {
+                    spellings.push((each, *label));
+                }
+            }
+        }
+    }
+    spellings.sort_by_key(|(spelling, _)| std::cmp::Reverse(spelling.len()));
+    spellings.dedup();
     let mut text = text.to_string();
-    for (spelling, label) in &places {
-        text = text.replace(spelling.as_str(), label);
+    for (spelling, label) in &spellings {
+        text = replace_path(&text, spelling, label);
     }
     redact_tokens(&text)
+}
+
+/// `path` as text, without a trailing separator.
+fn spelling(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
+
+/// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
+/// `label`.
+fn replace_path(text: &str, path: &str, label: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(path) {
+        let after = &rest[at + path.len()..];
+        // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
+        // around the path, so a path before one is still redacted.
+        let ends = !after.starts_with(char::is_alphanumeric);
+        out.push_str(&rest[..at]);
+        out.push_str(if ends { label } else { path });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Prefixes of credentials that are safe to recognise by their start.
@@ -128,27 +166,48 @@ const TOKEN_PREFIXES: &[&str] = &[
     "ghs_",
     "ghr_",
     "github_pat_",
-    "sk-ant-",
+    "glpat-",
+    "sk-",
     "AKIA",
     "xoxb-",
     "xoxp-",
+    "npm_",
+    "pypi-",
 ];
 
+/// Words that introduce a credential: the next long word after one of them, past spaces, `:`
+/// or `=`, is redacted whatever it looks like.
+const TOKEN_LEADS: &[&str] = &["bearer", "token", "password", "secret", "apikey", "api_key"];
+
+/// The scan visits each word once, so its cost is linear in the text.
 fn redact_tokens(text: &str) -> String {
     let token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
+    // Whether the previous word leads a credential and only spaces, `:` or `=` came since.
+    let mut led = false;
     while !rest.is_empty() {
-        // The next word: a run of token characters.
         let start = rest.find(token_char).unwrap_or(rest.len());
-        out.push_str(&rest[..start]);
+        let gap = &rest[..start];
+        out.push_str(gap);
+        if !gap
+            .chars()
+            .all(|c| c.is_whitespace() || c == ':' || c == '=')
+        {
+            led = false;
+        }
         rest = &rest[start..];
+        if rest.is_empty() {
+            break;
+        }
         let end = rest.find(|c: char| !token_char(c)).unwrap_or(rest.len());
         let word = &rest[..end];
-        let before = out.trim_end().to_ascii_lowercase();
-        let secret = (word.len() >= 16 && TOKEN_PREFIXES.iter().any(|p| word.starts_with(p)))
-            || (word.len() >= 16 && before.ends_with("bearer"));
+        let secret = word.len() >= 16
+            && (led || TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix)));
         out.push_str(if secret { "<redacted>" } else { word });
+        led = TOKEN_LEADS
+            .iter()
+            .any(|lead| word.eq_ignore_ascii_case(lead));
         rest = &rest[end..];
     }
     out
@@ -202,6 +261,35 @@ mod tests {
             "See <factory home>/envs/work-3/src/a.rs and <repository>/b.rs, <home>/notes, \
              token <redacted> and Authorization: Bearer <redacted>. Keep ghp_ and #12."
         );
+    }
+
+    #[test]
+    fn redaction_covers_more_shapes_and_keeps_other_paths() {
+        let user = Path::new("/home/me");
+        let home = Path::new("/home/me/.paja");
+        let places = [(home, "<factory home>"), (user, "<home>")];
+        // Built at run time, so secret scanners don't take the test's fake tokens for real ones.
+        let long = "c3".repeat(10);
+        let key = format!("sk-{long}");
+        let text = format!(
+            "See ~/.paja/envs/x, /home/meg/a, _/home/me_, _~/.paja_, /home/me- and /home/me. Token: {long}, password={long}, \
+             Bearer:{long}, key {key}, commit 0123456789abcdef0123 and a token of ours."
+        );
+        assert_eq!(
+            redact(&text, &places),
+            "See <factory home>/envs/x, /home/meg/a, _<home>_, _<factory home>_, <home>- and <home>. Token: <redacted>, \
+             password=<redacted>, Bearer:<redacted>, key <redacted>, commit \
+             0123456789abcdef0123 and a token of ours."
+        );
+    }
+
+    #[test]
+    fn redacting_a_long_finding_stays_fast() {
+        let text = "word ".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert_eq!(redact_tokens(&text), text);
+        // A scan that re-read the text for every word would take minutes here.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
