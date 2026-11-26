@@ -50,7 +50,10 @@ impl Labels {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let at = format!("{LABELS_FILE} on main, line {}: {line:?}", i + 1);
+            let at = format!(
+                "{LABELS_FILE} on the default branch, line {}: {line:?}",
+                i + 1
+            );
             let (key, value) = line
                 .split_once(char::is_whitespace)
                 .map(|(key, value)| (key, value.trim()))
@@ -73,7 +76,7 @@ impl Labels {
         }
         if labels.work == labels.follow_up {
             bail!(
-                "{LABELS_FILE} on main gives `work` and `follow-up` the same label {:?}; they \
+                "{LABELS_FILE} on the default branch gives `work` and `follow-up` the same label {:?}; they \
                  must differ, or follow-ups would queue themselves",
                 labels.work
             );
@@ -81,11 +84,11 @@ impl Labels {
         Ok(labels)
     }
 
-    /// The labels on the default branch of the checkout `ok` proved safe: `origin/main`, else
-    /// a local `main`. A repository without the file, or without either branch, gets the
-    /// defaults. Never read from the branch checked out, which is the change under review.
+    /// The labels on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
+    /// remote's default branch, whatever its name), else `origin/main`, else a local `main`. A
+    /// repository without the file, or without any of these, gets the defaults. Never read from the branch checked out, which is the change under review.
     fn of_default_branch(ok: &Untampered) -> Result<Self> {
-        for rev in ["origin/main", "main"] {
+        for rev in ["origin/HEAD", "origin/main", "main"] {
             let git = |args: &[&str]| {
                 crate::ahjo::git_command()
                     .arg("-C")
