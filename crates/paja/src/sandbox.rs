@@ -186,6 +186,40 @@ pub fn start(mounts: &[PathBuf]) -> Result<Option<Sbx>> {
     Ok(Some(sbx))
 }
 
+/// `path` as the sandbox spells it. The sandbox is Linux: on Windows `C:\a\b` is `/c/a/b` there
+/// (drive letter lower-cased, backslashes to slashes); elsewhere the path is unchanged. A UNC
+/// path has no such spelling and is refused. Use this for every host path handed to `sbx` for
+/// use inside the sandbox (`exec -w`, command lines, variables), but not for `sbx create`
+/// mounts, which `sbx` reads on the host.
+pub fn in_sandbox_path(path: &Path) -> Result<String> {
+    translate(&path.to_string_lossy())
+}
+
+fn translate(path: &str) -> Result<String> {
+    if !cfg!(windows) {
+        return Ok(path.to_string());
+    }
+    // `\\?\C:\a` is the verbatim form of a drive path; `\\?\UNC\..` and `\\server\..` are UNC.
+    let plain = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let b = plain.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        let rest = &plain[2..];
+        if rest.is_empty() || rest.starts_with(['\\', '/']) {
+            let rest = rest.replace('\\', "/");
+            return Ok(format!("/{}{}", (b[0] as char).to_ascii_lowercase(), rest));
+        }
+        bail!("`{path}` is a drive-relative path; give the full path, like `C:\\dir`");
+    }
+    if plain.starts_with(r"\\") || plain.starts_with("//") || path.starts_with(r"\\?\") {
+        bail!(
+            "`{path}` is a network (UNC) path, which the sandbox can't mount; use a directory on \
+             a local drive, such as `C:\\...`, for the factory home and the repository"
+        );
+    }
+    // Already a Linux-style path (`/work`, `/`).
+    Ok(path.replace('\\', "/"))
+}
+
 impl Sbx {
     fn unavailable(&self) -> String {
         format!(
@@ -206,20 +240,25 @@ impl Sbx {
 
     /// The command that runs `argv` in the sandbox, in `dir`, with exactly `env` set. The
     /// sandbox does not inherit the host's environment, so nothing else reaches it.
-    pub fn command(&self, dir: &Path, env: &[(String, String)], argv: &[String]) -> Command {
+    pub fn command(
+        &self,
+        dir: &Path,
+        env: &[(String, String)],
+        argv: &[String],
+    ) -> Result<Command> {
         let mut cmd = Command::new(&self.program);
-        cmd.arg("exec").arg("-w").arg(dir);
+        cmd.arg("exec").arg("-w").arg(in_sandbox_path(dir)?);
         for (key, value) in env {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
         cmd.arg(&self.name)
             .args(["--", "sh", "-c", WRAP, "sh"])
             .args(argv);
-        cmd
+        Ok(cmd)
     }
 
     /// The command that runs the shell script `script` (a check) in the sandbox.
-    pub fn script(&self, dir: &Path, env: &[(String, String)], script: &str) -> Command {
+    pub fn script(&self, dir: &Path, env: &[(String, String)], script: &str) -> Result<Command> {
         self.command(
             dir,
             env,
@@ -243,7 +282,9 @@ impl Sbx {
 
     fn exec_run(&self, dir: Option<&Path>, user: Option<&str>, script: &str) -> Result<()> {
         let mut cmd = Command::new(&self.program);
-        cmd.arg("exec").arg("-w").arg(dir.unwrap_or(Path::new("/")));
+        cmd.arg("exec")
+            .arg("-w")
+            .arg(in_sandbox_path(dir.unwrap_or(Path::new("/")))?);
         if let Some(user) = user {
             cmd.args(["-u", user]);
         }
@@ -312,11 +353,13 @@ mod tests {
 
     #[test]
     fn commands_carry_only_the_variables_they_are_given() {
-        let cmd = sbx().command(
-            Path::new("/work"),
-            &[("A".into(), "1".into())],
-            &["cargo".into(), "test".into()],
-        );
+        let cmd = sbx()
+            .command(
+                Path::new("/work"),
+                &[("A".into(), "1".into())],
+                &["cargo".into(), "test".into()],
+            )
+            .unwrap();
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -324,6 +367,49 @@ mod tests {
         assert_eq!(&args[..5], ["exec", "-w", "/work", "-e", "A=1"]);
         assert_eq!(&args[5..7], ["paja", "--"]);
         assert_eq!(&args[args.len() - 2..], ["cargo", "test"]);
+    }
+
+    #[test]
+    fn unix_paths_are_unchanged() {
+        if cfg!(windows) {
+            return;
+        }
+        assert_eq!(translate("/home/a b/c").unwrap(), "/home/a b/c");
+        assert_eq!(translate(r"//server/share").unwrap(), "//server/share");
+    }
+
+    #[test]
+    fn windows_paths_get_the_sandbox_spelling() {
+        if !cfg!(windows) {
+            return;
+        }
+        assert_eq!(translate(r"C:\a\b").unwrap(), "/c/a/b");
+        assert_eq!(translate(r"d:/a/b").unwrap(), "/d/a/b");
+        assert_eq!(translate(r"C:\").unwrap(), "/c/");
+        assert_eq!(translate("C:").unwrap(), "/c");
+        assert_eq!(
+            translate(r"C:\Users\A B\my repo").unwrap(),
+            "/c/Users/A B/my repo"
+        );
+        assert_eq!(translate(r"\\?\C:\a").unwrap(), "/c/a");
+        assert_eq!(translate("/").unwrap(), "/");
+        assert_eq!(translate("/work").unwrap(), "/work");
+    }
+
+    #[test]
+    fn unc_paths_are_refused_on_windows() {
+        if !cfg!(windows) {
+            return;
+        }
+        for unc in [
+            r"\\server\share\a",
+            r"\\?\UNC\server\share",
+            "//server/share",
+        ] {
+            let err = translate(unc).unwrap_err().to_string();
+            assert!(err.contains("UNC"), "{err}");
+        }
+        assert!(translate(r"C:dir").is_err());
     }
 
     #[test]

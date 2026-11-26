@@ -438,7 +438,7 @@ fn in_sandbox(
     dir: &Path,
     identity: Vec<(&str, String)>,
     script_or_argv: Result<&str, &[String]>,
-) -> Command {
+) -> Result<Command> {
     let mut vars = Command::new("env");
     without_credentials(&mut vars, Path::new(crate::sandbox::SCRATCH), identity);
     let env = crate::sandbox::env_of(&vars);
@@ -1269,7 +1269,7 @@ fn claude(
         Some(sbx) => {
             let mut argv = vec![program.clone()];
             argv.extend(args);
-            in_sandbox(sbx, &env.path, git_identity, Err(&argv))
+            in_sandbox(sbx, &env.path, git_identity, Err(&argv))?
         }
         None => {
             let mut cmd = Command::new(&program);
@@ -1911,7 +1911,7 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     let result = (|| {
         for check in checks {
             let mut cmd = match &sbx {
-                Some(sbx) => in_sandbox(sbx, dir, identity.clone(), Ok(check)),
+                Some(sbx) => in_sandbox(sbx, dir, identity.clone(), Ok(check))?,
                 None => {
                     let mut cmd = crate::platform::shell(check)?;
                     cmd.current_dir(dir);
