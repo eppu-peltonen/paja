@@ -283,7 +283,24 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
             _ => {}
         }
     }
+    // An item no sync has judged yet (imported before Jono read dependencies) waits on every
+    // dependency its body names, so a claim before the next sync can't start it too early.
+    let recorded = waiting_recorded(events);
+    for item in items.values_mut() {
+        if !recorded.contains(&item.number) {
+            item.waiting_on = dependencies(item.number, &item.body);
+        }
+    }
     Ok(items)
+}
+
+/// The items a `work.waiting` event was ever recorded for.
+fn waiting_recorded(events: &[Event]) -> BTreeSet<u64> {
+    events
+        .iter()
+        .filter(|e| e.kind == EV_WAITING)
+        .filter_map(|e| e.data["number"].as_u64())
+        .collect()
 }
 
 pub fn list(home: &Home) -> Result<Vec<WorkItem>> {
@@ -305,26 +322,51 @@ fn is_ready(item: &WorkItem) -> bool {
 }
 
 /// The issues an issue's body says it depends on: every `#N` on a line that starts with
-/// `Depends on` or `Blocked by` (any case, after an optional list marker), for example
-/// `Depends on #12, #14`. An issue never depends on itself.
+/// `Depends on` or `Blocked by` (any case, after optional quote, list or number markers and
+/// bold), for example `Depends on #12, #14`. Lines inside fenced code blocks don't count, and
+/// neither does a reference to another repository (`other/repo#12`), which Jono can't check.
+/// An issue never depends on itself.
 pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
     let mut found = BTreeSet::new();
+    let mut fenced = false;
     for line in body.lines() {
-        let line = line.trim_start().trim_start_matches(['-', '*', ' ']);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        // Quote, bullet and numbered-list markers, then bold or italics.
+        let line = trimmed
+            .trim_start_matches(['>', '-', '*', '+', ' ', '\t'])
+            .trim_start_matches(|c: char| c.is_ascii_digit());
+        let line = line
+            .trim_start_matches(['.', ')'])
+            .trim_start_matches([' ', '\t', '*', '_']);
         let lower = line.to_ascii_lowercase();
         let Some(rest) = ["depends on", "blocked by"]
             .iter()
             .find_map(|lead| lower.strip_prefix(lead))
+            // A whole phrase, not the start of a longer word (`depends onboarding`).
+            .filter(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
         else {
             continue;
         };
-        for part in rest.split('#').skip(1) {
+        let mut parts = rest.split('#');
+        let mut before = parts.next().unwrap_or("");
+        for part in parts {
+            // `owner/repo#12` names another repository's issue.
+            let other_repo =
+                before.ends_with(|c: char| c.is_ascii_alphanumeric() || "/-_.".contains(c));
             let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-            if let Ok(n) = digits.parse::<u64>() {
+            if let (Ok(n), false) = (digits.parse::<u64>(), other_repo) {
                 if n != number {
                     found.insert(n);
                 }
             }
+            before = part;
         }
     }
     found.into_iter().collect()
@@ -333,15 +375,56 @@ pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
 /// Queued items that wait on open dependencies, as `#179 waits on #178`, for a run that found
 /// nothing ready. None when no queued item is waiting.
 pub fn waiting(home: &Home) -> Result<Option<String>> {
-    let waiting: Vec<String> = list(home)?
+    let items: Vec<WorkItem> = list(home)?
         .into_iter()
         .filter(|item| item.open && item.status == Status::Queued && !item.waiting_on.is_empty())
+        .collect();
+    let mut waiting: Vec<String> = items
+        .iter()
         .map(|item| {
             let on: Vec<String> = item.waiting_on.iter().map(|n| format!("#{n}")).collect();
             format!("#{} waits on {}", item.number, on.join(", "))
         })
         .collect();
+    if let Some(cycle) = cycle(&items) {
+        let shown: Vec<String> = cycle.iter().map(|n| format!("#{n}")).collect();
+        waiting.push(format!(
+            "{} wait on each other, so none can start; remove one `Depends on` line",
+            shown.join(" -> ")
+        ));
+    }
     Ok((!waiting.is_empty()).then(|| waiting.join("; ")))
+}
+
+/// A dependency cycle among waiting items, as the numbers along it with the first repeated at
+/// the end (`[3, 5, 3]`), or None.
+fn cycle(items: &[WorkItem]) -> Option<Vec<u64>> {
+    let edges: BTreeMap<u64, &[u64]> = items
+        .iter()
+        .map(|item| (item.number, item.waiting_on.as_slice()))
+        .collect();
+    for &start in edges.keys() {
+        // Depth first from `start`, keeping the path.
+        let mut path = vec![start];
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, next)) = stack.pop() {
+            let deps = edges.get(&node).copied().unwrap_or_default();
+            if let Some(&dep) = deps.get(next) {
+                stack.push((node, next + 1));
+                if dep == start {
+                    path.push(start);
+                    return Some(path);
+                }
+                if edges.contains_key(&dep) && !path.contains(&dep) {
+                    path.push(dep);
+                    stack.push((dep, 0));
+                }
+            } else {
+                path.pop();
+            }
+        }
+    }
+    None
 }
 
 /// The next item to work on: the oldest open, queued issue. None when the queue is empty.
@@ -504,7 +587,9 @@ pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
 pub fn apply_with(home: &Home, open: &[Issue], open_outside: &BTreeSet<u64>) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
-    let items = replay(&log.read_all()?)?;
+    let events = log.read_all()?;
+    let items = replay(&events)?;
+    let recorded = waiting_recorded(&events);
     let mut report = SyncReport::default();
     for issue in open {
         match items.get(&issue.number) {
@@ -523,19 +608,28 @@ pub fn apply_with(home: &Home, open: &[Issue], open_outside: &BTreeSet<u64>) -> 
                 }
             }
         }
-        let on: Vec<u64> = dependencies(issue.number, &issue.body)
-            .into_iter()
-            // A dependency Paja has landed counts as done even before GitHub closes it.
+        let named = dependencies(issue.number, &issue.body);
+        let on: Vec<u64> = named
+            .iter()
+            .copied()
+            // A dependency Paja has landed counts as done even before GitHub closes it, unless
+            // this very sync finds it opened again.
             .filter(|n| {
+                let reopened =
+                    items.get(n).is_some_and(|i| !i.open) && open.iter().any(|i| i.number == *n);
                 let landed = items.get(n).is_some_and(|i| i.status == Status::Landed);
-                !landed && (open.iter().any(|i| i.number == *n) || open_outside.contains(n))
+                (!landed || reopened)
+                    && (open.iter().any(|i| i.number == *n) || open_outside.contains(n))
             })
             .collect();
         let before = items
             .get(&issue.number)
             .map(|item| item.waiting_on.as_slice())
             .unwrap_or_default();
-        if on != before {
+        // The first judgement of an item that names dependencies is recorded even when it
+        // matches, so replay stops assuming it waits on all of them.
+        let first = !recorded.contains(&issue.number) && !named.is_empty();
+        if on != before || first {
             log.append(
                 &lock,
                 EV_WAITING,
@@ -716,17 +810,16 @@ fn fetch_issues(ok: &Untampered) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
-/// Whether issue `number` of the checkout's GitHub repository is open. One that can't be read
-/// (a typo, a deleted issue) counts as open, so the item waits and `paja work list` shows why.
+/// Whether issue or pull request `number` of the checkout's GitHub repository is open (a
+/// merged pull request is closed). One that can't be read (a typo, a deleted issue) counts as
+/// open, so the item waits and `paja work list` shows why.
 fn issue_is_open(ok: &Untampered, number: u64) -> Result<bool> {
-    let output = gh_output(
-        ok,
-        &["issue", "view", &number.to_string(), "--json", "state"],
-    )?;
-    let state = serde_json::from_slice::<Value>(&output.stdout)
-        .ok()
-        .and_then(|v| v["state"].as_str().map(str::to_ascii_uppercase));
-    Ok(!(output.status.success() && state.as_deref() == Some("CLOSED")))
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{number}");
+    let output = gh_output(ok, &["api", &path, "--jq", ".state"])?;
+    let state = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    Ok(!(output.status.success() && state == "closed"))
 }
 
 #[cfg(test)]
@@ -748,6 +841,72 @@ mod tests {
                     depends on #5 (itself)\nNot a dependency: see #20";
         assert_eq!(dependencies(5, body), vec![9, 12, 14]);
         assert!(dependencies(1, "").is_empty());
+        // Numbered, quoted and plus-bulleted lines count; a longer word, a fenced code block
+        // and another repository's issue don't.
+        let body = "1. Depends on #3\n> Blocked by #4\n+ depends on #6\n2) **Depends on** #7\n\
+                    depends onboarding #5\n```\nDepends on #8\n```\n\
+                    Depends on other/repo#9 and #10, org/r#11";
+        assert_eq!(dependencies(1, body), vec![3, 4, 6, 7, 10]);
+    }
+
+    #[test]
+    fn a_dependency_cycle_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let mut a = issue(3, "A");
+        a.body = "Depends on #5".into();
+        let mut b = issue(5, "B");
+        b.body = "Depends on #3".into();
+        let mut c = issue(7, "C");
+        c.body = "Depends on #3".into();
+        apply(&home, &[a, b, c]).unwrap();
+        let shown = waiting(&home).unwrap().unwrap();
+        assert!(
+            shown.contains("#3 -> #5 -> #3 wait on each other"),
+            "{shown}"
+        );
+        assert!(shown.contains("#7 waits on #3"), "{shown}");
+    }
+
+    #[test]
+    fn an_item_no_sync_judged_waits_on_every_dependency_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        // Imported by an older Paja, which recorded no `work.waiting`.
+        let lock = home.lock().unwrap();
+        let mut old = issue(2, "Old");
+        old.body = "Depends on #1".into();
+        home.events()
+            .append(&lock, EV_IMPORTED, serde_json::to_value(&old).unwrap())
+            .unwrap();
+        drop(lock);
+        assert_eq!(get(&home, 2).unwrap().waiting_on, vec![1]);
+        assert!(claim(&home).unwrap().is_none());
+        // The first sync records its judgement, even though #1 is closed.
+        apply(&home, &[old.clone()]).unwrap();
+        assert!(get(&home, 2).unwrap().waiting_on.is_empty());
+        assert_eq!(claim(&home).unwrap().unwrap().number, 2);
+        // A new import whose dependency is already closed doesn't wait either.
+        let mut new = issue(4, "New");
+        new.body = "Depends on #1".into();
+        apply(&home, &[old, new]).unwrap();
+        assert!(get(&home, 4).unwrap().waiting_on.is_empty());
+    }
+
+    #[test]
+    fn a_landed_dependency_reopened_in_the_same_sync_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let first = issue(1, "First");
+        let mut second = issue(2, "Second");
+        second.body = "Depends on #1".into();
+        apply(&home, &[first.clone(), second.clone()]).unwrap();
+        set_status(&home, 1, Status::Landed, None).unwrap();
+        // GitHub closes #1, then it is reopened (a revert, say) before the next sync.
+        apply(&home, &[second.clone()]).unwrap();
+        assert!(get(&home, 2).unwrap().waiting_on.is_empty());
+        apply(&home, &[first, second]).unwrap();
+        assert_eq!(get(&home, 2).unwrap().waiting_on, vec![1]);
     }
 
     #[test]
