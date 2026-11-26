@@ -104,9 +104,32 @@ pub fn configured() -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// The project's setup script, read from the default branch.
+pub const SETUP_FILE: &str = ".paja/setup";
+
+/// Where the sandbox keeps the hash of the `.paja/setup` script that last succeeded in it, so
+/// the script runs again only when it changes. It lives in the sandbox's home: it describes the
+/// sandbox, so it goes away with it.
+const SETUP_MARKER: &str = "$HOME/.paja-setup-hash";
+
+/// How many of a failed setup script's last output lines go into the error.
+const SETUP_TAIL_LINES: usize = 20;
+
+/// A stable hash (FNV-1a, 64 bits) of `text`, as hex. It only has to notice a changed script.
+fn script_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 /// Start (or reuse) the sandbox with `mounts` reachable inside it. `Ok(None)` when it isn't
 /// configured; an error, never a silent fallback, when it is configured but can't start.
-pub fn start(mounts: &[PathBuf]) -> Result<Option<Sbx>> {
+/// `setup` is the project's `.paja/setup` from the default branch; without it the sandbox gets
+/// the Rust toolchain.
+pub fn start(mounts: &[PathBuf], setup: Option<&str>) -> Result<Option<Sbx>> {
     let Some(program) = configured() else {
         return Ok(None);
     };
@@ -165,7 +188,9 @@ pub fn start(mounts: &[PathBuf]) -> Result<Option<Sbx>> {
             );
         }
     }
-    if sbx.exec_ok(TOOLCHAIN_CHECK).is_err() {
+    if let Some(script) = setup {
+        sbx.run_setup(script)?;
+    } else if sbx.exec_ok(TOOLCHAIN_CHECK).is_err() {
         sbx.exec_as(Some("root"), &setup_root())
             .and_then(|()| sbx.exec_as(None, SETUP_USER))
             .with_context(|| {
@@ -291,7 +316,69 @@ impl Sbx {
         self.exec_run(None, user, script)
     }
 
+    /// Run the project's `.paja/setup` once as the sandbox user, again only when it changed.
+    /// A C toolchain, `curl` and `git` come first when the sandbox lacks them, since the user
+    /// can't install packages. A failing script is an error carrying the end of its output.
+    fn run_setup(&self, script: &str) -> Result<()> {
+        let hash = script_hash(script);
+        let marker = format!("[ \"$(cat \"{SETUP_MARKER}\" 2>/dev/null)\" = \"{hash}\" ]");
+        if self.exec_ok(&marker).is_ok() {
+            return Ok(());
+        }
+        let fix = format!(
+            "fix `.paja/setup` on the default branch and run again; to look around, run `{} exec \
+             -it {} sh`",
+            self.program, self.name
+        );
+        let base = "command -v cc >/dev/null 2>&1 && command -v curl >/dev/null 2>&1";
+        if self.exec_ok(base).is_err() {
+            self.exec_as(Some("root"), &setup_root()).with_context(|| {
+                format!("installing a C toolchain in the sandbox `{}`", self.name)
+            })?;
+        }
+        let out = self
+            .exec_output(None, None, script)
+            .with_context(|| self.unavailable())?;
+        if !out.status.success() {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = lines[lines.len().saturating_sub(SETUP_TAIL_LINES)..].join("\n");
+            bail!(
+                "`.paja/setup` failed in the sandbox `{}` ({}); its last output:\n{}\n{fix}",
+                self.name,
+                out.status,
+                tail
+            );
+        }
+        self.exec_ok(&format!("printf '%s\\n' \"{hash}\" > \"{SETUP_MARKER}\""))
+            .with_context(|| {
+                format!(
+                    "`.paja/setup` ran but the sandbox `{}` won't record it; {}",
+                    self.name,
+                    self.fix()
+                )
+            })
+    }
+
     fn exec_run(&self, dir: Option<&Path>, user: Option<&str>, script: &str) -> Result<()> {
+        let out = self.exec_output(dir, user, script)?;
+        if !out.status.success() {
+            bail!(
+                "`{} exec` failed: {}",
+                self.program,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn exec_output(
+        &self,
+        dir: Option<&Path>,
+        user: Option<&str>,
+        script: &str,
+    ) -> Result<std::process::Output> {
         let mut cmd = Command::new(&self.program);
         cmd.arg("exec")
             .arg("-w")
@@ -305,14 +392,7 @@ impl Sbx {
             .stdin(Stdio::null())
             .output()
             .with_context(|| self.unavailable())?;
-        if !out.status.success() {
-            bail!(
-                "`{} exec` failed: {}",
-                self.program,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(())
+        Ok(out)
     }
 
     /// What to tell the person when Claude Code inside the sandbox isn't signed in.
@@ -492,7 +572,7 @@ mod tests {
     fn an_unconfigured_sandbox_is_none() {
         // The variable is unset in the test environment; `start` must not try to run anything.
         if configured().is_none() {
-            assert!(start(&[]).unwrap().is_none());
+            assert!(start(&[], None).unwrap().is_none());
         }
     }
 }

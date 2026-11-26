@@ -7,7 +7,12 @@ pub(super) fn claude_program() -> String {
 
 /// The sandbox agents and checks run in, when `PAJA_SBX` turns it on. Refuses when it is on but
 /// can't start; says so when it is off.
-pub(super) fn start_sandbox(home: &Home, repo: &Path) -> Result<Option<crate::sandbox::Sbx>> {
+/// `base` is the default branch's commit, which `.paja/setup` is read from.
+pub(super) fn start_sandbox(
+    home: &Home,
+    repo: &Path,
+    base: &str,
+) -> Result<Option<crate::sandbox::Sbx>> {
     if crate::sandbox::configured().is_none() {
         progress(&format!(
             "no sandbox ({} is not set): agents and checks run as you, behind the deny-list hook only",
@@ -23,7 +28,8 @@ pub(super) fn start_sandbox(home: &Home, repo: &Path) -> Result<Option<crate::sa
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    crate::sandbox::start(&[envs, PathBuf::from(common)])
+    let setup = read_from_base(repo, base, crate::sandbox::SETUP_FILE)?;
+    crate::sandbox::start(&[envs, PathBuf::from(common)], setup.as_deref())
 }
 
 /// `argv` run in `sbx`, in `dir`, with the throwaway variables [`without_credentials`] gives

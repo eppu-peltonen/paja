@@ -2720,6 +2720,111 @@ fn agents_and_checks_run_through_the_sandbox() {
     );
 }
 
+/// A fake `sbx` for the setup tests: like [`fake_sbx`], but it never touches the host's packages
+/// (the root step is a no-op), "installs Rust" by creating `rust-installed` (which `cc --version`
+/// needs), and keeps the sandbox's home, where Paja records the setup hash, in `home/`.
+fn fake_sbx_for_setup(dir: &Path) -> std::path::PathBuf {
+    let body = "#!/bin/sh\necho \"$*\" >> D/sbx.log\n\
+         case \"$1\" in\ncreate) : > D/created; exit 0 ;;\nexec) shift\n\
+         [ -f D/created ] || { echo 'no such sandbox' >&2; exit 1; }\n\
+         while [ \"$1\" != \"--\" ]; do case \"$1\" in -w) cd \"$2\"; shift 2 ;; -e) export \"$2\"; shift 2 ;; *) shift ;; esac; done\n\
+         shift\n\
+         case \"$*\" in\n\
+         *apt_retry*) exit 0 ;;\n\
+         *sh.rustup.rs*) : > D/rust-installed; exit 0 ;;\n\
+         *\"cc --version\"*) [ -f D/rust-installed ]; exit $? ;;\n\
+         *\"command -v cc\"*) exit 0 ;;\n\
+         *paja-setup-hash*) mkdir -p D/sandbox-home; HOME=D/sandbox-home; export HOME ;;\n\
+         esac\n\
+         exec \"$@\" ;;\nesac\n"
+        .replace('D', &slash(dir));
+    program(dir, "sbx", &body)
+}
+
+/// Commits `.paja/setup` to main and pushes it.
+fn push_setup(f: &Factory, script: &str) {
+    std::fs::write(f.repo.join(".paja/setup"), script).unwrap();
+    git(&f.repo, &["add", "."]);
+    git(&f.repo, &["commit", "-q", "-m", "setup"]);
+    git(&f.repo, &["push", "-q", "origin", "main"]);
+}
+
+fn run_with_setup_sbx(f: &Factory, sbx: &Path) -> (bool, Value) {
+    paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx),
+        ],
+    )
+}
+
+#[test]
+fn the_projects_setup_script_runs_once_and_again_when_it_changes() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_for_setup(f.tmp.path());
+    let runs = f.tmp.path().join("setup-runs");
+    let script = |tag: &str| format!("echo {tag} >> {}/setup-runs\n", slash(f.tmp.path()));
+    let count = || {
+        std::fs::read_to_string(&runs)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    push_setup(&f, &script("one"));
+    let (ok, report) = run_with_setup_sbx(&f, &sbx);
+    assert!(ok, "{report}");
+    assert_eq!(count(), 1);
+    // The same script again: the sandbox has it recorded.
+    let (ok, report) = run_with_setup_sbx(&f, &sbx);
+    assert!(ok, "{report}");
+    assert_eq!(count(), 1);
+    // A changed script runs again.
+    push_setup(&f, &script("two"));
+    let (ok, report) = run_with_setup_sbx(&f, &sbx);
+    assert!(ok, "{report}");
+    assert_eq!(count(), 2);
+    // The project's script replaced the Rust default.
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert!(!log.contains("sh.rustup.rs"), "{log}");
+}
+
+#[test]
+fn a_failing_setup_script_stops_the_run_with_its_output() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_for_setup(f.tmp.path());
+    push_setup(
+        &f,
+        "echo installing the toolchain\necho no network >&2\nexit 3\n",
+    );
+    let (ok, report) = run_with_setup_sbx(&f, &sbx);
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap();
+    assert!(
+        error.contains("no network") && error.contains("installing the toolchain"),
+        "{error}"
+    );
+    assert!(
+        error.contains("fix `.paja/setup` on the default branch"),
+        "{error}"
+    );
+    // Fail closed: no agent ran, and the queue was not even read.
+    assert!(!f.tmp.path().join("claude-args.log").exists());
+    let (_, item) = paja(&f.home, &f.repo, &["work", "list"]);
+    assert!(!item.to_string().contains("claimed"), "{item}");
+}
+
+#[test]
+fn without_a_setup_script_the_sandbox_gets_rust() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_for_setup(f.tmp.path());
+    let (ok, report) = run_with_setup_sbx(&f, &sbx);
+    assert!(ok, "{report}");
+    assert!(f.tmp.path().join("rust-installed").exists());
+}
+
 #[test]
 fn a_signed_out_claude_in_the_sandbox_says_how_to_sign_in() {
     let f = Factory::new("true\n", "land");

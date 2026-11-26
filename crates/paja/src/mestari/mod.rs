@@ -300,13 +300,13 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         ahjo::clear_tampered(home, &repo)?;
     }
     let key = ahjo::ensure_untampered(home, &repo)?;
-    // Before the queue is touched: a sandbox that can't start is the person's to fix, and must
-    // not park an item.
-    crate::sandbox::activate(start_sandbox(home, &repo)?);
     git(&repo, &["fetch", "-q", "origin", "main"]).context(
         "fetching origin/main; check the network and that `origin` is the GitHub repository",
     )?;
     let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
+    // the person's to fix, and must not park an item.
+    crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
     progress("checking the queue (issues labelled paja)");
     jono::sync(home, &repo)?;
     let config = read_config(&repo, &base)?;
