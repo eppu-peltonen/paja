@@ -215,7 +215,7 @@ impl Pool<'_> {
                 }
                 told_fatal = true;
             }
-            self.reap_planners(&events)?;
+            self.reap_planners()?;
             let stopping = level > 0 || fatal.is_some();
             if stopping {
                 // A plan is only worth having for a lane that may start.
@@ -274,25 +274,26 @@ impl Pool<'_> {
         };
         let events = self.home.events().read_all()?;
         let plans = plans_since(&events, self.name, self.since);
+        let queue: Vec<u64> = next
+            .iter()
+            .map(|item| item.number)
+            .filter(|n| !busy.contains(n) && !self.held_back.contains(n))
+            .collect();
+        let running: Vec<&Plan> = self.lanes.values().map(|lane| &lane.plan).collect();
+        let planning: BTreeSet<u64> = self.planners.keys().copied().collect();
+        // At most as many plans at once as there are free lanes to use them.
+        let room = free.saturating_sub(self.planners.len());
+        let (chosen, to_plan) = choose(&queue, &plans, &running, &planning, free, room);
+        let chosen: Vec<Plan> = chosen.into_iter().cloned().collect();
+        for number in to_plan {
+            self.start_planner(number)?;
+        }
         let mut started = 0;
-        for item in next {
-            if started >= free {
-                break;
-            }
-            if busy.contains(&item.number) || self.held_back.contains(&item.number) {
-                continue;
-            }
-            let Some(plan) = plans.get(&item.number) else {
-                // At most as many plans at once as there are free lanes to use them.
-                if !self.planners.contains_key(&item.number) && self.planners.len() < free {
-                    self.start_planner(item.number)?;
-                }
+        for plan in chosen {
+            let Some(item) = next.iter().find(|item| item.number == plan.number) else {
                 continue;
             };
-            let running: Vec<&Plan> = self.lanes.values().map(|lane| &lane.plan).collect();
-            if blocked_by(plan, &running).is_some() {
-                continue;
-            }
+            let plan = &plan;
             let lane = (1..).find(|n| !self.lanes.contains_key(n)).unwrap_or(1);
             let start = record_lane(self.home, self.name, lane, item.number, "starting", None)?;
             record(
@@ -355,7 +356,7 @@ impl Pool<'_> {
     }
 
     /// Free the plans that ended; one that ended without recording a plan failed.
-    fn reap_planners(&mut self, events: &[Event]) -> Result<()> {
+    fn reap_planners(&mut self) -> Result<()> {
         let done: Vec<u64> = self
             .planners
             .iter_mut()
@@ -365,6 +366,8 @@ impl Pool<'_> {
             let Some((_, at)) = self.planners.remove(&number) else {
                 continue;
             };
+            // The plan may have been recorded after this tick read the log.
+            let events = self.home.events().read_all()?;
             let planned = events.iter().any(|e| {
                 e.seq > at
                     && e.kind == EV_POOL_PLANNED
@@ -530,9 +533,43 @@ fn follow_lane(home: &Home, repo: &str, n: u32, lane: &mut Lane, events: &[Event
     Ok(())
 }
 
-/// Start lane `lane`'s run of item `number`: `paja --json run --item <number>` in the checkout,
-/// which skips the sync the pool did and reads `stop` lines on stdin. Its progress lines are
-/// passed on to stderr with the lane in front; its report comes back on the channel.
+/// The items to admit this tick and the ones to start planning, from the runnable `queue` in
+/// order. An item is admitted only once every item before it has a plan, so a plan that
+/// finishes first never puts a later item ahead of an earlier one; an item whose plan overlaps
+/// a `running` plan, or one admitted before it in the same tick, is skipped and the next that
+/// doesn't overlap is admitted instead. At most `free` are admitted and `room` plans started.
+fn choose<'p>(
+    queue: &[u64],
+    plans: &'p BTreeMap<u64, Plan>,
+    running: &[&'p Plan],
+    planning: &BTreeSet<u64>,
+    free: usize,
+    room: usize,
+) -> (Vec<&'p Plan>, Vec<u64>) {
+    let mut chosen: Vec<&Plan> = Vec::new();
+    let mut to_plan = Vec::new();
+    let mut unplanned_before = false;
+    for number in queue {
+        match plans.get(number) {
+            None => {
+                unplanned_before = true;
+                if !planning.contains(number) && to_plan.len() < room {
+                    to_plan.push(*number);
+                }
+            }
+            Some(_) if unplanned_before || chosen.len() >= free => {}
+            Some(plan) => {
+                let mut busy: Vec<&Plan> = running.to_vec();
+                busy.extend(chosen.iter().copied());
+                if blocked_by(plan, &busy).is_none() {
+                    chosen.push(plan);
+                }
+            }
+        }
+    }
+    (chosen, to_plan)
+}
+
 /// The latest plan of each item of `repo` recorded after `since`.
 fn plans_since(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, Plan> {
     events
@@ -594,6 +631,9 @@ fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
     Ok(child)
 }
 
+/// Start lane `lane`'s run of item `number`: `paja --json run --item <number>` in the checkout,
+/// which skips the sync the pool did and reads `stop` lines on stdin. Its progress lines are
+/// passed on to stderr with the lane in front; its report comes back on the channel.
 fn spawn(
     repo: &Path,
     lane: u32,
@@ -1221,6 +1261,48 @@ mod tests {
         events.extend([round(11, 5), turn(12, EV_LANDING, 7)]);
         let status = from_events(&events, "acme/app", true, &[]);
         assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
+    }
+
+    #[test]
+    fn items_are_admitted_in_queue_order_and_skipped_only_for_an_overlap() {
+        let plan = |number, path: &str| Plan {
+            repo: "acme/app".into(),
+            number,
+            paths: vec![path.to_string()],
+            source: "spec".into(),
+            high_risk: false,
+            error: None,
+        };
+        let numbers = |plans: Vec<&Plan>| plans.iter().map(|p| p.number).collect::<Vec<_>>();
+        let none = BTreeSet::new();
+        // #5 is still being planned when #6's plan is in: #6 waits for it.
+        let plans: BTreeMap<u64, Plan> = [(6, plan(6, "b.rs")), (7, plan(7, "c.rs"))].into();
+        let (chosen, to_plan) = choose(&[5, 6, 7], &plans, &[], &BTreeSet::from([5]), 2, 1);
+        assert!(chosen.is_empty());
+        assert!(to_plan.is_empty(), "#5 is already being planned");
+        let (_, to_plan) = choose(&[5, 6, 8], &plans, &[], &none, 2, 2);
+        assert_eq!(to_plan, [5, 8]);
+        // Once planned, the first two go, in order.
+        let plans: BTreeMap<u64, Plan> = [
+            (5, plan(5, "a.rs")),
+            (6, plan(6, "b.rs")),
+            (7, plan(7, "c.rs")),
+        ]
+        .into();
+        let (chosen, _) = choose(&[5, 6, 7], &plans, &[], &none, 2, 2);
+        assert_eq!(numbers(chosen), [5, 6]);
+        // One that overlaps a running plan, or one chosen before it, is skipped for the next.
+        let running = plan(9, "b.rs");
+        let (chosen, _) = choose(&[5, 6, 7], &plans, &[&running], &none, 2, 2);
+        assert_eq!(numbers(chosen), [5, 7]);
+        let plans: BTreeMap<u64, Plan> = [
+            (5, plan(5, "src/")),
+            (6, plan(6, "src/b.rs")),
+            (7, plan(7, "c.rs")),
+        ]
+        .into();
+        let (chosen, _) = choose(&[5, 6, 7], &plans, &[], &none, 2, 2);
+        assert_eq!(numbers(chosen), [5, 7]);
     }
 
     #[test]

@@ -162,7 +162,10 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
     Ok(Plan {
         repo: name.to_string(),
         number,
-        high_risk: paths.iter().any(|p| is_high_risk(p, &high_risk)),
+        // A directory holding a high-risk path is high risk too.
+        high_risk: paths
+            .iter()
+            .any(|p| is_high_risk(p, &high_risk) || high_risk.iter().any(|h| overlap(p, h))),
         paths,
         source: source.to_string(),
         error: None,

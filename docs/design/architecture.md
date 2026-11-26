@@ -186,9 +186,10 @@ the item's `Touches:` line names the paths when it has one (`source: spec`), els
 `plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). The plan,
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
-`.paja/high-risk`) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
-`error`) overlaps everything, so its item runs only in an otherwise idle pool. The pool takes items in queue order,
-skips one that overlaps a busy lane's plan and admits the next that doesn't, recording `pool.admitted` (`repo`,
+`.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
+`error`) overlaps everything, so its item runs only in an otherwise idle pool. The pool takes items in queue order and
+admits one only once every item before it has a plan, so a plan that finishes first never puts a later item ahead;
+it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording `pool.admitted` (`repo`,
 `number`, `lane`, `paths`, `source`, `high_risk`). Each round records the paths its change touches as `run.changed`;
 when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`, `admitted`), so the planner's
 accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows each lane's `paths` and each
