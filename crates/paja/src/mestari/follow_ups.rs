@@ -186,6 +186,19 @@ pub(super) fn file_follow_ups(
     }
 }
 
+/// `text` made fit for a public issue comment: tokens redacted, and the repository's and the
+/// user's home paths (the factory home is under the latter by default) named, not shown.
+pub(super) fn redact_for_issue(text: &str, repo: &Path) -> String {
+    let user_home = ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let mut places = vec![(repo, "<repository>")];
+    places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
+    redact(text, &places)
+}
+
 /// Tokens that look like credentials become `<redacted>`, and each path in `places` (and
 /// anything under it) becomes its label. Longer paths go first, so a worktree under the factory
 /// home is named as the factory home, not cut in half. A path is matched only where no letter
@@ -487,6 +500,18 @@ mod tests {
         assert_eq!(
             shown,
             r"<home>\.paja, <home>/x, C:\Users\Meg and /home/me/y"
+        );
+    }
+
+    #[test]
+    fn an_issue_comment_names_the_repository_and_hides_tokens() {
+        let repo = Path::new("/work/acme-app");
+        let token = format!("ghp_{}", "A1".repeat(12));
+        let text = format!("test failed in /work/acme-app/src/lib.rs with {token}");
+        let shown = redact_for_issue(&text, repo);
+        assert_eq!(
+            shown,
+            "test failed in <repository>/src/lib.rs with <redacted>"
         );
     }
 

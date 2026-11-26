@@ -201,8 +201,8 @@ Before Vasara's checks in every round, Mestari fetches the default branch and me
 when the branch doesn't hold its tip yet, so the checks, the reviewers and CI judge the change as it would land, and a
 branch built on an old default branch never reaches the pull request. The diffs reviewers read then start from that
 tip. A merge that conflicts is left in progress and the round goes back to the builder, naming the conflicted files;
-the builder resolves them and commits, which finishes the merge, and a merge it leaves with conflicts is undone and asked
-for again.
+the builder resolves them and commits, which finishes the merge. A merge it leaves with conflicts stays in progress
+and goes back to it, naming the files that still conflict and any review blockers.
 
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
 for CI with `gh pr checks --watch`, merges it and marks the item landed. A red CI goes back to the builder as another
@@ -212,7 +212,7 @@ default branch moved on meanwhile (GitHub runs none on a conflicting pull reques
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
 otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
 setting to change. On `escalate`, three failed rounds or
-an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
+an error it can't fix, it comments on the issue with the question (redacted like a follow-up) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
 `run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `run.checked` (`round`, `commit`, `base`)
