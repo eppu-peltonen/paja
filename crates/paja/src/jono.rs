@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::ahjo::Untampered;
 use crate::events::Event;
 use crate::home::{Home, RunLock};
 use crate::mestari::{StepUsage, EV_ROUND};
@@ -474,8 +475,8 @@ pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
         );
     }
     // gh runs git in the checkout to find its GitHub repository.
-    crate::ahjo::ensure_untampered(home, repo)?;
-    let issues = fetch_issues(repo)?;
+    let ok = crate::ahjo::untampered(home, repo)?;
+    let issues = fetch_issues(&ok)?;
     // A dependency outside the queue (another label, or already closed) is asked about once
     // per sync; one in the queue is open by definition.
     let queued: BTreeSet<u64> = issues.iter().map(|issue| issue.number).collect();
@@ -486,7 +487,7 @@ pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
         .collect();
     let mut open_outside = BTreeSet::new();
     for number in outside {
-        if issue_is_open(repo, number)? {
+        if issue_is_open(&ok, number)? {
             open_outside.insert(number);
         }
     }
@@ -560,7 +561,7 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         bail!("the answer for #{number} is empty; say what Paja should do");
     }
     // gh runs git in the checkout to find its GitHub repository.
-    crate::ahjo::ensure_untampered(home, repo)?;
+    let ok = crate::ahjo::untampered(home, repo)?;
     let item = {
         let lock = home.lock()?;
         let log = home.events();
@@ -596,7 +597,7 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         item
     };
     gh(
-        repo,
+        &ok,
         &[
             "issue",
             "comment",
@@ -626,9 +627,9 @@ pub fn file(home: &Home, repo: &Path, title: &str, body: &str) -> Result<Filed> 
     if title.trim().is_empty() {
         bail!("the issue needs a title; pass --title");
     }
-    crate::ahjo::ensure_untampered(home, repo)?;
+    let ok = crate::ahjo::untampered(home, repo)?;
     let url = gh(
-        repo,
+        &ok,
         &[
             "issue", "create", "--label", LABEL, "--title", title, "--body", body,
         ],
@@ -638,7 +639,19 @@ pub fn file(home: &Home, repo: &Path, title: &str, body: &str) -> Result<Filed> 
     })
 }
 
-fn gh(repo: &Path, args: &[&str]) -> Result<String> {
+/// Run gh in the checkout the tamper lock allowed (`ok`). Every gh Jono runs goes through
+/// here, and taking the proof means no command can run it without the check.
+fn gh_output(ok: &Untampered, args: &[&str]) -> Result<std::process::Output> {
+    let gh = gh_program();
+    Command::new(&gh)
+        .current_dir(ok.path())
+        .args(args)
+        .output()
+        .with_context(|| format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)"))
+}
+
+fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
+    let repo = ok.path();
     if !repo.is_dir() {
         bail!(
             "{} is not a directory; pass --repo with a path inside the checkout",
@@ -646,13 +659,7 @@ fn gh(repo: &Path, args: &[&str]) -> Result<String> {
         );
     }
     let gh = gh_program();
-    let output = Command::new(&gh)
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .with_context(|| {
-            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
-        })?;
+    let output = gh_output(ok, args)?;
     if !output.status.success() {
         bail!(
             "`{gh} {} {}` failed in {}: {}; check `gh auth status` and that this checkout has a \
@@ -671,11 +678,12 @@ pub fn gh_program() -> String {
     std::env::var("PAJA_GH").unwrap_or_else(|_| "gh".to_string())
 }
 
-fn fetch_issues(repo: &Path) -> Result<Vec<Issue>> {
+fn fetch_issues(ok: &Untampered) -> Result<Vec<Issue>> {
+    let repo = ok.path();
     let gh = gh_program();
-    let output = Command::new(&gh)
-        .current_dir(repo)
-        .args([
+    let output = gh_output(
+        ok,
+        &[
             "issue",
             "list",
             "--label",
@@ -686,11 +694,8 @@ fn fetch_issues(repo: &Path) -> Result<Vec<Issue>> {
             &FETCH_LIMIT.to_string(),
             "--json",
             "number,title,body,url",
-        ])
-        .output()
-        .with_context(|| {
-            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
-        })?;
+        ],
+    )?;
     if !output.status.success() {
         bail!(
             "`{gh} issue list` failed in {}: {}; check `gh auth status` and that this checkout has a GitHub remote",
@@ -713,15 +718,11 @@ fn fetch_issues(repo: &Path) -> Result<Vec<Issue>> {
 
 /// Whether issue `number` of the checkout's GitHub repository is open. One that can't be read
 /// (a typo, a deleted issue) counts as open, so the item waits and `paja work list` shows why.
-fn issue_is_open(repo: &Path, number: u64) -> Result<bool> {
-    let gh = gh_program();
-    let output = Command::new(&gh)
-        .current_dir(repo)
-        .args(["issue", "view", &number.to_string(), "--json", "state"])
-        .output()
-        .with_context(|| {
-            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
-        })?;
+fn issue_is_open(ok: &Untampered, number: u64) -> Result<bool> {
+    let output = gh_output(
+        ok,
+        &["issue", "view", &number.to_string(), "--json", "state"],
+    )?;
     let state = serde_json::from_slice::<Value>(&output.stdout)
         .ok()
         .and_then(|v| v["state"].as_str().map(str::to_ascii_uppercase));
