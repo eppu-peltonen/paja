@@ -346,3 +346,105 @@ async function showAbout() {
 listen("paja://events-changed", () => refresh().catch(showError));
 showAbout().catch(showError);
 refresh().catch(showError);
+
+// Repositories and the runs Desk starts in them.
+function runLine(repo) {
+  const runs = repo.runs || {};
+  if (runs.desk) {
+    const kind = runs.every ? "keeps running" : "runs one item";
+    return `Paja Desk ${kind} here, started ${new Date(runs.started_ms).toLocaleTimeString()}.`;
+  }
+  if (runs.terminal) return `A paja run started elsewhere is working on #${runs.terminal}.`;
+  return "Not running.";
+}
+
+const repoNotes = new Map();
+
+function repoRow(repo) {
+  const buttons = [];
+  const act = (label, call, quiet) => {
+    const button = el("button", { type: "button", className: quiet ? "quiet" : "" }, label);
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      const result = await call().catch((err) => ({ error: String(err) }));
+      button.disabled = false;
+      if (result && result.error) repoNotes.set(repo.repo, `error: ${result.error}`);
+      else if (result && result.checks) repoNotes.set(repo.repo, doctorText(result));
+      else repoNotes.delete(repo.repo);
+      showRepos().catch(showError);
+    });
+    buttons.push(button);
+  };
+  const runs = repo.runs || {};
+  if (runs.desk) {
+    act("Stop after this step", () => invoke("run_stop", { repo: repo.repo, now: false }));
+    act("Stop now", () => invoke("run_stop", { repo: repo.repo, now: true }), true);
+  } else if (!runs.terminal && repo.checkout) {
+    act("Run one item", () => invoke("run_start", { repo: repo.repo, every: false }));
+    act("Keep running", () => invoke("run_start", { repo: repo.repo, every: true }));
+  }
+  if (repo.checkout) act("Check", () => invoke("repo_doctor", { repo: repo.repo }), true);
+  const children = [
+    el("div", { className: "row" }, [el("strong", {}, repo.repo), el("span", { className: "muted" }, repo.checkout ?? "checkout unknown: add it below")]),
+    el("div", {}, runLine(repo)),
+    el("div", { className: "actions" }, buttons),
+  ];
+  const note = repoNotes.get(repo.repo);
+  if (note) children.push(el("pre", { className: note.startsWith("error") ? "error" : "" }, note));
+  if (runs.output) children.push(el("pre", { className: "output" }, runs.output));
+  return el("li", {}, children);
+}
+
+function doctorText(report) {
+  const lines = report.checks.map((c) => `${c.status === "ok" ? "ok  " : c.status === "warning" ? "warn" : "FAIL"} ${c.name}: ${c.detail}${c.fix ? ` (${c.fix})` : ""}`);
+  lines.unshift(report.ok ? "Ready to run." : "A check failed; runs won't start until it is fixed.");
+  return lines.join("\n");
+}
+
+let reposShown = false;
+
+async function showRepos() {
+  if (!reposShown) return;
+  const result = await invoke("repos");
+  if (result && result.error) {
+    showError(`error: ${result.error}`);
+    return;
+  }
+  byId("repo-list").replaceChildren(...result.map(repoRow));
+}
+
+byId("show-repos").addEventListener("click", () => {
+  reposShown = !reposShown;
+  byId("repos").hidden = !reposShown;
+  showRepos().catch(showError);
+});
+
+byId("repo-add").addEventListener("click", async () => {
+  const path = byId("repo-path").value.trim();
+  const out = byId("repo-result");
+  if (!path) return;
+  const result = await invoke("repo_add", { path }).catch((err) => ({ error: String(err) }));
+  out.hidden = false;
+  out.className = result && result.error ? "error" : "muted";
+  out.textContent = result && result.error ? `error: ${result.error}` : `Added; ${(result.imported || []).length} new items.`;
+  if (!result.error) byId("repo-path").value = "";
+  showRepos().catch(showError);
+  refresh().catch(showError);
+});
+
+// While runs are going, their output and state are read again every few seconds.
+setInterval(() => {
+  if (reposShown) showRepos().catch(showError);
+}, 3000);
+listen("paja://events-changed", () => showRepos().catch(showError));
+
+// Closing while Desk's runs are going asks what happens to them.
+listen("paja://close-asked", (event) => {
+  byId("closing-repos").textContent = (event.payload || []).join(", ");
+  byId("closing").hidden = false;
+});
+byId("close-leave").addEventListener("click", () => invoke("close_desk", { stop: false }).catch(showError));
+byId("close-stop").addEventListener("click", () => invoke("close_desk", { stop: true }).catch(showError));
+byId("close-cancel").addEventListener("click", () => {
+  byId("closing").hidden = true;
+});

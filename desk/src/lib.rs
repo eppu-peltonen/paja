@@ -9,7 +9,14 @@ use std::time::Duration;
 use paja::home::Home;
 use paja::jono;
 use serde_json::{json, Value};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
+
+pub mod runs;
+use runs::Runner;
+
+/// The event the window hears when it asked to close while Desk's runs are going, with their
+/// repositories, so the person decides whether to stop them or leave them running.
+pub const CLOSE_ASKED: &str = "paja://close-asked";
 
 /// The event the window hears when Paja's event log changed, so it reads the queue again.
 pub const CHANGED: &str = "paja://events-changed";
@@ -102,10 +109,137 @@ fn checkout_of(home: &Home, repo: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
         return Ok(cwd.to_path_buf());
     }
     anyhow::bail!(
-        "Paja Desk doesn't know where {repo} is checked out yet: Paja hasn't run an item of it \
-         on this machine. Start Desk from inside its checkout, or run the same command there with \
-         `paja work`"
+        "Paja Desk doesn't know where {repo} is checked out yet: add it with its checkout folder \
+         under Repositories (or run `paja work sync` there), or start Desk from inside it"
     )
+}
+
+/// The repositories Paja knows: every one with a work item or a remembered checkout, with the
+/// checkout Desk would use (null when it doesn't know one) and where its runs stand
+/// ([`Runner::status`]).
+#[tauri::command]
+async fn repos(runner: tauri::State<'_, Runner>) -> Result<Value, String> {
+    let runner = runner.inner().clone();
+    Ok(off_main(move |home| repos_in(home, &runner, &checkout())).await)
+}
+
+/// [`repos`] for `home`.
+pub fn repos_in(home: &Home, runner: &Runner, cwd: &Path) -> Value {
+    let listed = (|| -> anyhow::Result<Value> {
+        let mut names: Vec<String> = jono::list_all_from(home, cwd)?
+            .into_iter()
+            .map(|item| item.repo)
+            .filter(|repo| !repo.is_empty())
+            .collect();
+        names.extend(
+            home.events()
+                .read_all()?
+                .iter()
+                .filter(|e| e.kind == jono::EV_CHECKOUT)
+                .filter_map(|e| e.data["repo"].as_str().map(str::to_string)),
+        );
+        names.sort();
+        names.dedup();
+        let repos: Vec<Value> = names
+            .iter()
+            .map(|repo| {
+                let checkout = jono::known_checkout(home, repo).ok().flatten();
+                json!({ "repo": repo, "checkout": checkout, "runs": runner.status(home, repo) })
+            })
+            .collect();
+        Ok(Value::Array(repos))
+    })();
+    listed.unwrap_or_else(error)
+}
+
+/// Add a repository by its checkout folder: sync its issues there, as `paja work sync` does,
+/// which also remembers the checkout. Returns the sync's JSON.
+#[tauri::command]
+async fn repo_add(path: String) -> Value {
+    off_main(move |home| {
+        let path = PathBuf::from(path.trim());
+        jono::sync(home, &path)
+            .and_then(|report| Ok(serde_json::to_value(report)?))
+            .unwrap_or_else(error)
+    })
+    .await
+}
+
+/// `paja doctor` for `repo`'s checkout: the checks a run needs, each with its fix.
+#[tauri::command]
+async fn repo_doctor(repo: String) -> Value {
+    off_main(move |home| {
+        checkout_of(home, &repo, &checkout())
+            .and_then(|path| paja::doctor::run_checks(home, &path))
+            .and_then(|report| Ok(serde_json::to_value(report)?))
+            .unwrap_or_else(error)
+    })
+    .await
+}
+
+/// Start `paja run` for `repo`: one item, or `every` to keep going. Refused while a check of
+/// `paja doctor` fails (the error lists the fixes) or a run of `repo` is going.
+#[tauri::command]
+async fn run_start(
+    runner: tauri::State<'_, Runner>,
+    repo: String,
+    every: bool,
+) -> Result<Value, String> {
+    let runner = runner.inner().clone();
+    Ok(off_main(move |home| run_start_in(home, &runner, &repo, every, &checkout())).await)
+}
+
+/// [`run_start`] for `home`.
+pub fn run_start_in(home: &Home, runner: &Runner, repo: &str, every: bool, cwd: &Path) -> Value {
+    let started = checkout_of(home, repo, cwd).and_then(|path| {
+        let report = paja::doctor::run_checks(home, &path)?;
+        if !report.ok {
+            let failed: Vec<String> = report
+                .checks
+                .iter()
+                .filter(|c| c.status == paja::doctor::Status::Failed)
+                .map(|c| match &c.fix {
+                    Some(fix) => format!("{}: {} ({fix})", c.name, c.detail),
+                    None => format!("{}: {}", c.name, c.detail),
+                })
+                .collect();
+            anyhow::bail!(
+                "paja doctor found what would stop a run of {repo}; fix it first:\n{}",
+                failed.join("\n")
+            );
+        }
+        runner.start(home, repo, &path, every)
+    });
+    started.unwrap_or_else(error)
+}
+
+/// Ask Desk's run of `repo` to stop after the step in flight, or `now`.
+#[tauri::command]
+async fn run_stop(
+    runner: tauri::State<'_, Runner>,
+    repo: String,
+    now: bool,
+) -> Result<Value, String> {
+    let runner = runner.inner().clone();
+    Ok(off_main(move |home| {
+        runner
+            .stop(&repo, now)
+            .map(|()| runner.status(home, &repo))
+            .unwrap_or_else(error)
+    })
+    .await)
+}
+
+/// Close Desk after the person chose what happens to its runs: `stop` sends each one `stop
+/// now`; otherwise they keep going on their own.
+#[tauri::command]
+fn close_desk(app: tauri::AppHandle, runner: tauri::State<'_, Runner>, stop: bool) {
+    if stop {
+        for repo in runner.running() {
+            let _ = runner.stop(&repo, true);
+        }
+    }
+    app.exit(0);
 }
 
 /// Desk's version and the `paja` it found: the one installed next to Desk (an installer puts
@@ -116,6 +250,17 @@ async fn about() -> Value {
     tauri::async_runtime::spawn_blocking(|| about_with(&paja_candidates()))
         .await
         .unwrap_or_else(|err| json!({ "error": format!("Desk's worker stopped: {err}") }))
+}
+
+/// The `paja` Desk starts runs with: the first of [`paja_candidates`] that exists, else the
+/// name alone, found on `PATH`.
+fn paja_program() -> PathBuf {
+    let candidates = paja_candidates();
+    candidates
+        .iter()
+        .find(|p| p.is_file())
+        .cloned()
+        .unwrap_or_else(|| candidates.last().cloned().unwrap_or_else(|| "paja".into()))
 }
 
 /// The `paja` programs Desk tries, in order.
@@ -198,12 +343,29 @@ fn watch(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(Runner::new(paja_program()))
+        .on_window_event(|window, event| {
+            // Closing while Desk's runs are going asks the person first.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let running = window.state::<Runner>().running();
+                if !running.is_empty() {
+                    api.prevent_close();
+                    let _ = window.emit(CLOSE_ASKED, running);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             work_list,
             work_run,
             work_answer,
             work_file,
-            about
+            about,
+            repos,
+            repo_add,
+            repo_doctor,
+            run_start,
+            run_stop,
+            close_desk
         ])
         .setup(|app| {
             watch(app.handle().clone());
@@ -347,7 +509,8 @@ mod tests {
             let gh = dir.path().join("gh");
             std::fs::write(
                 &gh,
-                "#!/bin/sh\n[ -f gh-down ] && { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }\n\
+                "#!/bin/sh\ncase \"$1\" in --version|auth) echo 'gh version 2'; exit 0 ;; esac\n\
+                 [ -f gh-down ] && { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }\n\
                  echo \"$@\" >> gh.log\n\
                  case \"$1 $2\" in\n\
                  \"repo view\") echo '{\"nameWithOwner\": \"acme/app\"}' ;;\n\
@@ -491,6 +654,34 @@ mod tests {
             error.contains("doesn't know where acme/other is checked out"),
             "{answered}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_doctor_check_blocks_starting_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        // The checkout has no `.paja/checks` on its default branch, which `paja doctor` fails.
+        let (home, _) = escalated_with_checkout(dir.path());
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let started = run_start_in(&home, &runner, "acme/app", false, dir.path());
+        let error = started["error"].as_str().unwrap_or_default();
+        assert!(error.contains("paja doctor found"), "{started}");
+        assert!(runner.running().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_repository_list_has_each_repository_with_its_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        import(&home, "acme/lib", 1, "Fix the parser");
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let listed = repos_in(&home, &runner, dir.path());
+        assert_eq!(listed[0]["repo"], "acme/app", "{listed}");
+        assert_eq!(listed[0]["checkout"], json!(checkout), "{listed}");
+        assert_eq!(listed[0]["runs"]["desk"], false, "{listed}");
+        assert_eq!(listed[1]["repo"], "acme/lib", "{listed}");
+        assert_eq!(listed[1]["checkout"], Value::Null, "{listed}");
     }
 
     #[test]

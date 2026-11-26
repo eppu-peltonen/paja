@@ -10,8 +10,30 @@
     <header>
       <h1>Paja Desk</h1>
       <span id="updated" class="muted"></span>
+      <button id="show-repos" type="button" class="quiet">Repositories</button>
       <button id="new-work" type="button">New work</button>
     </header>
+    <section id="closing" class="warning" hidden>
+      <p>Paja Desk is running <strong id="closing-repos"></strong>. What should happen to those runs?</p>
+      <div class="actions">
+        <button id="close-leave" type="button">Leave them running and close</button>
+        <button id="close-stop" type="button">Stop them now and close</button>
+        <button id="close-cancel" type="button" class="quiet">Cancel</button>
+      </div>
+    </section>
+    <section id="repos" hidden>
+      <h2>Repositories</h2>
+      <p class="muted">
+        Runs start the installed <code>paja run</code> in the repository's checkout, exactly as in a terminal. Paja
+        checks the repository first with <code>paja doctor</code> and won't start while a check fails.
+      </p>
+      <ul id="repo-list"></ul>
+      <div class="actions">
+        <input id="repo-path" type="text" placeholder="Path to a repository's checkout folder" />
+        <button id="repo-add" type="button">Add</button>
+      </div>
+      <p id="repo-result" hidden></p>
+    </section>
     <p id="versions" class="warning" hidden></p>
     <section id="filing" hidden>
       <h2>New work</h2>

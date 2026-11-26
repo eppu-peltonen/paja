@@ -199,9 +199,20 @@ default branch. With `none`, Paja lands on Vasara's checks and the reviewers alo
 
 Paja Desk shows the queue of every repository Paja knows in one window, with what waits on you first, and follows the
 event log as it changes. You can answer Paja's questions there and file new work (it shows the issue for approval
-before filing it). For a repository Paja hasn't run an item of on this machine yet, start Desk from inside its
-checkout so it knows where to run `gh`. Its footer shows Desk's version and the `paja` it found, and it warns when the
-two differ.
+before filing it). Its footer shows Desk's version and the `paja` it found, and it warns when the two differ.
+
+Under **Repositories** Desk lists every repository Paja knows. Add one by pasting its checkout folder's path (Desk
+syncs its issues there, as `paja work sync` does, and remembers the folder). For each repository:
+
+- **Check** shows `paja doctor`'s result with the fix for each problem. Desk won't start a run while a check fails.
+- **Run one item** starts `paja run --once --yes` in the checkout, and **Keep running** starts `paja run --every 5`.
+  It is the installed `paja`, so the run is exactly the CLI's, with its own lock and hook. Its output shows under the
+  repository and is kept in `desk/<owner>@<name>.log` in Paja's home.
+- **Stop after this step** and **Stop now** do what the first and second Ctrl-C do in a terminal.
+- A run started in a terminal shows as running too, and Desk won't start a second one in the same repository; stop it
+  where it was started.
+
+Closing Desk while its runs are going asks whether to stop them or leave them running on their own.
 
 ### Install Paja Desk
 
