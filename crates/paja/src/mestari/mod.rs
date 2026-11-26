@@ -838,14 +838,27 @@ fn run_item(
                 return escalated(home, repo, &env, item, &question, round);
             }
         }
-        // A merge Paja handed over must be finished, not committed with its conflicts.
-        if merging(&env.path) && !unmerged(&env.path)?.is_empty() {
-            git(&env.path, &["merge", "--abort"])?;
+        // A merge Paja handed over must be finished, not committed with its conflicts. It stays
+        // in progress, so the next round sees the files that still conflict.
+        let left = if merging(&env.path) {
+            unmerged(&env.path)?
+        } else {
+            Vec::new()
+        };
+        if !left.is_empty() {
             feedback = format!(
-                "The merge of {} was left with conflicts, so Paja undid it. Resolve every \
-                 conflicted file, `git add` it and `git commit -m '<message>'`.",
-                target.branch
+                "The merge of {} isn't finished: these files still have conflicts: {}. Resolve \
+                 each one, keeping what both sides meant, then `git add` the files and \
+                 `git commit -m '<message>'` to finish the merge.",
+                target.branch,
+                left.join(", ")
             );
+            if let Some(p) = &prior {
+                feedback.push_str(&format!(
+                    "\n\nThe review's blockers still need fixing too:\n\n{}",
+                    p.blockers
+                ));
+            }
             progress("the builder left the merge unfinished; asking again");
             let next = Next {
                 feedback: &feedback,

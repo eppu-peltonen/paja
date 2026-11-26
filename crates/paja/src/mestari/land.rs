@@ -240,8 +240,10 @@ pub(super) fn escalate(
     Ok(comment(repo, item, question).err())
 }
 
-/// Ask the person on the issue.
+/// Ask the person on the issue. The question can quote CI logs or review text, so it is
+/// redacted first: the issue is public.
 pub(super) fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
+    let question = follow_ups::redact_for_issue(question, repo);
     let body = format!(
         "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer with \
          `paja work answer {n} \"<your answer>\"` (or `/paja:answer` in Claude Code). That records \
