@@ -17,7 +17,9 @@ rate stays low. Every landed change is re-verified on `main` and reverted automa
 Review has to converge, or a fresh reviewer finding one more edge case each time keeps a change open forever.
 
 - **At most three rounds.** A change gets at most three build, check and review rounds. After the third it lands only if
-  the reviewers say `land`; otherwise it is escalated.
+  the reviewers say `land`; otherwise it is escalated. A round that fails on a turn limit (the builder's, or a
+  reviewer's after its one focused retry) counts against the three without a verdict. Builder and reviewer limit hits
+  are counted separately: a second round failed by the same kind of step escalates.
 - **Only blockers hold a change up.** A blocker is a bug in what the issue asks for, a security hole the change opens, a
   broken `CLAUDE.md` rule, or missing tests for the new behaviour. Every other finding (hardening ideas, edge cases
   outside the issue, nits) is a follow-up: once the change lands, Mestari files the landing round's follow-ups (at most

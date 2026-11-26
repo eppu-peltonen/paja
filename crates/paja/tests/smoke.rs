@@ -939,6 +939,8 @@ impl Factory {
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
                  *--json-schema*) if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
+                 if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
+                 if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
@@ -1778,6 +1780,30 @@ fn a_reviewer_at_its_turn_limit_fails_the_round_then_escalates() {
         builds[1]
     );
     assert!(!f.gh_log().contains("pr merge"));
+}
+
+#[test]
+fn a_capped_reviewer_runs_again_focused_and_the_other_verdict_is_kept() {
+    // High risk: two reviewers. The second stops at its turn limit once, under the hook.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    std::fs::write(f.tmp.path().join("review-limit-second"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 1, "{report}");
+    let calls = f.claude_calls();
+    let reviews: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.contains("--json-schema"))
+        .collect();
+    // Reviewer 1 once, reviewer 2 capped, then reviewer 2 again told to stay focused.
+    assert_eq!(reviews.len(), 3, "{calls:?}");
+    assert!(!reviews[1].contains("Stay focused"), "{}", reviews[1]);
+    assert!(reviews[2].contains("Stay focused"), "{}", reviews[2]);
+    assert_eq!(calls.len() - reviews.len(), 1, "one build: {calls:?}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["usage"]["steps"], 4, "{item}");
 }
 
 #[test]
