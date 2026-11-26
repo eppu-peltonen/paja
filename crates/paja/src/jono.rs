@@ -84,32 +84,15 @@ impl Labels {
         Ok(labels)
     }
 
-    /// The labels on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
-    /// remote's default branch, whatever its name), else `origin/main`, else a local `main`. A
-    /// repository without the file, or without any of these, gets the defaults. Never read from the branch checked out, which is the change under review.
+    /// The labels on the default branch of the checkout `ok` proved safe (see
+    /// [`crate::ahjo::show_on_default_branch`]). A repository without the file, or without a
+    /// default branch, gets the defaults. Never read from the branch checked out, which is the
+    /// change under review.
     fn of_default_branch(ok: &Untampered) -> Result<Self> {
-        for rev in ["origin/HEAD", "origin/main", "main"] {
-            let git = |args: &[&str]| {
-                crate::ahjo::git_command()
-                    .arg("-C")
-                    .arg(ok.path())
-                    .args(args)
-                    .output()
-                    .context("running git (is it installed?)")
-            };
-            let spec = format!("{rev}^{{commit}}");
-            if !git(&["rev-parse", "--verify", "-q", &spec])?
-                .status
-                .success()
-            {
-                continue;
-            }
-            return match crate::ahjo::show_at(ok.path(), rev, LABELS_FILE)? {
-                Some(text) => Self::parse(&text),
-                None => Ok(Self::default()),
-            };
+        match crate::ahjo::show_on_default_branch(ok, LABELS_FILE)? {
+            Some(text) => Self::parse(&text),
+            None => Ok(Self::default()),
         }
-        Ok(Self::default())
     }
 }
 

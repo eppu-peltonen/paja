@@ -400,11 +400,15 @@ fn run(cli: &Cli) -> Result<()> {
                     }
                     // Except when git's configuration was tampered with (running git again is the
                     // danger) or no later pass could start either: the loop stops for a person.
-                    Err(err) if mestari::is_fatal(&err) => return Err(err),
+                    Err(err) if mestari::is_fatal(&err) => {
+                        paja::posti::stopped(&home, repo);
+                        return Err(err);
+                    }
                     Err(err) => {
                         emit(cli, json!({ "error": format!("{err:#}") }), || {
                             format!("error: {err:#}")
                         });
+                        paja::posti::pass_failed(&home, repo);
                         Some("that pass failed; Paja keeps going")
                     }
                 };

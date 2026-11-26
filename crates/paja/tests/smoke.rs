@@ -2485,12 +2485,18 @@ fn a_landing_pass_says_once_that_the_checks_passed() {
 /// Returns that line, whether the loop was still running, and the first JSON line on stdout.
 /// A run whose stderr closes first fails the test instead of hanging it.
 fn first_wait_of_every(f: &Factory) -> (String, bool, Value) {
+    first_wait_of_every_with(f, &[])
+}
+
+/// [`first_wait_of_every`] with more environment variables.
+fn first_wait_of_every_with(f: &Factory, vars: &[(&str, &Path)]) -> (String, bool, Value) {
     use std::io::{BufRead, BufReader};
     let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
+        .envs(vars.iter().copied())
         .args(["--json", "run", "--every", "1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2844,6 +2850,106 @@ fn run_says_when_it_needs_a_decision() {
     ] {
         assert!(stderr.contains(step), "missing {step:?} in:\n{stderr}");
     }
+}
+
+/// A fake `PAJA_NOTIFIER` that logs each notice as `title|text`, and the path of its log.
+fn fake_notifier(f: &Factory) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = f.tmp.path().join("notices.log");
+    let script = program(
+        f.tmp.path(),
+        "notifier",
+        &format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> {}\n",
+            slash(&log)
+        ),
+    );
+    (script, log)
+}
+
+fn events_of(f: &Factory, kind: &str) -> Vec<Value> {
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    log.as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == kind)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn an_escalation_reaches_the_notifier() {
+    let f = Factory::new("true\n", "escalate");
+    let (notifier, log) = fake_notifier(&f);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_NOTIFIER", notifier.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    assert!(
+        notices.starts_with("Paja: acme/app#5 needs a decision|"),
+        "{notices}"
+    );
+    assert!(notices.contains("paja work answer 5"), "{notices}");
+    let sent = events_of(&f, "notify.sent");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["data"]["kind"], "escalated");
+    assert_eq!(sent[0]["data"]["number"], 5);
+    assert_eq!(sent[0]["data"]["channel"], "PAJA_NOTIFIER");
+}
+
+#[test]
+fn a_failed_pass_of_run_every_reaches_the_notifier() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(".paja/models", "nobody sonnet\n");
+    let (notifier, log) = fake_notifier(&f);
+    let (waiting, _, first) =
+        first_wait_of_every_with(&f, &[("PAJA_NOTIFIER", notifier.as_path())]);
+    assert!(waiting.contains("that pass failed"), "{waiting}");
+    assert!(first["error"].is_string(), "{first}");
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    assert!(
+        notices.starts_with("Paja: a pass failed in acme/app|"),
+        "{notices}"
+    );
+}
+
+#[test]
+fn a_push_url_that_is_not_a_url_is_recorded_and_the_run_carries_on() {
+    let f = Factory::new("true\n", "escalate");
+    f.on_main(".paja/notify", "# where notices go\nntfy.example/paja\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PAJA_NOTIFIER", "none")
+        .env_remove("PAJA_NOTIFY")
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("must start with https://").count(),
+        1,
+        "{stderr}"
+    );
+    let failed = events_of(&f, "notify.failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["data"]["channel"], "push");
+    assert!(events_of(&f, "notify.sent").is_empty());
 }
 
 #[test]

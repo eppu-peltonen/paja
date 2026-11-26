@@ -234,6 +234,26 @@ works, `paja run` prints one progress line per step on stderr (the issue it pick
 review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON.
 `paja run --every 5` keeps going, checking an empty queue every five minutes.
 
+### Posti
+
+The comment on the issue is posted with the person's own token, so GitHub doesn't notify them about it. Posti
+(`posti.rs`) tells them instead, next to that comment: when an item escalates (or is parked on an error), when a pass
+of `paja run --every` fails, and when the loop stops for a person. Each notice names the repository and, for an item,
+the issue and the answer command. It goes to two channels:
+
+- **Local.** `PAJA_NOTIFIER` names a program, run with the title and the text as its two arguments; `desktop` asks for
+  a desktop notification (a Windows toast through Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere,
+  through `platform.rs`); `none` turns it off. Unset, it is a desktop notification only when stderr is a terminal, so
+  scripts and tests never show one.
+- **Push.** `PAJA_NOTIFY`, else the first line of `.paja/notify` on the default branch that isn't empty or a `#`
+  comment, names an `https://` URL (an ntfy topic, say). Paja POSTs the title and text there with `curl`. The texts
+  hold no question, error, secret or local path, since a push leaves the machine; the question stays on the issue and
+  the error in the terminal. A repository the tamper lock holds isn't read for the URL.
+
+Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed` or
+`stopped`, `channel`, and the `error`), so Paja Desk can show the same inbox. A notice that can't be delivered never
+stops the run: it says so on stderr once per channel, and every notifier is stopped after 15 seconds.
+
 ## The deny-list hook
 
 Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config`, `--tools` naming only the built-in

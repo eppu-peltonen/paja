@@ -46,6 +46,8 @@ the real repository, to the smoke tests.
   `factory-follow-up` when missing). `paja run` reads them from `main`, never from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It allows local
   git and the programs Mestari passes from `.paja/commands`, and it fails closed.
+- `crates/paja/src/posti.rs`: Posti, the notices that tell the person a run needs them (desktop, `PAJA_NOTIFIER`,
+  a push URL), each recorded as `notify.sent` or `notify.failed`.
 - `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.
 - `crates/paja/src/platform.rs`: what differs between Windows and Unix. Paja runs natively on both; keep
   `std::os::unix`, `/`-only paths and `sh` assumptions out of the other modules' non-test code.
