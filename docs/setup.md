@@ -1,6 +1,8 @@
 # Setting up Paja
 
-How to install Paja and start it on its own queue. Paja runs natively on Windows, Linux and macOS.
+How to install Paja and start it on its own queue. Paja runs natively on Windows, Linux and macOS. Before the first
+run, read [`safety.md`](./safety.md): what the agents can do on your machine, the optional sandbox and a GitHub token
+limited to one repository.
 
 ## What Paja needs
 
