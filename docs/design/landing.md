@@ -30,7 +30,7 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   Mestari checks for itself too: before filing, it replaces words that start like a known credential (GitHub,
   GitLab, Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI) or follow `Bearer`, `token`, `password`, `secret` or
   `api_key` with `<redacted>`, and the factory home, the repository and the user's home directory (also as `~/...`)
-  with `<factory home>`, `<repository>` and `<home>`, where the path ends at a separator or punctuation.
+  with `<factory home>`, `<repository>` and `<home>`, where no letter or digit follows the path.
 - **A re-review judges the fix.** After a round of changes, the next reviewer gets the earlier blockers and reads only
   the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
   builder without a review. High-risk changes are the exception: both

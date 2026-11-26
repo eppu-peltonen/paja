@@ -94,8 +94,8 @@ pub(super) fn file_follow_ups(
 
 /// Tokens that look like credentials become `<redacted>`, and each path in `places` (and
 /// anything under it) becomes its label. Longer paths go first, so a worktree under the factory
-/// home is named as the factory home, not cut in half. A path is matched only where it ends at
-/// a separator or punctuation, so `/home/me` leaves `/home/meg` alone. A place under the user's
+/// home is named as the factory home, not cut in half. A path is matched only where no letter
+/// or digit follows it, so `/home/me` leaves `/home/meg` alone. A place under the user's
 /// home (the last entry labelled `<home>`) is also matched in its `~/...` spelling.
 pub(super) fn redact(text: &str, places: &[(&Path, &str)]) -> String {
     let user_homes: Vec<String> = places
@@ -140,14 +140,16 @@ fn spelling(path: &Path) -> String {
         .to_string()
 }
 
-/// `text` with each `path` that ends at a boundary (the end, a separator or punctuation, not a
-/// letter, digit, `_` or `-`) replaced by `label`.
+/// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
+/// `label`.
 fn replace_path(text: &str, path: &str, label: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find(path) {
         let after = &rest[at + path.len()..];
-        let ends = !after.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '-');
+        // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
+        // around the path, so a path before one is still redacted.
+        let ends = !after.starts_with(char::is_alphanumeric);
         out.push_str(&rest[..at]);
         out.push_str(if ends { label } else { path });
         rest = after;
@@ -270,12 +272,12 @@ mod tests {
         let long = "c3".repeat(10);
         let key = format!("sk-{long}");
         let text = format!(
-            "See ~/.paja/envs/x, /home/meg/a and /home/me. Token: {long}, password={long}, \
+            "See ~/.paja/envs/x, /home/meg/a, _/home/me_, _~/.paja_, /home/me- and /home/me. Token: {long}, password={long}, \
              Bearer:{long}, key {key}, commit 0123456789abcdef0123 and a token of ours."
         );
         assert_eq!(
             redact(&text, &places),
-            "See <factory home>/envs/x, /home/meg/a and <home>. Token: <redacted>, \
+            "See <factory home>/envs/x, /home/meg/a, _<home>_, _<factory home>_, <home>- and <home>. Token: <redacted>, \
              password=<redacted>, Bearer:<redacted>, key <redacted>, commit \
              0123456789abcdef0123 and a token of ours."
         );
