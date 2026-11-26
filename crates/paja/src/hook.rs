@@ -8,9 +8,12 @@
 //!
 //! Shell commands are not parsed in general, since a shell has too many ways to hide a denied
 //! command. Instead a command must have one plain shape: an optional `cd` to the worktree's
-//! root, then `cargo` and local `git` commands joined by `&&`, each optionally piped into
-//! `head`, `tail`, `grep` or `wc`. Every flag must be one Paja lists for that subcommand. No
-//! expansions, no redirections other than `2>&1`, and no other separators. Agents read and
+//! root, then local `git` and the programs the project lists in `.paja/commands` on its default
+//! branch (`cargo` when there is no such file) joined by `&&`, each optionally piped into
+//! `head`, `tail`, `grep` or `wc`. Every `git` and `cargo` flag must be one Paja lists for that
+//! subcommand; other listed programs get the generic checks (path arguments stay inside the
+//! worktree). Mestari passes the list as `--programs`; without it the hook blocks everything.
+//! No expansions, no redirections other than `2>&1`, and no other separators. Agents read and
 //! change files with the file tools.
 //!
 //! It is a guardrail, not a sandbox: code the agent writes still runs under `cargo test`
@@ -49,6 +52,95 @@ pub struct Bounds {
     /// Dependency sources and the toolchain, readable although they sit outside the worktree:
     /// `$CARGO_HOME/registry`, `$CARGO_HOME/git` and `$RUSTUP_HOME`.
     pub deps: Vec<PathBuf>,
+    /// The programs besides local `git` this agent may run, from `.paja/commands` on the
+    /// default branch (see [`Commands`]). [`Bounds::new`] starts with `cargo`; Mestari's
+    /// `--programs` replaces it.
+    pub programs: Vec<String>,
+}
+
+/// Where the project names the programs its agents may run, read from the default branch.
+pub const COMMANDS_FILE: &str = ".paja/commands";
+
+/// The programs `.paja/commands` allows: the builder (build and fix roles) gets every line,
+/// reviewers only the `review <program>` lines.
+#[derive(Debug, PartialEq)]
+pub struct Commands {
+    pub builder: Vec<String>,
+    pub reviewer: Vec<String>,
+}
+
+impl Commands {
+    /// Parse the file's text, `None` when it is missing: then the list is `cargo` for every
+    /// role, as it was before the file existed.
+    pub fn parse(text: Option<&str>) -> Result<Commands> {
+        let Some(text) = text else {
+            return Ok(Commands {
+                builder: vec!["cargo".into()],
+                reviewer: vec!["cargo".into()],
+            });
+        };
+        let (mut builder, mut reviewer) = (Vec::new(), Vec::new());
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let (review, name) = match words.as_slice() {
+                ["review", name] => (true, *name),
+                // `review` alone is a role with no program, not a program named review.
+                [name] if *name != "review" => (false, *name),
+                _ => bail!(
+                    "{COMMANDS_FILE} line `{line}` is not `<program>` or `review <program>`; fix \
+                     it on the default branch"
+                ),
+            };
+            if !valid_program(name) {
+                bail!(
+                    "{COMMANDS_FILE} names `{name}`, which is not a plain program name (letters, \
+                     digits, `_`, `-`, `.` or `+`); fix it on the default branch"
+                );
+            }
+            builder.push(name.to_string());
+            if review {
+                reviewer.push(name.to_string());
+            }
+        }
+        Ok(Commands { builder, reviewer })
+    }
+}
+
+/// A bare program name: no path, no option, nothing a shell reads specially.
+fn valid_program(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '.'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.+".contains(c))
+}
+
+/// How a list of programs travels on the hook's command line: comma-terminated, so an empty
+/// list (`,`) is told apart from a missing one.
+pub fn encode_programs(programs: &[String]) -> String {
+    let mut text: String = programs.iter().map(|p| format!("{p},")).collect();
+    if text.is_empty() {
+        text.push(',');
+    }
+    text
+}
+
+fn decode_programs(text: &str) -> Result<Vec<String>> {
+    if !text.ends_with(',') {
+        bail!("`--programs {text}` is not a list Mestari wrote (comma-terminated)");
+    }
+    let programs: Vec<String> = text
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(bad) = programs.iter().find(|p| !valid_program(p)) {
+        bail!("`--programs` holds `{bad}`, which is not a plain program name");
+    }
+    Ok(programs)
 }
 
 impl Bounds {
@@ -60,6 +152,7 @@ impl Bounds {
                 home: resolve(&home),
                 read_only: false,
                 deps: dependency_roots(),
+                programs: vec!["cargo".into()],
             }),
             _ => bail!("`paja hook` needs absolute --root and --home paths; Mestari passes both"),
         }
@@ -98,6 +191,7 @@ pub fn run(
     home: Option<PathBuf>,
     stamp: Option<PathBuf>,
     read_only: bool,
+    programs: Option<String>,
 ) -> ExitCode {
     // A hook that runs past Claude Code's timeout counts as "allow"; block well before it.
     std::thread::spawn(|| {
@@ -118,9 +212,18 @@ pub fn run(
         // Read the call first, so the caller's write never meets a closed pipe.
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        // No list from Mestari means no way to tell what is allowed: block everything.
+        let bounds = Bounds::new(root, home)?;
+        let Some(programs) = programs else {
+            bail!(
+                "Mestari passed no --programs list, so the hook can't tell which programs are \
+                 allowed"
+            );
+        };
         let bounds = Bounds {
             read_only,
-            ..Bounds::new(root, home)?
+            programs: decode_programs(&programs)?,
+            ..bounds
         };
         let input: HookInput = serde_json::from_str(&input)?;
         check(&input, &bounds)
@@ -831,7 +934,8 @@ fn next_is(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, rest: &str) -> 
     }
 }
 
-const SHAPE: &str = "agents run `cargo` and local `git` with plain flags, joined by `&&` and \
+const SHAPE: &str = "agents run local `git` and the programs listed in `.paja/commands` on the \
+     default branch (`cargo` when there is no such file) with plain flags, joined by `&&` and \
      optionally piped into `head`, `tail`, `grep` or `wc`; use the file tools for everything else";
 
 fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
@@ -929,8 +1033,9 @@ fn check_simple(
     let Some((program, args)) = words[start..].split_first() else {
         return Some(format!("an empty command; {SHAPE}"));
     };
-    // Cargo and git act on the directory they run in, which must be the worktree.
-    if matches!(*program, "cargo" | "git") && !here.starts_with(&b.root) {
+    let listed = b.programs.iter().any(|p| p == program);
+    // Programs act on the directory they run in, which must be the worktree.
+    if (listed || *program == "git") && !here.starts_with(&b.root) {
         return Some(format!(
             "the shell is in {}, outside the worktree; start with `cd '{}' &&`",
             crate::platform::shown(here),
@@ -938,8 +1043,11 @@ fn check_simple(
         ));
     }
     match *program {
-        "cargo" => check_cargo(args, b.read_only),
+        "cargo" if listed => check_cargo(args, b.read_only),
         "git" => check_git(args, here, b),
+        name if listed && valid_program(name) && !matches!(name, "cd" | "pwd") => {
+            check_listed(name, args, here, b)
+        }
         "pwd" if args.is_empty() => None,
         // Only into the worktree's root, and only as a step of its own, so a failed `cd`
         // stops the rest. No `.` or `..` parts: bash's `cd` drops `..` as text before it
@@ -973,8 +1081,52 @@ fn check_simple(
             )),
         },
         "cd" => Some("`cd` may only be the first step of a command, on its own".into()),
-        other => Some(format!("`{other}` is not allowed; {SHAPE}")),
+        other => {
+            let role = if b.read_only {
+                "reviewers run only the programs marked `review <program>` and"
+            } else {
+                "agents"
+            };
+            Some(format!(
+                "`{other}` is not allowed: {role} run local git and the programs listed in \
+                 {COMMANDS_FILE}; to allow it, add it to {COMMANDS_FILE} on the default branch \
+                 (`review {other}` for reviewers too). {SHAPE}"
+            ))
+        }
     }
+}
+
+/// A program the project lists, other than cargo: the generic checks only. Words are plain
+/// (the tokenizer saw to that); any that names a path, alone or after `--flag=`, stays inside
+/// the worktree.
+fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option<String> {
+    for arg in args {
+        let value = match arg.strip_prefix('-') {
+            Some(_) => arg.split_once('=').map_or("", |(_, value)| value),
+            None => arg,
+        };
+        let drive = value.as_bytes().get(1) == Some(&b':')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic);
+        if !(value.contains(['/', '\\']) || value.starts_with('.') || drive) {
+            continue;
+        }
+        if let Some(why) = crate::platform::path_problem(value, false) {
+            return Some(why);
+        }
+        let target = here.join(crate::platform::shell_path(value));
+        let reason = if b.read_only {
+            within_root(&format!("use {program}"), &target, b)
+        } else {
+            inside_root(&format!("use {program}"), &target, b)
+        };
+        if reason.is_some() {
+            return reason;
+        }
+    }
+    None
 }
 
 fn check_cargo(args: &[&str], read_only: bool) -> Option<String> {
@@ -1291,7 +1443,8 @@ pub fn self_test_inputs(root: &Path, read_only: bool) -> (String, String) {
     } else {
         "git push origin main"
     };
-    (call(blocked), call("cargo test"))
+    // Local git is allowed whatever `.paja/commands` lists, so the check works for every project.
+    (call(blocked), call("git status -s"))
 }
 
 // The cases use Unix paths; `windows_tests` below covers the Windows spellings.
@@ -1364,6 +1517,140 @@ mod scan_tests {
         assert_eq!(check(&input, &b).unwrap(), None);
         let took = start.elapsed();
         assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    }
+}
+
+#[cfg(test)]
+mod commands_tests {
+    use super::*;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_missing_file_lists_cargo_for_every_role() {
+        let c = Commands::parse(None).unwrap();
+        assert_eq!(c.builder, words(&["cargo"]));
+        assert_eq!(c.reviewer, words(&["cargo"]));
+    }
+
+    #[test]
+    fn review_lines_are_for_reviewers_too_and_comments_are_skipped() {
+        let c = Commands::parse(Some("# tools\nnpm\n\n  review node \npytest\n")).unwrap();
+        assert_eq!(c.builder, words(&["npm", "node", "pytest"]));
+        assert_eq!(c.reviewer, words(&["node"]));
+    }
+
+    #[test]
+    fn odd_lines_are_errors_that_name_the_file() {
+        for bad in [
+            "npm test",
+            "review",
+            "./npm",
+            "-x",
+            "a;b",
+            "review a b",
+            "$(x)",
+        ] {
+            let why = Commands::parse(Some(bad)).unwrap_err().to_string();
+            assert!(why.contains(".paja/commands"), "{bad}: {why}");
+        }
+    }
+
+    #[test]
+    fn programs_travel_comma_terminated_and_a_bare_list_is_refused() {
+        let list = words(&["cargo", "npm"]);
+        assert_eq!(decode_programs(&encode_programs(&list)).unwrap(), list);
+        assert!(decode_programs(&encode_programs(&[])).unwrap().is_empty());
+        assert!(decode_programs("cargo").is_err());
+        assert!(decode_programs("a/b,").is_err());
+    }
+
+    #[test]
+    fn without_a_list_the_hook_blocks_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("h");
+        // `run` reads stdin, so only its decision on a missing list is checked through
+        // `decode_programs`' refusal of anything Mestari did not write.
+        assert!(decode_programs("").is_err());
+        assert!(Bounds::new(Some(tmp.path().to_path_buf()), Some(home)).is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod program_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ROOT: &str = "/h/.paja/envs/work-1";
+
+    fn bash_as(programs: &[&str], read_only: bool, command: &str) -> Option<String> {
+        let b = Bounds {
+            read_only,
+            programs: programs.iter().map(|s| s.to_string()).collect(),
+            ..Bounds::new(Some(ROOT.into()), Some("/h/.paja".into())).unwrap()
+        };
+        let input = HookInput {
+            tool_name: "Bash".into(),
+            tool_input: json!({ "command": command }),
+            cwd: ROOT.into(),
+        };
+        check(&input, &b).unwrap()
+    }
+
+    #[test]
+    fn a_listed_program_is_allowed_under_the_shape_rules() {
+        let ok = |c: &str| assert_eq!(bash_as(&["npm", "pytest"], false, c), None, "{c}");
+        ok("npm test");
+        ok("npm run lint 2>&1 | tail -20");
+        ok("cd /h/.paja/envs/work-1 && pytest tests/test_x.py -q");
+        ok("git status && npm test");
+        ok("npm test --prefix=./web");
+    }
+
+    #[test]
+    fn an_unlisted_program_is_refused_with_the_commands_hint() {
+        for c in ["curl x", "npm test", "cargo test"] {
+            let why = bash_as(&["pytest"], false, c).expect(c);
+            assert!(why.contains(".paja/commands"), "{why}");
+            assert!(why.contains("default branch"), "{why}");
+        }
+        // Cargo's own checks apply only when it is listed, and then they apply in full.
+        assert_eq!(bash_as(&["cargo"], false, "cargo test"), None);
+        assert!(bash_as(&["cargo"], false, "cargo install x").is_some());
+    }
+
+    #[test]
+    fn a_reviewer_runs_only_the_review_lines() {
+        // Mestari hands a reviewer just those lines.
+        assert_eq!(bash_as(&["node"], true, "node check.js"), None);
+        assert!(bash_as(&["node"], true, "npm test").is_some());
+        assert!(bash_as(&[], true, "node check.js").is_some());
+        assert_eq!(bash_as(&[], true, "git status"), None);
+    }
+
+    #[test]
+    fn shape_rules_still_apply_to_listed_programs() {
+        for c in [
+            "npm test > out.txt",
+            "npm test $(id)",
+            "npm test `id`",
+            "npm test; id",
+            "npm test || id",
+            "npm test | sh",
+            "X=1 npm test",
+            "npm <<EOF",
+            "cd /tmp && npm test",
+            "npm test ../x",
+            "npm test /etc/passwd",
+            "npm test --out=/tmp/x",
+            "npm test ~/x",
+            "npm install ~/.ssh/id_rsa",
+            "npm test .git/config",
+        ] {
+            assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
+        }
     }
 }
 

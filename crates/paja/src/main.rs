@@ -71,6 +71,10 @@ enum Command {
         /// For reviewers: block every change, inside the worktree too.
         #[arg(long)]
         read_only: bool,
+        /// The programs besides local git the agent may run, comma-terminated (`cargo,npm,`;
+        /// `,` for none). Without it the hook blocks every call.
+        #[arg(long)]
+        programs: Option<String>,
     },
     /// Serve the same commands as MCP tools on stdin/stdout, for Claude Code.
     ///
@@ -190,9 +194,16 @@ fn main() -> ExitCode {
         home,
         stamp,
         read_only,
+        programs,
     } = &cli.command
     {
-        return paja::hook::run(root.clone(), home.clone(), stamp.clone(), *read_only);
+        return paja::hook::run(
+            root.clone(),
+            home.clone(),
+            stamp.clone(),
+            *read_only,
+            programs.clone(),
+        );
     }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
