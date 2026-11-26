@@ -77,6 +77,13 @@ escape hatch for an item that needs no answer.
 
 ## The run loop
 
+Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/high-risk` lists only what decides
+what lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review
+prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue,
+`GitGuard`) and `land.rs` (landing, waiting for CI, escalation). Usage counting (`usage.rs`), stderr progress text
+(`progress.rs`), follow-ups (`follow_ups.rs`) and the builder's question and answers (`builder.rs`) are normal risk.
+A unit test keeps the three high-risk files on the list.
+
 `paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`
 and `.paja/models` from `main` and checks them, claims the next item and creates an Ahjo environment `work-<issue>`
 from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it

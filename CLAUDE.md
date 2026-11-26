@@ -34,7 +34,11 @@ the real repository, to the smoke tests.
 - `crates/paja/src/home.rs`: the state directory (`$PAJA_HOME`, default `~/.paja`) and its lock.
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
 - `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues labelled `paja` (`gh`, or `$PAJA_GH`).
-- `crates/paja/src/mestari.rs`: `paja run`, the build, check, review and land loop for one work item.
+- `crates/paja/src/mestari/`: `paja run`, the build, check, review and land loop for one work item. Only the
+  high-risk parts are listed in `.paja/high-risk`: `mod.rs` (the round loop, main's configuration, the risk tier,
+  the review prompt and verdicts), `agent.rs` (`claude()`, the hook settings and self-test, the sandbox glue,
+  `GitGuard`) and `land.rs` (landing, waiting for CI, escalation). `usage.rs` (what a step spent), `progress.rs`
+  (stderr text), `follow_ups.rs` and `builder.rs` (the builder's question and answers) are normal risk.
 - `.paja/checks`, `.paja/high-risk`, `.paja/models`: Vasara's check commands, the high-risk path prefixes and the
   model per agent role. `paja run` reads them from `main`, never from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It fails closed.
