@@ -234,7 +234,10 @@ sandbox below closes when it is on.
 
 The sandbox is optional and off by default. It is a [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`)
 backend: set `PAJA_SBX` to the `sbx` program (`PAJA_SBX=sbx`) and `paja run` runs every agent session and every
-check command of Vasara inside one long-lived sandbox named `paja`, which every run reuses.
+check command of Vasara inside one long-lived sandbox named `paja`, which every run reuses. A run reuses it only when
+the directories it needs are mounted in it; otherwise it stops and says to remove the sandbox (`sbx rm paja`) so the
+next run creates it again. Toolchain setup waits (about five minutes) for apt's locks, which a new sandbox holds
+while it starts.
 
 - **What the code can reach.** Only what is mounted: the factory's `envs/` directory (the worktrees) and the
   repository's own `.git` directory, which commits in a worktree need. The owner's `HOME`, its credential files, git's
