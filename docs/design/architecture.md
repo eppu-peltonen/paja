@@ -71,8 +71,11 @@ escape hatch for an item that needs no answer.
 
 ## The run loop
 
-`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, claims the next item and creates an Ahjo
-environment `work-<issue>` from `main` (resuming the branch an earlier run kept). Then, for at most three rounds:
+`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`
+and `.paja/models` from `main` and checks them, claims the next item and creates an Ahjo environment `work-<issue>`
+from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
+claims anything, with an error naming the file and line, so one fix on `main` is all it takes; a `--every` loop
+reports it and tries again after its wait. Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
    A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own

@@ -1220,13 +1220,22 @@ fn the_second_high_risk_reviewer_runs_as_review_2() {
 fn a_bad_models_file_says_which_line_to_fix() {
     let f = Factory::new("true\n", "land");
     f.on_main(".paja/models", "build sonnet\nreviewer opus\n");
-    let (ok, report) = f.run();
-    assert!(ok, "{report}");
-    assert_eq!(report["outcome"], "escalated", "{report}");
-    let question = report["question"].as_str().unwrap();
+    // One fix on main is all it takes, so the pass stops before it claims an item, rather than
+    // parking each item in turn with the same error.
+    let (ok, err) = f.run();
+    assert!(!ok, "{err}");
+    let error = err["error"].as_str().unwrap();
     assert!(
-        question.contains(".paja/models on main, line 2") && question.contains("unknown role"),
-        "{question}"
+        error.contains(".paja/models on main, line 2") && error.contains("unknown role"),
+        "{error}"
+    );
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    let gh = std::fs::read_to_string(f.tmp.path().join("gh.log")).unwrap_or_default();
+    assert!(!gh.contains("issue comment"), "{gh}");
+    assert!(
+        !f.tmp.path().join("claude-args.log").exists(),
+        "no agent ran"
     );
 }
 
@@ -1791,14 +1800,19 @@ fn work_from_an_agent_the_hook_never_saw_does_not_land() {
 
 #[test]
 fn an_empty_checks_file_is_an_error_not_a_pass() {
+    // It stops the pass before the queue is touched, as any mistake in main's configuration does.
     let f = Factory::new("# nothing yet\n", "land");
-    let (ok, report) = f.run();
-    assert!(ok, "{report}");
-    assert_eq!(report["outcome"], "escalated", "{report}");
+    let (ok, err) = f.run();
+    assert!(!ok, "{err}");
     assert!(
-        report["question"].as_str().unwrap().contains("no commands"),
-        "{report}"
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains(".paja/checks on main has no commands"),
+        "{err}"
     );
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
     assert!(!f.gh_log().contains("pr merge"));
 }
 
