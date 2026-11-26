@@ -74,8 +74,13 @@ pub fn work_file_in(home: &Home, repo: &str, title: &str, body: &str, cwd: &Path
 /// Where to run the core's commands for `repo`: the checkout Paja last worked in for it, else
 /// the directory Desk started in when that is a checkout of `repo`.
 fn checkout_of(home: &Home, repo: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
+    // The core asks `gh` which repository a checkout is, so a checkout whose remote has since
+    // changed would act on another repository's item: it must still be `repo`.
     if let Some(path) = jono::known_checkout(home, repo)? {
-        return Ok(path);
+        // A failing `gh` is its own error, not a reason to look elsewhere.
+        if jono::repo_name(home, &path)? == repo {
+            return Ok(path);
+        }
     }
     if jono::repo_name(home, cwd).is_ok_and(|name| name == repo) {
         return Ok(cwd.to_path_buf());
@@ -315,6 +320,39 @@ mod tests {
             "{filed}"
         );
         assert_eq!(home.events().read_all().unwrap().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remembered_checkout_of_another_repository_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        // The fake gh names every checkout acme/app, so one remembered for acme/other is stale.
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        import(&home, "acme/other", 3, "Same number elsewhere");
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                paja::ahjo::EV_CREATED,
+                json!({
+                    "name": jono::env_name("acme/other", 3),
+                    "repo": checkout,
+                    "path": dir.path().join("env2"),
+                    "branch": "paja/y",
+                    "base_commit": "0",
+                    "port_base": 41010,
+                    "port_count": 10,
+                    "created_ms": 0,
+                }),
+            )
+            .unwrap();
+        drop(lock);
+        let answered = work_answer_in(&home, "acme/other", 3, "Use A", dir.path());
+        let error = answered["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("doesn't know where acme/other is checked out"),
+            "{answered}"
+        );
     }
 
     #[test]
