@@ -488,14 +488,7 @@ fn the_mcp_server_serves_the_same_core() {
     init_repo(&repo);
     let mut mcp = Mcp::start(&home, &repo, &[]);
 
-    let init = mcp.request(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "smoke", "version": "0"}
-        }),
-    );
+    let init = mcp.initialize();
     assert_eq!(init["result"]["serverInfo"]["name"], "paja", "{init}");
     let tools = mcp.request("tools/list", serde_json::json!({}));
     let names: Vec<&str> = tools["result"]["tools"]
@@ -813,6 +806,16 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         &repo,
         &["work", "set", "3", "escalated", "--note", "Which API?"],
     );
+    // Read without --json, the item says how to answer it.
+    let shown = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .args(["work", "show", "3"])
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("note: Which API?"), "{shown}");
+    assert!(shown.contains("paja work answer 3"), "{shown}");
     // Queuing it by hand would start a run that never sees the answer.
     let (ok, err) = paja(&home, &repo, &["work", "set", "3", "queued"]);
     assert!(!ok);

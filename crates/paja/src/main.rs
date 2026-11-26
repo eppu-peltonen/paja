@@ -427,6 +427,12 @@ fn describe_item(item: &jono::WorkItem) -> String {
     if let Some(note) = &item.note {
         line.push_str(&format!("\n  note: {note}"));
     }
+    if item.status == jono::Status::Escalated {
+        line.push_str(&format!(
+            "\n  answer: paja work answer {} \"<your answer>\"",
+            item.number
+        ));
+    }
     line
 }
 
