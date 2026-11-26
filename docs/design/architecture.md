@@ -570,10 +570,12 @@ the home lock as the run view does. Closing the window while Desk's runs are goi
 or leave them running. The log file holds output only, never state.
 
 Each repository also has a pool view ("Pool"), read every two seconds and on every log change: `pool::status` (lanes
-with their item, stage, step, time in step and spend; what waits and why; what landed; since the pool started, its
+with their item, stage, step, time in step, spend and admitted files; the lane landing and the merging queue; what
+waits and why; what landed; since the pool started, its
 spend, landings, ready items and items held for an answer) and the repository's newest `pool.*` and `run.*` events.
 Its lane count calls `pool::lanes` (as `paja pool lanes`), which a running pool reads on its next tick; lowering
-it below the busy lanes says which lanes finish their item first. "Start the pool" runs `paja run --every 5 --workers
+it below the busy lanes says which lanes finish their item first, and a box that holds no count is refused rather
+than read as 0. "Start the pool" runs `paja run --every 5 --workers
 N` the same way as a run, and Desk refuses it while a pool already runs for the repository. The view keeps nothing of
 its own: everything it shows is the event log's.
 

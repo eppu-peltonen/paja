@@ -5319,12 +5319,21 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     assert_eq!(status["lanes"][0]["stage"], "build", "{status}");
     assert_eq!(status["waiting"][0]["number"], 7, "{status}");
     assert_eq!(status["waiting"][0]["why"], "no free lane", "{status}");
+    // Since the pool started: nothing landed or held yet, one item ready for a lane.
+    assert!(status["started_ms"].as_u64().is_some(), "{status}");
+    assert!(status["spent_usd"].as_f64().is_some(), "{status}");
+    assert_eq!(status["landed_since_start"], 0, "{status}");
+    assert_eq!(status["ready"], 1, "{status}");
+    assert_eq!(status["held"], 0, "{status}");
     // The MCP tool returns the same value.
     let mut mcp = Mcp::start(&f.home, &f.repo, &[("PAJA_GH", f.gh.as_path())]);
     mcp.initialize();
     let (ok, by_mcp) = mcp.call("pool_status", serde_json::json!({}));
     assert!(ok, "{by_mcp}");
     assert_eq!(by_mcp["admitted"], status["admitted"]);
+    for key in ["started_ms", "ready", "held", "landed_since_start"] {
+        assert_eq!(by_mcp[key], status[key], "{key}");
+    }
     assert_eq!(
         by_mcp["lanes"][0]["since_ms"],
         status["lanes"][0]["since_ms"]
