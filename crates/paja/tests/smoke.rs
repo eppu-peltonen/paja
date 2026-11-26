@@ -1216,6 +1216,60 @@ fn a_step_records_when_its_fallback_model_served_it() {
 }
 
 #[test]
+fn run_every_says_when_it_waits_and_reports_progress_once() {
+    use std::io::{BufRead, BufReader};
+    // A pass that lands an item says once that the checks passed, before its reviewers.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("checks passed").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("reviewer 2 of 2 is reading the change"),
+        "{stderr}"
+    );
+
+    // With nothing left to do, `--every` says it waits, and keeps running until stopped.
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run", "--every", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(every.stderr.take().unwrap()).lines();
+    let waiting = lines
+        .by_ref()
+        .map(|line| line.unwrap())
+        .find(|line| line.contains("nothing to do right now"));
+    let still_running = every.try_wait().unwrap().is_none();
+    every.kill().unwrap();
+    every.wait().unwrap();
+    let waiting = waiting.expect("no wait line before stderr closed");
+    assert!(
+        waiting.contains("checking again in 1 minute (Ctrl+C stops)"),
+        "{waiting}"
+    );
+    assert!(still_running, "the loop stopped by itself");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut every.stdout.take().unwrap(), &mut stdout).unwrap();
+    let idle: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(idle["outcome"], "idle", "{stdout}");
+}
+
+#[test]
 fn run_records_what_each_agent_step_spent() {
     // The fake builder reports usage; the fake reviewer doesn't, like an older Claude Code.
     let f = Factory::new("true\n", "land");

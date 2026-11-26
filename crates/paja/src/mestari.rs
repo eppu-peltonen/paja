@@ -810,11 +810,12 @@ fn run_item(
         // reviewer's finished verdict is kept: only the capped review runs again.
         let mut retried = false;
         let mut i = 0;
+        progress("Vasara's checks passed");
         while i < reviewers {
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
             progress(&format!(
-                "checks passed; reviewer {} of {reviewers} is reading the change{}",
+                "reviewer {} of {reviewers} is reading the change{}",
                 i + 1,
                 if risky {
                     " (high risk: two must agree)"
