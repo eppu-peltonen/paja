@@ -1385,12 +1385,18 @@ struct Factory {
 
 impl Factory {
     fn new(checks: &str, verdict: &str) -> Self {
+        Self::on_branch(checks, verdict, "main", r#"{"nameWithOwner": "acme/app"}"#)
+    }
+
+    /// A repository whose default branch is `branch` and whose `gh repo view` says `view`.
+    fn on_branch(checks: &str, verdict: &str, branch: &str, view: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
         let origin = tmp.path().join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&origin, &["init", "-q", "--bare", "-b", branch]);
         init_repo(&repo);
+        git(&repo, &["branch", "-m", branch]);
         std::fs::create_dir_all(repo.join(".paja")).unwrap();
         std::fs::write(repo.join(".paja/checks"), checks).unwrap();
         git(&repo, &["add", "."]);
@@ -1399,7 +1405,7 @@ impl Factory {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
-        git(&repo, &["push", "-q", "origin", "main"]);
+        git(&repo, &["push", "-q", "origin", branch]);
 
         let dir = tmp.path();
         std::fs::write(
@@ -1415,7 +1421,7 @@ impl Factory {
             format!(
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && cat \"$a\" >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
-                 \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+                 \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
@@ -1477,6 +1483,20 @@ impl Factory {
         )
     }
 
+    /// `run`, with the progress lines it wrote on stderr.
+    fn run_with_stderr(&self) -> (Value, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&self.repo)
+            .env("PAJA_HOME", &self.home)
+            .env("PAJA_GH", &self.gh)
+            .env("PAJA_CLAUDE", &self.claude)
+            .args(["--json", "run"])
+            .output()
+            .unwrap();
+        let report = serde_json::from_slice(&output.stdout).unwrap();
+        (report, String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
     /// Commit `text` as `path` on main and push it, as a person changing the factory would.
     fn on_main(&self, path: &str, text: &str) {
         std::fs::write(self.repo.join(path), text).unwrap();
@@ -1526,6 +1546,44 @@ fn a_run_uses_the_labels_main_names() {
         "{log}"
     );
     assert!(!log.contains("factory"), "{log}");
+}
+
+#[test]
+fn run_lands_on_the_default_branch_with_an_allowed_merge_method() {
+    let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "trunk"}, "squashMergeAllowed": false, "mergeCommitAllowed": true, "rebaseMergeAllowed": false}"#;
+    let f = Factory::on_branch("test -f feature.txt\n", "land", "trunk", view);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("merges into: trunk (default branch), by a merge commit"),
+        "{stderr}"
+    );
+    let log = f.gh_log();
+    assert!(
+        log.contains(&format!("pr create --base trunk --head paja/{WORK_5}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("pr merge https://example.com/pull/1 --merge --delete-branch"),
+        "{log}"
+    );
+}
+
+#[test]
+fn run_escalates_when_the_repository_allows_no_merge_method() {
+    let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "main"}, "squashMergeAllowed": false, "mergeCommitAllowed": false, "rebaseMergeAllowed": false}"#;
+    let f = Factory::on_branch("test -f feature.txt\n", "land", "main", view);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("acme/app allows no merge method"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr merge"), "{}", f.gh_log());
 }
 
 #[test]

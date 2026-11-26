@@ -3,7 +3,7 @@
 //! reviewer agents read the diff cold, then land it or loop back, and escalate when stuck.
 //!
 //! Every step is a fresh headless `claude -p` run. The checks and the high-risk paths are read
-//! from the base commit on `main`, never from the branch under review, so a change can't
+//! from the base commit on the default branch, never from the branch under review, so a change can't
 //! loosen the checks that judge it.
 
 use std::path::{Path, PathBuf};
@@ -130,7 +130,7 @@ pub struct RoleModel {
     pub effort: Option<String>,
 }
 
-/// `.paja/models` as it is on main: one line per role, `role model [effort]`, plus an optional
+/// `.paja/models` as it is on the default branch: one line per role, `role model [effort]`, plus an optional
 /// `fallback model` line. A role with no line runs on the account's default model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Models {
@@ -143,7 +143,13 @@ pub struct Models {
 impl Models {
     /// Read the file's text. `#` starts a comment line. Anything else that isn't a known role
     /// with a plain model name (and a known effort) is an error naming the line and the fix.
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_on(text, "main")
+    }
+
+    /// [`Models::parse`], with errors naming the default branch the file was read from.
+    pub fn parse_on(text: &str, branch: &str) -> Result<Self> {
         let mut models = Models::default();
         // A leading `-` would reach `claude` as a flag of its own.
         let plain = |word: &str| {
@@ -157,7 +163,7 @@ impl Models {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let at = || format!("{MODELS_FILE} on main, line {}: {line:?}", i + 1);
+            let at = || format!("{MODELS_FILE} on {branch}, line {}: {line:?}", i + 1);
             let words: Vec<&str> = line.split_whitespace().collect();
             let (role, rest) = (words[0], &words[1..]);
             if let Some(bad) = rest.iter().find(|w| !plain(w)) {
@@ -309,10 +315,19 @@ impl std::fmt::Display for Declined {
 impl std::error::Error for Declined {}
 
 /// What a run is about to do, on stderr, before the first agent starts.
-fn summary(item: &jono::WorkItem, ci: CiMode, sandbox: bool) {
+fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bool) {
     progress(&format!("repository: {}", item.repo));
     progress(&format!("item: #{} {}", item.number, item.title));
-    progress("merges into: main (default branch), by squash");
+    let method = match target.merge_flag() {
+        Some("--squash") => "by squash",
+        Some("--rebase") => "by rebase",
+        Some(_) => "by a merge commit",
+        None => "no merge method allowed, so landing escalates",
+    };
+    progress(&format!(
+        "merges into: {} (default branch), {method}",
+        target.branch
+    ));
     progress(&match ci {
         CiMode::Required => "CI: required before landing".to_string(),
         CiMode::None => format!(
@@ -346,9 +361,15 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         ahjo::clear_tampered(home, &repo)?;
     }
     let key = ahjo::ensure_untampered(home, &repo)?;
-    git(&repo, &["fetch", "-q", "origin", "main"]).context(
-        "fetching origin/main; check the network and that `origin` is the GitHub repository",
-    )?;
+    // Once per pass: the default branch and the merge methods the repository allows.
+    let target = RepoSettings::read(&repo)?;
+    let branch = target.branch.as_str();
+    git(&repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+        format!(
+            "fetching origin/{branch}; check the network and that `origin` is the GitHub \
+             repository"
+        )
+    })?;
     let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
@@ -362,7 +383,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
     let name = jono::sync_with(home, &repo, Some(&labels))?.repo;
-    let config = read_config(&repo, &base, labels)?;
+    let config = read_config(&repo, &base, labels, target)?;
     // Before an item is claimed: waiting for CI that will never run fails after the whole build.
     if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
         bail!(
@@ -389,7 +410,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
-    summary(&item, config.ci, crate::sandbox::active().is_some());
+    summary(
+        &item,
+        &config.target,
+        config.ci,
+        crate::sandbox::active().is_some(),
+    );
     if opts.confirm && !confirmed()? {
         // Put the item back, so declining leaves the queue as it was. A resumed item was
         // active already and stays so.
@@ -494,7 +520,8 @@ struct Unrecorded {
     steps: Vec<StepUsage>,
 }
 
-/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on `main`).
+/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on the default
+/// branch).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CiMode {
     /// Wait for the pull request's CI checks to pass (the default).
@@ -504,18 +531,78 @@ enum CiMode {
 }
 
 impl CiMode {
-    fn parse(text: Option<&str>) -> Result<CiMode> {
+    fn parse(text: Option<&str>, branch: &str) -> Result<CiMode> {
         let words = lines(text.unwrap_or_default());
         match words.as_slice() {
             [] => Ok(CiMode::Required),
             [w] if w == "required" => Ok(CiMode::Required),
             [w] if w == "none" => Ok(CiMode::None),
-            _ => bail!("{CI_FILE} on main must hold `required` or `none`; fix it on main"),
+            _ => bail!("{CI_FILE} on {branch} must hold `required` or `none`; fix it on {branch}"),
         }
     }
 }
 
-/// Vasara's check commands, the high-risk paths and the model per role, as `main` has them.
+/// The repository's default branch and the merge methods it allows, from `gh repo view`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoSettings {
+    branch: String,
+    squash: bool,
+    merge_commit: bool,
+    rebase: bool,
+}
+
+impl RepoSettings {
+    fn read(repo: &Path) -> Result<Self> {
+        let gh = jono::gh_program();
+        let out = run_gh(
+            repo,
+            &[
+                "repo",
+                "view",
+                "--json",
+                "defaultBranchRef,squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed",
+            ],
+        )?;
+        let settings = Self::parse(&out);
+        settings.with_context(|| {
+            format!("`{gh} repo view` gave no default branch; check `gh auth status`")
+        })
+    }
+
+    /// A field `gh` leaves out is not taken to forbid anything: the branch is then `main` and
+    /// squash merging is allowed.
+    fn parse(json: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(json).ok()?;
+        let branch = match v["defaultBranchRef"]["name"].as_str() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ if v.get("defaultBranchRef").is_none() => "main".to_string(),
+            _ => return None,
+        };
+        let flag = |key: &str, default: bool| v[key].as_bool().unwrap_or(default);
+        Some(RepoSettings {
+            branch,
+            squash: flag("squashMergeAllowed", true),
+            merge_commit: flag("mergeCommitAllowed", false),
+            rebase: flag("rebaseMergeAllowed", false),
+        })
+    }
+
+    /// The `gh pr merge` flag to land with: squash, else rebase, else a merge commit.
+    fn merge_flag(&self) -> Option<&'static str> {
+        if self.squash {
+            Some("--squash")
+        } else if self.rebase {
+            Some("--rebase")
+        } else if self.merge_commit {
+            Some("--merge")
+        } else {
+            None
+        }
+    }
+}
+
+/// Vasara's check commands, the high-risk paths and the model per role, as the default branch
+/// has them.
 struct Config {
     ci: CiMode,
     checks: Vec<String>,
@@ -523,25 +610,36 @@ struct Config {
     models: Models,
     commands: crate::hook::Commands,
     labels: jono::Labels,
+    target: RepoSettings,
 }
 
-/// Read and check `main`'s configuration once, before an item is claimed: a mistake there is
-/// one fix on `main`, so it stops the pass instead of parking every item in turn.
-fn read_config(repo: &Path, base: &str, labels: jono::Labels) -> Result<Config> {
+/// Read and check the default branch's configuration once, before an item is claimed: a
+/// mistake there is one fix on that branch, so it stops the pass instead of parking every item
+/// in turn.
+fn read_config(
+    repo: &Path,
+    base: &str,
+    labels: jono::Labels,
+    target: RepoSettings,
+) -> Result<Config> {
+    let branch = target.branch.as_str();
     let checks = read_from_base(repo, base, CHECKS_FILE)?.with_context(|| {
-        format!("{CHECKS_FILE} is missing on main; add the check commands there")
+        format!("{CHECKS_FILE} is missing on {branch}; add the check commands there")
     })?;
     let checks: Vec<String> = lines(&checks);
     if checks.is_empty() {
-        // An empty gate would pass everything; that is never what main meant.
-        bail!("{CHECKS_FILE} on main has no commands; add the check commands there");
+        // An empty gate would pass everything; that is never what the branch meant.
+        bail!("{CHECKS_FILE} on {branch} has no commands; add the check commands there");
     }
     let high_risk = lines(&read_from_base(repo, base, HIGH_RISK_FILE)?.unwrap_or_default());
-    let models = Models::parse(&read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default())?;
+    let models = Models::parse_on(
+        &read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default(),
+        branch,
+    )?;
     let commands = crate::hook::Commands::parse(
         read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
     )?;
-    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref())?;
+    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref(), branch)?;
     Ok(Config {
         ci,
         checks,
@@ -549,6 +647,7 @@ fn read_config(repo: &Path, base: &str, labels: jono::Labels) -> Result<Config> 
         models,
         commands,
         labels,
+        target,
     })
 }
 
@@ -568,10 +667,11 @@ fn run_item(
         models,
         commands,
         labels,
+        target,
     } = config;
     let (env, kept) = environment(home, repo, base, item)?;
     // An earlier run's builder session is resumed only for work still on its branch: an
-    // environment made again from `main` starts a fresh one.
+    // environment made again from the default branch starts a fresh one.
     let mut carried = if kept && (resumed || !item.answers.is_empty()) {
         carried_session(home, item, &env.branch)?
     } else {
@@ -893,7 +993,7 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = land(home, repo, &env, item, round, &checked, ci);
+            let report = land(home, repo, &env, item, round, &checked, ci, &target);
             match &report {
                 Ok(RunReport::Landed { pr, .. }) => {
                     file_follow_ups(home, repo, item, pr, &follow_ups, &labels)
@@ -977,7 +1077,7 @@ fn turn_limit_twice(
     let question = format!(
         "In this run {note}, the second time that step stopped at its turn limit. The issue may \
          be too big for one change: split it into smaller issues, or raise the limit with a \
-         `max-turns` line in `{MODELS_FILE}` on main, then answer with what you changed."
+         `max-turns` line in `{MODELS_FILE}` on the default branch, then answer with what you changed."
     );
     escalated(home, repo, env, item, &question, round)
 }
@@ -1380,8 +1480,8 @@ fn review_prompt(
         "Issue #{number}: {title}\n\n{body}\n{answers}\n{diff}\n\n\
          You are an independent reviewer for this project. You did not write this change; decide \
          whether it lands.\n\n{scope} You already have the diff, so read only the surrounding \
-         code you need. Judge it by the rules in CLAUDE.md as they are on main: the CLAUDE.md in \
-         your system prompt is main's copy, not the branch's, so don't read it again.\n\n\
+         code you need. Judge it by the rules in CLAUDE.md as they are on the default branch: the CLAUDE.md in \
+         your system prompt is the default branch's copy, not the branch's, so don't read it again.\n\n\
          Verdicts: `land` if it does what the issue asks and has no blocker; `changes` only for \
          blockers, naming every blocker in the whole diff in `comments` (a later review reads \
          only the fix); `escalate` with a question only when the issue's \
@@ -1395,7 +1495,7 @@ fn review_prompt(
          neither. Paja files the bugs and risks together as one public issue after landing \
          (so never copy secrets, environment details or run output into them) and never files \
          nits. They never hold the change up.\n\n\
-         Vasara's checks (every command in `.paja/checks` on main: {checks}) already passed at \
+         Vasara's checks (every command in `.paja/checks` on the default branch: {checks}) already passed at \
          {checked}, the commit you are judging, so don't run them again. To probe a behaviour, \
          run one named test or the project itself, with Bash limited to {programs} and long \
          output piped through `tail -n 80` or `grep`. Read-only git is fine; you can't change \
@@ -2018,7 +2118,7 @@ mod tests {
 
         assert!(prompt.contains("DIFF-TEXT"), "{prompt}");
         assert!(!prompt.contains("git show base1:CLAUDE.md"), "{prompt}");
-        assert!(prompt.contains("CLAUDE.md in your system prompt is main's copy"));
+        assert!(prompt.contains("CLAUDE.md in your system prompt is the default branch's copy"));
         assert!(prompt.find("Issue #9").unwrap() < prompt.find("independent reviewer").unwrap());
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         // A re-review judges only the fix, at the checked commit, against the earlier blockers.

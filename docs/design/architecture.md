@@ -106,14 +106,17 @@ prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, 
 (`progress.rs`), follow-ups (`follow_ups.rs`) and the builder's question and answers (`builder.rs`) are normal risk.
 A unit test keeps the three high-risk files on the list.
 
-`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`,
-`.paja/models` and `.paja/ci` from `main` and checks them (`.paja/ci` is `required`, the default, or `none` for a
+`paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
+`gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
+and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, or `none` for a
 repository without CI; with `required` a repository with no GitHub Actions workflow stops the pass, and with `none`
-landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and creates an Ahjo environment named
-`<repo>-<hash>-work-<issue>` (the repository's name and a short hash of `owner/name`, so two repositories' item #5
-never share a worktree, branch or port block) from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
-claims anything, with an error naming the file and line, so one fix on `main` is all it takes. That holds even when the
-queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait. While it works on an item the run holds an OS file lock,
+landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
+creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
+`owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch
+(resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it claims anything,
+with an error naming the file and line, so one fix on the default branch is all it takes. That holds even when the
+queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
+While it works on an item the run holds an OS file lock,
 `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
 stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and
@@ -186,7 +189,9 @@ the builder is told to make the change easier to review. The same kind of step (
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
-for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
+for CI with `gh pr checks --watch`, merges it and marks the item landed. The merge is a squash when the repository allows it, otherwise a rebase,
+otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
+setting to change. On `escalate`, three failed rounds, a
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
