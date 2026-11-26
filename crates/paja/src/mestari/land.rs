@@ -10,9 +10,13 @@ pub(super) fn land(
     item: &WorkItem,
     rounds: u32,
     judged: &str,
+    target: &RepoSettings,
 ) -> Result<RunReport> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
+    let Some(merge_flag) = target.merge_flag() else {
+        return escalated(home, repo, env, item, &no_merge_method(&item.repo), rounds);
+    };
     git(
         &env.path,
         &[
@@ -48,7 +52,15 @@ pub(super) fn land(
         _ => run_gh(
             repo,
             &[
-                "pr", "create", "--base", "main", "--head", branch, "--title", &title, "--body",
+                "pr",
+                "create",
+                "--base",
+                &target.branch,
+                "--head",
+                branch,
+                "--title",
+                &title,
+                "--body",
                 &body,
             ],
         )?,
@@ -62,8 +74,17 @@ pub(super) fn land(
     // Free the worktree first: gh deletes the local branch too, which git refuses while a
     // worktree has it checked out.
     ahjo::remove(home, &env.name, true)?;
-    run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
-        .with_context(|| format!("{gh} pr merge {pr}"))?;
+    if let Err(err) = run_gh(repo, &["pr", "merge", &pr, merge_flag, "--delete-branch"]) {
+        let text = format!("{err:#}").to_lowercase();
+        if text.contains("not allowed") || text.contains("permission") {
+            let question = format!(
+                "GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{}",
+                no_merge_method(&item.repo)
+            );
+            return escalated(home, repo, env, item, &question, rounds);
+        }
+        return Err(err).with_context(|| format!("{gh} pr merge {pr}"));
+    }
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, &item.repo, item.number, Status::Landed, Some(&pr));
     let _ = record(
@@ -77,6 +98,16 @@ pub(super) fn land(
         pr,
         rounds,
     })
+}
+
+/// The question for a repository whose settings leave Paja no way to merge.
+fn no_merge_method(repo: &str) -> String {
+    format!(
+        "Paja can't land this change: {repo} allows no merge method Paja can use. Under \
+         Settings > General > Pull Requests, allow squash merging (preferred), rebase merging \
+         or merge commits, and make sure the signed-in `gh` account may merge there, then \
+         answer that it is changed."
+    )
 }
 
 pub(super) fn escalated(
