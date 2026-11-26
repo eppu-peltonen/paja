@@ -403,12 +403,8 @@ pub fn open_plain_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // O_NONBLOCK, which differs between systems.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        const NONBLOCK: i32 = 0o4000;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        const NONBLOCK: i32 = 0x0004;
-        options.custom_flags(NONBLOCK);
+        // Not waiting for a FIFO's writer, and never taking a terminal as the controlling one.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
@@ -564,6 +560,32 @@ fn kill_tree(child: &mut std::process::Child) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_plain_file_opens_only_plain_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        assert!(open_plain_file(&file).is_ok());
+        let missing = open_plain_file(&tmp.path().join("none")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let dir = open_plain_file(tmp.path()).unwrap_err();
+        assert_ne!(dir.kind(), std::io::ErrorKind::NotFound);
+        #[cfg(unix)]
+        {
+            // A FIFO with no writer is refused at once rather than waited on.
+            let fifo = tmp.path().join("fifo");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            assert_ne!(
+                open_plain_file(&fifo).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
