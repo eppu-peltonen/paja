@@ -198,7 +198,9 @@ for again.
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
 for CI with `gh pr checks --watch`, merges it and marks the item landed. A red CI goes back to the builder as another
 round, like a failed check, with the failing checks and the end of the first failed job's log (`gh run view --job <id>
---log-failed`); the pull request stays open and the next round pushes to it. The merge is a squash when the repository allows it, otherwise a rebase,
+--log-failed`); the pull request stays open and the next round pushes to it. So do checks that never start because the
+default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
+CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
 otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
 setting to change. On `escalate`, three failed rounds or
 an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
