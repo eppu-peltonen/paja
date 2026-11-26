@@ -818,6 +818,23 @@ fn work_waits_on_open_dependencies_until_they_close() {
     assert_eq!(next["number"], 2);
     let (_, shown) = paja(&home, &repo, &["work", "show", "6"]);
     assert_eq!(shown["waiting_on"], serde_json::json!([11]));
+
+    // A cycle is named in `paja work list`'s text.
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        r#"[{"number": 2, "title": "A", "body": "Depends on #8", "url": "https://example.com/2"},
+            {"number": 8, "title": "B", "body": "Depends on #2", "url": "https://example.com/8"}]"#,
+    )
+    .unwrap();
+    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    let listed = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .args(["work", "list"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("#2 -> #8 -> #2 wait on each other"), "{text}");
 }
 
 #[test]
