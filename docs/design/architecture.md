@@ -19,7 +19,7 @@ flowchart TB
         log[("event log")]
     end
     workers["Workers: headless Claude Code runs<br/>one per step, inside an Ahjo environment"]
-    repos["App repos, new or existing<br/>no factory files inside"]
+    repos["App repos, new or existing<br/>Paja files (.paja/, CLAUDE.md) on the default branch"]
 
     cc -- "MCP, CLI" --> iface
     desk -- "HTTP API" --> iface

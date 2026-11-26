@@ -52,10 +52,10 @@ Before Paja Desk's phone exit (step 6) and before step 7's full scope, v0.1 ship
 
 Steps 1 and 2 are done; step 3 is in progress.
 
-Step 1's exit test is Its exit test is `evals/step1-exit.py`: headless Claude Code, in a fresh environment made from
+Step 1's exit test is `evals/step1-exit.py`: headless Claude Code, in a fresh environment made from
 `origin/main` and guided only by `CLAUDE.md`, must run fmt, clippy and the tests, each passing on its first command and
 without editing any file. Clippy and the tests both compile Paja first, so they cover the build. The verdict comes from
 a log of the cargo processes Claude really started and a re-run of the checks, never from the model's own report. It
 needs a signed-in `claude`, so it runs on the owner's machine, not in CI; its latest passing output is in the pull
-request that added it. Step 2 is done: `paja mcp`, Jono's import and `paja run` have landed. Step 3 is in progress: Paja's own changes now
-go through the queue.
+request that added it. Step 2 is done: `paja mcp`, Jono's import and `paja run` have landed. Step 3 is in progress:
+Paja's own changes now go through the queue.
