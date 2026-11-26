@@ -91,6 +91,15 @@ pub(super) fn land(
         // and the next round pushes to it.
         if let Err(err) = wait_for_ci(repo, &pr) {
             let err = format!("{err:#}");
+            // Only a failed check, or checks that never start because the default branch moved
+            // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
+            // `gh` or network error, or a repository whose workflows never run, is not.
+            let failed_check = err.contains("\tfail\t");
+            if !failed_check && !default_branch_moved(repo, &target.branch, judged) {
+                let question =
+                    format!("CI did not report on {pr}, so Paja did not land it:\n\n{err}");
+                return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+            }
             let mut why = format!(
                 "CI failed on {pr}, so Paja did not land it. CI runs on GitHub's machines, which \
                  differ from this one (no git identity, a fresh checkout, other temp folders), so \
@@ -129,6 +138,18 @@ pub(super) fn land(
         pr,
         rounds,
     }))
+}
+
+/// Whether `branch` on origin has moved past what `judged` holds. A fetch that fails counts
+/// as not moved, so the caller escalates rather than spending a round.
+fn default_branch_moved(repo: &Path, branch: &str, judged: &str) -> bool {
+    if git(repo, &["fetch", "-q", "origin", branch]).is_err() {
+        return false;
+    }
+    let Ok(tip) = git(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"]) else {
+        return false;
+    };
+    git(repo, &["merge-base", "--is-ancestor", &tip, judged]).is_err()
 }
 
 /// The last lines of the first failed job's log that `gh pr checks` linked to, if `gh` can
