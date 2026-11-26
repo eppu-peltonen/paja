@@ -943,7 +943,7 @@ impl Factory {
                  v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
-                 if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\"}}'; exit 1; fi ;; esac\n\
+                 if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
@@ -1661,6 +1661,19 @@ fn a_resume_at_a_usage_limit_stops_instead_of_starting_fresh() {
         .collect();
     assert_eq!(builds.len(), 2, "{calls:?}");
     assert!(builds[1].contains("--resume"), "{}", builds[1]);
+    // The attempt's spend is recorded once, as only its own share of the session's total.
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let steps: Vec<Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .flat_map(|e| e["data"]["steps"].as_array().unwrap().clone())
+        .collect();
+    let builds: Vec<&Value> = steps.iter().filter(|s| s["step"] == "build").collect();
+    assert_eq!(builds.len(), 2, "{steps:?}");
+    let cost = builds[1]["cost_usd"].as_f64().unwrap();
+    assert!((cost - 0.15).abs() < 1e-9, "{steps:?}");
 }
 
 #[test]

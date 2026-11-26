@@ -1072,11 +1072,8 @@ fn build(
                     return Err(err);
                 };
                 if let Some(out) = result {
-                    // A fresh session would fail the same way: stop and say what to do.
-                    if let Some(fix) = not_retried(out) {
-                        return Err(err.context(fix));
-                    }
-                    // The failed attempt may still have spent something; it counts too.
+                    // The failed attempt may still have spent something; it counts too, whether
+                    // or not a fresh session follows.
                     let raw = StepUsage::from_result("build", None, models, role, out);
                     spent.push(match resume {
                         Some(earlier)
@@ -1087,6 +1084,10 @@ fn build(
                         }
                         _ => raw,
                     });
+                    // A fresh session would fail the same way: stop and say what to do.
+                    if let Some(fix) = not_retried(out) {
+                        return Err(err.context(fix));
+                    }
                 }
                 progress(&format!(
                     "resuming the builder's session failed ({}); starting a fresh one",
