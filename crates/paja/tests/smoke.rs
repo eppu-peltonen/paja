@@ -1804,6 +1804,24 @@ fn a_real_sandbox_hides_the_owners_files() {
         eprintln!("skipped: set PAJA_SBX_TEST to the `sbx` program to run this");
         return;
     };
+    /// Removes the sandbox `paja` when dropped, pass or fail, and once up front in case an
+    /// earlier run left one whose mounts no longer exist.
+    struct RemoveSandbox(std::ffi::OsString);
+    impl RemoveSandbox {
+        fn remove(&self) {
+            let _ = Command::new(&self.0)
+                .args(["rm", "paja"])
+                .stdin(std::process::Stdio::null())
+                .output();
+        }
+    }
+    impl Drop for RemoveSandbox {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+    let cleanup = RemoveSandbox(sbx.clone());
+    cleanup.remove();
     let secrets = tempfile::tempdir().unwrap();
     let planted = secrets.path().join(".netrc");
     std::fs::write(&planted, "machine example.com password hunter2\n").unwrap();

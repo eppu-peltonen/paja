@@ -30,9 +30,36 @@ const WRAP: &str = r#"PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec "$@""#;
 
 /// Installs a C toolchain when the sandbox lacks one. Runs as root (`sbx exec -u root`): the
 /// agent user has no working `sudo` in the sandbox.
+/// A fresh sandbox runs its own `apt-get` just after it starts, so each apt command here retries
+/// for up to about five minutes while apt's lists or dpkg lock is held, then fails naming the lock.
 const SETUP_ROOT: &str = r#"set -e
+apt_retry() {
+  tries=0
+  while :; do
+    if out=$("$@" 2>&1); then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    case "$out" in
+      *"Could not get lock"*|*"Unable to lock"*)
+        tries=$((tries + 1))
+        if [ "$tries" -ge 60 ]; then
+          printf '%s\n' "$out" >&2
+          echo "apt's lock is still held after 5 minutes (see the lock named above); wait for the other apt-get or dpkg to finish and run again" >&2
+          return 1
+        fi
+        sleep 5
+        ;;
+      *)
+        printf '%s\n' "$out" >&2
+        return 1
+        ;;
+    esac
+  done
+}
 if ! command -v cc >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-  apt-get update && apt-get install -y build-essential curl ca-certificates git
+  apt_retry apt-get update
+  apt_retry apt-get install -y build-essential curl ca-certificates git
 fi"#;
 
 /// Installs Rust (what Vasara's checks need) for the agent user, when the sandbox lacks it.
@@ -90,6 +117,17 @@ pub fn start(mounts: &[PathBuf]) -> Result<Option<Sbx>> {
             .output()
             .with_context(|| sbx.unavailable())?;
         if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("already exists") {
+                bail!(
+                    "the sandbox `{name}` already exists but its mounts don't match this run (a \
+                     removed factory home or directory?): {}; remove it with `{} rm {name}` and \
+                     run again",
+                    stderr.trim(),
+                    sbx.program,
+                    name = sbx.name
+                );
+            }
             bail!(
                 "creating the sandbox with `{} create --name {} claude ...` failed: {}; {}",
                 sbx.program,
