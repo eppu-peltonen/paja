@@ -1481,6 +1481,49 @@ mod tests {
         assert_eq!(waiting.needs_answer, "waiting on you");
     }
 
+    #[test]
+    fn known_checkout_is_the_newest_existing_one_of_that_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let (old, new, gone, other) = ("old", "new", "gone", "other");
+        for name in [old, new, other] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        let lock = home.lock().unwrap();
+        let log = home.events();
+        let env = |repo: &str, number: u64, path: &str| {
+            json!({
+                "name": env_name(repo, number),
+                "repo": dir.path().join(path),
+                "path": dir.path().join("env"),
+                "branch": "b",
+                "base_commit": "0",
+                "port_base": 41000,
+                "port_count": 10,
+                "created_ms": 0,
+            })
+        };
+        log.append(&lock, crate::ahjo::EV_CREATED, env(R, 1, old))
+            .unwrap();
+        log.append(&lock, crate::ahjo::EV_CREATED, env(R, 12, new))
+            .unwrap();
+        log.append(&lock, crate::ahjo::EV_CREATED, env(R, 2, gone))
+            .unwrap();
+        log.append(
+            &lock,
+            crate::ahjo::EV_CREATED,
+            env("acme/application", 3, other),
+        )
+        .unwrap();
+        drop(lock);
+        // The newest of R's whose folder still exists; another repository's never counts.
+        assert_eq!(
+            known_checkout(&home, R).unwrap(),
+            Some(dir.path().join(new))
+        );
+        assert_eq!(known_checkout(&home, "acme/none").unwrap(), None);
+    }
+
     // The queue of one repository, which most tests are about.
     const R: &str = "acme/app";
 
