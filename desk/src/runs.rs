@@ -28,6 +28,7 @@ struct DeskRun {
     child: Child,
     stdin: Option<ChildStdin>,
     every: bool,
+    workers: Option<u32>,
     started_ms: u64,
 }
 
@@ -47,12 +48,29 @@ impl Runner {
         }
     }
 
-    /// Start `paja run` for `repo` in `checkout`: one item, or `every` to keep going. Refused
-    /// while a run of `repo` is going, from Desk or a terminal.
-    pub fn start(&self, home: &Home, repo: &str, checkout: &Path, every: bool) -> Result<Value> {
+    /// Start `paja run` for `repo` in `checkout`: one item, or `every` to keep going, with
+    /// `workers` as a pool of that many lanes. Refused while a run or pool of `repo` is going,
+    /// from Desk or a terminal.
+    pub fn start(
+        &self,
+        home: &Home,
+        repo: &str,
+        checkout: &Path,
+        every: bool,
+        workers: Option<u32>,
+    ) -> Result<Value> {
+        if workers.is_some() && !every {
+            bail!("a pool keeps running: start it with every");
+        }
         let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
         if runs.get_mut(repo).is_some_and(|run| alive(&mut run.child)) {
             bail!("Desk is already running {repo}; stop that run first");
+        }
+        if paja::mestari::pool::status(home, repo)?.state == "running" {
+            bail!(
+                "a pool is already running for {repo} (started from a terminal or another \
+                 Desk); change its lanes with the lane count, or stop it there first"
+            );
         }
         if let Some(number) = running_item(home, repo)? {
             bail!(
@@ -76,6 +94,9 @@ impl Runner {
             .stderr(out);
         if every {
             cmd.args(["--every", &EVERY_MINUTES.to_string()]);
+            if let Some(n) = workers {
+                cmd.args(["--workers", &n.to_string()]);
+            }
         } else {
             cmd.args(["--once", "--yes"]);
         }
@@ -92,6 +113,7 @@ impl Runner {
                 child,
                 stdin,
                 every,
+                workers,
                 started_ms: now_ms(),
             },
         );
@@ -160,14 +182,15 @@ impl Runner {
         names
     }
 
-    /// Where runs of `repo` stand, for the window: `{"repo", "desk", "every", "started_ms",
-    /// "terminal", "output"}`. `desk` says Desk's own run is going; `terminal` names an item a
+    /// Where runs of `repo` stand, for the window: `{"repo", "desk", "every", "workers",
+    /// "started_ms", "terminal", "output"}`. `desk` says Desk's own run is going; `terminal` names an item a
     /// run Desk didn't start is working on; `output` is the end of Desk's last run's output.
     pub fn status(&self, home: &Home, repo: &str) -> Value {
         let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
         let mine = runs
             .get_mut(repo)
             .map(|run| (alive(&mut run.child), run.every, run.started_ms));
+        let workers = runs.get(repo).and_then(|run| run.workers);
         drop(runs);
         let desk = mine.is_some_and(|(alive, _, _)| alive);
         let terminal = if desk {
@@ -179,6 +202,7 @@ impl Runner {
             "repo": repo,
             "desk": desk,
             "every": mine.map(|(_, every, _)| every),
+            "workers": workers,
             "started_ms": mine.map(|(_, _, started)| started),
             "terminal": terminal,
             "output": tail(&log_path(home, repo), OUTPUT_LINES),
@@ -264,13 +288,15 @@ mod tests {
         std::fs::create_dir_all(&checkout).unwrap();
         let runner = Runner::new(fake_paja(dir.path()));
 
-        let started = runner.start(&home, "acme/app", &checkout, false).unwrap();
+        let started = runner
+            .start(&home, "acme/app", &checkout, false, None)
+            .unwrap();
         assert_eq!(started["desk"], true, "{started}");
         assert_eq!(started["every"], false, "{started}");
         assert_eq!(runner.running(), ["acme/app"]);
         // A second run of the same repository is refused while the first is going.
         let again = runner
-            .start(&home, "acme/app", &checkout, true)
+            .start(&home, "acme/app", &checkout, true, None)
             .unwrap_err();
         assert!(
             format!("{again:#}").contains("already running acme/app"),
@@ -292,7 +318,9 @@ mod tests {
         );
         assert!(output.contains("got: stop"), "{output}");
         // Once it ended, Desk can start the repository again, this time to keep running.
-        let looping = runner.start(&home, "acme/app", &checkout, true).unwrap();
+        let looping = runner
+            .start(&home, "acme/app", &checkout, true, None)
+            .unwrap();
         assert_eq!(looping["every"], true, "{looping}");
         runner.stop("acme/app", true).unwrap();
         wait_until("the loop ending", || !runner.is_running("acme/app"));
@@ -303,6 +331,49 @@ mod tests {
         assert!(output.contains("--every 5"), "{output}");
         assert!(output.contains("got: stop now"), "{output}");
         assert!(runner.stop("acme/app", false).is_err());
+    }
+
+    #[test]
+    fn a_pool_starts_with_its_lanes_and_one_elsewhere_blocks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let checkout = dir.path().join("app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let runner = Runner::new(fake_paja(dir.path()));
+        assert!(runner
+            .start(&home, "acme/app", &checkout, false, Some(2))
+            .is_err());
+        let started = runner
+            .start(&home, "acme/app", &checkout, true, Some(3))
+            .unwrap();
+        assert_eq!(started["workers"], 3, "{started}");
+        runner.stop("acme/app", false).unwrap();
+        wait_until("the pool ending", || !runner.is_running("acme/app"));
+        let output = runner.status(&home, "acme/app")["output"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(output.contains("--every 5 --workers 3"), "{output}");
+        // A pool a terminal started holds the pool lock and recorded its start.
+        {
+            let lock = home.lock().unwrap();
+            home.events()
+                .append(
+                    &lock,
+                    paja::mestari::pool::EV_POOL_STARTED,
+                    json!({"repo": "acme/app", "lanes": 2}),
+                )
+                .unwrap();
+        }
+        let held = home.try_pool_lock("acme/app").unwrap().unwrap();
+        let refused = runner
+            .start(&home, "acme/app", &checkout, true, Some(2))
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("pool is already running"),
+            "{refused:#}"
+        );
+        drop(held);
     }
 
     #[test]
@@ -332,12 +403,14 @@ mod tests {
         let runner = Runner::new(fake_paja(dir.path()));
         assert_eq!(runner.status(&home, "acme/app")["terminal"], 4);
         let refused = runner
-            .start(&home, "acme/app", &checkout, false)
+            .start(&home, "acme/app", &checkout, false, None)
             .unwrap_err();
         assert!(format!("{refused:#}").contains("acme/app#4"), "{refused:#}");
         drop(held);
         assert_eq!(runner.status(&home, "acme/app")["terminal"], Value::Null);
-        runner.start(&home, "acme/app", &checkout, false).unwrap();
+        runner
+            .start(&home, "acme/app", &checkout, false, None)
+            .unwrap();
         runner.stop("acme/app", false).unwrap();
         wait_until("the run ending", || !runner.is_running("acme/app"));
     }

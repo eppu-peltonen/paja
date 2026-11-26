@@ -384,6 +384,9 @@ function repoRow(repo) {
     act("Keep running", () => invoke("run_start", { repo: repo.repo, every: true }));
   }
   if (repo.checkout) act("Check", () => invoke("repo_doctor", { repo: repo.repo }), true);
+  const pool = el("button", { type: "button", className: "quiet" }, "Pool");
+  pool.addEventListener("click", () => openPool(repo.repo));
+  buttons.push(pool);
   const children = [
     el("div", { className: "row" }, [el("strong", {}, repo.repo), el("span", { className: "muted" }, repo.checkout ?? "checkout unknown: add it below")]),
     el("div", {}, runLine(repo)),
@@ -448,3 +451,155 @@ byId("close-stop").addEventListener("click", () => invoke("close_desk", { stop: 
 byId("close-cancel").addEventListener("click", () => {
   byId("closing").hidden = true;
 });
+
+// The pool view: one repository's worker pool (`paja run --every --workers`), all of it from
+// `pool_status` and the event log, with a lane count that a running pool reads on its next tick.
+const POOL_EVERY_MS = 2000;
+const POOL_STREAM = 30;
+let poolRepo = null;
+// The lane count the person is typing, kept until they set it or close the view.
+let poolDraft = null;
+let poolLast = null;
+
+function openPool(repo) {
+  poolRepo = repo;
+  poolDraft = null;
+  poolLast = null;
+  byId("pool-repo").textContent = repo;
+  byId("pool-result").hidden = true;
+  byId("pool").hidden = false;
+  showPool().catch(showError);
+}
+
+function poolNote(status, lanes) {
+  const busy = status.lanes.map((lane) => lane.lane);
+  if (lanes == null || Number.isNaN(lanes) || busy.length <= lanes) return "";
+  const names = busy.length === 1 ? `Lane ${busy[0]} is` : `Lanes ${busy.slice(0, -1).join(", ")} and ${busy[busy.length - 1]} are`;
+  return `${names} busy: each finishes its item, and no new lane starts until fewer than ${lanes + 1} are busy.`;
+}
+
+function poolSummary(status) {
+  const target = status.target == null ? "no lane count set" : `${status.busy} of ${status.target} lanes busy`;
+  if (status.state !== "running") return `Stopped; ${target}. ${status.waiting.length} waiting, ${status.held} held for your answer.`;
+  const up = duration(Date.now() - status.started_ms);
+  return `Running for ${up}: ${target}, spent $${status.spent_usd.toFixed(2)}, landed ${status.landed_since_start}, ${status.ready} ready, ${status.held} held for your answer.`;
+}
+
+function renderPool(status, repo, stream) {
+  byId("pool-summary").textContent = poolSummary(status);
+  const input = byId("pool-lanes");
+  if (poolDraft == null && document.activeElement !== input) input.value = status.target ?? "";
+  const runs = (repo && repo.runs) || {};
+  const ours = runs.desk && runs.workers != null;
+  byId("pool-start").hidden = status.state === "running" || runs.desk || !!runs.terminal || !(repo && repo.checkout);
+  byId("pool-stop").hidden = !ours;
+  byId("pool-stop-now").hidden = !ours;
+  const note = poolNote(status, poolDraft);
+  byId("pool-note").textContent = note;
+  byId("pool-note").hidden = !note;
+  const now = Date.now();
+  byId("pool-table").tBodies[0].replaceChildren(
+    ...status.lanes.map((lane) =>
+      el("tr", {}, [
+        el("td", {}, String(lane.lane)),
+        el("td", {}, `#${lane.number} ${lane.title}`),
+        el("td", {}, lane.stage),
+        el("td", {}, lane.step ?? "-"),
+        el("td", {}, duration(now - lane.since_ms)),
+        el("td", {}, `$${lane.spent_usd.toFixed(2)}`),
+      ]),
+    ),
+  );
+  byId("pool-table").hidden = status.lanes.length === 0;
+  byId("pool-waiting").replaceChildren(
+    ...(status.waiting.length
+      ? status.waiting.map((item) => el("li", {}, `#${item.number} ${item.title}: ${item.why}`))
+      : [el("li", { className: "muted" }, "Nothing waiting.")]),
+  );
+  byId("pool-landed").replaceChildren(
+    ...(status.landed.length
+      ? status.landed.map((landing) =>
+          el("li", {}, `#${landing.number} ${new Date(landing.ts_ms).toLocaleString()}${landing.pr ? ` ${landing.pr}` : ""}`),
+        )
+      : [el("li", { className: "muted" }, "Nothing landed yet.")]),
+  );
+  byId("pool-stream").textContent = (stream || [])
+    .map((e) => {
+      const d = e.data || {};
+      const what = [d.lane != null ? `lane ${d.lane}` : "", d.number != null ? `#${d.number}` : "", d.stage || d.role || "", d.outcome || "", d.lanes != null ? `${d.lanes} lanes` : ""]
+        .filter(Boolean)
+        .join(" ");
+      return `${new Date(e.ts_ms).toLocaleTimeString()}  ${e.kind}  ${what}`;
+    })
+    .join("\n");
+}
+
+async function showPool() {
+  if (!poolRepo) return;
+  const repo = poolRepo;
+  const [status, repos, stream] = await Promise.all([
+    invoke("pool_status", { repo }),
+    invoke("repos"),
+    invoke("pool_events", { repo, limit: POOL_STREAM }),
+  ]);
+  if (repo !== poolRepo) return;
+  if (status && status.error) {
+    showError(`error: ${status.error}`);
+    return;
+  }
+  poolLast = status;
+  const entry = Array.isArray(repos) ? repos.find((r) => r.repo === repo) : null;
+  renderPool(status, entry, Array.isArray(stream) ? stream : []);
+}
+
+function poolResult(result, ok) {
+  const out = byId("pool-result");
+  out.hidden = false;
+  out.className = result && result.error ? "error" : "muted";
+  out.textContent = result && result.error ? `error: ${result.error}` : ok;
+}
+
+byId("pool-lanes").addEventListener("input", () => {
+  const value = byId("pool-lanes").value;
+  poolDraft = value === "" ? null : Number(value);
+  if (poolLast) {
+    const note = poolNote(poolLast, poolDraft);
+    byId("pool-note").textContent = note;
+    byId("pool-note").hidden = !note;
+  }
+});
+
+byId("pool-set").addEventListener("click", async () => {
+  const lanes = Number(byId("pool-lanes").value);
+  if (!Number.isInteger(lanes)) return;
+  const result = await invoke("pool_lanes", { repo: poolRepo, lanes }).catch((err) => ({ error: String(err) }));
+  if (!result.error) poolDraft = null;
+  poolResult(result, result.running ? `Set to ${lanes}; the pool reads it on its next tick.` : `Set to ${lanes}; the next pool starts with it unless it is given another.`);
+  showPool().catch(showError);
+});
+
+byId("pool-start").addEventListener("click", async () => {
+  const lanes = Number(byId("pool-lanes").value) || (poolLast && poolLast.target) || 2;
+  const result = await invoke("run_start", { repo: poolRepo, every: true, workers: lanes }).catch((err) => ({ error: String(err) }));
+  poolResult(result, `Started a pool of ${lanes} lanes.`);
+  showPool().catch(showError);
+  showRepos().catch(showError);
+});
+
+for (const [id, now] of [["pool-stop", false], ["pool-stop-now", true]]) {
+  byId(id).addEventListener("click", async () => {
+    const result = await invoke("run_stop", { repo: poolRepo, now }).catch((err) => ({ error: String(err) }));
+    poolResult(result, now ? "Stopping the pool now." : "The pool stops after each lane's step.");
+    showPool().catch(showError);
+  });
+}
+
+byId("pool-close").addEventListener("click", () => {
+  poolRepo = null;
+  byId("pool").hidden = true;
+});
+
+setInterval(() => {
+  if (poolRepo) showPool().catch(showError);
+}, POOL_EVERY_MS);
+listen("paja://events-changed", () => showPool().catch(showError));
