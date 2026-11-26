@@ -829,6 +829,7 @@ fn run_item(
                 &env,
                 item,
                 base,
+                &checked,
                 prior.as_ref().filter(|_| !risky),
                 reviewer,
                 &models,
@@ -1231,13 +1232,23 @@ fn review(
     env: &Env,
     item: &WorkItem,
     base: &str,
+    checked: &str,
     prior: Option<&Prior>,
     reviewer: u32,
     models: &Models,
     role: &str,
     focused: bool,
 ) -> Result<(Review, StepUsage)> {
-    let before = git(&env.path, &["rev-parse", "HEAD"])?;
+    // The reviewer judges the commit the checks passed at, and nothing else.
+    let head = git(&env.path, &["rev-parse", "HEAD"])?;
+    if head != checked {
+        bail!(
+            "the worktree {} is at {head}, not at {checked} where Vasara's checks passed, so it \
+             was not reviewed; run again",
+            env.path.display()
+        );
+    }
+    let before = checked.to_string();
     let mut prompt = review_prompt(item, base, &before, prior);
     if focused {
         prompt.push_str(&format!(
@@ -3011,6 +3022,18 @@ mod tests {
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         assert!(prompt.contains("don't run `cargo fmt`, `cargo clippy` or the whole `cargo test`"));
         assert!(prompt.contains("`cargo test <name>`"));
+        // A re-review judges only the fix, at the checked commit, against the earlier blockers.
+        let prior = super::Prior {
+            reviewed: "old456".into(),
+            blockers: "Fix the parser.".into(),
+            follow_ups: vec!["Tidy the helper".into()],
+        };
+        let prompt = super::review_prompt(&item, "base1", "abc123", Some(&prior));
+        assert!(prompt.contains("already passed at abc123"), "{prompt}");
+        assert!(prompt.contains("`git diff old456..HEAD`"), "{prompt}");
+        assert!(prompt.contains("Fix the parser."), "{prompt}");
+        assert!(prompt.contains("Tidy the helper"), "{prompt}");
+        assert!(!prompt.contains("git diff base1...HEAD"), "{prompt}");
     }
 
     #[test]
