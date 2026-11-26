@@ -102,10 +102,11 @@ says so on stderr. Items claimed with `paja work claim` are never taken over. Th
 3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
    answers `land`, `changes` (blockers only) or `escalate`, plus non-blocking follow-ups that Mestari files as
    `paja-follow-up` issues once the change lands. A later round's reviewer judges only the fix for the earlier
-   blockers, except on high-risk changes. It may read, run cargo and use read-only git, and changes nothing. Its prompt names the commit Vasara's checks
-   passed at, the one it judges, and tells it not to re-run formatting, lints or the full test suite; to probe a
-   behaviour it runs one named test or the CLI, with long output piped through `tail` or `grep`. A change
-   touching a path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
+   blockers, except on high-risk changes. It may read, run cargo and use read-only git, and changes nothing. Its
+   prompt names the commit Vasara's checks passed at, which the run loop passes in and the review refuses to judge
+   if `HEAD` has moved from it, and tells it not to re-run formatting, lints or the full test suite; to probe a
+   behaviour it runs one named test or the CLI, with long output piped through `tail` or `grep`. A change touching a
+   path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
    An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
    or the name with an extension, at any depth, in any letter case.
 
