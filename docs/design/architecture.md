@@ -263,24 +263,25 @@ file-system monitor, and no git Paja starts honours replacement refs or grafts, 
 the owner's global git configuration, before each agent and check run. Those files include every file git reads
 configuration from and the worktree's links to the repository. If they changed, it parks the item, records
 `run.tampered` and stops with an error naming the changed files, and for a configuration file the entries added, removed
-or changed with their old and new values (credential-like ones hidden), so a person can tell what wrote them (a
-`--every` loop included), without running git or gh there again, not even to clean up or comment on the issue. The guard
-also notices another environment's links and configuration changing. Until a person has checked that repository (found
-by its shared git directory, however its path is spelled) and runs `paja run --tamper-checked`, every command and MCP
-tool that runs git or gh there refuses: later runs, `work sync`, `env create` and `env remove`. The check lives in Ahjo:
-`ahjo::untampered` returns a proof (`Untampered`) that Ahjo's git helper and Jono's gh helper require, so a new command
-there can't run either without the check. Ahjo checks under the home lock with the events it read under it, since a stop
-recorded meanwhile must be seen. Mestari runs git and gh through its own helpers after `ahjo::ensure_untampered`.
-Configuration files are compared by the entries git reads, leaving out `branch.*`, which ordinary git work writes; every
-other file byte for byte. The hook's copy is checked again after each agent run, and a copy that changed counts as a run
-the hook never saw. Each phase takes its own snapshot, so a change made between phases (by a process the code left
-running, say) is not caught, nor is a relative include resolved against a file other than the repository's or the
-owner's main configuration. The guardrail's limit stays: code that runs as the owner can still change things none of
-these checks look at, and only the sandbox closes that. Reviewers run the hook with `--read-only`: no file edits, no
-`cargo fmt` without `--check` and no git command that changes the branch; after the review, the branch and worktree are
-put back where it started, whatever the code its builds ran did. Because no settings file loads, agents authenticate the
-way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through `apiKeyHelper` or provider
-settings.
+or changed with their old and new values (shown only in sections such as `core.` and `extensions.`, and never when they
+look like a URL with a user or a header; a name holding a URL shows only its section and key), so a person can tell what
+wrote them (a `--every` loop included), without running git or gh there again, not even to clean up or comment on the
+issue. The guard also notices another environment's links and configuration changing. Until a person has checked that
+repository (found by its shared git directory, however its path is spelled) and runs `paja run --tamper-checked`, every
+command and MCP tool that runs git or gh there refuses: later runs, `work sync`, `env create` and `env remove`. The
+check lives in Ahjo: `ahjo::untampered` returns a proof (`Untampered`) that Ahjo's git helper and Jono's gh helper
+require, so a new command there can't run either without the check. Ahjo checks under the home lock with the events it
+read under it, since a stop recorded meanwhile must be seen. Mestari runs git and gh through its own helpers after
+`ahjo::ensure_untampered`. Configuration files are compared by the entries git reads, leaving out `branch.*`, which
+ordinary git work writes; every other file byte for byte. The hook's copy is checked again after each agent run, and a
+copy that changed counts as a run the hook never saw. Each phase takes its own snapshot, so a change made between phases
+(by a process the code left running, say) is not caught, nor is a relative include resolved against a file other than
+the repository's or the owner's main configuration. The guardrail's limit stays: code that runs as the owner can still
+change things none of these checks look at, and only the sandbox closes that. Reviewers run the hook with `--read-only`:
+no file edits, no `cargo fmt` without `--check` and no git command that changes the branch; after the review, the branch
+and worktree are put back where it started, whatever the code its builds ran did. Because no settings file loads, agents
+authenticate the way `claude` does without one (a signed-in subscription or `ANTHROPIC_API_KEY`), not through
+`apiKeyHelper` or provider settings.
 
 The limits above (credential files in `HOME`, the shared git configuration, the hook's copy, the stamp) are what the
 sandbox below closes when it is on.

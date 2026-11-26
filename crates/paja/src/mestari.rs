@@ -2174,8 +2174,9 @@ fn config_entries(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// The entries that differ between two [`config_entries`] listings, as `name: old -> new`,
-/// `name added (value)` or `name removed`. A value whose name looks like a credential is never
-/// shown, and long values are cut.
+/// `name added (value)` or `name removed`. Values show only in sections that hold no URLs or
+/// credentials (`core.`, `extensions.` and the like), never when they look like a URL with a user
+/// or a header, and are cut when long; a name with a URL in it shows only its section and key.
 fn config_changes(before: &[u8], after: &[u8]) -> Vec<String> {
     fn entries(raw: &[u8]) -> Vec<(String, String)> {
         raw.split(|b| *b == 0)
@@ -2187,25 +2188,54 @@ fn config_changes(before: &[u8], after: &[u8]) -> Vec<String> {
             })
             .collect()
     }
+    // Only sections whose values carry no URLs or secrets show them; anything that looks like
+    // a URL with a user, or a header, stays hidden even there.
     fn shown(name: &str, value: &str) -> String {
-        let secret = [
-            "token",
-            "password",
-            "secret",
-            "extraheader",
-            "credential",
-            "key",
+        let lower = name.to_ascii_lowercase();
+        let plain = [
+            "core.",
+            "extensions.",
+            "safe.",
+            "init.",
+            "gc.",
+            "index.",
+            "feature.",
         ]
         .iter()
-        .any(|word| name.to_ascii_lowercase().contains(word));
-        if secret {
-            return "(hidden)".into();
+        .any(|prefix| lower.starts_with(prefix))
+            && !["password", "token", "secret", "key", "credential", "header"]
+                .iter()
+                .any(|word| lower.contains(word));
+        let value_lower = value.to_ascii_lowercase();
+        let risky = [
+            "@",
+            "://",
+            "authorization",
+            "bearer",
+            "ghp_",
+            "ghs_",
+            "github_pat_",
+        ]
+        .iter()
+        .any(|bit| value_lower.contains(bit));
+        if !plain || risky {
+            return "(value hidden)".into();
         }
         let mut cut: String = value.chars().take(80).collect();
-        if cut.len() < value.len() {
+        if value.chars().count() > 80 {
             cut.push('…');
         }
         format!("`{cut}`")
+    }
+    // A subsection can hold a URL with a user and password (`url.<url>.insteadof`).
+    fn shown_name(name: &str) -> String {
+        if name.contains('@') || name.contains("://") {
+            let first = name.split('.').next().unwrap_or("");
+            let last = name.rsplit('.').next().unwrap_or("");
+            format!("{first}.(hidden).{last}")
+        } else {
+            name.to_string()
+        }
     }
     let (was, now) = (entries(before), entries(after));
     let mut changes = Vec::new();
@@ -2235,6 +2265,8 @@ fn config_changes(before: &[u8], after: &[u8]) -> Vec<String> {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let shown_as = shown_name(name);
+        let name = shown_as.as_str();
         changes.push(match (old.is_empty(), new.is_empty()) {
             (true, _) => format!("{name} added ({})", list(&new)),
             (_, true) => format!("{name} removed"),
@@ -3325,9 +3357,31 @@ mod tests {
             [
                 "core.repositoryformatversion: `0` -> `1`",
                 "extensions.relativeworktrees added (`true`)",
-                "http.extraheader: (hidden) -> (hidden)",
+                "http.extraheader: (value hidden) -> (value hidden)",
                 "remote.origin.url removed",
             ]
+        );
+        // No credential reaches the message, in a value or in a name.
+        let secret = "ghs_s3cr3t";
+        let with_url = listing(&[
+            (
+                "remote.origin.url",
+                &format!("https://x-access-token:{secret}@example.invalid/r"),
+            ),
+            (
+                "url.https://u:pw@example.invalid/.insteadof",
+                "https://example.invalid/",
+            ),
+            ("core.sshcommand", &format!("ssh -o User=me@{secret}")),
+        ]);
+        let changes = config_changes(&before, &with_url).join("; ");
+        assert!(
+            !changes.contains(secret) && !changes.contains("pw@"),
+            "{changes}"
+        );
+        assert!(
+            changes.contains("url.(hidden).insteadof added"),
+            "{changes}"
         );
         assert!(config_changes(&before, &before).is_empty());
         let long = listing(&[("core.editor", &"x".repeat(200))]);
