@@ -85,7 +85,14 @@ reports it and tries again after its wait. While it works on an item the run hol
 `runs/<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
 stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its `work-<issue>` environment, and
-says so on stderr. Items claimed with `paja work claim` are never taken over. Then, for at most three rounds:
+says so on stderr. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git and gh run
+in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the terminal's
+Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build, the
+checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
+`stopped`, the item stays active for the next run, and the run reports `{"outcome": "stopped"}`; `--every` stops its
+loop too. Any error after a Ctrl-C ends the same way rather than parking the item, unless the repository was tampered
+with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. Then, for at
+most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
    A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own

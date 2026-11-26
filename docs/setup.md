@@ -67,5 +67,12 @@ the repository's checkout, because the MCP tools work on the checkout they run i
 
 `paja run --every 5` takes the oldest open issue labelled `paja`. It builds the change, runs Vasara's checks, has it
 reviewed and lands it, or asks a question on the issue when it can't decide. Then it takes the next issue. When the
-queue is empty it checks again every five minutes. Stop it with Ctrl+C. After pulling a newer Paja, run
+queue is empty it checks again every five minutes.
+
+Stop it with Ctrl+C. The first Ctrl+C lets the step in flight (an agent or a check) finish and keeps it, then stops; the
+item stays active, and the next `paja run` resumes it where its environment left off. Press Ctrl+C again to stop at
+once: Paja ends the agent or check and everything it started, and the item still resumes next time, without that
+step's unfinished work. Closing the terminal or a reboot is like the second Ctrl+C.
+
+After pulling a newer Paja, run
 `cargo install --path crates/paja` again.

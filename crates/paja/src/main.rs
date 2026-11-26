@@ -274,6 +274,8 @@ fn run(cli: &Cli) -> Result<()> {
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
+            // Ctrl-C finishes the step in flight and stops; a second one stops at once.
+            paja::platform::catch_interrupts()?;
             loop {
                 let outcome = mestari::run_once(
                     &home,
@@ -308,12 +310,22 @@ fn run(cli: &Cli) -> Result<()> {
                         Some("that pass failed; Paja keeps going")
                     }
                 };
+                if paja::platform::interrupts() > 0 {
+                    break;
+                }
                 if let Some(why) = wait {
                     mestari::progress(&format!(
                         "{why}; checking again in {minutes} minute{} (Ctrl+C stops)",
                         if *minutes == 1 { "" } else { "s" }
                     ));
-                    std::thread::sleep(std::time::Duration::from_secs(minutes.saturating_mul(60)));
+                    let until = std::time::Instant::now()
+                        + std::time::Duration::from_secs(minutes.saturating_mul(60));
+                    while std::time::Instant::now() < until && paja::platform::interrupts() == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    if paja::platform::interrupts() > 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -413,6 +425,9 @@ fn describe_run(report: &mestari::RunReport) -> String {
         mestari::RunReport::Escalated {
             number, question, ..
         } => format!("#{number} escalated:\n{question}"),
+        mestari::RunReport::Stopped { number, .. } => {
+            format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
+        }
     }
 }
 

@@ -355,6 +355,160 @@ pub fn quote_hook_word(path: &Path) -> Result<String> {
     }
 }
 
+/// How many times the person pressed Ctrl-C since [`catch_interrupts`].
+static INTERRUPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How many times the person pressed Ctrl-C (Ctrl-Break on Windows too) since
+/// [`catch_interrupts`]: 0 while nobody did, 1 to stop after the current step, 2 or more to
+/// stop now.
+pub fn interrupts() -> u32 {
+    INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn interrupted() {
+    INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Count Ctrl-C instead of dying on it, for `paja run`. The first says on stderr that the run
+/// stops after this step; the second that it stops now, and if the process is still alive
+/// ten seconds later (stuck on something that isn't a child Paja can end) it exits.
+pub fn catch_interrupts() -> Result<()> {
+    #[cfg(unix)]
+    {
+        extern "C" fn on_sigint(_: std::ffi::c_int) {
+            interrupted();
+        }
+        extern "C" {
+            fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+        }
+        const SIGINT: std::ffi::c_int = 2;
+        const SIG_ERR: usize = usize::MAX;
+        // SAFETY: the handler only increments an atomic, which is async-signal-safe.
+        if unsafe { signal(SIGINT, on_sigint as extern "C" fn(std::ffi::c_int) as usize) }
+            == SIG_ERR
+        {
+            bail!("can't catch Ctrl-C: {}", std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(windows)]
+    win::catch_ctrl_c()?;
+    std::thread::spawn(|| {
+        let mut seen = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = interrupts();
+            if now == seen {
+                continue;
+            }
+            if seen == 0 {
+                eprintln!("paja: stopping after this step; press Ctrl-C again to stop now");
+            }
+            if now >= 2 && seen < 2 {
+                eprintln!("paja: stopping now");
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    std::process::exit(130);
+                });
+            }
+            seen = now;
+        }
+    });
+    Ok(())
+}
+
+/// Run `cmd` in a process group of its own, so the terminal's Ctrl-C reaches only `paja`,
+/// which decides when its children stop. Unix: a new process group; Windows:
+/// `CREATE_NEW_PROCESS_GROUP`, which also makes the child ignore Ctrl-C.
+pub fn own_process_group(cmd: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        std::os::windows::process::CommandExt::creation_flags(cmd, CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd
+}
+
+/// [`Command::output`] for a long step (an agent or a check), in its own process group, ended
+/// with everything it started when the person presses Ctrl-C a second time.
+pub fn output_until_stopped(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = own_process_group(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drain both pipes while waiting, so a chatty child can't fill one and stall.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if interrupts() >= 2 {
+            kill_tree(&mut child);
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "stopped by a second Ctrl-C",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// End `child` and every process it started, so a second Ctrl-C leaves nothing running.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        const SIGKILL: std::ffi::c_int = 9;
+        if let Ok(group) = i32::try_from(child.id()) {
+            // SAFETY: a plain system call; the child leads its own process group.
+            unsafe {
+                kill(-group, SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +586,27 @@ mod win {
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    /// Count Ctrl-C and Ctrl-Break instead of ending the process; closing the console still
+    /// ends it.
+    pub fn catch_ctrl_c() -> anyhow::Result<()> {
+        use windows_sys::Win32::System::Console::{
+            SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+        };
+        unsafe extern "system" fn on_ctrl(kind: u32) -> windows_sys::core::BOOL {
+            if kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT {
+                super::interrupted();
+                1
+            } else {
+                0
+            }
+        }
+        // SAFETY: registers a handler that only increments an atomic.
+        if unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) } == 0 {
+            anyhow::bail!("can't catch Ctrl-C: {}", Error::last_os_error());
+        }
+        Ok(())
+    }
 
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
         text.encode_wide().chain(Some(0)).collect()
