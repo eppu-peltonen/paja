@@ -140,21 +140,36 @@ fn spelling(path: &Path) -> String {
         .to_string()
 }
 
+/// Whether `path` is spelled the Windows way (a drive letter or a `\`), where case doesn't
+/// matter.
+fn is_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.contains('\\') || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
 /// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
-/// `label`.
+/// `label`. A Windows path matches in any letter case, as Windows itself does.
 fn replace_path(text: &str, path: &str, label: &str) -> String {
+    // ASCII lowercasing keeps every byte offset, so a match in `haystack` is one in `text`.
+    let fold = is_windows_path(path);
+    let (haystack, needle) = if fold {
+        (text.to_ascii_lowercase(), path.to_ascii_lowercase())
+    } else {
+        (text.to_string(), path.to_string())
+    };
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(path) {
-        let after = &rest[at + path.len()..];
+    let mut from = 0;
+    while let Some(found) = haystack[from..].find(&needle) {
+        let at = from + found;
+        let end = at + needle.len();
         // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
         // around the path, so a path before one is still redacted.
-        let ends = !after.starts_with(char::is_alphanumeric);
-        out.push_str(&rest[..at]);
-        out.push_str(if ends { label } else { path });
-        rest = after;
+        let ends = !text[end..].starts_with(char::is_alphanumeric);
+        out.push_str(&text[from..at]);
+        out.push_str(if ends { label } else { &text[at..end] });
+        from = end;
     }
-    out.push_str(rest);
+    out.push_str(&text[from..]);
     out
 }
 
@@ -173,18 +188,23 @@ const TOKEN_PREFIXES: &[&str] = &[
     "xoxp-",
     "npm_",
     "pypi-",
+    // A JSON Web Token's header.
+    "eyJ",
 ];
 
-/// Words that introduce a credential: the next long word after one of them, past spaces, `:`
-/// or `=`, is redacted whatever it looks like.
+/// Words that introduce a credential: the next long value after one of them, past spaces,
+/// quotes, `:`, `=` or `,`, is redacted whatever it looks like.
 const TOKEN_LEADS: &[&str] = &["bearer", "token", "password", "secret", "apikey", "api_key"];
 
-/// The scan visits each word once, so its cost is linear in the text.
+/// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
+/// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole.
 fn redact_tokens(text: &str) -> String {
     let token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let value_char = |c: char| token_char(c) || matches!(c, '.' | '+' | '/' | '=');
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    // Whether the previous word leads a credential and only spaces, `:` or `=` came since.
+    // Whether the previous word leads a credential and only spaces, quotes, `:`, `=` or `,`
+    // came since.
     let mut led = false;
     while !rest.is_empty() {
         let start = rest.find(token_char).unwrap_or(rest.len());
@@ -192,7 +212,7 @@ fn redact_tokens(text: &str) -> String {
         out.push_str(gap);
         if !gap
             .chars()
-            .all(|c| c.is_whitespace() || c == ':' || c == '=')
+            .all(|c| c.is_whitespace() || matches!(c, ':' | '=' | ',' | '"' | '\''))
         {
             led = false;
         }
@@ -202,9 +222,23 @@ fn redact_tokens(text: &str) -> String {
         }
         let end = rest.find(|c: char| !token_char(c)).unwrap_or(rest.len());
         let word = &rest[..end];
-        let secret = word.len() >= 16
-            && (led || TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix)));
-        out.push_str(if secret { "<redacted>" } else { word });
+        let prefixed =
+            word.len() >= 16 && TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix));
+        if prefixed || led {
+            // The whole value, up to the first character no token holds; a sentence's full
+            // stop stays outside it. Only a lead or a prefix starts this scan, and a redacted
+            // value is skipped, so each character is still read a bounded number of times.
+            let value_end = rest[..rest.find(|c: char| !value_char(c)).unwrap_or(rest.len())]
+                .trim_end_matches('.')
+                .len();
+            if prefixed || value_end >= 16 {
+                out.push_str("<redacted>");
+                rest = &rest[value_end..];
+                led = false;
+                continue;
+            }
+        }
+        out.push_str(word);
         led = TOKEN_LEADS
             .iter()
             .any(|lead| word.eq_ignore_ascii_case(lead));
@@ -284,10 +318,45 @@ mod tests {
     }
 
     #[test]
+    fn quoted_dotted_and_base64_values_go_whole() {
+        // Built at run time, so secret scanners don't take the test's fake tokens for real ones.
+        let part = "d4".repeat(10);
+        let jwt = format!("eyJ{part}.{part}.{part}");
+        let base64 = format!("{part}+{part}/{part}==");
+        let text = format!(
+            "\"token\": \"{part}\", password=\"{part}\", token, {part}, Bearer {jwt}. \
+             secret {base64} and {jwt} alone; a token. Then the end."
+        );
+        assert_eq!(
+            redact_tokens(&text),
+            "\"token\": \"<redacted>\", password=\"<redacted>\", token, <redacted>, Bearer \
+             <redacted>. secret <redacted> and <redacted> alone; a token. Then the end."
+        );
+    }
+
+    #[test]
+    fn windows_paths_match_in_any_case() {
+        let home = Path::new(r"C:\Users\Me");
+        let places = [(home, "<home>"), (Path::new("/home/Me"), "<home>")];
+        let shown = redact(
+            r"c:\users\me\.paja, C:/USERS/ME/x, C:\Users\Meg and /home/me/y",
+            &places,
+        );
+        // Unix paths keep their case: `/home/me` is another directory than `/home/Me`.
+        assert_eq!(
+            shown,
+            r"<home>\.paja, <home>/x, C:\Users\Meg and /home/me/y"
+        );
+    }
+
+    #[test]
     fn redacting_a_long_finding_stays_fast() {
         let text = "word ".repeat(200_000);
         let started = std::time::Instant::now();
         assert_eq!(redact_tokens(&text), text);
+        // Dotted runs after a lead word stay linear too.
+        let dotted = format!("token {}", "a.".repeat(200_000));
+        assert_eq!(redact_tokens(&dotted), "token <redacted>.");
         // A scan that re-read the text for every word would take minutes here.
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
