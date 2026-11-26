@@ -4,6 +4,7 @@
 //! default branch). Every attempt is recorded as `notify.sent` or `notify.failed`. A notice
 //! that can't be delivered never stops the run: it says so on stderr, once per channel.
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -50,16 +51,20 @@ impl Notice {
         }
     }
 
-    /// A pass of `paja run --every` failed, and the loop carries on.
-    pub fn pass_failed(repo: Option<String>) -> Self {
+    /// A pass of `paja run` failed; with `--every` the loop carries on (`keeps_going`).
+    pub fn pass_failed(repo: Option<String>, keeps_going: bool) -> Self {
         let place = repo.clone().unwrap_or_else(|| "a repository".to_string());
+        let text = if keeps_going {
+            "A pass of paja run failed and Paja keeps going; the error is in the terminal."
+        } else {
+            "paja run failed; the error is in the terminal."
+        };
         Self {
             repo,
             number: None,
             kind: "pass_failed",
             title: format!("Paja: a pass failed in {place}"),
-            text: "A pass of paja run failed and Paja keeps going; the error is in the terminal."
-                .to_string(),
+            text: text.to_string(),
         }
     }
 
@@ -76,16 +81,33 @@ impl Notice {
     }
 }
 
-/// Tell the person a pass of `paja run --every` in `checkout` failed.
-pub fn pass_failed(home: &Home, checkout: &Path) {
-    send(
-        home,
-        checkout,
-        &Notice::pass_failed(repo_of(home, checkout)),
-    );
+/// Which failed passes of `paja run --every` Posti tells of: the first in a row only, so an
+/// error that lasts all night (gh signed out, the network down) is one notice, not one per
+/// pass. A pass that doesn't fail starts the count again.
+#[derive(Debug, Default)]
+pub struct Failures {
+    failing: bool,
 }
 
-/// Tell the person `paja run --every` in `checkout` stopped for them.
+impl Failures {
+    /// A pass failed; whether to tell the person.
+    pub fn failed(&mut self) -> bool {
+        !std::mem::replace(&mut self.failing, true)
+    }
+
+    /// A pass didn't fail.
+    pub fn passed(&mut self) {
+        self.failing = false;
+    }
+}
+
+/// Tell the person a pass of `paja run` in `checkout` failed; `keeps_going` for `--every`.
+pub fn pass_failed(home: &Home, checkout: &Path, keeps_going: bool) {
+    let notice = Notice::pass_failed(repo_of(home, checkout), keeps_going);
+    send(home, checkout, &notice);
+}
+
+/// Tell the person `paja run` in `checkout` stopped for them.
 pub fn stopped(home: &Home, checkout: &Path) {
     send(home, checkout, &Notice::stopped(repo_of(home, checkout)));
 }
@@ -206,7 +228,9 @@ fn outcome(
         Err(err) => {
             data["error"] = json!(err);
             if !warned.swap(true, Ordering::SeqCst) {
-                eprintln!(
+                // A closed stderr must not stop the run either.
+                let _ = writeln!(
+                    std::io::stderr(),
                     "paja: {err}; Paja carries on without this notice (see Notifications in docs/setup.md)"
                 );
             }
@@ -232,8 +256,18 @@ mod tests {
     }
 
     #[test]
+    fn only_the_first_failed_pass_in_a_row_is_told() {
+        let mut f = Failures::default();
+        assert!(f.failed());
+        assert!(!f.failed());
+        assert!(!f.failed());
+        f.passed();
+        assert!(f.failed());
+    }
+
+    #[test]
     fn a_pass_without_a_known_repository_still_reads() {
-        let n = Notice::pass_failed(None);
+        let n = Notice::pass_failed(None, true);
         assert_eq!(n.title, "Paja: a pass failed in a repository");
     }
 }
