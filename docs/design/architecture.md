@@ -262,8 +262,9 @@ repository, to make Mestari's own git run a program with Mestari's credentials. 
 file-system monitor, and no git Paja starts honours replacement refs or grafts, and Mestari snapshots those files, and
 the owner's global git configuration, before each agent and check run. Those files include every file git reads
 configuration from and the worktree's links to the repository. If they changed, it parks the item, records
-`run.tampered` and stops with an error naming the changed files (a `--every` loop included) without running git or gh
-there again, not even to clean up or comment on the issue. The guard also notices another environment's links and
+`run.tampered` and stops with an error naming the changed files, and for a configuration file the entries added,
+removed or changed with their old and new values (credential-like ones hidden), so a person can tell what wrote them
+(a `--every` loop included), without running git or gh there again, not even to clean up or comment on the issue. The guard also notices another environment's links and
 configuration changing. Until a person has checked that repository (found by its shared git directory, however its
 path is spelled) and runs `paja run --tamper-checked`, every command and MCP tool that runs git or gh there refuses:
 later runs, `work sync`, `env create` and `env remove`. The check lives in Ahjo: `ahjo::untampered` returns a proof

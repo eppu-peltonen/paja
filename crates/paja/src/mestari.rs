@@ -2173,6 +2173,77 @@ fn config_entries(path: &Path) -> Option<Vec<u8>> {
     Some(kept)
 }
 
+/// The entries that differ between two [`config_entries`] listings, as `name: old -> new`,
+/// `name added (value)` or `name removed`. A value whose name looks like a credential is never
+/// shown, and long values are cut.
+fn config_changes(before: &[u8], after: &[u8]) -> Vec<String> {
+    fn entries(raw: &[u8]) -> Vec<(String, String)> {
+        raw.split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                let e = String::from_utf8_lossy(e);
+                let (name, value) = e.split_once('\n').unwrap_or((&e, ""));
+                (name.to_string(), value.to_string())
+            })
+            .collect()
+    }
+    fn shown(name: &str, value: &str) -> String {
+        let secret = [
+            "token",
+            "password",
+            "secret",
+            "extraheader",
+            "credential",
+            "key",
+        ]
+        .iter()
+        .any(|word| name.to_ascii_lowercase().contains(word));
+        if secret {
+            return "(hidden)".into();
+        }
+        let mut cut: String = value.chars().take(80).collect();
+        if cut.len() < value.len() {
+            cut.push('…');
+        }
+        format!("`{cut}`")
+    }
+    let (was, now) = (entries(before), entries(after));
+    let mut changes = Vec::new();
+    let names: std::collections::BTreeSet<&str> = was
+        .iter()
+        .chain(&now)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    for name in names {
+        let old: Vec<&str> = was
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        let new: Vec<&str> = now
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        if old == new {
+            continue;
+        }
+        let list = |values: &[&str]| -> String {
+            values
+                .iter()
+                .map(|v| shown(name, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        changes.push(match (old.is_empty(), new.is_empty()) {
+            (true, _) => format!("{name} added ({})", list(&new)),
+            (_, true) => format!("{name} removed"),
+            _ => format!("{name}: {} -> {}", list(&old), list(&new)),
+        });
+    }
+    changes
+}
+
 /// A file's contents, read only when it is a plain file: opening a FIFO someone planted
 /// would hang. Anything else reads as a marker that differs from every real content.
 fn read_regular(path: &Path) -> Option<Vec<u8>> {
@@ -3083,11 +3154,39 @@ impl GitGuard {
             .map(|(path, _)| path.display().to_string())
             .collect();
         if now != self.snapshot || !others.is_empty() {
+            let before = |path: &PathBuf| self.snapshot.iter().find(|(p, _)| p == path);
             let mut changed: Vec<String> = now
                 .iter()
                 .filter(|entry| !self.snapshot.contains(entry))
                 .chain(self.snapshot.iter().filter(|entry| !now.contains(entry)))
-                .map(|(path, _)| path.display().to_string())
+                .map(|(path, _)| path)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|path| {
+                    let shown = path.display().to_string();
+                    // A configuration file says which entries changed, so a person can tell
+                    // what wrote it.
+                    let after = now
+                        .iter()
+                        .find(|(p, _)| p == path)
+                        .and_then(|(_, c)| c.as_ref());
+                    let was = before(path).and_then(|(_, c)| c.as_ref());
+                    match (was, after) {
+                        (Some(was), Some(after))
+                            if self.files.contains(path) && !self.raw.contains(path) =>
+                        {
+                            let entries = config_changes(was, after);
+                            if entries.is_empty() {
+                                shown
+                            } else {
+                                format!("{shown}: {}", entries.join("; "))
+                            }
+                        }
+                        (None, Some(_)) => format!("{shown}: added"),
+                        (Some(_), None) => format!("{shown}: removed"),
+                        _ => shown,
+                    }
+                })
                 .chain(others)
                 .collect();
             changed.sort();
@@ -3095,8 +3194,9 @@ impl GitGuard {
             return Err(Tampered(format!(
                 "git's configuration, hooks or attributes changed while {what} ran ({}), so \
                  Paja stopped before running git there again; a person must check and restore \
-                 those files before running Paja again. Your own edits to them during a run \
-                 stop it too",
+                 those files before running Paja again. The agent may have changed them, or \
+                 another program writing to the same repository meanwhile (an editor, another \
+                 session, a `git worktree add`), or your own edits",
                 changed.join(", ")
             ))
             .into());
@@ -3199,6 +3299,79 @@ mod tests {
         let line = shown_line("Fix\r\x1b[2Kpaja: landed #5\nnext\u{2028}\u{202E}x\u{2067}y");
         assert!(!line.chars().any(unsafe_on_a_terminal), "{line:?}");
         assert!(shown_line(&"x".repeat(1000)).chars().count() <= 303);
+    }
+
+    #[test]
+    fn config_changes_name_each_entry_and_hide_credentials() {
+        let listing = |entries: &[(&str, &str)]| -> Vec<u8> {
+            entries
+                .iter()
+                .flat_map(|(n, v)| format!("{n}\n{v}\0").into_bytes())
+                .collect()
+        };
+        let before = listing(&[
+            ("core.repositoryformatversion", "0"),
+            ("remote.origin.url", "https://example.invalid/r"),
+            ("http.extraheader", "Authorization: old"),
+        ]);
+        let after = listing(&[
+            ("core.repositoryformatversion", "1"),
+            ("extensions.relativeworktrees", "true"),
+            ("http.extraheader", "Authorization: new"),
+        ]);
+        let changes = config_changes(&before, &after);
+        assert_eq!(
+            changes,
+            [
+                "core.repositoryformatversion: `0` -> `1`",
+                "extensions.relativeworktrees added (`true`)",
+                "http.extraheader: (hidden) -> (hidden)",
+                "remote.origin.url removed",
+            ]
+        );
+        assert!(config_changes(&before, &before).is_empty());
+        let long = listing(&[("core.editor", &"x".repeat(200))]);
+        let cut = config_changes(&[], &long);
+        assert!(cut[0].ends_with("…`)"), "{cut:?}");
+    }
+
+    #[test]
+    fn a_tamper_stop_names_the_configuration_entries_that_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", tail(&out));
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.name=paja",
+            "-c",
+            "user.email=paja@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ]);
+        let worktree = tmp.path().join("work");
+        run(&["worktree", "add", "-q", worktree.to_str().unwrap()]);
+        let guard = GitGuard::new(&worktree).unwrap();
+        guard.check("nothing").unwrap();
+        // A branch entry is the agent's own business and still doesn't count.
+        run(&["config", "branch.x.remote", "origin"]);
+        guard.check("nothing").unwrap();
+        run(&["config", "extensions.example", "true"]);
+        let err = format!("{:#}", guard.check("the agent").unwrap_err());
+        assert!(err.contains("extensions.example added (`true`)"), "{err}");
+        assert!(!err.contains("branch.x"), "{err}");
     }
 
     #[test]
