@@ -22,7 +22,12 @@ mod builder;
 mod follow_ups;
 mod land;
 mod progress;
+mod triage;
 mod usage;
+
+pub use triage::{
+    triage, triage_if_due, TriageReport, Triaged, Verdict, EV_TRIAGE_FAILED, EV_TRIAGE_RAN,
+};
 
 use agent::*;
 use builder::*;
@@ -44,7 +49,7 @@ pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
 pub const MODELS_FILE: &str = ".paja/models";
 pub const CI_FILE: &str = ".paja/ci";
 /// The roles `.paja/models` may name, besides `fallback`.
-pub const ROLES: [&str; 5] = ["build", "fix", "review", "re-review", "review-2"];
+pub const ROLES: [&str; 6] = ["build", "fix", "review", "re-review", "review-2", "triage"];
 /// The effort levels Claude Code takes.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 

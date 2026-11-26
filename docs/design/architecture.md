@@ -194,7 +194,7 @@ most three rounds:
 Each agent runs on the model `.paja/models` names for its role, read from the default branch like the checks, so a change can't
 pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
 build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
-the fix) and `review-2` (the second high-risk reviewer). Mestari passes `--model` and, when given, `--effort`; a role
+the fix), `review-2` (the second high-risk reviewer) and `triage` (`paja triage`, the cheapest model). Mestari passes `--model` and, when given, `--effort`; a role
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. An unknown role, effort or a
 malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the

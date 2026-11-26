@@ -380,6 +380,20 @@ impl PajaMcp {
         .await
     }
 
+    #[tool(
+        description = "Triage the open follow-up issues: one cheap agent reading the default branch sorts each into keep, duplicate of #N, already fixed (with the commit or file that shows it) or not worth doing. Duplicates and already-fixed issues are closed with a comment giving the reason and the evidence; not-worth-doing ones are only listed. Returns {repo, base, items: [{number, title, verdict, duplicate_of, evidence, reason, closed, error}], closed, not_worth_doing}."
+    )]
+    async fn triage(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            Ok(serde_json::to_value(crate::mestari::triage(
+                &home,
+                &checkout(args.repo)?,
+            )?)?)
+        })
+        .await
+    }
+
     #[tool(description = "Show the event log, oldest first.")]
     async fn log(&self, Parameters(args): Parameters<LogArgs>) -> Result<String, String> {
         let home = self.home.clone();
