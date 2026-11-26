@@ -432,11 +432,7 @@ fn is_waiting(item: &WorkItem) -> bool {
 /// The "nothing can start" line for a dependency cycle among the waiting ones of `items` (as
 /// `list` returns them), for `paja work list` and for a run that found nothing ready.
 pub fn cycle_note(items: &[WorkItem]) -> Option<String> {
-    let waiting: Vec<WorkItem> = items
-        .iter()
-        .filter(|item| is_waiting(item))
-        .cloned()
-        .collect();
+    let waiting: Vec<&WorkItem> = items.iter().filter(|item| is_waiting(item)).collect();
     cycle(&waiting).map(|cycle| {
         let shown: Vec<String> = cycle.iter().map(|n| format!("#{n}")).collect();
         format!(
@@ -448,12 +444,13 @@ pub fn cycle_note(items: &[WorkItem]) -> Option<String> {
 
 /// A dependency cycle among waiting items, as the numbers along it with the first repeated at
 /// the end (`[3, 5, 3]`), or None.
-fn cycle(items: &[WorkItem]) -> Option<Vec<u64>> {
-    cycle_search(items).0
+fn cycle(items: &[&WorkItem]) -> Option<Vec<u64>> {
+    cycle_search(items, usize::MAX).0
 }
 
-/// `cycle`, with how many times the search entered an item, so a test can bound the work.
-fn cycle_search(items: &[WorkItem]) -> (Option<Vec<u64>>, usize) {
+/// `cycle`, with how many times the search entered an item. It gives up, finding nothing, once
+/// it has entered more than `limit`, so a test that bounds the work fails rather than hangs.
+fn cycle_search(items: &[&WorkItem], limit: usize) -> (Option<Vec<u64>>, usize) {
     let mut entered = 0;
     let edges: BTreeMap<u64, &[u64]> = items
         .iter()
@@ -475,6 +472,9 @@ fn cycle_search(items: &[WorkItem]) -> (Option<Vec<u64>>, usize) {
                 }
                 if edges.contains_key(&dep) && seen.insert(dep) {
                     entered += 1;
+                    if entered > limit {
+                        return (None, entered);
+                    }
                     path.push(dep);
                     stack.push((dep, 0));
                 }
@@ -964,11 +964,12 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let (found, entered) = cycle_search(&items);
-        assert!(found.is_none());
+        let items: Vec<&WorkItem> = items.iter().collect();
         // Each start enters every other item at most once; a search that followed every path
-        // would enter them exponentially many times.
+        // would enter them exponentially many times, and stops at the limit.
+        let (found, entered) = cycle_search(&items, 60 * 60);
         assert!(entered <= 60 * 60, "{entered}");
+        assert!(found.is_none());
     }
 
     #[test]
