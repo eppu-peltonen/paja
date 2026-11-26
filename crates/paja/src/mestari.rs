@@ -3346,6 +3346,18 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn sandbox_and_platform_are_high_risk() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.paja/high-risk"),
+        )
+        .unwrap();
+        let prefixes = super::lines(&text);
+        for file in ["crates/paja/src/sandbox.rs", "crates/paja/src/platform.rs"] {
+            assert!(super::is_high_risk(file, &prefixes), "{file}");
+        }
+    }
+
+    #[test]
     fn nested_configuration_is_high_risk() {
         let prefixes: Vec<String> = [".cargo/", "CLAUDE.md", "crates/paja/src/hook.rs"]
             .map(String::from)
