@@ -48,6 +48,16 @@ enum Command {
         /// per item.
         #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
         every: Option<u64>,
+        /// Take one item, run it to landed or escalated, and exit. The default; the first
+        /// command to try.
+        #[arg(long, conflicts_with = "every")]
+        once: bool,
+        /// Take this item instead of the oldest queued one.
+        #[arg(long, value_name = "NUMBER", conflicts_with = "every")]
+        item: Option<u64>,
+        /// Don't ask for confirmation, even on a terminal.
+        #[arg(long)]
+        yes: bool,
         /// After Paja stopped because git's configuration changed during a run: you have
         /// checked and restored the files it named, and Paja may run git in this repository
         /// again.
@@ -303,8 +313,16 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Run {
             repo,
             every,
+            once,
+            item,
+            yes,
             tamper_checked,
         } => {
+            // Only a single run on a terminal asks; a loop and a script never wait for a person.
+            // `--once` is also what a run without `--every` does; the flag names it.
+            let _ = once;
+            let confirm =
+                every.is_none() && !*yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
@@ -316,21 +334,19 @@ fn run(cli: &Cli) -> Result<()> {
                     mestari::RunOptions {
                         repo,
                         tamper_checked: std::mem::take(&mut checked),
+                        item: *item,
+                        confirm,
                     },
                 );
                 let Some(minutes) = every else {
                     let report = outcome?;
-                    emit(cli, serde_json::to_value(&report)?, || {
-                        describe_run(&report)
-                    });
+                    emit(cli, run_json(&report)?, || describe_run(&report));
                     break;
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
                 let wait = match outcome {
                     Ok(report) => {
-                        emit(cli, serde_json::to_value(&report)?, || {
-                            describe_run(&report)
-                        });
+                        emit(cli, run_json(&report)?, || describe_run(&report));
                         matches!(report, mestari::RunReport::Idle)
                             .then_some("nothing to do right now")
                     }
@@ -466,6 +482,18 @@ fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
             println!("{text}");
         }
     }
+}
+
+/// The run's report, with whether a sandbox was in use.
+fn run_json(report: &mestari::RunReport) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(report)?;
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert(
+            "sandbox".to_string(),
+            json!(paja::sandbox::active().is_some()),
+        );
+    }
+    Ok(value)
 }
 
 fn describe_run(report: &mestari::RunReport) -> String {

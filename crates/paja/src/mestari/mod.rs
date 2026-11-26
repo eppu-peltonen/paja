@@ -43,6 +43,7 @@ pub const CHECKS_FILE: &str = ".paja/checks";
 pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
 /// The model and effort for each agent role, read from the base commit.
 pub const MODELS_FILE: &str = ".paja/models";
+pub const CI_FILE: &str = ".paja/ci";
 /// The roles `.paja/models` may name, besides `fallback`.
 pub const ROLES: [&str; 5] = ["build", "fix", "review", "re-review", "review-2"];
 /// The effort levels Claude Code takes.
@@ -289,6 +290,51 @@ pub struct RunOptions<'a> {
     /// A person has checked the repository's git configuration after Paja stopped on
     /// tampering, and Paja may run git there again.
     pub tamper_checked: bool,
+    /// Take only this item instead of the oldest queued one (`paja run --item`).
+    pub item: Option<u64>,
+    /// Ask the person, after the summary, before the first agent starts.
+    pub confirm: bool,
+}
+
+/// The person did not confirm the run, so nothing was started.
+#[derive(Debug)]
+pub struct Declined;
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not confirmed; nothing was started (pass --yes to skip the question)")
+    }
+}
+
+impl std::error::Error for Declined {}
+
+/// What a run is about to do, on stderr, before the first agent starts.
+fn summary(item: &jono::WorkItem, ci: CiMode, sandbox: bool) {
+    progress(&format!("repository: {}", item.repo));
+    progress(&format!("item: #{} {}", item.number, item.title));
+    progress("merges into: main (default branch), by squash");
+    progress(&match ci {
+        CiMode::Required => "CI: required before landing".to_string(),
+        CiMode::None => format!(
+            "CI: not required ({CI_FILE} says none); Vasara's checks and the reviewers decide"
+        ),
+    });
+    if sandbox {
+        progress("sandbox: in use");
+    } else {
+        progress(
+            "no sandbox: agents and the checks run as this user, with this user's files and \
+             sign-ins, and the deny-list hook is a guardrail, not a sandbox",
+        );
+    }
+}
+
+/// Ask on stderr and read a yes or no from stdin.
+fn confirmed() -> Result<bool> {
+    eprint!("Go ahead? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Take the next work item and run it to an outcome.
@@ -312,18 +358,41 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // home are never claimed.
     let name = jono::sync(home, &repo)?.repo;
     let config = read_config(&repo, &base)?;
+    // Before an item is claimed: waiting for CI that will never run fails after the whole build.
+    if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
+        bail!(
+            "this repository has no GitHub Actions workflow, so Paja would wait for CI that never \
+             comes; add a workflow that runs the checks on pull requests, or put `none` in \
+             {CI_FILE} on the default branch to land on Vasara's checks and the reviewers alone"
+        );
+    }
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
         lock: _working,
         resumed,
-    }) = jono::claim_for_run(home, &name)?
+    }) = jono::claim_for_run_item(home, &name, opts.item)?
     else {
+        if let Some(number) = opts.item {
+            bail!(
+                "work item #{number} is not queued (or another run holds it); see \
+                 `paja work list`"
+            );
+        }
         if let Some(waiting) = jono::waiting(home, &name)? {
             progress(&format!("nothing is ready: {waiting}"));
         }
         return Ok(RunReport::Idle);
     };
+    summary(&item, config.ci, crate::sandbox::active().is_some());
+    if opts.confirm && !confirmed()? {
+        // Put the item back, so declining leaves the queue as it was. A resumed item was
+        // active already and stays so.
+        if !resumed {
+            jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
+        }
+        return Err(Declined.into());
+    }
     if resumed {
         progress(&format!(
             "resuming #{}: {} (an earlier run stopped before finishing it)",
@@ -420,8 +489,30 @@ struct Unrecorded {
     steps: Vec<StepUsage>,
 }
 
+/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on `main`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CiMode {
+    /// Wait for the pull request's CI checks to pass (the default).
+    Required,
+    /// No CI: land on Vasara's checks and the reviewers alone.
+    None,
+}
+
+impl CiMode {
+    fn parse(text: Option<&str>) -> Result<CiMode> {
+        let words = lines(text.unwrap_or_default());
+        match words.as_slice() {
+            [] => Ok(CiMode::Required),
+            [w] if w == "required" => Ok(CiMode::Required),
+            [w] if w == "none" => Ok(CiMode::None),
+            _ => bail!("{CI_FILE} on main must hold `required` or `none`; fix it on main"),
+        }
+    }
+}
+
 /// Vasara's check commands, the high-risk paths and the model per role, as `main` has them.
 struct Config {
+    ci: CiMode,
     checks: Vec<String>,
     high_risk: Vec<String>,
     models: Models,
@@ -444,7 +535,9 @@ fn read_config(repo: &Path, base: &str) -> Result<Config> {
     let commands = crate::hook::Commands::parse(
         read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
     )?;
+    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref())?;
     Ok(Config {
+        ci,
         checks,
         high_risk,
         models,
@@ -462,6 +555,7 @@ fn run_item(
     run: &mut Unrecorded,
 ) -> Result<RunReport> {
     let Config {
+        ci,
         checks,
         high_risk,
         models,
@@ -791,7 +885,7 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = land(home, repo, &env, item, round, &checked);
+            let report = land(home, repo, &env, item, round, &checked, ci);
             match &report {
                 Ok(RunReport::Landed { pr, .. }) => {
                     file_follow_ups(home, repo, item, pr, &follow_ups)

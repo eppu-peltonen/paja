@@ -31,8 +31,11 @@ claude          # sign in, then exit
 git clone https://github.com/eppu-peltonen/paja C:\Projektit\paja
 cd C:\Projektit\paja
 cargo install --path crates/paja
-paja run --every 5
+paja run --once
 ```
+
+`paja run --once` takes one item, shows what it will do, and exits when the item has landed or been escalated. When
+you are comfortable with that, `paja run --every 5` keeps going.
 
 The clone can go anywhere. Keep Paja's home in its default place (`.paja` in your user profile): Paja keeps the
 deny-list hook's binary there, and other accounts must not be able to write to it. A drive without permissions, such
@@ -45,8 +48,10 @@ Install Git, rustup (<https://rustup.rs>), the GitHub CLI and Claude Code, sign 
 ```sh
 git clone https://github.com/eppu-peltonen/paja ~/paja && cd ~/paja
 cargo install --path crates/paja
-paja run --every 5
+paja run --once
 ```
+
+Then `paja run --every 5` keeps going, as described below.
 
 ## Using Paja from Claude Code
 
@@ -63,9 +68,24 @@ claude plugin install paja --marketplace eppu-peltonen/paja
 Inside Claude Code, `/plugin install paja --marketplace eppu-peltonen/paja` does the same. Start Claude Code from inside
 the repository's checkout, because the MCP tools work on the checkout they run in.
 
+## CI
+
+Paja waits for the pull request's CI before it lands. `.paja/ci`, read from the default branch next to `.paja/checks`,
+says whether the repository has any: `required` (the default when the file is missing) or `none`. With `required`, a
+repository with no GitHub Actions workflow (`gh workflow list` is empty) stops the pass before an item is claimed, with an
+error that names the two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the
+default branch. With `none`, Paja lands on Vasara's checks and the reviewers alone, and says so in the pull request body.
+
 ## What happens next
 
-`paja run --every 5` takes the oldest open issue labelled `paja`. It builds the change, runs Vasara's checks, has it
+`paja run --once` takes the oldest open issue labelled `paja` (or the one named with `--item <number>`) and exits when
+it is done. Before the first agent starts, every `paja run` prints on stderr the repository, the item, the default
+branch it merges into (by squash), whether CI is required and whether a sandbox is in use. Without a sandbox it adds
+that agents and the checks run as you, with your files and sign-ins, and that the deny-list hook is a guardrail, not a
+sandbox. On a terminal, `--once` then asks for confirmation; `--yes` skips the question, and `--every` and runs without
+a terminal never ask. With `--json`, the report gains a `sandbox` field.
+
+`paja run --every 5` does the same in a loop. It builds the change, runs Vasara's checks, has it
 reviewed and lands it, or asks a question on the issue when it can't decide. Then it takes the next issue. When the
 queue is empty it checks again every five minutes.
 
