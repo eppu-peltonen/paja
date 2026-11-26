@@ -2342,10 +2342,10 @@ mod windows_tests {
         }
         // Globs override ignores, so the whole worktree is checked.
         assert!(grep(json!({"pattern": "x", "glob": "*.rs"})).is_some());
-        // With `target` clean again, only a junction elsewhere into it can block the search: it
-        // reaches `target` by another name, so the walk must take it in.
-        std::fs::remove_dir(e.root.join("target").join("debug").join("out")).unwrap();
-        assert_eq!(grep(json!({"pattern": "x"})), None);
+        // A junction elsewhere in the worktree into `target` reaches it by another name, so the
+        // whole worktree is walked again and the junction out of `target\debug` is found. The
+        // first search above, with that same junction out in place, was allowed: only the
+        // rescan can block this one.
         junction(&e.root.join("src").join("via"), &e.root.join("target"));
         assert!(
             grep(json!({"pattern": "x"})).is_some(),
