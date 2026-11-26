@@ -670,6 +670,9 @@ fn run_item(
         target,
     } = config;
     let (env, kept) = environment(home, repo, base, item)?;
+    // The default branch the change is judged against: it moves forward when the branch is
+    // brought up to date with it.
+    let mut base = base.to_string();
     // An earlier run's builder session is resumed only for work still on its branch: an
     // environment made again from the default branch starts a fresh one.
     let mut carried = if kept && (resumed || !item.answers.is_empty()) {
@@ -708,7 +711,7 @@ fn run_item(
             home,
             &env,
             item,
-            base,
+            &base,
             &feedback,
             &models,
             role,
@@ -773,6 +776,18 @@ fn run_item(
                 format!("Paja's builder needs a decision before it can go on:\n\n{asked}");
             return escalated(home, repo, &env, item, &question, round);
         }
+        // A merge Paja handed over must be finished, not committed with its conflicts.
+        if merging(&env.path) && !unmerged(&env.path)?.is_empty() {
+            git(&env.path, &["merge", "--abort"])?;
+            feedback = format!(
+                "The merge of {} was left with conflicts, so Paja undid it. Resolve every \
+                 conflicted file, `git add` it and `git commit -m '<message>'`.",
+                target.branch
+            );
+            progress("the builder left the merge unfinished; asking again");
+            record_round(home, item, round, "conflict", &feedback, steps)?;
+            continue;
+        }
         commit_leftovers(&env, item)?;
         if git(
             &env.path,
@@ -793,6 +808,39 @@ fn run_item(
                 );
                 progress("the builder committed no fix; asking again");
                 record_round(home, item, round, "no_change", &feedback, steps)?;
+                continue;
+            }
+        }
+        // Judge the change as it would land: on the latest default branch.
+        match catch_up(repo, &env, &target.branch)? {
+            // The builder may have finished a merge Paja handed over: diffs start from there.
+            CatchUp::Current(tip) => base = tip,
+            CatchUp::Merged(tip) => {
+                progress(&format!(
+                    "{} moved on; merged it into the branch",
+                    target.branch
+                ));
+                base = tip;
+            }
+            CatchUp::Conflict(files) => {
+                let branch = &target.branch;
+                feedback = format!(
+                    "{branch} moved on since this branch was made, and merging it conflicts in: \
+                     {}. Paja started the merge: the conflicted files hold conflict markers. \
+                     Resolve each one, keeping what both sides meant, then `git add` the files \
+                     and `git commit -m '<message>'` to finish the merge.",
+                    files.join(", ")
+                );
+                if let Some(prior) = &prior {
+                    feedback.push_str(&format!(
+                        "\n\nThe review's blockers still need fixing too:\n\n{}",
+                        prior.blockers
+                    ));
+                }
+                progress(&format!(
+                    "the branch conflicts with {branch}; sending the merge to the builder"
+                ));
+                record_round(home, item, round, "conflict", &files.join(", "), steps)?;
                 continue;
             }
         }
@@ -904,7 +952,7 @@ fn run_item(
                 home,
                 &env,
                 item,
-                base,
+                &base,
                 &checked,
                 prior.as_ref().filter(|_| !risky),
                 reviewer,
@@ -993,7 +1041,21 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = land(home, repo, &env, item, round, &checked, ci, &target);
+            let report = match land(home, repo, &env, item, round, &checked, ci, &target) {
+                Ok(Landing::Retry(why)) => {
+                    progress("CI failed; sending the failure back to the builder");
+                    record_round(home, item, round, "ci_failed", &why, steps)?;
+                    feedback = why.clone();
+                    prior = Some(Prior {
+                        reviewed: checked,
+                        blockers: why,
+                        follow_ups: follow_ups.clone(),
+                    });
+                    continue;
+                }
+                Ok(Landing::Done(report)) => Ok(report),
+                Err(err) => Err(err),
+            };
             match &report {
                 Ok(RunReport::Landed { pr, .. }) => {
                     file_follow_ups(home, repo, item, pr, &follow_ups, &labels)
@@ -1845,6 +1907,71 @@ fn tail(output: &Output) -> String {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     clip(text.trim())
+}
+
+/// What bringing a branch up to date with the default branch found.
+enum CatchUp {
+    /// The branch already holds the default branch's tip, given here.
+    Current(String),
+    /// The default branch merged in cleanly; its tip, the new base.
+    Merged(String),
+    /// The merge conflicts in these files. It is left in progress for the builder to finish.
+    Conflict(Vec<String>),
+}
+
+/// Merge the latest `branch` into the environment's branch, so Vasara's checks, the
+/// reviewers and CI judge the change as it would land, and a stale branch never reaches the
+/// pull request.
+fn catch_up(repo: &Path, env: &Env, branch: &str) -> Result<CatchUp> {
+    // A merge an earlier round left unfinished starts over.
+    if merging(&env.path) {
+        git(&env.path, &["merge", "--abort"])?;
+    }
+    git(repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+        format!("fetching origin/{branch}; check the network and that `origin` is the GitHub repository")
+    })?;
+    let tip = git(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    if git(&env.path, &["merge-base", "--is-ancestor", &tip, "HEAD"]).is_ok() {
+        return Ok(CatchUp::Current(tip));
+    }
+    // The person's identity when git has one, so the merge commit is theirs like the build.
+    let mut args: Vec<&str> = Vec::new();
+    if git(&env.path, &["config", "user.email"]).is_err() {
+        args.extend([
+            "-c",
+            "user.name=Paja",
+            "-c",
+            "user.email=paja@example.invalid",
+        ]);
+    }
+    let message = format!("Merge {branch} into {}", env.branch);
+    args.extend(["merge", "-q", "--no-edit", "-m", &message, &tip]);
+    match git(&env.path, &args) {
+        Ok(_) => Ok(CatchUp::Merged(tip)),
+        Err(err) => {
+            let files = unmerged(&env.path)?;
+            if files.is_empty() {
+                if merging(&env.path) {
+                    let _ = git(&env.path, &["merge", "--abort"]);
+                }
+                return Err(err.context(format!("merging origin/{branch} into {}", env.branch)));
+            }
+            Ok(CatchUp::Conflict(files))
+        }
+    }
+}
+
+/// Whether a merge is in progress in `dir`.
+fn merging(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
+}
+
+/// The files with unresolved merge conflicts in `dir`.
+fn unmerged(dir: &Path) -> Result<Vec<String>> {
+    Ok(lines(&git(
+        dir,
+        &["diff", "--name-only", "--diff-filter=U"],
+    )?))
 }
 
 fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
