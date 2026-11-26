@@ -38,6 +38,25 @@ fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> 
 }
 
 #[test]
+fn work_sync_outside_a_checkout_says_to_pass_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let home = tmp.path().join("home");
+    let (ok, out) = paja(
+        &home,
+        tmp.path(),
+        &["work", "sync", "--repo", plain.to_str().unwrap()],
+    );
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("is not inside a git checkout") && error.contains("`--repo`"),
+        "{error}"
+    );
+}
+
+#[test]
 fn env_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("app");
