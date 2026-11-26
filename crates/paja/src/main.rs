@@ -64,6 +64,24 @@ enum Command {
         #[arg(long)]
         tamper_checked: bool,
     },
+    /// Set an existing repository up for Paja in one pull request.
+    ///
+    /// Detects the stack, writes `.paja/checks`, `.paja/commands`, `.paja/models` and
+    /// `.paja/high-risk`, adds a `CLAUDE.md` (or a "Working with Paja" section to the existing
+    /// one), creates the work label, and opens a pull request from `paja/init`. Never pushes to
+    /// the default branch; Paja starts working once the pull request is merged.
+    Init {
+        /// Any path inside the repository's checkout (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// When the repository has no GitHub Actions workflow, write one that runs the checks on
+        /// pull requests. Without it, `.paja/ci` says `none`.
+        #[arg(long)]
+        ci: bool,
+        /// Write the files again on the branch although `.paja/checks` is on the default branch.
+        #[arg(long)]
+        force: bool,
+    },
     /// The deny-list hook Mestari runs agents under (Claude Code `PreToolUse`). Reads the
     /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow. Prints no
     /// JSON: Claude Code reads only its exit code and stderr.
@@ -262,6 +280,19 @@ fn run(cli: &Cli) -> Result<()> {
                 eprintln!("error: {err:#}");
                 std::process::exit(1);
             }
+        }
+        Command::Init { repo, ci, force } => {
+            let report = paja::init::run(
+                &home,
+                &std::path::absolute(repo)?,
+                paja::init::Options {
+                    ci: *ci,
+                    force: *force,
+                },
+            )?;
+            emit(cli, serde_json::to_value(&report)?, || {
+                describe_init(&report)
+            });
         }
         Command::Env { command } => match command {
             EnvCommand::Create { name, repo, base } => {
@@ -511,6 +542,37 @@ fn describe_run(report: &mestari::RunReport) -> String {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
         }
     }
+}
+
+fn describe_init(report: &paja::init::Report) -> String {
+    let found = if report.detected.stacks.is_empty() {
+        "no stack Paja knows".to_string()
+    } else {
+        report.detected.stacks.join(", ")
+    };
+    let mut text = format!(
+        "detected: {found}\nchecks: {}\nwrote: {}\nci: {}\n",
+        if report.detected.checks.is_empty() {
+            "none".to_string()
+        } else {
+            report.detected.checks.join("; ")
+        },
+        report.files.join(", "),
+        report.ci
+    );
+    if report.ci == "none" {
+        text.push_str(
+            "  the repository has no CI; `.paja/ci` says `none` (use --ci to add a workflow)\n",
+        );
+    }
+    if let Some(note) = &report.note {
+        text.push_str(&format!("note: {note}\n"));
+    }
+    text.push_str(&format!(
+        "pull request: {}\nPaja starts working once it is merged into {}.",
+        report.pull_request, report.default_branch
+    ));
+    text
 }
 
 fn describe_item(item: &jono::WorkItem) -> String {

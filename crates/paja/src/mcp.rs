@@ -108,6 +108,18 @@ pub struct FileArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct InitArgs {
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
+    /// When the repository has no workflow, write one that runs the checks on pull requests.
+    #[serde(default)]
+    ci: bool,
+    /// Write the files again on the branch although .paja/checks is on the default branch.
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
     /// Only the last N events.
     limit: Option<usize>,
@@ -305,6 +317,25 @@ impl PajaMcp {
                 &args.title,
                 &args.body,
             )?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Set an existing repository up for Paja in one pull request: detects the stack, writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true."
+    )]
+    async fn init(&self, Parameters(args): Parameters<InitArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let report = crate::init::run(
+                &home,
+                &checkout(args.repo)?,
+                crate::init::Options {
+                    ci: args.ci,
+                    force: args.force,
+                },
+            )?;
+            Ok(serde_json::to_value(report)?)
         })
         .await
     }

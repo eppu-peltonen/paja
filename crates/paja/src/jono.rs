@@ -1174,7 +1174,7 @@ fn gh_output(ok: &Untampered, args: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)"))
 }
 
-fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
+pub(crate) fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
     let repo = ok.path();
     if !repo.is_dir() {
         bail!(
