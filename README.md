@@ -40,3 +40,7 @@ claude plugin install paja --marketplace eppu-peltonen/paja
 
 State lives in `$PAJA_HOME` (default `.paja` in your home directory). See [CLAUDE.md](CLAUDE.md) for how to work on
 Paja.
+
+## License
+
+Paja is licensed under the [Apache License 2.0](LICENSE).
