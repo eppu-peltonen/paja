@@ -510,6 +510,17 @@ person's text stays in the window across refreshes and errors. Desk's Tauri perm
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
 `https://github.com/` links, nothing else.
 
+Desk also starts and stops runs (`desk/src/runs.rs`). It lists every repository with a work item or a `work.checkout`,
+adds one by syncing in a checkout folder the person names, and shows `doctor::run_checks` for it. A run is the
+installed `paja` as a child process (`paja run --once --yes` or `paja run --every 5`, with `--stop-on-stdin`) in the
+repository's checkout, so it is the CLI's run with its own lock and hook. "Stop after this step" and "Stop now" write
+`stop` and `stop now` to its stdin; after "Stop now" Desk ends a `paja` still going 15 seconds later. The run's output
+goes to `desk/<owner>@<name>.log` in the home, not to a pipe, so a run left going when Desk closes still has somewhere
+to write; Desk shows its end. Desk refuses to start a run while `paja doctor` has a failing check, while its own run of
+the repository is going, or while any active item's run lock is held (a run started from a terminal), probing it under
+the home lock as the run view does. Closing the window while Desk's runs are going asks whether to stop them (`stop now`)
+or leave them running. The log file holds output only, never state.
+
 Desk is a workspace member but not a default one, since it needs the webview's development files to build (WebKitGTK
 on Linux): plain `cargo build` and `cargo test` cover the core, and CI's `desk` job runs clippy and the tests for
 `-p paja-desk` on Windows and Linux.

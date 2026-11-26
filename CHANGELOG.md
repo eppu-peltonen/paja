@@ -5,6 +5,8 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
 
 ## Unreleased
 
+- Paja Desk starts and stops runs: add a repository by its checkout folder, check it with `paja doctor`, run one item
+  or keep running, and stop after the step or at once. `paja run --stop-on-stdin` is how it stops them.
 - Paja Desk follows a running item live: its round, current step and model, how long the step has run, what each
   finished step spent and the pull request. `paja work show` includes the same `run` for an active item, and a run
   that stopped shows as interrupted.
