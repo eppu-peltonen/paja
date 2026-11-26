@@ -11,5 +11,5 @@ Use only the `paja` MCP tools; don't run shell commands.
 2. If the person named an item (for example `/paja:answer 31`), use it. Otherwise show each escalated item's number, title, link and question (its `note`), and ask which one they want to answer.
 3. Ask for the answer if they haven't given it. Help them make it a clear decision Paja can act on, but keep their meaning; never answer for them.
 4. Show the exact text that will be posted on the issue and wait for the person to confirm.
-5. Call `work_answer` with the number and the text. It posts the answer as a comment on the issue and sets the item back to queued, and fails without changing anything if the item isn't escalated.
-6. Say that the answer is posted and the item is queued, with the issue link. The next `paja run` picks it up.
+5. Call `work_answer` with the number and the text. It records the answer for Paja's next run (agents can't read issue comments, so this is how the answer reaches them), sets the item back to queued, and posts the answer as a comment on the issue. It fails without changing anything if the item isn't escalated.
+6. Say that the answer is recorded and the item is queued, with the issue link. The next `paja run` picks it up and its agents get the answer.

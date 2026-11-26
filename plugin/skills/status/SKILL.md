@@ -5,7 +5,7 @@ description: Summarise Paja's queue (active, queued and escalated items), its la
 
 # Paja status
 
-Use only the `paja` MCP tools; don't run shell commands and don't change anything.
+Use only the `paja` MCP tools and don't run shell commands. Apart from the sync in step 1, which imports new issues, change nothing.
 
 1. Call `work_sync` to import the latest issues labelled `paja`. If it fails (for example `gh` isn't signed in), say so in one line and go on with the queue as it is.
 2. Call `work_list`. Group the open items by status: **active**, **queued** (oldest first, which is the order Paja takes them), and **escalated**. Leave out landed and closed items, but give their count.

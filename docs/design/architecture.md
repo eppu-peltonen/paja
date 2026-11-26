@@ -57,9 +57,14 @@ Jono's items are GitHub issues labelled `paja`. `paja work sync` reads the open 
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the oldest
 open, queued item and marks it active under the home lock, so two runs never share one. A sync that reads its full limit
-of issues refuses to close anything rather than drop work it could not see. `paja work answer <issue> <text>` posts a person's
-answer to an escalated item as a comment on its issue and queues it again, and `paja work file --title --body` opens a
-new issue labelled `paja`; both use `gh`, and the MCP tools `work_answer` and `work_file` do the same.
+of issues refuses to close anything rather than drop work it could not see.
+
+`paja work answer <issue> <text>` records a person's answer to an escalated item (`work.answered`, with the question it
+answers) and queues the item again under the home lock, then posts the answer as a comment on the issue. Each item
+keeps its `answers`, and every later run passes them to the builder and the reviewers, since agents can't read the
+issue's comments; a reply on the issue alone doesn't reach them, and Paja's question on the issue says so.
+`paja work file --title --body` opens a new issue labelled `paja`. Both use `gh`, and the MCP tools `work_answer` and
+`work_file` do the same.
 
 ## The run loop
 
