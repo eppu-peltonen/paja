@@ -1104,25 +1104,23 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
     };
     for arg in args {
         let value = match arg.strip_prefix('-') {
-            Some(rest) => match arg.split_once('=') {
-                Some((_, value)) => value,
-                // A value glued to a short flag (`-o/tmp/x`, `-C../other`) is a path too.
-                None if !rest.starts_with('-') => {
-                    let glued = rest.char_indices().nth(1).map_or("", |(at, _)| &rest[at..]);
-                    let starts_as_path =
-                        glued.starts_with(['/', '\\', '.', '~']) || has_drive(glued);
-                    // A cluster such as `-xvf/tmp/a` hides where its path starts, so it is
-                    // refused rather than guessed at.
-                    if !starts_as_path && (glued.contains(['/', '\\']) || glued.contains(':')) {
-                        return Some(format!(
-                            "`{arg}` glues a path to a short flag; put a space between the \
-                             flag and its value so the hook can check the path"
-                        ));
-                    }
-                    glued
+            // `--flag=value`: the value may be a path.
+            Some(rest) if rest.starts_with('-') => rest.split_once('=').map_or("", |(_, v)| v),
+            // A value glued to a short flag (`-o/tmp/x`, `-C../other`, `-o/tmp/x=1`) is a path
+            // too. A `=` inside it is part of the name, so it is not split off.
+            Some(rest) => {
+                let glued = rest.char_indices().nth(1).map_or("", |(at, _)| &rest[at..]);
+                let starts_as_path = glued.starts_with(['/', '\\', '.', '~']) || has_drive(glued);
+                // A cluster such as `-xvf/tmp/a` or `-xC..` hides where its path starts, so it
+                // is refused rather than guessed at.
+                if !starts_as_path && (glued.contains(['/', '\\', ':']) || glued.contains("..")) {
+                    return Some(format!(
+                        "`{arg}` glues a path to a short flag; put a space between the flag and \
+                         its value so the hook can check the path"
+                    ));
                 }
-                None => "",
-            },
+                glued
+            }
             None => arg,
         };
         if !(value.contains(['/', '\\']) || value.starts_with('.') || has_drive(value)) {
@@ -1664,6 +1662,9 @@ mod program_tests {
             "npm test -C../other",
             "npm test -xvf/tmp/a",
             "npm test -Isrc/../../x",
+            "npm test -o/tmp/x=1",
+            "npm test -C../other=a",
+            "npm test -xC..",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -1678,6 +1679,8 @@ mod program_tests {
         let why = bash_as(&["npm"], false, "npm test -Isrc/include").unwrap();
         assert!(why.contains("put a space between"), "{why}");
         ok("npm test -I src/include");
+        ok("npm test -Dfeature=on");
+        ok("npm test --out=./build");
     }
 }
 

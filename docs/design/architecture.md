@@ -244,8 +244,8 @@ the tool call, because the reported `cwd` moves when the agent runs `cd`.
   stops the agent, and a hook started without the list blocks every call. A listed program runs under the shape rules
   above and the generic checks: it must start in the worktree, and any word that names a path (also after `--flag=`
   or glued to a short flag, as in `-o./out`) must stay inside it and obey the write rules; a short-flag cluster with a
-  path inside it (`-xvf/tmp/a`) is refused, with the fix of putting a space before the value. A program not on the list is refused with a message naming
-  `.paja/commands` on the default branch as the fix. Only `cargo` and `git` have per-subcommand flag lists.
+  path inside it (`-xvf/tmp/a`, `-xC..`) is refused, with the fix of putting a space before the value. A program not
+  on the list is refused with a message naming `.paja/commands` on the default branch as the fix. Only `cargo` and `git` have per-subcommand flag lists.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
