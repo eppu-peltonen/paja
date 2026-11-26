@@ -1729,6 +1729,55 @@ fn run_refuses_to_start_agents_when_the_sandbox_cannot_start() {
     assert!(!item.to_string().contains("escalated"), "{item}");
 }
 
+/// Runs `paja run` with the fake `sbx` script `body`; returns the error and checks no agent ran.
+fn run_with_sbx_body(body: &str) -> (String, std::path::PathBuf) {
+    let f = Factory::new("true\n", "land");
+    let sbx = program(f.tmp.path(), "sbx", body);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(!ok, "{report}");
+    assert!(!f.tmp.path().join("claude-args.log").exists());
+    let error = report["error"].as_str().unwrap().to_string();
+    (error, sbx)
+}
+
+#[test]
+fn a_left_behind_sandbox_that_will_not_run_says_how_to_remove_it() {
+    let (error, sbx) = run_with_sbx_body(
+        "#!/bin/sh\ncase \"$1\" in\n\
+         create) echo \"sandbox 'paja' already exists\" >&2; exit 1 ;;\n\
+         *) echo 'mounts are gone' >&2; exit 1 ;;\nesac\n",
+    );
+    assert!(error.contains("already exists"), "{error}");
+    assert!(
+        error.contains("`paja`") && error.contains(&format!("{} rm paja", sbx.display())),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_running_sandbox_with_other_mounts_says_how_to_remove_it() {
+    // It answers in `/` but has none of this factory's directories.
+    let (error, sbx) = run_with_sbx_body(
+        "#!/bin/sh\ncase \"$1\" in\n\
+         exec) [ \"$3\" = \"/\" ] || { echo 'no such directory' >&2; exit 1; }; exit 0 ;;\n\
+         *) exit 0 ;;\nesac\n",
+    );
+    assert!(error.contains("is not mounted"), "{error}");
+    assert!(
+        error.contains(&format!("{} rm paja", sbx.display())),
+        "{error}"
+    );
+}
+
 #[test]
 fn agents_and_checks_run_through_the_sandbox() {
     let f = Factory::new("test -f feature.txt\n", "land");

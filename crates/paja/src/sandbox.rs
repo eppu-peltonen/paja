@@ -28,13 +28,13 @@ pub const SCRATCH: &str = "/tmp/paja-home";
 /// Puts rustup's directory on `PATH`, then runs the command it is given.
 const WRAP: &str = r#"PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec "$@""#;
 
-/// Installs a C toolchain when the sandbox lacks one. Runs as root (`sbx exec -u root`): the
-/// agent user has no working `sudo` in the sandbox.
-/// A fresh sandbox runs its own `apt-get` just after it starts, so each apt command here retries
-/// for up to about five minutes while apt's lists or dpkg lock is held, then fails naming the lock.
-const SETUP_ROOT: &str = r#"set -e
-apt_retry() {
+/// A shell function that runs a command (an `apt-get`), retrying while apt's lists or dpkg lock
+/// is held. A fresh sandbox runs its own `apt-get` just after it starts. It tries
+/// `$PAJA_APT_TRIES` times (default 60) `$PAJA_APT_INTERVAL` seconds apart (default 5), about
+/// five minutes, then fails with apt's message, which names the lock. Tests override both.
+const APT_RETRY: &str = r#"apt_retry() {
   tries=0
+  max="${PAJA_APT_TRIES:-60}"
   while :; do
     if out=$("$@" 2>&1); then
       printf '%s\n' "$out"
@@ -43,12 +43,12 @@ apt_retry() {
     case "$out" in
       *"Could not get lock"*|*"Unable to lock"*)
         tries=$((tries + 1))
-        if [ "$tries" -ge 60 ]; then
+        if [ "$tries" -ge "$max" ]; then
           printf '%s\n' "$out" >&2
-          echo "apt's lock is still held after 5 minutes (see the lock named above); wait for the other apt-get or dpkg to finish and run again" >&2
+          echo "apt's lock is still held after $tries tries (the lock is named above); wait for the other apt-get or dpkg to finish and run again" >&2
           return 1
         fi
-        sleep 5
+        sleep "${PAJA_APT_INTERVAL:-5}"
         ;;
       *)
         printf '%s\n' "$out" >&2
@@ -56,11 +56,18 @@ apt_retry() {
         ;;
     esac
   done
+}"#;
+
+/// Installs a C toolchain when the sandbox lacks one. Runs as root (`sbx exec -u root`): the
+/// agent user has no working `sudo` in the sandbox.
+fn setup_root() -> String {
+    format!(
+        "set -e\n{APT_RETRY}\n\
+         if ! command -v cc >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then\n  \
+         apt_retry apt-get update\n  \
+         apt_retry apt-get install -y build-essential curl ca-certificates git\nfi"
+    )
 }
-if ! command -v cc >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-  apt_retry apt-get update
-  apt_retry apt-get install -y build-essential curl ca-certificates git
-fi"#;
 
 /// Installs Rust (what Vasara's checks need) for the agent user, when the sandbox lacks it.
 const SETUP_USER: &str = r#"set -e
@@ -144,8 +151,22 @@ pub fn start(mounts: &[PathBuf]) -> Result<Option<Sbx>> {
             )
         })?;
     }
+    // A sandbox that was already there may have been made for another factory home or another
+    // set of mounts; agents would then fail later on a raw `-w` error.
+    for mount in mounts {
+        if sbx.exec_in(mount, "true").is_err() {
+            bail!(
+                "the sandbox `{name}` exists but `{}` is not mounted in it (it was made for \
+                 another factory home or repository); remove it with `{} rm {name}` and run \
+                 again, and Paja creates it with the right mounts",
+                mount.display(),
+                sbx.program,
+                name = sbx.name
+            );
+        }
+    }
     if sbx.exec_ok(TOOLCHAIN_CHECK).is_err() {
-        sbx.exec_as(Some("root"), SETUP_ROOT)
+        sbx.exec_as(Some("root"), &setup_root())
             .and_then(|()| sbx.exec_as(None, SETUP_USER))
             .with_context(|| {
                 format!(
@@ -210,10 +231,19 @@ impl Sbx {
         self.exec_as(None, script)
     }
 
+    /// Run `script` in the sandbox, in `dir`.
+    fn exec_in(&self, dir: &Path, script: &str) -> Result<()> {
+        self.exec_run(Some(dir), None, script)
+    }
+
     /// Run `script` in the sandbox as `user` (the sandbox's default user when `None`).
     fn exec_as(&self, user: Option<&str>, script: &str) -> Result<()> {
+        self.exec_run(None, user, script)
+    }
+
+    fn exec_run(&self, dir: Option<&Path>, user: Option<&str>, script: &str) -> Result<()> {
         let mut cmd = Command::new(&self.program);
-        cmd.arg("exec").args(["-w", "/"]);
+        cmd.arg("exec").arg("-w").arg(dir.unwrap_or(Path::new("/")));
         if let Some(user) = user {
             cmd.args(["-u", user]);
         }
@@ -303,6 +333,62 @@ mod tests {
         assert!(signed_out("", "Not logged in"));
         assert!(!signed_out(r#"{"is_error": true, "result": "boom"}"#, ""));
         assert!(!signed_out(r#"{"is_error": false, "result": "done"}"#, ""));
+    }
+
+    /// Run `apt_retry` over a fake `apt-get` (a shell function) that holds the lock for
+    /// `held` calls, then succeeds. Returns whether it succeeded, its stdout and stderr.
+    fn run_apt_retry(held: u32, tries: u32) -> (bool, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir
+            .path()
+            .join("calls")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let script = format!(
+            "{APT_RETRY}\n\
+             fake_apt() {{\n  n=$(cat '{counter}' 2>/dev/null || echo 0); n=$((n + 1)); \
+             echo $n > '{counter}'\n  \
+             if [ \"$n\" -le {held} ]; then\n    \
+             echo 'E: Could not get lock /var/lib/apt/lists/lock. It is held by process 437 (apt-get)'\n    \
+             return 100\n  fi\n  echo installed\n}}\n\
+             apt_retry fake_apt update"
+        );
+        let out = Command::new("sh")
+            .args(["-c", &script])
+            .env("PAJA_APT_TRIES", tries.to_string())
+            .env("PAJA_APT_INTERVAL", "0")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn apt_setup_waits_for_a_held_lock() {
+        let (ok, stdout, stderr) = run_apt_retry(1, 5);
+        assert!(ok, "{stderr}");
+        assert!(stdout.contains("installed"), "{stdout}");
+    }
+
+    #[test]
+    fn apt_setup_gives_up_naming_the_lock() {
+        let (ok, _, stderr) = run_apt_retry(u32::MAX, 3);
+        assert!(!ok);
+        assert!(
+            stderr.contains("/var/lib/apt/lists/lock") && stderr.contains("still held"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn setup_runs_apt_through_the_retry() {
+        let script = setup_root();
+        assert!(script.contains("apt_retry apt-get update"), "{script}");
+        assert!(script.contains("apt_retry apt-get install"), "{script}");
     }
 
     #[test]
