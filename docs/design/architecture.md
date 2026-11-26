@@ -151,6 +151,23 @@ loop too. Any error after a Ctrl-C ends the same way rather than parking the ite
 with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. A program that
 starts `paja run` without a terminal (Paja Desk) passes `--stop-on-stdin` and writes a `stop` or `stop now` line to
 its stdin instead, which counts as the first or second Ctrl-C on every platform; stdin closing leaves the run going.
+
+`paja run --every M --workers N` runs a pool of lanes (`crates/paja/src/mestari/pool.rs`). One process holds
+`runs/<owner>@<name>@pool.lock`, so a repository has one pool, and keeps up to N lanes busy. Each lane is a `paja run
+--item <issue>` of its own, in its own Ahjo environment, that skips the sync; the pool syncs Jono for all of them, at the
+start, after a lane finishes and every M minutes while a lane is free. Every tick (half a second) it reads the lane
+count, the latest `pool.lanes` event (`repo`, `lanes`), and hands each free lane the next item a run could take
+(`jono::runnable`: items a stopped run left active first, then ready ones, never one a live run holds). `paja pool
+lanes <N>` records a new count, which the running pool reads on its next tick: a higher one starts lanes then, and a
+lower one lets running items finish and starts none until the busy lanes are under it. An item whose lane ended on an
+error waits for the next timed sync, as `--every` waits after a failed pass. The pool records `pool.started` (`repo`,
+`lanes`, `pid`), `pool.lane` (`repo`, `lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage`
+is `starting`, `build`, `checks`, `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja
+pool status` and its MCP tool `pool_status` rebuild the pool from them and the lock alone. Ctrl-C or a `stop` line
+stops admitting and is passed on to every lane's run, which finishes its step as one run does; the pool stops when
+the lanes have. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
+(`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes.
+
 Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, local git and the programs `.paja/commands` lists (`cargo` by default).
@@ -387,7 +404,7 @@ configuration from and the worktree's links to the repository. If they changed, 
 or changed with their old and new values (shown only in sections such as `core.` and `extensions.`, and never when they
 look like a URL with a user or a header; a name holding a URL shows only its section and key), so a person can tell what
 wrote them (a `--every` loop included), without running git or gh there again, not even to clean up or comment on the
-issue. The guard also notices another environment's links and configuration changing. Until a person has checked that
+issue. The guard also notices another environment's links and configuration changing; an environment another run (a pool's other lane) is adding while the snapshot is taken, whose `gitdir` and `commondir` aren't both written yet, is left to the next snapshot, and one removed meanwhile doesn't count. Until a person has checked that
 repository (found by its shared git directory, however its path is spelled) and runs `paja run --tamper-checked`, every
 command and MCP tool that runs git or gh there refuses: later runs, `work sync`, `env create` and `env remove`. The
 check lives in Ahjo: `ahjo::untampered` returns a proof (`Untampered`) that Ahjo's git helper and Jono's gh helper

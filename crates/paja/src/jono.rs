@@ -945,41 +945,17 @@ pub fn claim_for_run_item(home: &Home, repo: &str, only: Option<u64>) -> Result<
     let lock = home.lock()?;
     let log = home.events();
     pin_legacy(&lock, &log, repo)?;
-    let events = log.read_all()?;
-    // Which items' latest status change was a run's claim.
-    let mut by_run = BTreeMap::new();
-    // Replaying first refuses a status change it can't read, so every one parses here. Only
-    // this repository's items are ever taken, whatever the log holds of others.
-    let items = replay_repo(&events, repo)?;
-    let legacy = legacy_repo(&events, repo);
-    for event in events
-        .iter()
-        .filter(|e| e.kind == EV_STATUS && event_repo(e, legacy) == repo)
-    {
-        if let Ok(change) = serde_json::from_value::<StatusChange>(event.data.clone()) {
-            by_run.insert(change.number, change.run && change.status == Status::Active);
-        }
-    }
-    for item in items.values() {
-        let left =
-            item.open && item.status == Status::Active && by_run.get(&item.number) == Some(&true);
-        if !left || !wanted(item) {
-            continue;
-        }
+    let (left, ready) = run_candidates(&log.read_all()?, repo)?;
+    for item in left.into_iter().filter(wanted) {
         if let Some(run_lock) = home.try_run_lock(repo, item.number)? {
             return Ok(Some(RunClaim {
-                item: item.clone(),
+                item,
                 lock: run_lock,
                 resumed: true,
             }));
         }
     }
-    let mut ordered: Vec<&WorkItem> = items.values().collect();
-    ordered.sort_by_key(|item| item.priority);
-    for item in ordered
-        .into_iter()
-        .filter(|item| is_ready(item) && wanted(item))
-    {
+    for item in ready.into_iter().filter(wanted) {
         // A queued item a live run still holds (set back by hand mid-run) waits for that run.
         let Some(run_lock) = home.try_run_lock(repo, item.number)? else {
             continue;
@@ -992,7 +968,7 @@ pub fn claim_for_run_item(home: &Home, repo: &str, only: Option<u64>) -> Result<
                 "run": true
             }),
         )?;
-        let mut item = item.clone();
+        let mut item = item;
         item.status = Status::Active;
         item.note = None;
         return Ok(Some(RunClaim {
@@ -1002,6 +978,55 @@ pub fn claim_for_run_item(home: &Home, repo: &str, only: Option<u64>) -> Result<
         }));
     }
     Ok(None)
+}
+
+/// What a `paja run` could take now, in the order it takes them: the items earlier runs left
+/// active whose run is gone, then the ready ones. Items a live run holds are left out. A pool
+/// hands these to its lanes; the lanes' own runs claim them.
+pub fn runnable(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
+    let lock = home.lock()?;
+    let log = home.events();
+    pin_legacy(&lock, &log, repo)?;
+    let (left, ready) = run_candidates(&log.read_all()?, repo)?;
+    let mut free = Vec::new();
+    for item in left.into_iter().chain(ready) {
+        // Probed under the home lock, under which runs claim, so a claim never meets the probe.
+        if home.try_run_lock(repo, item.number)?.is_some() {
+            free.push(item);
+        }
+    }
+    Ok(free)
+}
+
+/// The items of `repo` a run may take, before their run locks are looked at: those an earlier
+/// `paja run` left active (its latest status change was a run's claim), and the ready ones in
+/// priority order. Items a person or another worker claimed with `paja work claim` are in
+/// neither.
+fn run_candidates(events: &[Event], repo: &str) -> Result<(Vec<WorkItem>, Vec<WorkItem>)> {
+    // Which items' latest status change was a run's claim.
+    let mut by_run = BTreeMap::new();
+    // Replaying first refuses a status change it can't read, so every one parses here. Only
+    // this repository's items are ever taken, whatever the log holds of others.
+    let items = replay_repo(events, repo)?;
+    let legacy = legacy_repo(events, repo);
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EV_STATUS && event_repo(e, legacy) == repo)
+    {
+        if let Ok(change) = serde_json::from_value::<StatusChange>(event.data.clone()) {
+            by_run.insert(change.number, change.run && change.status == Status::Active);
+        }
+    }
+    let left = items
+        .values()
+        .filter(|item| {
+            item.open && item.status == Status::Active && by_run.get(&item.number) == Some(&true)
+        })
+        .cloned()
+        .collect();
+    let mut ready: Vec<WorkItem> = items.into_values().filter(is_ready).collect();
+    ready.sort_by_key(|item| item.priority);
+    Ok((left, ready))
 }
 
 /// Read a status name as the CLI and MCP tools take it.

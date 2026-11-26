@@ -71,6 +71,19 @@ enum Command {
         /// Desk; never asks for confirmation.
         #[arg(long)]
         stop_on_stdin: bool,
+        /// With --every: keep up to this many items going at once, each in a lane of its own
+        /// (its own `paja run` and environment). `paja pool lanes <N>` changes the number while
+        /// it runs, and `paja pool status` shows the lanes.
+        #[arg(long, value_name = "N", requires = "every", value_parser = clap::value_parser!(u32).range(1..=paja::mestari::pool::MAX_LANES as i64))]
+        workers: Option<u32>,
+        /// A pool's lane: its pool synced Jono already, so the run doesn't.
+        #[arg(long, hide = true, requires = "item")]
+        lane: bool,
+    },
+    /// The worker pool of `paja run --workers`: its lane count and its lanes.
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommand,
     },
     /// Sort the open follow-up issues: one cheap agent reading the default branch marks each as
     /// keep, duplicate, already fixed or not worth doing. Duplicates and already-fixed issues
@@ -157,6 +170,28 @@ enum Command {
         /// Only the last N events.
         #[arg(long)]
         limit: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolCommand {
+    /// Set the number of lanes the repository's pool keeps busy, or show it. A running pool
+    /// reads it on its next tick: more lanes start then; fewer let running items finish and
+    /// start no new ones until the busy lanes are under the number.
+    Lanes {
+        /// 0 to 32; 0 lets the busy lanes finish and starts none. Leave it out to show it.
+        #[arg(value_parser = clap::value_parser!(u32).range(0..=paja::mestari::pool::MAX_LANES as i64))]
+        lanes: Option<u32>,
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// The pool: running or stopped, its lanes (item, stage, step, time in step, spend), the
+    /// items waiting and why, and the latest landings.
+    Status {
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
     },
 }
 
@@ -437,6 +472,8 @@ fn run(cli: &Cli) -> Result<()> {
             yes,
             tamper_checked,
             stop_on_stdin,
+            workers,
+            lane,
         } => {
             // Only a single run on a terminal asks; a loop and a script never wait for a person.
             // `--once` is also what a run without `--every` does; the flag names it.
@@ -454,6 +491,23 @@ fn run(cli: &Cli) -> Result<()> {
             if *stop_on_stdin {
                 paja::platform::stop_on_stdin();
             }
+            if let (Some(lanes), Some(minutes)) = (workers, every) {
+                let pool = mestari::pool::run(
+                    &home,
+                    mestari::pool::PoolOptions {
+                        repo,
+                        lanes: *lanes,
+                        every: *minutes,
+                        json: cli.json,
+                    },
+                );
+                if let Err(err) = &pool {
+                    if mestari::is_fatal(err) {
+                        paja::posti::stopped(&home, repo);
+                    }
+                }
+                return pool;
+            }
             loop {
                 let outcome = mestari::run_once(
                     &home,
@@ -462,6 +516,7 @@ fn run(cli: &Cli) -> Result<()> {
                         tamper_checked: std::mem::take(&mut checked),
                         item: *item,
                         confirm,
+                        sync: !*lane,
                     },
                 );
                 let Some(minutes) = every else {
@@ -634,6 +689,30 @@ fn run(cli: &Cli) -> Result<()> {
                 emit(cli, serde_json::to_value(&item)?, || {
                     item.as_ref()
                         .map_or("nothing queued".to_string(), describe_item)
+                });
+            }
+        },
+        Command::Pool { command } => match command {
+            PoolCommand::Lanes { lanes, repo } => {
+                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let report = mestari::pool::lanes(&home, &name, *lanes)?;
+                emit(cli, serde_json::to_value(&report)?, || {
+                    let count = report
+                        .lanes
+                        .map_or("no lane count set".to_string(), |n| format!("{n} lanes"));
+                    let state = if report.running {
+                        "running"
+                    } else {
+                        "not running"
+                    };
+                    format!("pool of {}: {count} ({state})", report.repo)
+                });
+            }
+            PoolCommand::Status { repo } => {
+                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let status = mestari::pool::status(&home, &name)?;
+                emit(cli, serde_json::to_value(&status)?, || {
+                    mestari::pool::describe(&status, paja::events::now_ms())
                 });
             }
         },

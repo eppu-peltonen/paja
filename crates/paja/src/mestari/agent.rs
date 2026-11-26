@@ -1159,6 +1159,14 @@ impl GitGuard {
         if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
             for entry in entries.flatten() {
                 let dir = entry.path();
+                // A worktree another run (a pool's other lane) is adding right now has no
+                // `gitdir` or `commondir` with content yet, and gets them in a moment: that is
+                // not a change to an existing worktree. Watching starts with its next snapshot.
+                let written =
+                    |name: &str| read_regular(&dir.join(name)).is_some_and(|b| !b.is_empty());
+                if dir != own && !(written("gitdir") && written("commondir")) {
+                    continue;
+                }
                 for name in ["gitdir", "commondir", "config.worktree"] {
                     guard.others.push(dir.join(name));
                 }
@@ -1432,6 +1440,54 @@ mod tests {
             !err.contains("repositoryformatversion") && !err.contains("[core]"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn guard_ignores_a_worktree_being_added_but_not_a_changed_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let main = dir.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", tail(&out));
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.name=paja",
+            "-c",
+            "user.email=paja@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ]);
+        let worktree = dir.join("work");
+        run(&["worktree", "add", "-q", worktree.to_str().unwrap()]);
+        run(&["worktree", "add", "-q", dir.join("other").to_str().unwrap()]);
+        let admin = main.join(".git/worktrees");
+        // Another lane's `git worktree add` caught halfway: `gitdir` written, `commondir` not.
+        let adding = admin.join("adding");
+        std::fs::create_dir_all(&adding).unwrap();
+        std::fs::write(
+            adding.join("gitdir"),
+            dir.join("adding/.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let guard = GitGuard::new(&worktree).unwrap();
+        std::fs::write(adding.join("commondir"), "../..\n").unwrap();
+        guard.check("another run").unwrap();
+        // A worktree that was complete is still watched.
+        std::fs::write(admin.join("other/commondir"), "/elsewhere\n").unwrap();
+        let err = format!("{:#}", guard.check("the agent").unwrap_err());
+        assert!(err.contains("other"), "{err}");
     }
 
     #[test]

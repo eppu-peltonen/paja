@@ -1692,6 +1692,7 @@ impl Factory {
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/hang-fix ]; then : > {d}/hanging; while [ -f {d}/hang-fix ]; do sleep 0.1; done; exit 1; fi ;; esac\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
+                 for w in $(ls {d}/holds 2>/dev/null); do case \"$*\" in *\"$w feature\"*) : > {d}/holding-$w; while [ -f {d}/holds/$w ]; do sleep 0.1; done ;; esac; done\n\
                  if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/leave-merge ]; then rm {d}/leave-merge; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  echo built >> feature.txt\n\
@@ -5164,4 +5165,230 @@ fn a_merge_github_refuses_escalates_naming_the_setting() {
         "{question}"
     );
     assert!(question.contains("allow squash merging"), "{question}");
+}
+
+/// A pool's test factory: items #5 Alpha, #6 Beta, #7 Gamma (and #8 Delta with `four`), each
+/// builder held until its `holds/<title>` file is removed.
+#[cfg(unix)]
+fn pool_factory(four: bool) -> Factory {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    let mut titles = vec!["Alpha", "Beta", "Gamma"];
+    if four {
+        titles.push("Delta");
+    }
+    let issues: Vec<Value> = titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            serde_json::json!({"number": 5 + i, "title": format!("{t} feature"), "body": "Please.",
+                               "url": format!("https://example.com/{}", 5 + i)})
+        })
+        .collect();
+    std::fs::write(dir.join("issues.json"), Value::Array(issues).to_string()).unwrap();
+    std::fs::create_dir_all(dir.join("holds")).unwrap();
+    for t in titles {
+        std::fs::write(dir.join("holds").join(t), "").unwrap();
+    }
+    f
+}
+
+#[cfg(unix)]
+fn start_pool(f: &Factory, workers: &str) -> std::process::Child {
+    let log = std::fs::File::create(f.tmp.path().join("pool.err")).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env_remove("PAJA_SBX")
+        .args([
+            "--json",
+            "run",
+            "--every",
+            "1",
+            "--workers",
+            workers,
+            "--stop-on-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(log)
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn wait_until(f: &Factory, what: &str, mut done: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !done() {
+        if started.elapsed().as_secs() >= 90 {
+            let err = std::fs::read_to_string(f.tmp.path().join("pool.err")).unwrap_or_default();
+            let tail: Vec<&str> = err.lines().rev().take(30).collect();
+            let (_, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+            let held: Vec<String> = std::fs::read_dir(f.tmp.path())
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| name.starts_with("holding-"))
+                .collect();
+            let (_, log) = paja(&f.home, &f.repo, &["log"]);
+            let log: Vec<String> = log
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| format!("{} {} {}", e["seq"], e["kind"], e["data"]))
+                .collect();
+            panic!(
+                "{what} never happened; holding {held:?}; pool status {status}\nlog:\n{}\nits last lines:\n{}",
+                log.join("\n"),
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn holding(f: &Factory, title: &str) -> bool {
+    f.tmp.path().join(format!("holding-{title}")).exists()
+}
+
+#[cfg(unix)]
+fn release(f: &Factory, title: &str) {
+    std::fs::remove_file(f.tmp.path().join("holds").join(title)).unwrap();
+}
+
+#[cfg(unix)]
+fn landed(f: &Factory) -> usize {
+    let (_, items) = paja(&f.home, &f.repo, &["work", "list"]);
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["status"] == "landed")
+        .count()
+}
+
+/// Stop the pool with a `stop` line and return its stdout lines, one report per item.
+#[cfg(unix)]
+fn stop_pool(f: &Factory, mut pool: std::process::Child) -> Vec<Value> {
+    use std::io::Write as _;
+    let mut stdin = pool.stdin.take().unwrap();
+    writeln!(stdin, "stop").unwrap();
+    stdin.flush().unwrap();
+    let output = pool.wait_with_output().unwrap();
+    let err = std::fs::read_to_string(f.tmp.path().join("pool.err")).unwrap_or_default();
+    assert!(output.status.success(), "{err}");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
+    let f = pool_factory(false);
+    let pool = start_pool(&f, "2");
+    wait_until(&f, "two lanes building", || {
+        holding(&f, "Alpha") && holding(&f, "Beta")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(!holding(&f, "Gamma"), "a third lane started");
+    let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert!(ok, "{status}");
+    assert_eq!(status["state"], "running", "{status}");
+    assert_eq!(status["busy"], 2, "{status}");
+    assert_eq!(status["target"], 2, "{status}");
+    assert_eq!(status["admitted"], serde_json::json!([5, 6]), "{status}");
+    assert_eq!(status["lanes"][0]["stage"], "build", "{status}");
+    assert_eq!(status["waiting"][0]["number"], 7, "{status}");
+    assert_eq!(status["waiting"][0]["why"], "no free lane", "{status}");
+    // The MCP tool returns the same value.
+    let mut mcp = Mcp::start(&f.home, &f.repo, &[("PAJA_GH", f.gh.as_path())]);
+    mcp.initialize();
+    let (ok, by_mcp) = mcp.call("pool_status", serde_json::json!({}));
+    assert!(ok, "{by_mcp}");
+    assert_eq!(by_mcp["admitted"], status["admitted"]);
+    assert_eq!(
+        by_mcp["lanes"][0]["since_ms"],
+        status["lanes"][0]["since_ms"]
+    );
+
+    // A lane that finishes takes the third item.
+    release(&f, "Alpha");
+    wait_until(&f, "the third item starting", || holding(&f, "Gamma"));
+    release(&f, "Beta");
+    release(&f, "Gamma");
+    wait_until(&f, "all three landing", || landed(&f) == 3);
+    let reports = stop_pool(&f, pool);
+    let mut numbers: Vec<u64> = reports
+        .iter()
+        .inspect(|r| assert_eq!(r["outcome"], "landed", "{r}"))
+        .map(|r| r["number"].as_u64().unwrap())
+        .collect();
+    numbers.sort();
+    assert_eq!(numbers, [5, 6, 7]);
+    assert!(reports.iter().all(|r| r["lane"].as_u64().is_some()));
+    let (_, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert_eq!(status["state"], "stopped", "{status}");
+    assert_eq!(status["busy"], 0, "{status}");
+    assert_eq!(status["landed"].as_array().unwrap().len(), 3, "{status}");
+    let lanes = events_of(&f, "pool.lane");
+    for stage in ["starting", "build", "checks", "review", "land", "done"] {
+        assert!(
+            lanes.iter().any(|e| e["data"]["stage"] == stage),
+            "no {stage} in {lanes:?}"
+        );
+    }
+    assert_eq!(events_of(&f, "pool.stopped").len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn pool_lanes_changes_a_running_pools_lanes() {
+    let f = pool_factory(true);
+    let pool = start_pool(&f, "2");
+    wait_until(&f, "two lanes building", || {
+        holding(&f, "Alpha") && holding(&f, "Beta")
+    });
+    let (ok, lanes) = paja(&f.home, &f.repo, &["pool", "lanes", "1"]);
+    assert!(ok, "{lanes}");
+    assert_eq!(lanes["lanes"], 1);
+    assert_eq!(lanes["running"], true);
+    // Both running items go on; when one is done, none starts in its place.
+    release(&f, "Alpha");
+    wait_until(&f, "Alpha landing", || landed(&f) == 1);
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    assert!(
+        !holding(&f, "Gamma") && !holding(&f, "Delta"),
+        "a lane started over the limit"
+    );
+    let (_, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert_eq!(status["busy"], 1, "{status}");
+    // Raised, the next tick starts the new lanes.
+    let (_, shown) = paja(&f.home, &f.repo, &["pool", "lanes"]);
+    assert_eq!(shown["lanes"], 1);
+    paja(&f.home, &f.repo, &["pool", "lanes", "3"]);
+    wait_until(&f, "two more lanes starting", || {
+        holding(&f, "Gamma") && holding(&f, "Delta")
+    });
+    let (_, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert_eq!(status["busy"], 3, "{status}");
+    for t in ["Beta", "Gamma", "Delta"] {
+        release(&f, t);
+    }
+    wait_until(&f, "all four landing", || landed(&f) == 4);
+    assert_eq!(stop_pool(&f, pool).len(), 4);
+}
+
+#[test]
+fn workers_needs_every_and_pool_lanes_has_a_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ok, err) = paja(tmp.path(), tmp.path(), &["run", "--workers", "2"]);
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("--every"), "{err}");
+    let (ok, err) = paja(tmp.path(), tmp.path(), &["pool", "lanes", "33"]);
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("33"), "{err}");
 }
