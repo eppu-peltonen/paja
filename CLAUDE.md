@@ -39,9 +39,10 @@ the real repository, to the smoke tests.
   the review prompt and verdicts), `agent.rs` (`claude()`, the hook settings and self-test, the sandbox glue,
   `GitGuard`) and `land.rs` (landing, waiting for CI, escalation). `usage.rs` (what a step spent), `progress.rs`
   (stderr text), `follow_ups.rs` and `builder.rs` (the builder's question and answers) are normal risk.
-- `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`: Vasara's check commands, the high-risk path
-  prefixes, the model per agent role and the programs agents may run besides local git (`review <program>` for
-  reviewers too; `cargo` when missing). `paja run` reads them from `main`, never from the branch under review.
+- `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`, `.paja/labels`: Vasara's check commands, the
+  high-risk path prefixes, the model per agent role, the programs agents may run besides local git (`review <program>`
+  for reviewers too; `cargo` when missing) and the repository's `work` and `follow-up` issue labels (`factory` and
+  `factory-follow-up` when missing). `paja run` reads them from `main`, never from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It allows local
   git and the programs Mestari passes from `.paja/commands`, and it fails closed.
 - `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.

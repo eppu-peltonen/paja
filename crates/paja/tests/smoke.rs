@@ -671,7 +671,9 @@ fn the_mcp_server_answers_and_files_issues() {
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(log.contains("issue comment 3 --body"), "{log}");
     assert!(
-        log.contains("issue create --label paja --title Add a status page --body What to build."),
+        log.contains(
+            "issue create --label factory --title Add a status page --body What to build."
+        ),
         "{log}"
     );
     mcp.finish();
@@ -741,7 +743,7 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     assert_eq!(report["imported"], serde_json::json!([7, 3]));
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(
-        log.contains("--label paja") && log.contains("--state open"),
+        log.contains("--label factory") && log.contains("--state open"),
         "{log}"
     );
 
@@ -984,9 +986,77 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
     assert_eq!(filed["url"], "https://example.com/9");
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(
-        log.contains("issue create --label paja --title Add a status page --body What to build."),
+        log.contains(
+            "issue create --label factory --title Add a status page --body What to build."
+        ),
         "{log}"
     );
+}
+
+#[test]
+fn a_repository_names_its_own_work_and_follow_up_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("game"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(
+        repo.join(".paja/labels"),
+        "# queue labels\nwork game\nfollow-up game-ideas\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    // A `gh` that lists issues only for the label `game`, as GitHub would.
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/game\"}}' ;;\n\
+             \"issue list\") case \"$*\" in *\"--label game \"*) echo '[{{\"number\": 4, \"title\": \"Add a boss\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; *) echo '[]' ;; esac ;;\n\
+             \"issue create\") echo https://example.com/9 ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["imported"], serde_json::json!([4]));
+    let (ok, filed) = paja_with(
+        &home,
+        &repo,
+        &["work", "file", "--title", "Add a level", "--body", "Soon."],
+        &with_gh,
+    );
+    assert!(ok, "{filed}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("issue create --label game --title Add a level"),
+        "{log}"
+    );
+    assert!(!log.contains("factory"), "{log}");
+}
+
+#[test]
+fn a_bad_labels_file_says_which_line_to_fix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\nwork other\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    let gh = fake_gh(tmp.path(), "[]");
+    let (ok, err) = paja_with(
+        &home,
+        &repo,
+        &["work", "sync"],
+        &[("PAJA_GH", gh.as_path())],
+    );
+    assert!(!ok);
+    let err = err["error"].as_str().unwrap();
+    assert!(err.contains(".paja/labels on main, line 2"), "{err}");
 }
 
 /// A fake `gh` for a repository called `name` (`owner/name`) whose open issues are `issues`
@@ -1371,6 +1441,25 @@ fn run_lands_an_issue_whose_prompt_is_longer_than_a_windows_command_line() {
 }
 
 #[test]
+fn a_run_uses_the_labels_main_names() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.on_main(".paja/labels", "work game\nfollow-up game-ideas\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(
+        log.contains("issue list --label game --state open"),
+        "{log}"
+    );
+    assert!(
+        log.contains("issue create --label game-ideas --title Tidy the helper"),
+        "{log}"
+    );
+    assert!(!log.contains("factory"), "{log}");
+}
+
+#[test]
 fn run_builds_reviews_and_lands_an_issue() {
     // Vasara's checks run the branch's code, so they get no GitHub access either: Mestari's
     // `PAJA_GH` is gone, and so is its PAJA_HOME.
@@ -1408,7 +1497,7 @@ fn run_builds_reviews_and_lands_an_issue() {
     // A finding that didn't block landing becomes an issue for a person to queue, not queued
     // work.
     assert!(
-        log.contains("issue create --label paja-follow-up --title Tidy the helper"),
+        log.contains("issue create --label factory-follow-up --title Tidy the helper"),
         "{log}"
     );
     // The prompt reaches `claude` on stdin, not on its command line.

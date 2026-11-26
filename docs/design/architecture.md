@@ -33,7 +33,7 @@ flowchart TB
 | Unit | Job | First version built with |
 | --- | --- | --- |
 | **Ahjo** (environments) | An isolated environment per chunk: git worktree, ports, database, services, seed data. Each one sandboxed and failing closed (no run if the sandbox can't start, hooks block when they fail), with a GitHub token that reaches only the repository being worked on | git worktrees, Docker Compose |
-| **Jono** (queue and scheduler) | Work items with dependencies (`Depends on #N`); lease each chunk to one worker; pick the next one with plain rules; enforce a diff-size budget per chunk; pace work to the account's usage limits | GitHub issues labelled `paja`, event log |
+| **Jono** (queue and scheduler) | Work items with dependencies (`Depends on #N`); lease each chunk to one worker; pick the next one with plain rules; enforce a diff-size budget per chunk; pace work to the account's usage limits | GitHub issues with the work label (`.paja/labels`, `paja` in this repository), event log |
 | **Kaava** (specs and harness) | Versioned specs with acceptance criteria and a risk tier; held-out scenarios the builder never sees; an eval suite of real chunks that tests the harness itself; the domain harness and canon rules, the `CLAUDE.md` and skills each environment reads from the project's default branch rather than from outside the repository | Markdown in the repo |
 | **Mestari** (orchestrator) | Run workflow graphs: spec, plan, build, verify, review, land, post-land verify. Fix loops are capped at three rounds, after which the builder rethinks the approach instead of patching. Planner, builder, reviewer and evaluator are separate roles. A learn step after landing drafts harness rules from failures | YAML graphs; `claude -p` subprocesses |
 | **Vasara** (verifier) | Load rules and scenarios from `main`, never from the branch; boot the environment and run deterministic and end-to-end checks; an independent, skeptical evaluator agent grades the running app against the acceptance criteria and held-out scenarios; after landing, re-run on `main` and revert on failure | The app's own test commands, Playwright |
@@ -61,8 +61,11 @@ events appends a `work.synced` event naming it, so a later command from another 
 
 ## Work queue
 
-Jono's items are GitHub issues labelled `paja`, each belonging to a repository. `paja work sync` reads the open ones of
-the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
+Jono's items are GitHub issues with the work label (`.paja/labels`, `paja` in this repository), each belonging to a
+repository. `.paja/labels`, read from the default branch like `.paja/checks` and never from the branch under review,
+has two lines: `work <label>`, which Jono imports, and `follow-up <label>`, which Mestari files non-blocking findings
+with. Without the file they are `factory` and `factory-follow-up`; this repository keeps `paja` and `paja-follow-up`.
+`paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
 events; it never touches another repository's items, even when their issue numbers are the same. `paja work
 list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
 in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with its
@@ -90,7 +93,7 @@ issue's comments; a reply on the issue alone doesn't reach them, and Paja's ques
 same reason `paja work set <issue> queued` refuses an escalated item and points at `paja work answer`; it is the only
 way an escalated item is queued again. Setting it `active` and then `queued` by hand still works, as a deliberate
 escape hatch for an item that needs no answer.
-`paja work file --title --body` opens a new issue labelled `paja`. Both use `gh`, and the MCP tools `work_answer` and
+`paja work file --title --body` opens a new issue with the work label. Both use `gh`, and the MCP tools `work_answer` and
 `work_file` do the same.
 
 ## The run loop
@@ -153,7 +156,7 @@ most three rounds:
    run that changes those flags changed the index.
 3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
    answers `land`, `changes` (blockers only) or `escalate`, plus non-blocking follow-ups that Mestari files as
-   `paja-follow-up` issues once the change lands. A later round's reviewer judges only the fix for the earlier
+   follow-up issues (the `follow-up` label of `.paja/labels`) once the change lands. A later round's reviewer judges only the fix for the earlier
    blockers, except on high-risk changes. It may read, run cargo and use read-only git, and changes nothing. Its
    prompt names the commit Vasara's checks passed at, which the run loop passes in and the review refuses to judge
    if `HEAD` has moved from it, and tells it not to re-run formatting, lints or the full test suite; to probe a
