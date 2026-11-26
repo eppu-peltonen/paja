@@ -22,7 +22,7 @@ flowchart TB
     repos["App repos, new or existing<br/>Paja files (.paja/, CLAUDE.md) on the default branch"]
 
     cc -- "MCP, CLI" --> iface
-    desk -- "HTTP API" --> iface
+    desk -- "in-process (HTTP API after v0.1)" --> core
     iface --> core
     mestari -- starts --> workers
     workers -- "land verified changes" --> repos
@@ -40,7 +40,7 @@ flowchart TB
 | **Posti** (inbox) | Collect every agent question and escalation; send one digest, each item with options and a recommendation; mirror status to the issue | Issue comments, event log |
 | Interface | One set of core functions exposed three ways, all reading from the event log | CLI (`paja ... --json`), MCP server (official Rust MCP SDK), HTTP API |
 | Claude Code plugin | `plugin/`: the MCP server config (`paja mcp`) and the skills `/paja:status` (the queue, latest events, open questions), `/paja:answer` (answer an escalation and requeue it) and `/paja:spec` (turn a conversation into a `paja` issue after the person approves it). The skills change Paja's state only through its MCP tools. Agents Mestari starts load no plugins; their deny-list hook is set by Mestari itself | Claude Code plugin, installed from this repository's marketplace |
-| **Paja Desk** | Board of chunks, Posti inbox, outcome metrics, spend and history, usable from a phone | Web app over the HTTP API, TypeScript types generated from the core |
+| **Paja Desk** | Board of chunks, Posti inbox, outcome metrics, spend and history, usable from a phone | Desktop app (Tauri 2) calling the core in-process; the HTTP API, for the phone, comes after v0.1 |
 
 ## State
 
@@ -456,4 +456,25 @@ tool returns the JSON the matching `paja --json` command prints, and a failure i
 ## CLI output
 
 Under `--json` every command prints exactly one JSON value on stdout. Failures, usage errors included, carry an
-`error` key and exit non-zero; `--help` prints `{"help": ...}` and `--version` prints `{"version": ...}`.
+`error` key and exit non-zero; `--help` prints `{"help": ...}` and `--version` prints `{"version": ..., "commit": ...}`.
+
+## Paja Desk
+
+Paja Desk (`desk/`, the `paja-desk` crate) is a Tauri 2 desktop app: a native window (WebView2 on Windows, WebKit on
+macOS, WebKitGTK on Linux) with a plain HTML, CSS and JavaScript front end in `desk/ui/`, so `cargo build -p paja-desk`
+builds all of it with no npm step. Its Rust side depends on the `paja` crate and calls the same library functions as
+the CLI and the MCP server, in-process, through Tauri commands that return the JSON `paja --json` prints: it is another
+door to the one core. Desk keeps no state of its own. Everything it shows comes from replaying `$PAJA_HOME`'s event
+log, and any write it makes later goes through the core and holds the home lock. The HTTP API, so Desk's view reaches a
+phone, comes after v0.1.
+
+The first window is read-only. For every repository in the log it lists the work items, grouped as waiting on you
+(escalated, with the question and the answer command), active, queued and the latest landed, each linking to its issue
+(opened in the browser). It reads the queue again whenever `events.jsonl` changes, polling its size and time, and an
+error from the core shows in the window with the text the CLI prints. Desk's Tauri permissions
+(`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
+`https://github.com/` links, nothing else.
+
+Desk is a workspace member but not a default one, since it needs the webview's development files to build (WebKitGTK
+on Linux): plain `cargo build` and `cargo test` cover the core, and CI's `desk` job runs clippy and the tests for
+`-p paja-desk` on Windows and Linux.

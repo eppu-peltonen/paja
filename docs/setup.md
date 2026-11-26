@@ -193,6 +193,19 @@ repository with no GitHub Actions workflow (`gh workflow list` is empty) stops t
 error that names the two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the
 default branch. With `none`, Paja lands on Vasara's checks and the reviewers alone, and says so in the pull request body.
 
+## Paja Desk
+
+Paja Desk shows the queue of every repository Paja knows in one window, with what waits on you first, and follows the
+event log as it changes. Until it has installers, build and start it from a clone of Paja:
+
+```sh
+cargo run --release -p paja-desk
+```
+
+On Linux it needs WebKitGTK's development packages first (on Debian or Ubuntu:
+`sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`). On Windows it uses WebView2, which Windows 10 and
+11 already have. It reads the same `PAJA_HOME` as `paja`.
+
 ## Notifications
 
 Paja tells you when an item needs your answer, a pass of `paja run --every` fails, or the loop stops. Run in a terminal,

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/paja"]
+members = ["crates/paja", "desk"]
+# Desk needs a webview (WebKitGTK on Linux) to build, so plain `cargo build` and `cargo test`
+# cover the core only; `-p paja-desk` or `--workspace` builds Desk too.
+default-members = ["crates/paja"]
 
 [workspace.package]
 edition = "2021"
