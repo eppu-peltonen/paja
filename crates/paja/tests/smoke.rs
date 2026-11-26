@@ -1045,6 +1045,30 @@ fn a_repository_names_its_own_work_and_follow_up_labels() {
 }
 
 #[test]
+fn work_sync_reads_the_labels_from_a_default_branch_not_called_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, home) = (tmp.path().join("src"), tmp.path().join("home"));
+    init_repo(&src);
+    git(&src, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(src.join(".paja")).unwrap();
+    std::fs::write(src.join(".paja/labels"), "work game\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-q", "-m", "labels"]);
+    git(tmp.path(), &["clone", "-q", "--bare", "src", "origin.git"]);
+    git(tmp.path(), &["clone", "-q", "origin.git", "app"]);
+    let gh = fake_gh(tmp.path(), "[]");
+    let (ok, report) = paja_with(
+        &home,
+        &tmp.path().join("app"),
+        &["work", "sync"],
+        &[("PAJA_GH", gh.as_path())],
+    );
+    assert!(ok, "{report}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("issue list --label game"), "{log}");
+}
+
+#[test]
 fn a_bad_labels_file_says_which_line_to_fix() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -1062,7 +1086,10 @@ fn a_bad_labels_file_says_which_line_to_fix() {
     );
     assert!(!ok);
     let err = err["error"].as_str().unwrap();
-    assert!(err.contains(".paja/labels on main, line 2"), "{err}");
+    assert!(
+        err.contains(".paja/labels on the default branch, line 2"),
+        "{err}"
+    );
 }
 
 /// A fake `gh` for a repository called `name` (`owner/name`) whose open issues are `issues`
@@ -1431,6 +1458,7 @@ impl Factory {
                  \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
+                 \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi ;;\n\
                  \"pr checks\") if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
@@ -3952,4 +3980,19 @@ fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
         !stderr.contains("sending the failure back to the builder"),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_merge_github_refuses_escalates_naming_the_setting() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("GitHub refused to merge https://example.com/pull/1"),
+        "{question}"
+    );
+    assert!(question.contains("allow squash merging"), "{question}");
 }
