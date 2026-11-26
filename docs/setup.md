@@ -196,7 +196,9 @@ default branch. With `none`, Paja lands on Vasara's checks and the reviewers alo
 ## Paja Desk
 
 Paja Desk shows the queue of every repository Paja knows in one window, with what waits on you first, and follows the
-event log as it changes. Until it has installers, build and start it from a clone of Paja:
+event log as it changes. You can answer Paja's questions there and file new work (it shows the issue for approval
+before filing it). For a repository Paja hasn't run an item of on this machine yet, start Desk from inside its
+checkout so it knows where to run `gh`. Until it has installers, build and start it from a clone of Paja:
 
 ```sh
 cargo run --release -p paja-desk

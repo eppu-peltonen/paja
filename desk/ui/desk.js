@@ -45,20 +45,61 @@ function itemRow(item) {
   const children = [row];
   if (item.status === "escalated") {
     if (item.note) children.push(el("div", { className: "note" }, item.note));
-    children.push(
-      el("div", { className: "muted" }, [
-        "Answer with ",
-        el("code", {}, `paja work answer ${item.number} "<your answer>"`),
-      ]),
-    );
+    children.push(answerForm(item));
   }
   return el("li", {}, children);
 }
+
+// What the person has typed, by item, so a refresh or an error never loses it.
+const drafts = new Map();
+
+function answerForm(item) {
+  const key = `${item.repo}#${item.number}`;
+  const text = el("textarea", { rows: "3", placeholder: "Your answer" });
+  text.value = drafts.get(key) ?? "";
+  text.addEventListener("input", () => drafts.set(key, text.value));
+  const send = el("button", { type: "button" }, "Send answer");
+  const problem = el("p", { className: "error" });
+  problem.hidden = true;
+  send.addEventListener("click", async () => {
+    if (!text.value.trim()) {
+      problem.textContent = "Write an answer first.";
+      problem.hidden = false;
+      return;
+    }
+    send.disabled = true;
+    const result = await invoke("work_answer", {
+      repo: item.repo,
+      number: item.number,
+      text: text.value,
+    }).catch((err) => ({ error: String(err) }));
+    send.disabled = false;
+    if (result && result.error) {
+      problem.textContent = `error: ${result.error}`;
+      problem.hidden = false;
+      return;
+    }
+    drafts.delete(key);
+    refresh().catch(showError);
+  });
+  return el("div", { className: "answer" }, [
+    text,
+    el("div", { className: "actions" }, [send]),
+    problem,
+    el("div", { className: "muted" }, [
+      "Or answer with ",
+      el("code", {}, `paja work answer ${item.number} "<your answer>"`),
+    ]),
+  ]);
+}
+
+let knownRepos = [];
 
 function render(items) {
   const queue = document.getElementById("queue");
   queue.replaceChildren();
   const repos = [...new Set(items.map((i) => i.repo))].sort();
+  knownRepos = repos.filter((r) => r);
   if (repos.length === 0) {
     queue.append(el("p", { className: "muted" }, "No work items yet. Run `paja work sync` in a repository's checkout."));
   }
@@ -81,8 +122,13 @@ function showError(err) {
   box.hidden = false;
 }
 
+// Each refresh has a number; an older one that finishes late doesn't draw over a newer one.
+let latest = 0;
+
 async function refresh() {
+  const mine = ++latest;
   const result = await invoke("work_list");
+  if (mine !== latest) return;
   const box = document.getElementById("error");
   if (result && !Array.isArray(result) && result.error) {
     showError(`error: ${result.error}`);
@@ -92,6 +138,72 @@ async function refresh() {
   render(result);
   document.getElementById("updated").textContent = `updated ${new Date().toLocaleTimeString()}`;
 }
+
+// The "New work" form: edit, then review what will be filed, then file it.
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function showFiling(step) {
+  byId("file-edit").hidden = step !== "edit";
+  byId("file-confirm").hidden = step !== "confirm";
+}
+
+byId("new-work").addEventListener("click", () => {
+  const select = byId("file-repo");
+  const chosen = select.value;
+  select.replaceChildren(...knownRepos.map((r) => el("option", { value: r }, r)));
+  if (knownRepos.includes(chosen)) select.value = chosen;
+  byId("filing").hidden = false;
+  byId("file-result").hidden = true;
+  showFiling("edit");
+});
+
+byId("file-cancel").addEventListener("click", () => {
+  byId("filing").hidden = true;
+});
+
+byId("file-review").addEventListener("click", () => {
+  const result = byId("file-result");
+  if (!byId("file-repo").value || !byId("file-title").value.trim()) {
+    result.className = "error";
+    result.textContent = "Pick a repository and give the issue a title.";
+    result.hidden = false;
+    return;
+  }
+  result.hidden = true;
+  byId("confirm-repo").textContent = byId("file-repo").value;
+  byId("confirm-title").textContent = byId("file-title").value;
+  byId("confirm-body").textContent = byId("file-body").value;
+  showFiling("confirm");
+});
+
+byId("file-back").addEventListener("click", () => showFiling("edit"));
+
+byId("file-send").addEventListener("click", async () => {
+  const send = byId("file-send");
+  const result = byId("file-result");
+  send.disabled = true;
+  const filed = await invoke("work_file", {
+    repo: byId("file-repo").value,
+    title: byId("file-title").value,
+    body: byId("file-body").value,
+  }).catch((err) => ({ error: String(err) }));
+  send.disabled = false;
+  result.hidden = false;
+  if (filed && filed.error) {
+    // The text stays in the form, to fix and send again.
+    result.className = "error";
+    result.textContent = `error: ${filed.error}`;
+    showFiling("edit");
+    return;
+  }
+  result.className = "";
+  result.replaceChildren("Filed ", issueLink({ url: filed.url, number: filed.url.split("/").pop() }));
+  byId("file-title").value = "";
+  byId("file-body").value = "";
+  showFiling("edit");
+});
 
 listen("paja://events-changed", () => refresh().catch(showError));
 refresh().catch(showError);

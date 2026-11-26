@@ -10,7 +10,34 @@
     <header>
       <h1>Paja Desk</h1>
       <span id="updated" class="muted"></span>
+      <button id="new-work" type="button">New work</button>
     </header>
+    <section id="filing" hidden>
+      <h2>New work</h2>
+      <p class="muted">
+        A good issue names the goal, what done looks like, and what is out of scope, and is small enough for one
+        pull request. Paja files it with the repository's work label, and the next sync queues it.
+      </p>
+      <div id="file-edit">
+        <label>Repository <select id="file-repo"></select></label>
+        <label>Title <input id="file-title" type="text" /></label>
+        <label>Body <textarea id="file-body" rows="10"></textarea></label>
+        <div class="actions">
+          <button id="file-review" type="button">Review</button>
+          <button id="file-cancel" type="button" class="quiet">Cancel</button>
+        </div>
+      </div>
+      <div id="file-confirm" hidden>
+        <p>File this issue in <strong id="confirm-repo"></strong>?</p>
+        <h3 id="confirm-title"></h3>
+        <pre id="confirm-body"></pre>
+        <div class="actions">
+          <button id="file-send" type="button">File issue</button>
+          <button id="file-back" type="button" class="quiet">Edit</button>
+        </div>
+      </div>
+      <p id="file-result" hidden></p>
+    </section>
     <main>
       <p id="error" class="error" hidden></p>
       <div id="queue"></div>
