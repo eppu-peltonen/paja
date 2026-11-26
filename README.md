@@ -22,6 +22,9 @@ The design lives in [`docs/`](docs/index.md): start with the [overview](docs/des
 
 ## Getting started
 
+To use Paja on your own project, start with the [quickstart](docs/quickstart.md): install, set up the repository,
+write the first issue and watch Paja land it.
+
 Paja runs natively on Windows, Linux and macOS. [`docs/setup.md`](docs/setup.md) lists what to install and how to
 start Paja on its own queue (`paja run --every 5`). Every command also takes `--json`:
 
