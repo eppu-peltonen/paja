@@ -2111,6 +2111,46 @@ fn a_bad_models_file_says_which_line_to_fix() {
 }
 
 #[test]
+fn run_once_lands_one_of_two_items_and_says_what_it_will_do_without_asking() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 5, "title": "Add a feature file", "body": "Please.", "url": "https://example.com/5"},
+            {"number": 6, "title": "Another", "body": "Later.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+    // Stdin is not a terminal here, so the run must not wait for an answer.
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env_remove("PAJA_SBX")
+        .args(["--json", "run", "--once"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["number"], 5);
+    assert_eq!(report["sandbox"], false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in [
+        "repository: acme/app",
+        "#5 Add a feature file",
+        "main (default branch), by squash",
+        "CI: required",
+        "no sandbox",
+        "guardrail, not a sandbox",
+    ] {
+        assert!(stderr.contains(line), "missing {line:?} in:\n{stderr}");
+    }
+    // Only one item was taken; the other is still queued.
+    let (_, other) = paja(&f.home, &f.repo, &["work", "show", "6"]);
+    assert_eq!(other["status"], "queued");
+}
+
+#[test]
 fn run_says_what_it_is_doing_on_stderr() {
     // Building takes minutes; a silent run reads as a broken one. Stdout stays one JSON value.
     let f = Factory::new("true\n", "land");
