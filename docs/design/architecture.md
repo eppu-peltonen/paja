@@ -106,7 +106,7 @@ loop too. Any error after a Ctrl-C ends the same way rather than parking the ite
 with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. Then, for at
 most three rounds:
 
-1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
+1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, local git and the programs `.paja/commands` lists (`cargo` by default).
    A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own
    session from earlier in the same run with `--resume <session_id>` and sends only the feedback, so it keeps what it
    learned and its earlier turns come from the prompt cache. It runs with the same flags and hook as any session.
@@ -188,7 +188,7 @@ Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-confi
 tools its role uses (`Read,Edit,Write,Glob,Grep,Bash` for builders, `Read,Glob,Grep,Bash` for reviewers, so no subagent
 or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the worktree's path and git status go in the
 first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool call
-to `paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file and no
+to `paja hook --root <environment> --home <factory home> --programs <list>` as a Claude Code `PreToolUse` hook. No settings file and no
 MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it off.
 Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the branch
 under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read from
@@ -201,13 +201,23 @@ the tool call, because the reported `cwd` moves when the agent runs `cd`.
   the worktree's root as a step of its own (an absolute path with no `.` or `..` parts, since bash's `cd` drops `..` as
   text before following links, and no leading `//`, which can name a network path; a symlink or junction that is itself
   the root is accepted, since cargo and git act on where they physically run, which trusts the link not to change
-  between the hook's check and the shell following it), then `cargo`, local `git` and `pwd` commands joined by `&&`,
+  between the hook's check and the shell following it), then local `git`, `pwd` and the programs the project lists
+  (see below) joined by `&&`,
   each optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading
   `~` or `=`, a `~` right after an unquoted `=` or `:` in any word (bash expands it in assignment-like words, even in a
   commit message; the hook refuses it in every word), redirections other than `2>&1`, or other separators outside single
   quotes. Only `RUST_BACKTRACE` and `RUST_LOG` may be set in front of a command, and only the value may be quoted
   (`RUST_LOG='debug'`): bash runs a word with a quote before its `=` as a program, so the hook refuses it and says to
   quote only the value. A value with a `~` is refused, since bash expands it after the `=` or a `:`.
+- **Listed programs.** `.paja/commands`, read from the default branch like `.paja/checks` and never from the branch
+  under review, names the programs agents may run besides local `git`: one per line, `#` comments allowed (`npm`, `node`,
+  `pytest`, `go`). A line `review <program>` lets reviewers run it too; the other lines are for the builder (build and fix
+  roles) only. A missing file lists `cargo` for every role, so a repository without one behaves as before. Mestari reads
+  the file and passes the role's list as `--programs` (comma-terminated, `,` for none); a file it can't read or parse
+  stops the agent, and a hook started without the list blocks every call. A listed program runs under the shape rules
+  above and the generic checks: it must start in the worktree, and any word that names a path (also after `--flag=`)
+  must stay inside it and obey the write rules. A program not on the list is refused with a message naming
+  `.paja/commands` on the default branch as the fix. Only `cargo` and `git` have per-subcommand flag lists.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
@@ -261,7 +271,7 @@ file on every call: an agent run that took more than one turn or changed the wor
 branch is reset to where the run started. Only the two managed-settings locations (each file and its
 `managed-settings.d` drop-ins) are checked up front. The stamp catches a hook that was silently dropped, not an agent
 that forges it while hooks are off; containing that is the sandbox's job. Before each agent Mestari checks that the hook
-blocks a `git push` (for a reviewer, a local `git commit`) with the deny-list's message and allows `cargo test`, and
+blocks a `git push` (for a reviewer, a local `git commit`) with the deny-list's message and allows `git status`, and
 refuses to start the agent if not. The hook is a guardrail, not a sandbox: code the agent writes still runs under `cargo
 test`. Mestari takes away the easy ways that code could reach GitHub: agents run without GitHub or registry tokens, the
 SSH agent or askpass programs, with gh's login, git's global and system configuration and every credential helper
