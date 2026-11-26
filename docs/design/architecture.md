@@ -69,7 +69,8 @@ with. Without the file they are `factory` and `factory-follow-up`; this reposito
 events; it never touches another repository's items, even when their issue numbers are the same. `paja work
 list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
 in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with its
-`repo`. Whether an issue is open is kept apart from
+`repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no
+`work.*` event names one yet. Whether an issue is open is kept apart from
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
 oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.

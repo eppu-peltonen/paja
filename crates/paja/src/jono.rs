@@ -590,6 +590,27 @@ pub fn list_all(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
         .collect())
 }
 
+/// Every repository's work items, as [`list_all`], for a command run in `checkout`. Only a log
+/// with events from before items carried a repository, and no `work.*` event yet that names
+/// one, needs the checkout's repository; any other log is listed without asking `gh`, so this
+/// works outside a GitHub checkout too.
+pub fn list_all_from(home: &Home, checkout: &Path) -> Result<Vec<WorkItem>> {
+    let events = home.events().read_all()?;
+    let pinned = events
+        .iter()
+        .filter(|e| e.kind.starts_with("work."))
+        .any(|e| e.data["repo"].is_string());
+    let unplaced = events
+        .iter()
+        .any(|e| is_item_event(e) && !e.data["repo"].is_string());
+    let fallback = if unplaced && !pinned {
+        repo_name(home, checkout)?
+    } else {
+        String::new()
+    };
+    Ok(replay(&events, &fallback)?.into_values().collect())
+}
+
 pub fn get(home: &Home, repo: &str, number: u64) -> Result<WorkItem> {
     replay_repo(&home.events().read_all()?, repo)?
         .remove(&number)
