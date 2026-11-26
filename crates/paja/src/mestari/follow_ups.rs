@@ -188,10 +188,14 @@ mod tests {
             (repo, "<repository>"),
             (user, "<home>"),
         ];
-        let text = "See /home/me/.paja/envs/work-3/src/a.rs and /home/me/src/paja/b.rs, \
-                    /home/me/notes, token ghp_ABCDEFGHIJKLMNOPQRSTuvwx and \
-                    Authorization: Bearer abcdefghijklmnopqrstuvwxyz. Keep ghp_ and #12.";
-        let shown = redact(text, &places);
+        // Built at run time, so secret scanners don't take the test's fake tokens for real ones.
+        let token = format!("ghp_{}", "A1".repeat(12));
+        let bearer = "b2".repeat(13);
+        let text = format!(
+            "See /home/me/.paja/envs/work-3/src/a.rs and /home/me/src/paja/b.rs, /home/me/notes, \
+             token {token} and Authorization: Bearer {bearer}. Keep ghp_ and #12."
+        );
+        let shown = redact(&text, &places);
         assert_eq!(
             shown,
             "See <factory home>/envs/work-3/src/a.rs and <repository>/b.rs, <home>/notes, \
