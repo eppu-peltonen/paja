@@ -382,8 +382,19 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 }
             }
             // A wildcard can walk into a symlink the literal prefix never names, and an absolute
-            // pattern can start anywhere in the worktree, so the whole worktree is checked.
-            if let Some(link) = link_out(&bounds.root, bounds, 0) {
+            // pattern can start anywhere in the worktree, so the whole worktree is checked. A
+            // Grep without a `glob` skips what git ignores, as ripgrep does, which keeps a large
+            // `target/` from slowing every search.
+            let skip = if input.tool_name == "Grep" && t["glob"].is_null() {
+                grep_skips(
+                    bounds,
+                    &base,
+                    std::env::var_os("RIPGREP_CONFIG_PATH").is_some(),
+                )
+            } else {
+                Vec::new()
+            };
+            if let Some(link) = scan(bounds, &skip) {
                 return Ok(Some(format!(
                     "{} is a symlink out of the worktree (or nested too deep to check), and \
                      searches here could follow it; search a directory without it, or Read \
@@ -411,9 +422,97 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
     }
 }
 
+/// ripgrep's own ignore files. A `!` line in one can bring back a directory git ignores.
+const RG_IGNORE_FILES: &[&str] = &[".ignore", ".rgignore"];
+
+/// The directories a Grep without a `glob` never enters, so the symlink scan may leave them out.
+/// Git and ripgrep read ignore files with different engines, so neither is asked: the only
+/// directory ever left out is the worktree's own top-level `target`, and only when the
+/// worktree's `.gitignore` names it in a line both read the same way (`target`, `target/`,
+/// `/target` or `/target/`) and holds no `!` line that could bring it back. Anything else that
+/// could make ripgrep search it leaves nothing out:
+/// - a ripgrep config file (`rg_config`, from `RIPGREP_CONFIG_PATH`), which can turn ignores off;
+/// - a ripgrep ignore file (`.ignore`, `.rgignore`) in the worktree's top directory or above it,
+///   or a `.gitignore` above it with a `!` line;
+/// - no `.git` in the worktree, without which ripgrep ignores `.gitignore`;
+/// - a `.gitignore` that isn't all UTF-8, which ripgrep stops reading at the first bad line, or
+///   that holds anything but comments, names and `*`/`?` (no braces, classes, escapes or spaces)
+///   or is over 4 KiB, since ripgrep drops a file it can't compile;
+/// - a search that starts inside `target`.
+fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
+    let target = b.root.join("target");
+    let exists = |path: PathBuf| std::fs::symlink_metadata(path).is_ok();
+    let negates = |gitignore: PathBuf| match std::fs::read(&gitignore) {
+        Ok(text) => text
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(b"!")),
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    };
+    let rg_ignore = b.root.ancestors().any(|dir| {
+        RG_IGNORE_FILES.iter().any(|name| exists(dir.join(name)))
+            || (dir != b.root && negates(dir.join(".gitignore")))
+    });
+    // ripgrep follows a `.git` link to see whether it exists.
+    let git = std::fs::metadata(b.root.join(".git")).is_ok();
+    if rg_config || rg_ignore || !git || resolve(base).starts_with(&target) {
+        return Vec::new();
+    }
+    // ripgrep stops reading an ignore file at its first line that isn't UTF-8.
+    let Ok(text) = std::fs::read_to_string(b.root.join(".gitignore")) else {
+        return Vec::new();
+    };
+    let lines: Vec<&[u8]> = text
+        .as_bytes()
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .collect();
+    // ripgrep drops a whole ignore file whose patterns it can't compile, for example a huge
+    // brace alternation, so only a small file of names and `*`/`?` wildcards (and comments) is
+    // trusted. ripgrep compiles tens of thousands of wildcards; 4 KiB holds far fewer.
+    let plain = |line: &&[u8]| {
+        line.is_empty()
+            || line.starts_with(b"#")
+            || line
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-/*?".contains(c))
+    };
+    if text.len() > 4096 || !lines.iter().all(plain) {
+        return Vec::new();
+    }
+    let names = lines
+        .iter()
+        .any(|line| [&b"target"[..], b"target/", b"/target", b"/target/"].contains(line));
+    if names && !lines.iter().any(|line| line.starts_with(b"!")) {
+        vec![target]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The first symlink out of the worktree, leaving out the directories in `skip`. If the walk
+/// finds a symlink into a skipped directory, a search could reach it by that name, so the whole
+/// worktree is walked.
+fn scan(b: &Bounds, skip: &[PathBuf]) -> Option<PathBuf> {
+    let mut unsure = false;
+    if let Some(found) = link_out(&b.root, b, skip, &mut unsure, 0) {
+        return Some(found);
+    }
+    if !unsure || skip.is_empty() {
+        return None;
+    }
+    link_out(&b.root, b, &[], &mut unsure, 0)
+}
+
 /// The first symlink under `dir` that leads out of the worktree, if any. Git's own directory
-/// is skipped: nothing in it links out, and it is large.
-fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
+/// is skipped: nothing in it links out, and it is large. So are the directories in `skip`;
+/// `unsure` is set when something seen means they shouldn't have been.
+fn link_out(
+    dir: &Path,
+    b: &Bounds,
+    skip: &[PathBuf],
+    unsure: &mut bool,
+    depth: usize,
+) -> Option<PathBuf> {
     // Deeper than any real source tree: treat it as one, since it can't be checked.
     if depth > 32 {
         return Some(dir.to_path_buf());
@@ -434,11 +533,15 @@ fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
             return Some(path);
         };
         if kind.is_symlink() {
-            if !resolve(&path).starts_with(&b.root) {
+            let target = resolve(&path);
+            if !target.starts_with(&b.root) {
                 return Some(path);
             }
-        } else if kind.is_dir() && entry.file_name() != ".git" {
-            if let Some(found) = link_out(&path, b, depth + 1) {
+            if skip.iter().any(|dir| target.starts_with(dir)) {
+                *unsure = true;
+            }
+        } else if kind.is_dir() && entry.file_name() != ".git" && !skip.contains(&path) {
+            if let Some(found) = link_out(&path, b, skip, unsure, depth + 1) {
                 return Some(found);
             }
         }
@@ -1116,6 +1219,46 @@ pub fn self_test_inputs(root: &Path, read_only: bool) -> (String, String) {
 }
 
 // The cases use Unix paths; `windows_tests` below covers the Windows spellings.
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_large_ignored_target_keeps_searches_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("home").join("envs").join("a");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init");
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        // About as many entries as a few builds leave behind.
+        for d in 0..100 {
+            let dir = root.join("target").join("debug").join(format!("d{d}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..1000 {
+                std::fs::write(dir.join(format!("f{f}")), "").unwrap();
+            }
+        }
+        let b = Bounds::new(Some(root.clone()), Some(tmp.path().join("home"))).unwrap();
+        let input = HookInput {
+            tool_name: "Grep".into(),
+            tool_input: json!({"pattern": "x"}),
+            cwd: root.clone(),
+        };
+        let start = std::time::Instant::now();
+        assert_eq!(check(&input, &b).unwrap(), None);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1471,6 +1614,136 @@ mod tests {
         };
         assert!(check(&grep, &b).unwrap().is_some());
         assert_eq!(call("Write", "src/new/x.rs"), None);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_grep_skips_only_a_target_ripgrep_skips_too() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("paja-hook-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("home/envs/a");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        // A link out inside the ignored directory, where a Grep without a glob never goes.
+        symlink(&outside, root.join("target/debug/out")).unwrap();
+        let b = Bounds::new(Some(root.clone()), Some(tmp.join("home"))).unwrap();
+        let search = |tool: &str, input: Value| {
+            let input = HookInput {
+                tool_name: tool.into(),
+                tool_input: input,
+                cwd: root.clone(),
+            };
+            check(&input, &b).unwrap()
+        };
+        let grep = || search("Grep", json!({"pattern": "x"}));
+        assert_eq!(grep(), None);
+        // Globs override ignores in ripgrep, and Glob and LS don't use them at all.
+        assert!(search("Grep", json!({"pattern": "x", "glob": "*.rs"})).is_some());
+        assert!(search("Glob", json!({"pattern": "*/debug/**"})).is_some());
+        assert!(search("LS", json!({"path": "."})).is_some());
+        // A search that starts inside the ignored directory searches it.
+        assert!(search("Grep", json!({"pattern": "x", "path": "target"})).is_some());
+        assert!(search("Grep", json!({"pattern": "x", "path": "target/debug"})).is_some());
+        // Each spelling both engines read the same way, line ends included.
+        for line in ["/target\n", "target", "/target/\r\n"] {
+            std::fs::write(root.join(".gitignore"), line).unwrap();
+            assert_eq!(grep(), None, "{line:?}");
+        }
+        let gitignore = |text: &str| std::fs::write(root.join(".gitignore"), text).unwrap();
+        // ripgrep's own ignore files in the worktree's top directory, or above it, can bring
+        // `target` back, as can any `!` line.
+        for name in [".ignore", ".rgignore"] {
+            for dir in [root.clone(), tmp.clone()] {
+                std::fs::write(dir.join(name), "!target/\n").unwrap();
+                assert!(grep().is_some(), "{name} in {}", dir.display());
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+        }
+        // ripgrep drops a file it can't compile, and the hook doesn't compile it, so only
+        // names and simple wildcards count.
+        let braces: Vec<String> = (0..2000).map(|n| format!("x{n}")).collect();
+        for text in [
+            format!("target/\n{{{}}}\n", braces.join(",")),
+            "target/\n[ab].log\n".to_string(),
+            format!("target/\n#{}\n", "x".repeat(5000)),
+        ] {
+            gitignore(&text);
+            assert!(grep().is_some(), "{}", &text[..20]);
+        }
+        gitignore("# build output\n/target\n__pycache__/\n*.pyc\n**/out?.log\n");
+        assert_eq!(grep(), None, "comments, names and simple wildcards");
+        std::fs::write(root.join(".gitignore"), b"\xff\ntarget/\n").unwrap();
+        assert!(
+            grep().is_some(),
+            "a line ripgrep can't read before `target/`"
+        );
+        gitignore("target/\n!keep\n");
+        assert!(grep().is_some(), "a `!` line");
+        std::fs::write(tmp.join(".gitignore"), "!target\n").unwrap();
+        assert!(grep().is_some(), "a `!` line above the worktree");
+        std::fs::remove_file(tmp.join(".gitignore")).unwrap();
+        gitignore("target/\n");
+        // Without `.git`, ripgrep doesn't read `.gitignore` at all.
+        std::fs::rename(root.join(".git"), root.join("git-moved")).unwrap();
+        assert!(grep().is_some(), "no .git");
+        symlink(root.join("nowhere"), root.join(".git")).unwrap();
+        assert!(grep().is_some(), "a dangling .git link");
+        std::fs::remove_file(root.join(".git")).unwrap();
+        std::fs::rename(root.join("git-moved"), root.join(".git")).unwrap();
+        assert_eq!(grep(), None);
+        // Nothing else is left out, however git reads it: a directory whose contents alone are
+        // ignored (ripgrep enters it and reads its ignore files), a pattern ripgrep's globs
+        // don't parse the same way, a `target` below a fake nested repository (ripgrep stops
+        // applying the top `.gitignore` there), and what only git's `info/exclude` ignores.
+        gitignore("target\na/*\nt[[:alpha:]]x/\nb/\n");
+        std::fs::write(root.join(".git/info/exclude"), "c/\n").unwrap();
+        for dir in ["a", "tbx", "n/target", "c"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            symlink(&outside, root.join(dir).join("out")).unwrap();
+            assert!(grep().is_some(), "{dir}");
+            std::fs::remove_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::create_dir_all(root.join("n")).unwrap();
+        std::fs::write(root.join("n/.git"), "").unwrap();
+        std::fs::create_dir_all(root.join("n/target")).unwrap();
+        symlink(&outside, root.join("n/target/out")).unwrap();
+        assert!(grep().is_some(), "a fake nested repository");
+        std::fs::remove_dir_all(root.join("n")).unwrap();
+        gitignore("target/\n");
+        assert_eq!(grep(), None);
+        assert!(grep_skips(&b, &root, true).is_empty());
+        assert!(!grep_skips(&b, &root, false).is_empty());
+        // A link inside the worktree into the ignored directory reaches it by another name.
+        symlink(root.join("target"), root.join("src/via")).unwrap();
+        assert!(grep().is_some(), "a link into the ignored directory");
+        std::fs::remove_file(root.join("src/via")).unwrap();
+        // ripgrep matches with case, so `TARGET` is searched.
+        git(&["config", "core.ignoreCase", "true"]);
+        std::fs::create_dir_all(root.join("TARGET")).unwrap();
+        symlink(&outside, root.join("TARGET/out")).unwrap();
+        assert!(grep().is_some(), "TARGET is not ignored by ripgrep");
+        std::fs::remove_dir_all(root.join("TARGET")).unwrap();
+        assert_eq!(grep(), None);
+        // The ignored name itself may be the link out.
+        std::fs::remove_dir_all(root.join("target")).unwrap();
+        symlink(&outside, root.join("target")).unwrap();
+        assert!(grep().is_some(), "target as a link out");
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 

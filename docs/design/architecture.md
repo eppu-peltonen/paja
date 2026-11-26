@@ -160,7 +160,18 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
-  followed, and are blocked while the worktree holds a symlink out of the worktree. A file tool path may not
+  followed, and are blocked while the worktree holds a symlink out of the worktree. To keep that scan fast, a `Grep`
+  without a `glob` leaves out the worktree's top-level `target` directory, which ripgrep never enters either, when the
+  worktree's `.gitignore` names it in a line git and ripgrep read the same way (`target`, `target/`, `/target`,
+  `/target/`). Git and ripgrep match ignore patterns with different engines, so no other directory is left out, and
+  git is not asked. `target` itself is still checked for being a link out. Nothing is left out when any of these
+  could make ripgrep search it after all: a `!` line in that `.gitignore` or in one above the worktree, a ripgrep
+  ignore file (`.ignore`, `.rgignore`) in the worktree's top directory or above it, `RIPGREP_CONFIG_PATH`, a worktree
+  without `.git`, a `.gitignore` that isn't all UTF-8 (ripgrep stops reading at the first bad line) or that is over 4
+  KiB or holds anything but comments, names and `*`/`?` (ripgrep drops a file it can't compile), a search that
+  starts inside `target`, or a symlink into it. `Glob`, `LS` and a `Grep` with a `glob` always walk the whole
+  worktree. These conditions follow how ripgrep reads ignore files, so a ripgrep change means checking them again. A
+  file tool path may not
   start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
   (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
