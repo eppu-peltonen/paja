@@ -942,7 +942,8 @@ impl Factory {
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
-                 *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\"}}'; exit 0; fi ;; esac\n\
+                 *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
+                 if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\"}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
@@ -955,6 +956,7 @@ impl Factory {
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add feature.txt\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
+                 if [ -f {d}/no-session ]; then echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi\n\
                  echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4, \"duration_ms\": 900, \"session_id\": \"s-1\", \"total_cost_usd\": 0.25, \"usage\": {{\"input_tokens\": 100, \"output_tokens\": 20, \"cache_read_input_tokens\": 3000, \"cache_creation_input_tokens\": 400}}, \"modelUsage\": {{\"claude-test\": {{\"inputTokens\": 100, \"outputTokens\": 20, \"cacheReadInputTokens\": 3000, \"cacheCreationInputTokens\": 400, \"costUSD\": 0.25}}}}}}' ;;\nesac\n"
             ),
         );
@@ -1624,6 +1626,66 @@ fn a_resume_that_fails_starts_a_fresh_session() {
     );
     assert!(!builds[2].contains("--resume"), "{}", builds[2]);
     assert!(builds[2].contains("add more"), "{}", builds[2]);
+    // The failed attempt's spend is recorded as a step of its own, before the fresh session.
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let steps: Vec<Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .flat_map(|e| e["data"]["steps"].as_array().unwrap().clone())
+        .collect();
+    let builds: Vec<&Value> = steps.iter().filter(|s| s["step"] == "build").collect();
+    assert_eq!(builds.len(), 3, "{steps:?}");
+    assert_eq!(builds[1]["session_id"], "s-2", "{steps:?}");
+    assert_eq!(builds[1]["cost_usd"], 0.05, "{steps:?}");
+}
+
+#[test]
+fn a_resume_at_a_usage_limit_stops_instead_of_starting_fresh() {
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("resume-limited"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("usage or rate limit") && question.contains("wait until it resets"),
+        "{question}"
+    );
+    // One fresh build, one review, one resume that hit the limit: no fresh session after it.
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(builds[1].contains("--resume"), "{}", builds[1]);
+}
+
+#[test]
+fn a_builder_without_a_session_gets_a_fresh_one_next_round() {
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    std::fs::write(f.tmp.path().join("no-session"), "").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no builder session to resume; starting a fresh one"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    assert!(calls.iter().all(|c| !c.contains("--resume")), "{calls:?}");
 }
 
 #[test]
