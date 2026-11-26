@@ -89,8 +89,8 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
     let events = log.read_all()?;
-    untampered_in(&events, opts.repo)?;
-    let repo = main_repo(opts.repo)?;
+    let ok = untampered_in(&events, opts.repo)?;
+    let repo = main_repo(&ok, opts.repo)?;
     let branch = format!("paja/{}", opts.name);
 
     let envs = replay(&events)?;
@@ -104,6 +104,7 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
 
     // `remove` keeps branches, so a reused name may find its old branch: resume it.
     let resume = git(
+        &ok,
         &repo,
         &[
             "rev-parse",
@@ -128,6 +129,7 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
         (opts.base.unwrap_or("HEAD"), opts.repo)
     };
     let base_commit = git(
+        &ok,
         start_in,
         &["rev-parse", "--verify", &format!("{start}^{{commit}}")],
     )
@@ -153,7 +155,7 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     } else {
         vec!["worktree", "add", "-b", &branch, &path_str, &base_commit]
     };
-    git(&repo, &add).with_context(|| format!("creating worktree for {:?}", opts.name))?;
+    git(&ok, &repo, &add).with_context(|| format!("creating worktree for {:?}", opts.name))?;
 
     let env = Env {
         name: opts.name.to_string(),
@@ -181,9 +183,13 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
             )));
         }
         // Without its event the worktree would be an orphan that blocks the name; undo it.
-        let _ = git(&env.repo, &["worktree", "remove", "--force", &path_str]);
+        let _ = git(
+            &ok,
+            &env.repo,
+            &["worktree", "remove", "--force", &path_str],
+        );
         if !resume {
-            let _ = git(&env.repo, &["branch", "-D", &env.branch]);
+            let _ = git(&ok, &env.repo, &["branch", "-D", &env.branch]);
         }
         return Err(err.context(format!(
             "recording environment {:?}; the worktree was rolled back",
@@ -222,41 +228,46 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
         .path
         .to_str()
         .with_context(|| format!("environment path {} is not UTF-8", env.path.display()))?;
-    if env.repo.exists() {
-        untampered_in(&events, &env.repo)?;
-    }
+    // git runs only where the repository still exists, and only once the tamper lock allows it.
+    let checked = if env.repo.exists() {
+        Some(untampered_in(&events, &env.repo)?)
+    } else {
+        None
+    };
 
-    if !env.repo.exists() {
-        // git can't run against a repository that is gone; only the directory is left.
-        if env.path.exists() {
-            if !force {
-                bail!(
-                    "repository {} no longer exists, so git can't remove the worktree; \
+    match checked {
+        None => {
+            // git can't run against a repository that is gone; only the directory is left.
+            if env.path.exists() {
+                if !force {
+                    bail!(
+                        "repository {} no longer exists, so git can't remove the worktree; \
                      pass --force to delete {path} directly",
-                    env.repo.display()
-                );
+                        env.repo.display()
+                    );
+                }
+                std::fs::remove_dir_all(&env.path).with_context(|| format!("deleting {path}"))?;
             }
-            std::fs::remove_dir_all(&env.path).with_context(|| format!("deleting {path}"))?;
         }
-    } else if env.path.exists() {
-        let mut args = vec!["worktree", "remove"];
-        if force {
-            args.push("--force");
-        }
-        args.push(path);
-        let removed = git(&env.repo, &args);
-        if removed.is_err() && force && !is_registered_worktree(&env.repo, &env.path) {
-            // git no longer knows this directory as a worktree (re-cloned repo, lost
-            // metadata); with --force, delete it directly and let git forget the rest.
-            std::fs::remove_dir_all(&env.path).with_context(|| format!("deleting {path}"))?;
-            git(&env.repo, &["worktree", "prune"]).with_context(|| {
-                format!(
-                    "pruning worktrees of {} after deleting {path}",
-                    env.repo.display()
-                )
-            })?;
-        } else {
-            removed.with_context(|| {
+        Some(ok) if env.path.exists() => {
+            let mut args = vec!["worktree", "remove"];
+            if force {
+                args.push("--force");
+            }
+            args.push(path);
+            let removed = git(&ok, &env.repo, &args);
+            if removed.is_err() && force && !is_registered_worktree(&ok, &env.repo, &env.path) {
+                // git no longer knows this directory as a worktree (re-cloned repo, lost
+                // metadata); with --force, delete it directly and let git forget the rest.
+                std::fs::remove_dir_all(&env.path).with_context(|| format!("deleting {path}"))?;
+                git(&ok, &env.repo, &["worktree", "prune"]).with_context(|| {
+                    format!(
+                        "pruning worktrees of {} after deleting {path}",
+                        env.repo.display()
+                    )
+                })?;
+            } else {
+                removed.with_context(|| {
                 if force {
                     // git still tracks it and refuses: say how to clear what git is guarding.
                     format!(
@@ -270,15 +281,17 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
                     format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
                 }
             })?;
+            }
         }
-    } else {
-        // The directory is already gone; let git forget about it too.
-        git(&env.repo, &["worktree", "prune"]).with_context(|| {
-            format!(
-                "pruning worktrees of {} for environment {name:?}",
-                env.repo.display()
-            )
-        })?;
+        Some(ok) => {
+            // The directory is already gone; let git forget about it too.
+            git(&ok, &env.repo, &["worktree", "prune"]).with_context(|| {
+                format!(
+                    "pruning worktrees of {} for environment {name:?}",
+                    env.repo.display()
+                )
+            })?;
+        }
     }
 
     log.append(
@@ -312,7 +325,7 @@ impl std::error::Error for Tampered {}
 /// was spelled: its shared git directory, which rev-parse finds without running any program
 /// from the configuration.
 pub fn repo_key(path: &Path) -> Result<String> {
-    let common = git(
+    let common = git_unchecked(
         path,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
@@ -329,16 +342,43 @@ pub fn repo_key(path: &Path) -> Result<String> {
         .to_string())
 }
 
+/// Proof that the tamper lock allowed git and gh in a repository. Only [`untampered`] makes
+/// one, and Ahjo's and Jono's git and gh helpers take it, so a new command can't run them
+/// there without the check.
+pub struct Untampered {
+    key: String,
+    path: PathBuf,
+}
+
+impl Untampered {
+    /// The repository's key (see [`repo_key`]).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The path the check was made for, where gh runs.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Refuse with [`Tampered`] when the repository at `path` is locked: the log's last tamper
 /// event for it is [`EV_TAMPERED`]. Every command that runs git or gh in a repository calls
-/// this first. Returns the repository's key.
-pub fn ensure_untampered(home: &Home, path: &Path) -> Result<String> {
+/// this first and passes the proof to the helper that runs them.
+pub fn untampered(home: &Home, path: &Path) -> Result<Untampered> {
     untampered_in(&home.events().read_all()?, path)
 }
 
-/// [`ensure_untampered`] on events the caller has already read, so a command that replays the
-/// log anyway reads it once.
-pub fn untampered_in(events: &[Event], path: &Path) -> Result<String> {
+/// [`untampered`], returning only the repository's key, for Mestari, which runs git and gh
+/// through its own helpers.
+pub fn ensure_untampered(home: &Home, path: &Path) -> Result<String> {
+    untampered(home, path).map(|ok| ok.key)
+}
+
+/// [`untampered`] on events the caller has already read, so a command that replays the log
+/// anyway reads it once. The caller must have read them under the home lock it still holds,
+/// or a tamper stop recorded since would go unseen; so this stays private to Ahjo.
+fn untampered_in(events: &[Event], path: &Path) -> Result<Untampered> {
     let key = repo_key(path)?;
     let last = events
         .iter()
@@ -353,7 +393,10 @@ pub fn untampered_in(events: &[Event], path: &Path) -> Result<String> {
         ))
         .into());
     }
-    Ok(key)
+    Ok(Untampered {
+        key,
+        path: path.to_path_buf(),
+    })
 }
 
 /// A person has checked the repository at `path` after a tamper stop: record it, so Paja
@@ -369,8 +412,9 @@ pub fn clear_tampered(home: &Home, path: &Path) -> Result<String> {
 /// The main repository's top level for any path inside it, even from inside a linked
 /// worktree (an agent creating an environment from within its own environment) or a
 /// submodule. git lists the main worktree first.
-fn main_repo(path: &Path) -> Result<PathBuf> {
+fn main_repo(ok: &Untampered, path: &Path) -> Result<PathBuf> {
     let dirs = git(
+        ok,
         path,
         &[
             "rev-parse",
@@ -381,7 +425,7 @@ fn main_repo(path: &Path) -> Result<PathBuf> {
         ],
     )
     .map_err(|err| {
-        let bare = git(path, &["rev-parse", "--is-bare-repository"]).is_ok_and(|b| b == "true");
+        let bare = git(ok, path, &["rev-parse", "--is-bare-repository"]).is_ok_and(|b| b == "true");
         if bare {
             err.context(format!(
                 "{} is a bare repository; run paja from a checkout of it",
@@ -407,7 +451,7 @@ fn main_repo(path: &Path) -> Result<PathBuf> {
         return Ok(PathBuf::from(top));
     }
     // A linked worktree: git lists the main worktree first.
-    let list = git(path, &["worktree", "list", "--porcelain"])?;
+    let list = git(ok, path, &["worktree", "list", "--porcelain"])?;
     list.lines()
         .next()
         .and_then(|l| l.strip_prefix("worktree "))
@@ -416,8 +460,8 @@ fn main_repo(path: &Path) -> Result<PathBuf> {
 }
 
 /// Whether git still lists `path` as one of `repo`'s worktrees.
-fn is_registered_worktree(repo: &Path, path: &Path) -> bool {
-    let Ok(list) = git(repo, &["worktree", "list", "--porcelain"]) else {
+fn is_registered_worktree(ok: &Untampered, repo: &Path, path: &Path) -> bool {
+    let Ok(list) = git(ok, repo, &["worktree", "list", "--porcelain"]) else {
         return true; // can't tell: keep git's own error rather than deleting
     };
     let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -470,8 +514,16 @@ pub(crate) fn git_command() -> Command {
     cmd
 }
 
-/// Run git in `dir` and return trimmed stdout, or an error carrying git's stderr.
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
+/// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
+/// trimmed stdout, or an error carrying git's stderr. Taking the proof means no command can
+/// run git here without the check.
+fn git(_ok: &Untampered, dir: &Path, args: &[&str]) -> Result<String> {
+    git_unchecked(dir, args)
+}
+
+/// [`git`] without the tamper lock: only for [`repo_key`], whose rev-parse the check itself
+/// needs and which runs nothing from the configuration, and for tests.
+fn git_unchecked(dir: &Path, args: &[&str]) -> Result<String> {
     let output = git_command()
         .arg("-C")
         .arg(dir)
@@ -511,7 +563,7 @@ mod tests {
         let repo = |name: &str| {
             let path = dir.path().join(name);
             std::fs::create_dir_all(&path).unwrap();
-            git(&path, &["init", "-q"]).unwrap();
+            git_unchecked(&path, &["init", "-q"]).unwrap();
             path
         };
         let (a, b) = (repo("a"), repo("b"));
@@ -528,22 +580,23 @@ mod tests {
                 data: serde_json::json!({ "repo": key, "error": "config changed" }),
             }
         };
-        let tampered =
-            |e: anyhow::Result<String>| e.is_err_and(|err| err.chain().any(|c| c.is::<Tampered>()));
+        let tampered = |e: anyhow::Result<Untampered>| {
+            e.is_err_and(|err| err.chain().any(|c| c.is::<Tampered>()))
+        };
         let mut events = vec![event(EV_TAMPERED, &key_a)];
         assert!(tampered(untampered_in(&events, &a)));
         // Another repository's events never lock this one, nor clear it.
-        assert_eq!(untampered_in(&events, &b).unwrap(), key_b);
+        assert_eq!(untampered_in(&events, &b).unwrap().key, key_b);
         events.push(event(EV_TAMPER_CHECKED, &key_b));
         assert!(tampered(untampered_in(&events, &a)));
         // Checked, then tampered again: the last one for the key decides each time.
         events.push(event(EV_TAMPER_CHECKED, &key_a));
-        assert_eq!(untampered_in(&events, &a).unwrap(), key_a);
+        assert_eq!(untampered_in(&events, &a).unwrap().key, key_a);
         events.push(event(EV_TAMPERED, &key_a));
         assert!(tampered(untampered_in(&events, &a)));
         events.push(event(EV_TAMPERED, &key_b));
         events.push(event(EV_TAMPER_CHECKED, &key_a));
-        assert_eq!(untampered_in(&events, &a).unwrap(), key_a);
+        assert_eq!(untampered_in(&events, &a).unwrap().key, key_a);
         assert!(tampered(untampered_in(&events, &b)));
     }
 

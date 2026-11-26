@@ -257,8 +257,10 @@ configuration from and the worktree's links to the repository. If they changed, 
 there again, not even to clean up or comment on the issue. The guard also notices another environment's links and
 configuration changing. Until a person has checked that repository (found by its shared git directory, however its
 path is spelled) and runs `paja run --tamper-checked`, every command and MCP tool that runs git or gh there refuses:
-later runs, `work sync`, `env create` and `env remove`. The check lives in Ahjo, so a new command gets it by calling
-`ahjo::ensure_untampered` before its first git or gh. Configuration files are compared by
+later runs, `work sync`, `env create` and `env remove`. The check lives in Ahjo: `ahjo::untampered` returns a proof
+(`Untampered`) that Ahjo's git helper and Jono's gh helper require, so a new command there can't run either without the
+check. Ahjo checks under the home lock with the events it read under it, since a stop recorded meanwhile must be seen.
+Mestari runs git and gh through its own helpers after `ahjo::ensure_untampered`. Configuration files are compared by
 the entries git reads, leaving out `branch.*`, which ordinary git work writes; every other file byte for byte. The
 hook's copy is checked again after each agent run, and a copy that changed counts as a run the hook never saw. Each
 phase takes its own snapshot, so a change made between phases (by a process the code left running, say) is not caught,
