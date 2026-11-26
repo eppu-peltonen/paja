@@ -1123,8 +1123,23 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
                          its value so the hook can check the path"
                     ));
                 }
+                // Programs don't expand `~`, but one could still read `-o~` as home.
+                if glued.starts_with('~') {
+                    return Some(format!(
+                        "`{arg}` glues `~` to a short flag; name the path inside the worktree"
+                    ));
+                }
                 values.push(glued);
                 values.extend(rest.split_once('=').map(|(_, v)| v));
+                // A cluster such as `-xf.git` can hide a dot name after its flag letters: each
+                // dot starts a name that is checked too (`.git` is refused, `.txt` is fine).
+                values.extend(
+                    glued
+                        .char_indices()
+                        .skip(1)
+                        .filter(|&(_, c)| c == '.')
+                        .map(|(at, _)| &glued[at..]),
+                );
             }
             None => values.push(arg),
         }
@@ -1674,6 +1689,9 @@ mod program_tests {
             "npm test -xC..",
             "npm test -o=.git",
             "npm test -Dx=.github",
+            "npm test -xf.git",
+            "npm test -xo.claude/settings.json",
+            "npm test -o~",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -1689,6 +1707,8 @@ mod program_tests {
         assert!(why.contains("put a space between"), "{why}");
         ok("npm test -I src/include");
         ok("npm test -Dfeature=on");
+        ok("npm test -ofile.txt");
+        ok("npm test -Dversion=1.2.3");
         ok("npm test --out=./build");
     }
 }
