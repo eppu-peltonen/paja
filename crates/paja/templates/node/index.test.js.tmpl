@@ -1,0 +1,7 @@
+const test = require("node:test");
+const assert = require("node:assert");
+const { greeting } = require("./index.js");
+
+test("greets by name", () => {
+  assert.strictEqual(greeting("Paja"), "Hello, Paja!");
+});

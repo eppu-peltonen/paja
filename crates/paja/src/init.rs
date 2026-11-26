@@ -16,6 +16,9 @@ use crate::ahjo::{self, git_command};
 use crate::home::Home;
 use crate::jono::{self, Labels, LABELS_FILE};
 
+mod scaffold;
+pub use scaffold::{run_new, NewOptions, NewReport, STACKS};
+
 /// The branch the pull request comes from.
 pub const BRANCH: &str = "paja/init";
 

@@ -82,6 +82,30 @@ merged, on issues with the work label.
 If `.paja/checks` is already on the default branch, `paja init` refuses; `--force` writes the files again on the branch.
 `--json` prints what it detected, the files it wrote and the pull request, and the MCP tool `init` returns the same.
 
+## Starting a new project
+
+For a project that doesn't exist yet, with `gh` signed in:
+
+```sh
+paja init --new my-app --stack rust     # or node, python; --public for a public repository (default --private)
+```
+
+It creates the repository `my-app` under your account with `gh repo create`, clones it to `my-app` in the current
+directory (`--dir <path>` to clone elsewhere), and pushes one first commit holding a walking skeleton:
+
+- a minimal app with one passing test, with a formatter and a linter configured (Rust: `rustfmt` and `clippy`; Node:
+  Prettier and ESLint, run by `npm run lint`; Python: `ruff` for both, with `pytest` for the test);
+- a workflow in `.github/workflows/paja.yml` that runs the checks on pull requests;
+- the `.paja/` files and `CLAUDE.md` that `paja init` writes for the stack, and `.paja/labels` naming the work label
+  `paja` and the follow-up label `paja-follow-up`, which it creates in the repository.
+
+This is the one place Paja pushes to a default branch: the repository is empty and new. The skeletons are templates in
+the binary (`crates/paja/templates/`), so the command needs the network only for GitHub (and for installing the
+stack's tools in CI). When it succeeds it prints the next steps: file an issue with `/paja:spec`, then `paja run --once`.
+If it fails after creating the repository, the error names the repository so you can finish by hand or delete it.
+`--json` prints the repository, the directory, the files, the checks and the next steps; the MCP tool `init` takes
+`new`, `stack`, `public` and `dir` for the same.
+
 ## Check the setup
 
 `paja doctor` (with `--repo <path>`; the default is the current directory) checks that this machine and the repository
