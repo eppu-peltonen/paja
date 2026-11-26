@@ -96,3 +96,5 @@ step's unfinished work. Closing the terminal is like the second Ctrl+C; after a 
 
 After pulling a newer Paja, run
 `cargo install --path crates/paja` again.
+
+Something went wrong, or you want to update or uninstall Paja: see [`troubleshooting.md`](./troubleshooting.md).
