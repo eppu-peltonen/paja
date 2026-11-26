@@ -560,8 +560,11 @@ fn kill_tree(child: &mut std::process::Child) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn open_plain_file_opens_only_plain_files() {
+        let refused = |err: std::io::Error| err.to_string().contains("is not a plain file");
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("f");
         std::fs::write(&file, "x").unwrap();
@@ -569,24 +572,24 @@ mod tests {
         let missing = open_plain_file(&tmp.path().join("none")).unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
         let dir = open_plain_file(tmp.path()).unwrap_err();
-        assert_ne!(dir.kind(), std::io::ErrorKind::NotFound);
+        if cfg!(unix) {
+            // Unix opens a directory for reading, so the type check is what refuses it.
+            assert!(refused(dir));
+        } else {
+            // Windows won't open a directory as a file at all.
+            assert_eq!(dir.kind(), std::io::ErrorKind::PermissionDenied, "{dir}");
+        }
         #[cfg(unix)]
         {
+            use std::os::unix::ffi::OsStrExt;
             // A FIFO with no writer is refused at once rather than waited on.
             let fifo = tmp.path().join("fifo");
-            let made = std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap();
-            assert!(made.success());
-            assert_ne!(
-                open_plain_file(&fifo).unwrap_err().kind(),
-                std::io::ErrorKind::NotFound
-            );
+            let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `name` is a valid NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            assert!(refused(open_plain_file(&fifo).unwrap_err()));
         }
     }
-
-    use super::*;
 
     #[test]
     fn hook_words_are_quoted_for_the_platform_shell() {
