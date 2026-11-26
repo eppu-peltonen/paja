@@ -104,19 +104,10 @@ impl Labels {
             {
                 continue;
             }
-            let output = git(&["show", &format!("{rev}:{LABELS_FILE}")])?;
-            if output.status.success() {
-                return Self::parse(&String::from_utf8_lossy(&output.stdout));
-            }
-            let err = String::from_utf8_lossy(&output.stderr);
-            if err.contains("does not exist in") || err.contains("exists on disk, but not in") {
-                return Ok(Self::default());
-            }
-            bail!(
-                "git show {rev}:{LABELS_FILE} failed in {}: {}",
-                ok.path().display(),
-                err.trim()
-            );
+            return match crate::ahjo::show_at(ok.path(), rev, LABELS_FILE)? {
+                Some(text) => Self::parse(&text),
+                None => Ok(Self::default()),
+            };
         }
         Ok(Self::default())
     }
@@ -173,7 +164,7 @@ pub struct WorkItem {
     pub title: String,
     pub body: String,
     pub url: String,
-    /// Whether the issue is open and labelled `paja`. A closed issue keeps its status, so an
+    /// Whether the issue is open and has the work label. A closed issue keeps its status, so an
     /// escalation's question or a landing survives the issue closing and reopening.
     pub open: bool,
     pub status: Status,

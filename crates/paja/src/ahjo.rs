@@ -519,6 +519,33 @@ pub(crate) fn git_command() -> Command {
     cmd
 }
 
+/// A file as it is at `rev` in `repo`, or None if `rev` doesn't have it. Any other git failure
+/// is an error: a settings or check file that can't be read must never count as an empty one.
+/// Git runs in the C locale, since a missing file is told apart by git's English message.
+pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<String>> {
+    let spec = format!("{rev}:{path}");
+    let output = git_command()
+        .env("LC_ALL", "C")
+        .env_remove("LANGUAGE")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &spec])
+        .output()
+        .context("running git (is it installed?)")?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    if err.contains("does not exist in") || err.contains("exists on disk, but not in") {
+        return Ok(None);
+    }
+    bail!(
+        "git show {spec} failed in {}: {}",
+        repo.display(),
+        err.trim()
+    )
+}
+
 /// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
 /// trimmed stdout, or an error carrying git's stderr. Taking the proof means no command can
 /// run git here without the check.
@@ -560,6 +587,43 @@ mod tests {
             port_count: PORT_BLOCK,
             created_ms: 0,
         }
+    }
+
+    #[test]
+    fn show_at_tells_a_missing_file_from_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_unchecked(repo, &["init", "-q"]).unwrap();
+        std::fs::write(repo.join("kept.txt"), "kept\n").unwrap();
+        git_unchecked(repo, &["add", "kept.txt"]).unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "c",
+            ],
+        )
+        .unwrap();
+        // On disk but not committed: still missing at HEAD.
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+        assert_eq!(
+            show_at(repo, "HEAD", "kept.txt").unwrap().as_deref(),
+            Some("kept\n")
+        );
+        assert_eq!(show_at(repo, "HEAD", "gone.txt").unwrap(), None);
+        assert_eq!(show_at(repo, "HEAD", "new.txt").unwrap(), None);
+        let err = show_at(repo, "no-such-rev", "kept.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("git show no-such-rev:kept.txt failed in"),
+            "{err}"
+        );
     }
 
     #[test]

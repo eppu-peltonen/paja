@@ -33,7 +33,8 @@ the real repository, to the smoke tests.
 - `crates/paja/src/events.rs`: the append-only event log, the core's only source of truth.
 - `crates/paja/src/home.rs`: the state directory (`$PAJA_HOME`, default `~/.paja`) and its lock.
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
-- `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues labelled `paja` (`gh`, or `$PAJA_GH`).
+- `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues with the work label (`paja` here; `gh`,
+  or `$PAJA_GH`).
 - `crates/paja/src/mestari/`: `paja run`, the build, check, review and land loop for one work item. Only the
   high-risk parts are listed in `.paja/high-risk`: `mod.rs` (the round loop, main's configuration, the risk tier,
   the review prompt and verdicts), `agent.rs` (`claude()`, the hook settings and self-test, the sandbox glue,
