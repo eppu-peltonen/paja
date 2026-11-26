@@ -116,10 +116,11 @@ pub struct Review {
     /// The intent question for a person, when the verdict is `escalate`.
     #[serde(default)]
     pub question: String,
-    /// Findings that don't block landing. Mestari files each as a `paja-follow-up` issue once
-    /// the change lands, for a person to queue, instead of holding this change up.
+    /// Findings that don't block landing, each marked `bug`, `risk` or `nit`. Once the change
+    /// lands, Mestari files its bugs and risks together as one follow-up issue, for a person to
+    /// queue, instead of holding this change up; nits are never filed.
     #[serde(default)]
-    pub follow_ups: Vec<String>,
+    pub follow_ups: Vec<Finding>,
 }
 
 /// The model, and optionally the effort, one role runs on.
@@ -280,7 +281,7 @@ struct Prior {
     /// The blockers they named.
     blockers: String,
     /// Their non-blocking findings, for the next reviewer to keep or drop.
-    follow_ups: Vec<String>,
+    follow_ups: Vec<Finding>,
 }
 
 pub struct RunOptions<'a> {
@@ -584,7 +585,7 @@ fn run_item(
 
     let mut feedback = String::new();
     let mut prior: Option<Prior> = None;
-    let mut follow_ups: Vec<String> = Vec::new();
+    let mut follow_ups: Vec<Finding> = Vec::new();
     // The builder's last result in this run: its session is resumed for a fix round, and its
     // running totals come off the next step's. Not kept across runs: an earlier run's session
     // comes from the event log instead (`carried`).
@@ -872,7 +873,7 @@ fn run_item(
         follow_ups.clear();
         for review in &reviews {
             for finding in &review.follow_ups {
-                if !finding.trim().is_empty() && !follow_ups.contains(finding) {
+                if !finding.text.trim().is_empty() && !follow_ups.contains(finding) {
                     follow_ups.push(finding.clone());
                 }
             }
@@ -903,7 +904,7 @@ fn run_item(
                         record_follow_up(
                             home,
                             item,
-                            finding,
+                            &finding.shown(),
                             None,
                             "not filed: the change did not land",
                         );
@@ -935,6 +936,20 @@ fn run_item(
             .collect::<Vec<_>>()
             .join("\n\n");
         feedback = format!("A reviewer asked for changes:\n\n{blockers}");
+        // Another round runs anyway, so a nit that takes a line or two is fixed now rather
+        // than filed; a nit not fixed is simply dropped.
+        let nits: Vec<&str> = follow_ups
+            .iter()
+            .filter(|f| f.kind == FindingKind::Nit)
+            .map(|f| f.text.as_str())
+            .collect();
+        if !nits.is_empty() {
+            feedback.push_str(&format!(
+                "\n\nThe reviewers also noted these nits. Fix one only if it takes a line or \
+                 two; otherwise leave it:\n\n{}",
+                nits.join("\n\n")
+            ));
+        }
         // Without named blockers there is nothing to narrow the next review to.
         prior = (!blockers.is_empty()).then(|| Prior {
             reviewed: checked,
@@ -1350,7 +1365,12 @@ fn review_prompt(
             follow_ups = if prior.follow_ups.is_empty() {
                 "(none)".to_string()
             } else {
-                prior.follow_ups.join("\n\n")
+                prior
+                    .follow_ups
+                    .iter()
+                    .map(Finding::shown)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
             }
         ),
     };
@@ -1367,11 +1387,14 @@ fn review_prompt(
          only the fix); `escalate` with a question only when the issue's \
          intent is unclear or the change would weaken a check (a person must decide). A blocker \
          is a bug in what the issue asks for, a security hole the change opens, a broken \
-         CLAUDE.md rule, or missing tests for the new behaviour. Anything else, including \
-         hardening ideas, edge cases outside the issue and nits, goes in `follow_ups`, one \
-         finding each, starting with a short title line, at most five; Paja files them as public \
-         issues after landing, so never copy secrets, environment details or run output into \
-         them. They never hold the change up.\n\n\
+         CLAUDE.md rule, or missing tests for the new behaviour. Anything else goes in \
+         `follow_ups`, one finding each, starting with a short title line, at most five, each \
+         marked with its `kind`: `bug` for a wrong result outside what the issue asks, `risk` \
+         for a security or data-loss risk or a missing test for behaviour that could break, \
+         `nit` for style, naming, comment wording or a small refactor. Leave out ideas that are \
+         neither. Paja files the bugs and risks together as one public issue after landing \
+         (so never copy secrets, environment details or run output into them) and never files \
+         nits. They never hold the change up.\n\n\
          Vasara's checks (every command in `.paja/checks` on main: {checks}) already passed at \
          {checked}, the commit you are judging, so don't run them again. To probe a behaviour, \
          run one named test or the project itself, with Bash limited to {programs} and long \
@@ -1494,7 +1517,17 @@ fn review(
             "summary": {"type": "string"},
             "comments": {"type": "string"},
             "question": {"type": "string"},
-            "follow_ups": {"type": "array", "items": {"type": "string"}}
+            "follow_ups": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["bug", "risk", "nit"]},
+                        "finding": {"type": "string"}
+                    },
+                    "required": ["kind", "finding"]
+                }
+            }
         },
         "required": ["verdict", "summary"]
     });
@@ -1992,7 +2025,10 @@ mod tests {
         let prior = super::Prior {
             reviewed: "old456".into(),
             blockers: "Fix the parser.".into(),
-            follow_ups: vec!["Tidy the helper".into()],
+            follow_ups: vec![Finding {
+                kind: FindingKind::Risk,
+                text: "Tidy the helper".into(),
+            }],
         };
         let prompt = review_prompt(&item, Some(&prior));
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
