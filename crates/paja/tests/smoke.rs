@@ -1911,8 +1911,7 @@ fn a_step_records_when_its_fallback_model_served_it() {
 }
 
 #[test]
-fn run_every_says_when_it_waits_and_reports_progress_once() {
-    use std::io::{BufRead, BufReader};
+fn a_landing_pass_says_once_that_the_checks_passed() {
     // A pass that lands an item says once that the checks passed, before its reviewers.
     let f = Factory::new("true\n", "land");
     f.on_main(".paja/high-risk", "feature.txt\n");
@@ -1924,15 +1923,22 @@ fn run_every_says_when_it_waits_and_reports_progress_once() {
         .args(["--json", "run"])
         .output()
         .unwrap();
+    let report: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(report["outcome"], "landed", "{report}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches("checks passed").count(), 1, "{stderr}");
     assert!(
         stderr.contains("reviewer 2 of 2 is reading the change"),
         "{stderr}"
     );
+}
 
-    // With nothing left to do, `--every` says it waits, and keeps running until stopped.
-    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+/// Starts `paja --json run --every 1`, reads stderr up to its first wait line, then stops it.
+/// Returns that line, whether the loop was still running, and the first JSON line on stdout.
+/// A run whose stderr closes first fails the test instead of hanging it.
+fn first_wait_of_every(f: &Factory) -> (String, bool, Value) {
+    use std::io::{BufRead, BufReader};
     let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
@@ -1944,24 +1950,55 @@ fn run_every_says_when_it_waits_and_reports_progress_once() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut lines = BufReader::new(every.stderr.take().unwrap()).lines();
-    let waiting = lines
-        .by_ref()
+    // Every wait line, whatever its reason, ends the search, so a pass that fails instead of
+    // idling can't keep the test reading forever.
+    let waiting = BufReader::new(every.stderr.take().unwrap())
+        .lines()
         .map(|line| line.unwrap())
-        .find(|line| line.contains("nothing to do right now"));
+        .find(|line| line.contains("checking again in"));
     let still_running = every.try_wait().unwrap().is_none();
     every.kill().unwrap();
     every.wait().unwrap();
     let waiting = waiting.expect("no wait line before stderr closed");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut every.stdout.take().unwrap(), &mut stdout).unwrap();
+    let first: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    (waiting, still_running, first)
+}
+
+#[test]
+fn run_every_says_when_it_waits() {
+    // With nothing to do, `--every` says it waits, and keeps running until stopped.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    let (waiting, still_running, first) = first_wait_of_every(&f);
     assert!(
-        waiting.contains("checking again in 1 minute (Ctrl+C stops)"),
+        waiting.contains("nothing to do right now; checking again in 1 minute (Ctrl+C stops)"),
         "{waiting}"
     );
     assert!(still_running, "the loop stopped by itself");
-    let mut stdout = String::new();
-    std::io::Read::read_to_string(&mut every.stdout.take().unwrap(), &mut stdout).unwrap();
-    let idle: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
-    assert_eq!(idle["outcome"], "idle", "{stdout}");
+    assert_eq!(first["outcome"], "idle", "{first}");
+}
+
+#[test]
+fn run_every_keeps_going_after_a_pass_fails() {
+    // A `.paja/models` on main that names no real role fails every pass, idle or not; the loop
+    // reports the error and waits for the next pass instead of stopping.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/models", "nobody sonnet\n");
+    let (waiting, still_running, first) = first_wait_of_every(&f);
+    assert!(
+        waiting.contains("that pass failed; Paja keeps going; checking again in 1 minute"),
+        "{waiting}"
+    );
+    assert!(still_running, "the loop stopped by itself");
+    assert!(
+        first["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown role"),
+        "{first}"
+    );
 }
 
 #[test]
