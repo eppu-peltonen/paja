@@ -1436,7 +1436,7 @@ impl Factory {
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper, which logs ghp_ABCDEFGHIJKLMNOPQRSTuvwx\\\"]}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [{{\\\"kind\\\": \\\"risk\\\", \\\"finding\\\": \\\"Tidy the helper, which logs ghp_ABCDEFGHIJKLMNOPQRSTuvwx\\\"}}, {{\\\"kind\\\": \\\"nit\\\", \\\"finding\\\": \\\"Rename the variable\\\"}}]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
@@ -1569,6 +1569,14 @@ fn run_builds_reviews_and_lands_an_issue() {
         log.contains("issue create --label factory-follow-up --title Tidy the helper"),
         "{log}"
     );
+    // The reviewer's risk and nit make one issue that holds only the risk: nits are not filed.
+    assert_eq!(
+        log.matches("issue create --label factory-follow-up")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("Rename the variable"), "{log}");
     // The prompt reaches `claude` on stdin, not on its command line.
     assert!(f.tmp.path().join("prompt-on-stdin").exists());
     // A token in a finding never reaches the public issue.
@@ -2212,6 +2220,35 @@ fn run_records_what_each_agent_step_spent() {
     assert_eq!(usage["cost_usd"], 0.25);
     let (_, listed) = paja(&f.home, &f.repo, &["work", "list"]);
     assert_eq!(listed[0]["usage"], *usage);
+}
+
+#[test]
+fn a_fix_round_hands_the_builder_the_nits() {
+    // Round one asks for changes, so the nit goes to the fix round instead of an issue.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(!builds[0].contains("Rename the variable"), "{}", builds[0]);
+    assert!(
+        builds[1].contains("also noted these nits") && builds[1].contains("Rename the variable"),
+        "{}",
+        builds[1]
+    );
+    let log = f.gh_log();
+    assert_eq!(
+        log.matches("issue create --label factory-follow-up")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("Rename the variable"), "{log}");
 }
 
 #[test]

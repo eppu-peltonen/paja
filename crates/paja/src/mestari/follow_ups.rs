@@ -1,20 +1,85 @@
 use super::*;
 
-/// At most this many follow-up issues per change; the rest are folded into the last one.
-pub(super) const MAX_FOLLOW_UPS: usize = 5;
+/// What kind of finding a reviewer reports beside its verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// A wrong result outside what the issue asks.
+    Bug,
+    /// A security or data-loss risk, or a missing test for behaviour that could break.
+    Risk,
+    /// Style, naming, comment wording or a small refactor: fixed in a round that runs anyway,
+    /// never filed.
+    Nit,
+}
 
-/// File each non-blocking review finding as an issue with the repository's follow-up label,
-/// once the change has landed. Jono imports only the work label, so a follow-up waits until a
-/// person relabels it: reviewers suggest work, people set intent. A failure here is recorded,
-/// never turned into an escalation: the change is already merged.
+/// One non-blocking review finding. A plain string, as reviewers wrote them before findings
+/// were marked, reads as a `risk`, so it is still filed rather than lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Finding {
+    pub kind: FindingKind,
+    #[serde(rename = "finding")]
+    pub text: String,
+}
+
+impl<'de> Deserialize<'de> for Finding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Plain(String),
+            Marked { kind: FindingKind, finding: String },
+        }
+        Ok(match Shape::deserialize(deserializer)? {
+            Shape::Plain(text) => Finding {
+                kind: FindingKind::Risk,
+                text,
+            },
+            Shape::Marked { kind, finding } => Finding {
+                kind,
+                text: finding,
+            },
+        })
+    }
+}
+
+impl Finding {
+    /// The finding with its kind, as a reviewer or the log sees it.
+    pub fn shown(&self) -> String {
+        let kind = match self.kind {
+            FindingKind::Bug => "bug",
+            FindingKind::Risk => "risk",
+            FindingKind::Nit => "nit",
+        };
+        format!("[{kind}] {}", self.text)
+    }
+}
+
+/// The findings worth an issue (bugs and risks) and the nits, which are never filed.
+pub(super) fn worth_filing(findings: &[Finding]) -> (Vec<&Finding>, Vec<&Finding>) {
+    findings.iter().partition(|f| f.kind != FindingKind::Nit)
+}
+
+/// File the landed change's bugs and risks together as one issue with the repository's
+/// follow-up label, so one change asks for at most one more round of work. Nits are recorded in
+/// the log and dropped; with nothing else, no issue is filed. Jono imports only the work label,
+/// so the follow-up waits until a person relabels it: reviewers suggest work, people set intent.
+/// A failure here is recorded, never turned into an escalation: the change is already merged.
 pub(super) fn file_follow_ups(
     home: &Home,
     repo: &Path,
     item: &WorkItem,
     pr: &str,
-    findings: &[String],
+    findings: &[Finding],
     labels: &jono::Labels,
 ) {
+    let (filed, nits) = worth_filing(findings);
+    for nit in &nits {
+        record_follow_up(home, item, &nit.shown(), None, "not filed: a nit");
+    }
+    if filed.is_empty() {
+        return;
+    }
     // Review text came from an agent that read untrusted code: keep each finding short, never
     // let it mention anyone, and keep tokens and local paths out of a public issue.
     let user_home = ["HOME", "USERPROFILE"]
@@ -24,63 +89,62 @@ pub(super) fn file_follow_ups(
         .collect::<Vec<_>>();
     let mut places = vec![(home.root(), "<factory home>"), (repo, "<repository>")];
     places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
-    let mut findings: Vec<String> = findings
+    let shown: Vec<String> = filed
         .iter()
         .map(|finding| {
-            let finding = redact(finding, &places);
-            let mut text: String = finding.chars().take(4000).collect();
-            if text.len() < finding.len() {
-                text.push_str("\n\n(cut short)");
+            let text = redact(&finding.shown(), &places);
+            let mut cut: String = text.chars().take(4000).collect();
+            if cut.len() < text.len() {
+                cut.push_str("\n\n(cut short)");
             }
-            text.replace('@', "@\u{200b}")
+            cut.replace('@', "@\u{200b}")
         })
         .collect();
-    if findings.len() > MAX_FOLLOW_UPS {
-        let rest = findings.split_off(MAX_FOLLOW_UPS - 1);
-        findings.push(format!(
-            "More review follow-ups for #{}\n\n{}",
-            item.number,
-            rest.join("\n\n---\n\n")
-        ));
-    }
-    for finding in &findings {
-        let title: String = finding
-            .lines()
-            .map(|line| {
-                line.trim()
-                    .trim_matches(['#', '-', '*', '_', '`', ' '])
-                    .trim()
-            })
-            .find(|line| !line.is_empty())
-            .unwrap_or("Review follow-up")
-            .chars()
-            .take(100)
-            .collect();
-        let body = format!(
-            "{finding}\n\nA reviewer found this while reviewing #{number} ({pr}). It did not \
-             block landing. Relabel it `{work}` to queue it.",
-            number = item.number,
-            work = labels.work
-        );
-        let filed = run_gh(
-            repo,
-            &[
-                "issue",
-                "create",
-                "--label",
-                &labels.follow_up,
-                "--title",
-                &title,
-                "--body",
-                &body,
-            ],
-        );
-        match &filed {
-            Ok(issue) => record_follow_up(home, item, finding, Some(issue.as_str()), ""),
+    let first: String = shown[0]
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches("[bug]")
+                .trim_start_matches("[risk]")
+                .trim_matches(['#', '-', '*', '_', '`', ' '])
+                .trim()
+        })
+        .find(|line| !line.is_empty())
+        .unwrap_or("Review follow-up")
+        .chars()
+        .take(90)
+        .collect();
+    let title = match shown.len() {
+        1 => first,
+        n => format!("{first} (+{} more)", n - 1),
+    };
+    let body = format!(
+        "{}\n\nReviewers found these while reviewing #{number} ({pr}). They did not block \
+         landing. Relabel this issue `{work}` to queue them as one piece of work.",
+        shown.join("\n\n---\n\n"),
+        number = item.number,
+        work = labels.work
+    );
+    let issue = run_gh(
+        repo,
+        &[
+            "issue",
+            "create",
+            "--label",
+            &labels.follow_up,
+            "--title",
+            &title,
+            "--body",
+            &body,
+        ],
+    );
+    for finding in &filed {
+        match &issue {
+            Ok(issue) => record_follow_up(home, item, &finding.shown(), Some(issue.as_str()), ""),
             Err(err) => record_follow_up(
                 home,
                 item,
-                finding,
+                &finding.shown(),
                 None,
                 &format!(
                     "{err:#}; if the label is missing, create it with `gh label create \
@@ -278,6 +342,43 @@ pub(super) fn record_follow_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finding(kind: FindingKind, text: &str) -> Finding {
+        Finding {
+            kind,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn only_bugs_and_risks_are_worth_an_issue() {
+        let nits = [
+            finding(FindingKind::Nit, "Rename x"),
+            finding(FindingKind::Nit, "Reword y"),
+        ];
+        assert!(worth_filing(&nits).0.is_empty());
+        let mixed = [
+            finding(FindingKind::Nit, "Rename x"),
+            finding(FindingKind::Bug, "Off by one in z"),
+            finding(FindingKind::Nit, "Reword y"),
+        ];
+        let (filed, dropped) = worth_filing(&mixed);
+        assert_eq!(filed, [&mixed[1]]);
+        assert_eq!(dropped.len(), 2);
+    }
+
+    #[test]
+    fn a_finding_reads_marked_or_plain() {
+        let marked: Finding =
+            serde_json::from_value(json!({"kind": "nit", "finding": "Rename x"})).unwrap();
+        assert_eq!(marked, finding(FindingKind::Nit, "Rename x"));
+        // A reviewer that still writes plain strings has them filed, not lost.
+        let plain: Finding = serde_json::from_value(json!("Off by one")).unwrap();
+        assert_eq!(plain, finding(FindingKind::Risk, "Off by one"));
+        assert!(
+            serde_json::from_value::<Finding>(json!({"kind": "idea", "finding": "x"})).is_err()
+        );
+    }
 
     #[test]
     fn findings_lose_tokens_and_local_paths() {
