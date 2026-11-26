@@ -62,7 +62,9 @@ of issues refuses to close anything rather than drop work it could not see.
 `paja work answer <issue> <text>` records a person's answer to an escalated item (`work.answered`, with the question it
 answers) and queues the item again under the home lock, then posts the answer as a comment on the issue. Each item
 keeps its `answers`, and every later run passes them to the builder and the reviewers, since agents can't read the
-issue's comments; a reply on the issue alone doesn't reach them, and Paja's question on the issue says so.
+issue's comments; a reply on the issue alone doesn't reach them, and Paja's question on the issue says so. For the
+same reason `paja work set <issue> queued` refuses an escalated item and points at `paja work answer`; it is the only
+way an escalated item is queued again.
 `paja work file --title --body` opens a new issue labelled `paja`. Both use `gh`, and the MCP tools `work_answer` and
 `work_file` do the same.
 

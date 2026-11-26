@@ -724,6 +724,16 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         &repo,
         &["work", "set", "3", "escalated", "--note", "Which API?"],
     );
+    // Queuing it by hand would start a run that never sees the answer.
+    let (ok, err) = paja(&home, &repo, &["work", "set", "3", "queued"]);
+    assert!(!ok);
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("paja work answer 3"),
+        "{err}"
+    );
     let (ok, item) = paja_with(&home, &repo, &["work", "answer", "3", "Use v2"], &with_gh);
     assert!(ok, "{item}");
     assert_eq!(item["status"], "queued");
@@ -1174,7 +1184,7 @@ fn run_says_when_it_needs_a_decision() {
     for step in [
         "running Vasara's checks (1 command)",
         "#5 needs a decision; asked on the issue",
-        "paja work set 5 queued",
+        "paja work answer 5",
     ] {
         assert!(stderr.contains(step), "missing {step:?} in:\n{stderr}");
     }
