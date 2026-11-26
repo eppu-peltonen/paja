@@ -224,18 +224,18 @@ the tool call, because the reported `cwd` moves when the agent runs `cd`.
   followed, and are blocked while the worktree holds a symlink out of the worktree. To keep that scan fast, a `Grep`
   without a `glob` leaves out the worktree's top-level `target` directory, which ripgrep never enters either, when the
   worktree's `.gitignore` names it in a line git and ripgrep read the same way (`target`, `target/`, `/target`,
-  `/target/`). Git and ripgrep match ignore patterns with different engines, so no other directory is left out, and
-  git is not asked. `target` itself is still checked for being a link out. Nothing is left out when any of these
-  could make ripgrep search it after all: a `!` line in that `.gitignore` or in one above the worktree, a ripgrep
-  ignore file (`.ignore`, `.rgignore`) in the worktree's top directory or above it, `RIPGREP_CONFIG_PATH`, a worktree
-  without `.git`, a `.gitignore` that isn't all UTF-8 (ripgrep stops reading at the first bad line) or that is over 4
-  KiB or holds anything but comments, names and `*`/`?` (ripgrep drops a file it can't compile), a search that
-  starts inside `target`, or a symlink into it. `Glob`, `LS` and a `Grep` with a `glob` always walk the whole
+  `/target/`). Git and ripgrep match ignore patterns with different engines, so no other directory is left out, and git
+  is not asked. `target` itself is still checked for being a link out. Nothing is left out when any of these could make
+  ripgrep search it after all: a `!` line in that `.gitignore` or in one above the worktree, a ripgrep ignore file
+  (`.ignore`, `.rgignore`) in the worktree's top directory or above it, `RIPGREP_CONFIG_PATH`, a worktree without
+  `.git`, a `.gitignore` that isn't a plain file or isn't all UTF-8 (ripgrep stops reading at the first bad line) or
+  that is over 4 KiB or holds anything but comments, names and `*`/`?` (ripgrep drops a file it can't compile), a search
+  that starts inside `target`, or a symlink into it. `Glob`, `LS` and a `Grep` with a `glob` always walk the whole
   worktree. These conditions follow how ripgrep reads ignore files, so a ripgrep change means checking them again. They
   also assume that Claude Code's `Grep` runs ripgrep with its default ignore handling (no `--no-ignore`, `-u` or
-  `--ignore-file`) and in the hook's environment, which is where `RIPGREP_CONFIG_PATH` is read. A `.gitignore` is read
-  only up to 4 KiB; a bigger one leaves nothing out. A file tool path may not start with `~`, a search pattern may not
-  hold `..` or a path inside braces, and no tool may name a credential path (`.ssh`, `.config/gh` and the like).
+  `--ignore-file`) and in the hook's environment, which is where `RIPGREP_CONFIG_PATH` is read. A file tool path may not
+  start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
+  (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
 - **On Windows** the same rules apply to Windows spellings, and paths the file system reads differently from how they
   look are refused rather than interpreted: device and UNC paths (`\\?\`, `\\server\share`), drive-relative
