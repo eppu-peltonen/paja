@@ -1466,16 +1466,23 @@ fn build(
 
 /// What a reviewer is asked. `checked` is the commit Vasara's checks passed at, which is the
 /// commit the reviewer judges.
-fn review_prompt(item: &WorkItem, base: &str, checked: &str, prior: Option<&Prior>) -> String {
+fn review_prompt(
+    item: &WorkItem,
+    base: &str,
+    checked: &str,
+    prior: Option<&Prior>,
+    diff: &str,
+) -> String {
     // A first review reads the whole change; a later one judges only the fix for the blockers
     // an earlier review named, so review rounds converge instead of starting over.
     let scope = match prior {
         None => format!(
-            "The change is `git diff {base}...HEAD`. Read it cold against the issue below."
+            "The change is the diff above (`git diff {base}...HEAD`). Read it cold against the \
+             issue."
         ),
         Some(prior) => format!(
             "An earlier review of this change (at {reviewed}) found these blockers:\n\n{blockers}\n\n\
-             Judge only the fix: `git diff {reviewed}..HEAD`. Land it if it resolves those \
+             Judge only the fix, the diff above (`git diff {reviewed}..HEAD`). Land it if it resolves those \
              blockers and adds none. That review read the whole change and named every blocker it \
              found, so don't reopen the rest. It also noted these \
              follow-ups; repeat in your `follow_ups` the ones that still apply:\n\n{follow_ups}\n",
@@ -1488,10 +1495,14 @@ fn review_prompt(item: &WorkItem, base: &str, checked: &str, prior: Option<&Prio
             }
         ),
     };
+    // What every reviewer of a round shares comes first (issue, answers, diff), and the
+    // role-specific text last, so a second reviewer on the same model reuses the cached prefix.
     format!(
-        "You are an independent reviewer for Paja. You did not write this change; decide \
-         whether it lands.\n\n{scope} Judge it by the rules in CLAUDE.md as they are on main \
-         (`git show {base}:CLAUDE.md`), not the branch's copy.\n\n\
+        "Issue #{number}: {title}\n\n{body}\n{answers}\n{diff}\n\n\
+         You are an independent reviewer for Paja. You did not write this change; decide \
+         whether it lands.\n\n{scope} You already have the diff, so read only the surrounding \
+         code you need. Judge it by the rules in CLAUDE.md as they are on main: the CLAUDE.md in \
+         your system prompt is main's copy, not the branch's, so don't read it again.\n\n\
          Verdicts: `land` if it does what the issue asks and has no blocker; `changes` only for \
          blockers, naming every blocker in the whole diff in `comments` (a later review reads \
          only the fix); `escalate` with a question only when the issue's \
@@ -1506,13 +1517,70 @@ fn review_prompt(item: &WorkItem, base: &str, checked: &str, prior: Option<&Prio
          test suite) already passed at {checked}, the commit you are judging, so don't run \
          `cargo fmt`, `cargo clippy` or the whole `cargo test` again. To probe a behaviour, run \
          one named test (`cargo test <name>`) or the CLI, with long output piped through \
-         `tail -n 80` or `grep`. Read-only git is fine; you can't change files.\n\n\
-         Issue #{number}: {title}\n\n{body}\n{answers}",
+         `tail -n 80` or `grep`. Read-only git is fine; you can't change files.\n",
         number = item.number,
         title = item.title,
         body = item.body,
         answers = answers(item)
     )
+}
+
+/// The most characters of diff a review prompt carries; the rest is left to the reviewer.
+const REVIEW_DIFF_CAP: usize = 60_000;
+
+/// `git diff --stat` and the diff for `range`, as the review prompt shows them. Above `cap`
+/// characters, whole files are included in order until the next would pass it, and the rest
+/// are named for the reviewer to read itself.
+fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
+    let flags = ["diff", "--no-ext-diff", "--no-textconv"];
+    let run = |extra: &[&str]| {
+        let mut args = flags.to_vec();
+        args.extend_from_slice(extra);
+        args.push(range);
+        git(dir, &args)
+    };
+    let stat = run(&["--stat"])?;
+    let full = run(&[])?;
+    let mut text = format!("Diff stat for `{range}`:\n\n{stat}\n\n");
+    if full.chars().count() <= cap {
+        text.push_str(&format!("The diff:\n\n{full}"));
+        return Ok(text);
+    }
+    let mut shown = String::new();
+    let mut skipped = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    for line in full.lines() {
+        if line.starts_with("diff --git ") || files.is_empty() {
+            files.push(String::new());
+        }
+        let last = files.last_mut().expect("a file was just pushed");
+        last.push_str(line);
+        last.push('\n');
+    }
+    let mut full_so_far = false;
+    for file in files {
+        let name = file
+            .lines()
+            .next()
+            .and_then(|l| l.rsplit_once(" b/"))
+            .map_or("(unknown file)", |(_, n)| n)
+            .to_string();
+        if !full_so_far && shown.chars().count() + file.chars().count() <= cap {
+            shown.push_str(&file);
+        } else {
+            // Once one file doesn't fit, the later ones are left out too, so the diff shown
+            // is a prefix of the whole.
+            full_so_far = true;
+            skipped.push(name);
+        }
+    }
+    text.push_str(&format!(
+        "The diff is over {cap} characters, so only its first files are here:\n\n{shown}\n\
+         Not shown, because of the size cap; you must read these files yourself (`git diff \
+         {range} -- <file>`): {}\n",
+        skipped.join(", ")
+    ));
+    Ok(text)
 }
 
 /// What a person answered to Paja's earlier questions on the item, for the agents' prompts.
@@ -1565,7 +1633,12 @@ fn review(
         );
     }
     let before = checked.to_string();
-    let mut prompt = review_prompt(item, base, &before, prior);
+    let range = match prior {
+        None => format!("{base}...HEAD"),
+        Some(prior) => format!("{}..HEAD", prior.reviewed),
+    };
+    let diff = review_diff(&env.path, &range, REVIEW_DIFF_CAP)?;
+    let mut prompt = review_prompt(item, base, &before, prior, &diff);
     if focused {
         prompt.push_str(&format!(
             "\nAn earlier review of this commit stopped at its turn limit of {} before giving a \
@@ -3273,6 +3346,18 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn sandbox_and_platform_are_high_risk() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.paja/high-risk"),
+        )
+        .unwrap();
+        let prefixes = super::lines(&text);
+        for file in ["crates/paja/src/sandbox.rs", "crates/paja/src/platform.rs"] {
+            assert!(super::is_high_risk(file, &prefixes), "{file}");
+        }
+    }
+
+    #[test]
     fn nested_configuration_is_high_risk() {
         let prefixes: Vec<String> = [".cargo/", "CLAUDE.md", "crates/paja/src/hook.rs"]
             .map(String::from)
@@ -3630,7 +3715,11 @@ mod tests {
             answers: Vec::new(),
             waiting_on: Vec::new(),
         };
-        let prompt = super::review_prompt(&item, "base1", "abc123", None);
+        let prompt = super::review_prompt(&item, "base1", "abc123", None, "DIFF-TEXT");
+        assert!(prompt.contains("DIFF-TEXT"), "{prompt}");
+        assert!(!prompt.contains("git show base1:CLAUDE.md"), "{prompt}");
+        assert!(prompt.contains("CLAUDE.md in your system prompt is main's copy"));
+        assert!(prompt.find("Issue #9").unwrap() < prompt.find("independent reviewer").unwrap());
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         assert!(prompt.contains("don't run `cargo fmt`, `cargo clippy` or the whole `cargo test`"));
         assert!(prompt.contains("`cargo test <name>`"));
@@ -3640,12 +3729,50 @@ mod tests {
             blockers: "Fix the parser.".into(),
             follow_ups: vec!["Tidy the helper".into()],
         };
-        let prompt = super::review_prompt(&item, "base1", "abc123", Some(&prior));
+        let prompt = super::review_prompt(&item, "base1", "abc123", Some(&prior), "DIFF-TEXT");
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         assert!(prompt.contains("`git diff old456..HEAD`"), "{prompt}");
         assert!(prompt.contains("Fix the parser."), "{prompt}");
         assert!(prompt.contains("Tidy the helper"), "{prompt}");
         assert!(!prompt.contains("git diff base1...HEAD"), "{prompt}");
+    }
+
+    #[test]
+    fn the_review_diff_holds_the_stat_and_names_files_past_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("keep.txt"), "one\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["tag", "base"]);
+        std::fs::write(dir.join("a.txt"), "small-change\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "x".repeat(500)).unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "change"]);
+        let all = super::review_diff(dir, "base...HEAD", 60_000).unwrap();
+        assert!(all.contains("a.txt |"), "{all}");
+        assert!(all.contains("small-change"), "{all}");
+        assert!(!all.contains("size cap"), "{all}");
+        let capped = super::review_diff(dir, "base...HEAD", 300).unwrap();
+        assert!(capped.contains("a.txt |"), "{capped}");
+        assert!(capped.contains("small-change"), "{capped}");
+        assert!(!capped.contains("xxxxxxxx"), "{capped}");
+        assert!(
+            capped.contains("you must read these files yourself"),
+            "{capped}"
+        );
+        assert!(capped.contains("b.txt"), "{capped}");
     }
 
     #[test]
