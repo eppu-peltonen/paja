@@ -1,7 +1,7 @@
 //! End-to-end: drive the real `paja` binary against a throwaway git repo.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
@@ -943,6 +943,7 @@ impl Factory {
                  v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\"}}'; exit 0; fi ;; esac\n\
+                 if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
@@ -1114,6 +1115,57 @@ fn a_round_that_errors_still_records_what_it_spent() {
     assert_eq!(item["status"], "escalated", "{item}");
     assert_eq!(item["usage"]["steps"], 1, "{item}");
     assert_eq!(item["usage"]["input_tokens"], 100, "{item}");
+}
+
+#[test]
+fn a_run_resumes_an_item_an_interrupted_run_left_active() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("hang"), "").unwrap();
+    let vars = [
+        ("PAJA_GH", f.gh.as_path()),
+        ("PAJA_CLAUDE", f.claude.as_path()),
+    ];
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .envs(vars.iter().copied())
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Stop the run mid-build, as Ctrl-C or a closed terminal would.
+    let started = std::time::Instant::now();
+    while !dir.join("hanging").exists() {
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the builder never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run.kill().unwrap();
+    run.wait().unwrap();
+    std::fs::remove_file(dir.join("hang")).unwrap();
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+
+    // The next run picks the same item up again, in the same environment, and says so.
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .envs(vars.iter().copied())
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["number"], 5, "{report}");
+    assert!(stderr.contains("resuming #5"), "{stderr}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "landed", "{item}");
 }
 
 #[test]

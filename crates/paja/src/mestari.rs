@@ -467,10 +467,23 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     progress("checking the queue (issues labelled paja)");
     jono::sync(home, &repo)?;
     let config = read_config(&repo, &base)?;
-    let Some(item) = jono::claim(home)? else {
+    // The claim's lock is held until this pass is done with the item, however it ends.
+    let Some(jono::RunClaim {
+        item,
+        lock: _working,
+        resumed,
+    }) = jono::claim_for_run(home)?
+    else {
         return Ok(RunReport::Idle);
     };
-    progress(&format!("picked #{}: {}", item.number, item.title));
+    if resumed {
+        progress(&format!(
+            "resuming #{}: {} (an earlier run stopped before finishing it)",
+            item.number, item.title
+        ));
+    } else {
+        progress(&format!("picked #{}: {}", item.number, item.title));
+    }
     // Anything that goes wrong from here is reported on the issue, not lost.
     let mut run = Unrecorded::default();
     match run_item(home, &repo, &base, &item, config, &mut run) {
