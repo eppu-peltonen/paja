@@ -290,6 +290,51 @@ pub struct RunOptions<'a> {
     /// A person has checked the repository's git configuration after Paja stopped on
     /// tampering, and Paja may run git there again.
     pub tamper_checked: bool,
+    /// Take only this item instead of the oldest queued one (`paja run --item`).
+    pub item: Option<u64>,
+    /// Ask the person, after the summary, before the first agent starts.
+    pub confirm: bool,
+}
+
+/// The person did not confirm the run, so nothing was started.
+#[derive(Debug)]
+pub struct Declined;
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not confirmed; nothing was started (pass --yes to skip the question)")
+    }
+}
+
+impl std::error::Error for Declined {}
+
+/// What a run is about to do, on stderr, before the first agent starts.
+fn summary(item: &jono::WorkItem, ci: CiMode, sandbox: bool) {
+    progress(&format!("repository: {}", item.repo));
+    progress(&format!("item: #{} {}", item.number, item.title));
+    progress("merges into: main (default branch), by squash");
+    progress(&match ci {
+        CiMode::Required => "CI: required before landing".to_string(),
+        CiMode::None => format!(
+            "CI: not required ({CI_FILE} says none); Vasara's checks and the reviewers decide"
+        ),
+    });
+    if sandbox {
+        progress("sandbox: in use");
+    } else {
+        progress(
+            "no sandbox: agents and the checks run as this user, with this user's files and \
+             sign-ins, and the deny-list hook is a guardrail, not a sandbox",
+        );
+    }
+}
+
+/// Ask on stderr and read a yes or no from stdin.
+fn confirmed() -> Result<bool> {
+    eprint!("Go ahead? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Take the next work item and run it to an outcome.
@@ -326,13 +371,28 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         item,
         lock: _working,
         resumed,
-    }) = jono::claim_for_run(home, &name)?
+    }) = jono::claim_for_run_item(home, &name, opts.item)?
     else {
+        if let Some(number) = opts.item {
+            bail!(
+                "work item #{number} is not queued (or another run holds it); see \
+                 `paja work list`"
+            );
+        }
         if let Some(waiting) = jono::waiting(home, &name)? {
             progress(&format!("nothing is ready: {waiting}"));
         }
         return Ok(RunReport::Idle);
     };
+    summary(&item, config.ci, crate::sandbox::active().is_some());
+    if opts.confirm && !confirmed()? {
+        // Put the item back, so declining leaves the queue as it was. A resumed item was
+        // active already and stays so.
+        if !resumed {
+            jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
+        }
+        return Err(Declined.into());
+    }
     if resumed {
         progress(&format!(
             "resuming #{}: {} (an earlier run stopped before finishing it)",

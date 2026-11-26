@@ -707,6 +707,12 @@ pub struct RunClaim {
 /// first, so it is resumed instead of being skipped for good. Otherwise the next queued item is
 /// claimed. Items a person or another worker claimed with `paja work claim` are never taken.
 pub fn claim_for_run(home: &Home, repo: &str) -> Result<Option<RunClaim>> {
+    claim_for_run_item(home, repo, None)
+}
+
+/// [`claim_for_run`], taking only item `only` when one is named (`paja run --item`).
+pub fn claim_for_run_item(home: &Home, repo: &str, only: Option<u64>) -> Result<Option<RunClaim>> {
+    let wanted = |item: &WorkItem| only.is_none_or(|n| n == item.number);
     let lock = home.lock()?;
     let log = home.events();
     pin_legacy(&lock, &log, repo)?;
@@ -728,7 +734,7 @@ pub fn claim_for_run(home: &Home, repo: &str) -> Result<Option<RunClaim>> {
     for item in items.values() {
         let left =
             item.open && item.status == Status::Active && by_run.get(&item.number) == Some(&true);
-        if !left {
+        if !left || !wanted(item) {
             continue;
         }
         if let Some(run_lock) = home.try_run_lock(repo, item.number)? {
@@ -739,7 +745,7 @@ pub fn claim_for_run(home: &Home, repo: &str) -> Result<Option<RunClaim>> {
             }));
         }
     }
-    for item in items.values().filter(|item| is_ready(item)) {
+    for item in items.values().filter(|item| is_ready(item) && wanted(item)) {
         // A queued item a live run still holds (set back by hand mid-run) waits for that run.
         let Some(run_lock) = home.try_run_lock(repo, item.number)? else {
             continue;
