@@ -7,7 +7,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::events::Event;
 use crate::home::Home;
@@ -149,12 +149,12 @@ struct Number {
 }
 
 /// The part of a `run.round` event the queue reads. Rounds recorded before usage was kept have
-/// no `steps`.
+/// no `steps`. Each step is read on its own, so one Paja can't read doesn't stop the queue.
 #[derive(Deserialize)]
 struct Round {
     number: u64,
     #[serde(default)]
-    steps: Vec<StepUsage>,
+    steps: Value,
 }
 
 #[derive(Deserialize)]
@@ -234,9 +234,24 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
             EV_ROUND => {
                 let round: Round =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
-                if let Some(item) = items.get_mut(&round.number) {
-                    for step in &round.steps {
-                        item.usage.get_or_insert_with(Usage::default).add(step);
+                // Steps that aren't a list count as one step whose usage is unknown.
+                let steps = match round.steps {
+                    Value::Null => Vec::new(),
+                    Value::Array(steps) => steps,
+                    other => vec![other],
+                };
+                if let (Some(item), false) = (items.get_mut(&round.number), steps.is_empty()) {
+                    let usage = item.usage.get_or_insert_with(Usage::default);
+                    for step in steps {
+                        // Usage is informational: a step that can't be read counts as one whose
+                        // usage is unknown.
+                        match serde_json::from_value::<StepUsage>(step) {
+                            Ok(step) => usage.add(&step),
+                            Err(_) => {
+                                usage.steps += 1;
+                                usage.unknown_steps += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -667,6 +682,22 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 200);
         assert_eq!(usage.num_turns, 8);
         assert_eq!(usage.cost_usd, 1.0);
+
+        // A step Paja can't read counts as unknown; it doesn't stop the queue.
+        let lock = home.lock().unwrap();
+        for steps in [json!([{ "step": 7 }]), json!("not a list")] {
+            log.append(
+                &lock,
+                EV_ROUND,
+                json!({ "number": 1, "round": 4, "steps": steps }),
+            )
+            .unwrap();
+        }
+        drop(lock);
+        let usage = get(&home, 1).unwrap().usage.unwrap();
+        assert_eq!((usage.steps, usage.unknown_steps), (5, 3));
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(list(&home).unwrap().len(), 1);
     }
 
     #[test]

@@ -125,7 +125,8 @@ review finding. Each `run.round` event also lists the round's agent steps under 
 cache-creation tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p`
 result. A field the result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying
 those events gives each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching
-MCP tools; steps with missing fields count in its `unknown_steps` and add nothing. While it works, `paja run` prints one progress line per step on stderr (the issue it picked, each build
+MCP tools; steps with missing fields count in its `unknown_steps` and add nothing, and so does a recorded step Jono can't read,
+so a bad usage record never stops the queue. While it works, `paja run` prints one progress line per step on stderr (the issue it picked, each build
 round, the checks, each review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so
 stdout keeps its JSON. `paja run --every 5` keeps going, checking an empty queue every five minutes.
 
