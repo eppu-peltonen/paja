@@ -121,3 +121,11 @@ footer { padding: 8px 20px 16px; }
 #repos .actions input { flex: 1; }
 #repo-list li { display: block; }
 pre.output { max-height: 240px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; background: var(--bg); padding: 6px 8px; }
+#pool { margin: 12px 20px 0; }
+#pool .row { display: flex; gap: 12px; align-items: baseline; }
+#pool-table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 13px; }
+#pool-table th, #pool-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+#pool-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
+#pool-lanes { width: 4.5em; }
+#pool .actions { align-items: center; }
+#pool .actions label { display: flex; gap: 6px; align-items: center; margin: 0; }

@@ -565,6 +565,17 @@ pub struct PoolStatus {
     pub waiting: Vec<WaitingItem>,
     /// The latest landings of the repository, newest first.
     pub landed: Vec<Landing>,
+    /// When the running pool started, in milliseconds since the Unix epoch; None while stopped.
+    pub started_ms: Option<u64>,
+    /// What the repository's finished rounds spent since the running pool started, in US
+    /// dollars (Claude Code's estimate).
+    pub spent_usd: f64,
+    /// How many items landed since the running pool started.
+    pub landed_since_start: usize,
+    /// How many open items are held, escalated and waiting on the person's answer.
+    pub held: usize,
+    /// How many waiting items are ready and wait only for a free lane.
+    pub ready: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -678,7 +689,7 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         })
         .collect();
     let admitted: Vec<u64> = lanes.iter().map(|lane| lane.number).collect();
-    let waiting = items
+    let waiting: Vec<WaitingItem> = items
         .iter()
         .filter(|item| item.open && item.status == Status::Queued)
         .filter(|item| !admitted.contains(&item.number))
@@ -708,6 +719,28 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         })
         .take(LANDINGS)
         .collect();
+    let since = started.filter(|_| running).map(|start| &events[start..]);
+    let spent_usd = since
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e.kind == EV_ROUND && e.data["repo"] == repo)
+        .flat_map(|e| e.data["steps"].as_array().cloned().unwrap_or_default())
+        .filter_map(|step| step["cost_usd"].as_f64())
+        .sum::<f64>()
+        + 0.0;
+    let landed_since_start = since
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e.kind == EV_LANDED && e.data["repo"] == repo)
+        .count();
+    let held = items
+        .iter()
+        .filter(|item| item.open && item.status == Status::Escalated)
+        .count();
+    let ready = waiting
+        .iter()
+        .filter(|item: &&WaitingItem| item.why == "no free lane")
+        .count();
     PoolStatus {
         repo: repo.to_string(),
         state: if running { "running" } else { "stopped" }.to_string(),
@@ -717,6 +750,11 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         lanes,
         waiting,
         landed,
+        started_ms: since.map(|events| events[0].ts_ms),
+        spent_usd,
+        landed_since_start,
+        held,
+        ready,
     }
 }
 
@@ -730,6 +768,18 @@ pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
         "pool of {}: {}, {} busy of {target}",
         status.repo, status.state, status.busy
     )];
+    if let Some(started) = status.started_ms {
+        let minutes = now_ms.saturating_sub(started) / 60_000;
+        out.push(format!(
+            "running {}h{:02}m: spent ${:.2}, landed {}, {} ready, {} held for an answer",
+            minutes / 60,
+            minutes % 60,
+            status.spent_usd,
+            status.landed_since_start,
+            status.ready,
+            status.held
+        ));
+    }
     if !status.lanes.is_empty() {
         out.push("lane  item    stage     step      in step  spent".to_string());
         for lane in &status.lanes {
@@ -837,6 +887,10 @@ mod tests {
         assert_eq!(status.waiting[0].why, "no free lane");
         assert_eq!(status.waiting[1].why, "waits on #5");
         assert_eq!(status.landed[0].number, 6);
+        assert_eq!(status.started_ms, Some(2000));
+        assert!((status.spent_usd - 0.75).abs() < 1e-9);
+        assert_eq!(status.landed_since_start, 1);
+        assert_eq!((status.held, status.ready), (0, 1));
         let text = describe(&status, 67_000);
         assert!(text.contains("running, 1 busy of 3 lanes"), "{text}");
         assert!(text.contains("1m00s"), "{text}");

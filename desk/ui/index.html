@@ -34,6 +34,34 @@
       </div>
       <p id="repo-result" hidden></p>
     </section>
+    <section id="pool" hidden>
+      <div class="row">
+        <h2>Pool of <span id="pool-repo"></span></h2>
+        <button id="pool-close" type="button" class="quiet">Close</button>
+      </div>
+      <p id="pool-summary"></p>
+      <div class="actions">
+        <label>Lanes <input id="pool-lanes" type="number" min="0" max="32" step="1" /></label>
+        <button id="pool-set" type="button">Set lanes</button>
+        <button id="pool-start" type="button">Start the pool</button>
+        <button id="pool-stop" type="button">Stop after this step</button>
+        <button id="pool-stop-now" type="button" class="quiet">Stop now</button>
+      </div>
+      <p id="pool-note" class="muted" hidden></p>
+      <p id="pool-result" hidden></p>
+      <table id="pool-table">
+        <thead>
+          <tr><th>Lane</th><th>Item</th><th>Stage</th><th>Step</th><th>In step</th><th>Spent</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <h3>Waiting</h3>
+      <ul id="pool-waiting"></ul>
+      <h3>Landed</h3>
+      <ul id="pool-landed"></ul>
+      <h3>Events</h3>
+      <pre id="pool-stream" class="output"></pre>
+    </section>
     <p id="versions" class="warning" hidden></p>
     <section id="filing" hidden>
       <h2>New work</h2>

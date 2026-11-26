@@ -184,13 +184,22 @@ async fn run_start(
     runner: tauri::State<'_, Runner>,
     repo: String,
     every: bool,
+    workers: Option<u32>,
 ) -> Result<Value, String> {
     let runner = runner.inner().clone();
-    Ok(off_main(move |home| run_start_in(home, &runner, &repo, every, &checkout())).await)
+    Ok(off_main(move |home| run_start_in(home, &runner, &repo, every, workers, &checkout())).await)
 }
 
-/// [`run_start`] for `home`.
-pub fn run_start_in(home: &Home, runner: &Runner, repo: &str, every: bool, cwd: &Path) -> Value {
+/// [`run_start`] for `home`. `workers` runs a pool of that many lanes (`paja run --every
+/// --workers`), with `every`.
+pub fn run_start_in(
+    home: &Home,
+    runner: &Runner,
+    repo: &str,
+    every: bool,
+    workers: Option<u32>,
+    cwd: &Path,
+) -> Value {
     let started = checkout_of(home, repo, cwd).and_then(|path| {
         let report = paja::doctor::run_checks(home, &path)?;
         if !report.ok {
@@ -208,9 +217,62 @@ pub fn run_start_in(home: &Home, runner: &Runner, repo: &str, every: bool, cwd: 
                 failed.join("\n")
             );
         }
-        runner.start(home, repo, &path, every)
+        runner.start(home, repo, &path, every, workers)
     });
     started.unwrap_or_else(error)
+}
+
+/// The pool of `repo`, as `paja --json pool status` prints it.
+#[tauri::command]
+async fn pool_status(repo: String) -> Value {
+    off_main(move |home| pool_status_in(home, &repo)).await
+}
+
+/// [`pool_status`] for `home`.
+pub fn pool_status_in(home: &Home, repo: &str) -> Value {
+    paja::mestari::pool::status(home, repo)
+        .and_then(|status| Ok(serde_json::to_value(status)?))
+        .unwrap_or_else(error)
+}
+
+/// Set the lane count of `repo`'s pool, as `paja --json pool lanes <N>` does, or with null
+/// show it. A running pool reads it on its next tick.
+#[tauri::command]
+async fn pool_lanes(repo: String, lanes: Option<u32>) -> Value {
+    off_main(move |home| pool_lanes_in(home, &repo, lanes)).await
+}
+
+/// [`pool_lanes`] for `home`.
+pub fn pool_lanes_in(home: &Home, repo: &str, lanes: Option<u32>) -> Value {
+    paja::mestari::pool::lanes(home, repo, lanes)
+        .and_then(|lanes| Ok(serde_json::to_value(lanes)?))
+        .unwrap_or_else(error)
+}
+
+/// The event kinds the pool view's stream shows: the pool's own and its lanes' runs'.
+const STREAM_KINDS: [&str; 2] = ["pool.", "run."];
+
+/// The latest `limit` events of `repo`'s pool and runs, newest first, as `paja --json log`
+/// prints them, for the pool view's live stream.
+#[tauri::command]
+async fn pool_events(repo: String, limit: usize) -> Value {
+    off_main(move |home| pool_events_in(home, &repo, limit)).await
+}
+
+/// [`pool_events`] for `home`.
+pub fn pool_events_in(home: &Home, repo: &str, limit: usize) -> Value {
+    let events = home.events().read_all().map(|events| {
+        events
+            .into_iter()
+            .rev()
+            .filter(|e| STREAM_KINDS.iter().any(|kind| e.kind.starts_with(kind)))
+            .filter(|e| e.data["repo"] == repo)
+            .take(limit)
+            .collect::<Vec<_>>()
+    });
+    events
+        .and_then(|events| Ok(serde_json::to_value(events)?))
+        .unwrap_or_else(error)
 }
 
 /// Ask Desk's run of `repo` to stop after the step in flight, or `now`.
@@ -365,6 +427,9 @@ pub fn run() {
             repo_doctor,
             run_start,
             run_stop,
+            pool_status,
+            pool_lanes,
+            pool_events,
             close_desk
         ])
         .setup(|app| {
@@ -663,7 +728,7 @@ mod tests {
         // The checkout has no `.paja/checks` on its default branch, which `paja doctor` fails.
         let (home, _) = escalated_with_checkout(dir.path());
         let runner = Runner::new(dir.path().join("no-paja"));
-        let started = run_start_in(&home, &runner, "acme/app", false, dir.path());
+        let started = run_start_in(&home, &runner, "acme/app", false, None, dir.path());
         let error = started["error"].as_str().unwrap_or_default();
         assert!(error.contains("paja doctor found"), "{started}");
         assert!(runner.running().is_empty());
@@ -694,6 +759,60 @@ mod tests {
         assert!(
             error.contains("doesn't know where acme/app is checked out"),
             "{answered}"
+        );
+    }
+
+    #[test]
+    fn the_lane_count_desk_sets_is_the_one_paja_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        import(&home, "acme/app", 3, "Add a login page");
+        assert_eq!(pool_lanes_in(&home, "acme/app", None)["lanes"], Value::Null);
+        let set = pool_lanes_in(&home, "acme/app", Some(2));
+        assert_eq!(set["lanes"], 2, "{set}");
+        assert_eq!(set["running"], false, "{set}");
+        // The same as `paja pool lanes` and `paja pool status` read.
+        let lanes = paja::mestari::pool::lanes(&home, "acme/app", None).unwrap();
+        assert_eq!(lanes.lanes, Some(2));
+        let status = pool_status_in(&home, "acme/app");
+        let core = paja::mestari::pool::status(&home, "acme/app").unwrap();
+        assert_eq!(status, serde_json::to_value(core).unwrap());
+        assert_eq!(status["target"], 2, "{status}");
+        assert_eq!(status["waiting"][0]["number"], 3, "{status}");
+        assert!(pool_lanes_in(&home, "acme/app", Some(99))["error"].is_string());
+    }
+
+    #[test]
+    fn the_pool_stream_holds_the_repositorys_pool_and_run_events_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        import(&home, "acme/app", 3, "Add a login page");
+        pool_lanes_in(&home, "acme/app", Some(2));
+        pool_lanes_in(&home, "acme/other", Some(4));
+        {
+            let lock = home.lock().unwrap();
+            home.events()
+                .append(
+                    &lock,
+                    "run.step",
+                    json!({"repo": "acme/app", "number": 3, "round": 1, "role": "build"}),
+                )
+                .unwrap();
+        }
+        let stream = pool_events_in(&home, "acme/app", 10);
+        let kinds: Vec<&str> = stream
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["run.step", "pool.lanes"]);
+        assert_eq!(
+            pool_events_in(&home, "acme/app", 1)
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
