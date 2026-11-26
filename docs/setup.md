@@ -53,6 +53,35 @@ paja run --once
 
 Then `paja run --every 5` keeps going, as described below.
 
+## Setting up your own repository
+
+In a checkout of an existing repository, with `gh` signed in and the default branch pushed:
+
+```sh
+paja init          # --ci also writes a GitHub Actions workflow when the repository has none
+```
+
+`paja init` finds the stack from the files on the default branch (`Cargo.toml`; `package.json` with its `test` and
+`lint` scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`;
+`go.mod`) and writes, in one pull request from the branch `paja/init`:
+
+- `.paja/checks` and `.paja/commands` for what it found. When it finds nothing it knows, both hold commented templates
+  and `paja init` says to fill in the checks in the pull request.
+- `.paja/models` with Paja's defaults, and `.paja/high-risk` listing `.paja/`, `CLAUDE.md`, `.github/`, `.claude/` and
+  the stack's build configuration.
+- `CLAUDE.md`: a starter with the project's commands and the rules for agents, or, when the repository has one, a
+  "Working with Paja" section appended to it, the rest untouched.
+- With `--ci` and no workflow in `.github/workflows`, a workflow that runs the checks on pull requests; without
+  `--ci`, `.paja/ci` containing `none`, which says the repository has no CI (see [CI](#ci)).
+
+It also creates the work and follow-up labels (`.paja/labels`, `factory` and `factory-follow-up` when missing) if the
+repository lacks them. It works in a temporary worktree, so your checkout is untouched, and it pushes only `paja/init`,
+never the default branch. Read the pull request, change what is wrong, and merge it: Paja starts working once it is
+merged, on issues with the work label.
+
+If `.paja/checks` is already on the default branch, `paja init` refuses; `--force` writes the files again on the branch.
+`--json` prints what it detected, the files it wrote and the pull request, and the MCP tool `init` returns the same.
+
 ## Check the setup
 
 `paja doctor` (with `--repo <path>`; the default is the current directory) checks that this machine and the repository

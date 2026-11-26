@@ -4073,6 +4073,113 @@ fn the_deny_list_hook_blocks_and_fails_closed() {
     );
 }
 
+/// A repository with a bare `origin`, the `files` committed on main, and a fake `gh` that logs
+/// its arguments and prints a pull request URL. Returns (tmp, repo, home, gh).
+fn init_fixture(
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    init_repo(&repo);
+    // `paja init` commits with the repository's own identity, which CI runners don't have.
+    git(&repo, &["config", "user.name", "test"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    for (name, text) in files {
+        std::fs::write(repo.join(name), text).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "files"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             \"pr create\") echo https://example.com/pull/7 ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    (tmp, repo, home, gh)
+}
+
+/// The text of `path` on branch `rev` of `repo`.
+fn show(repo: &Path, rev: &str, path: &str) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &format!("{rev}:{path}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{rev}:{path} is missing");
+    String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
+}
+
+#[test]
+fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
+    let (tmp, repo, home, gh) = init_fixture(&[(
+        "package.json",
+        r#"{"scripts": {"test": "jest", "lint": "eslint ."}}"#,
+    )]);
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci"], &vars);
+    assert!(ok, "{out}");
+    assert_eq!(out["branch"], "paja/init");
+    assert_eq!(out["default_branch"], "main");
+    assert_eq!(out["detected"]["checks"][0], "npm test");
+    assert_eq!(out["detected"]["commands"][0], "npm");
+    assert_eq!(out["pull_request"], "https://example.com/pull/7");
+    assert_eq!(out["ci"], "workflow");
+
+    let checks = show(&repo, "paja/init", ".paja/checks");
+    assert!(checks.contains("npm test\n") && checks.contains("npm run lint\n"));
+    assert!(show(&repo, "paja/init", ".paja/commands").contains("\nnpm\nreview npm\n"));
+    assert!(show(&repo, "paja/init", ".paja/high-risk").contains("\n.github/\n"));
+    assert!(show(&repo, "paja/init", ".paja/models").contains("build sonnet"));
+    assert!(show(&repo, "paja/init", "CLAUDE.md").contains("## Working with Paja"));
+    assert!(show(&repo, "paja/init", ".github/workflows/paja.yml").contains("run: npm test"));
+
+    // Nothing reached main, locally or on origin, and the checkout is untouched.
+    let on_main = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["cat-file", "-e", "origin/main:.paja/checks"])
+        .status()
+        .unwrap();
+    assert!(!on_main.success());
+    assert!(!repo.join(".paja").exists());
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("label create factory"), "{log}");
+    assert!(
+        log.contains("pr create --base main --head paja/init"),
+        "{log}"
+    );
+
+    // Once the files are on main, a second init is refused; --force writes them on the branch.
+    git(&repo, &["merge", "-q", "--ff-only", "paja/init"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let (ok, out) = paja_with(&home, &repo, &["init"], &vars);
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains(".paja/checks is already on main") && error.contains("--force"),
+        "{error}"
+    );
+}
+
 #[test]
 fn a_run_merges_a_default_branch_that_moved_while_it_built() {
     let f = Factory::new("test -f feature.txt && test -f other.txt\n", "land");
@@ -4163,6 +4270,29 @@ fn red_ci_goes_back_to_the_builder_with_the_failed_log() {
         "{}",
         f.gh_log()
     );
+}
+
+#[test]
+fn init_keeps_the_repositorys_own_claude_md_and_adds_one_section() {
+    let own = "# My app\n\nBuild with care.\n";
+    let (_tmp, repo, home, gh) = init_fixture(&[("CLAUDE.md", own), ("go.mod", "module x\n")]);
+    let (ok, out) = paja_with(&home, &repo, &["init"], &[("PAJA_GH", gh.as_path())]);
+    assert!(ok, "{out}");
+    assert_eq!(out["ci"], "none");
+    assert_eq!(show(&repo, "paja/init", ".paja/ci"), "none\n");
+    let claude = show(&repo, "paja/init", "CLAUDE.md");
+    assert!(claude.starts_with(own), "{claude}");
+    assert_eq!(claude.matches("## Working with Paja").count(), 1);
+    assert!(claude.contains("go test ./..."));
+}
+
+#[test]
+fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
+    let (_tmp, repo, home, gh) = init_fixture(&[("README.md", "# app\n")]);
+    let (ok, out) = paja_with(&home, &repo, &["init"], &[("PAJA_GH", gh.as_path())]);
+    assert!(ok, "{out}");
+    assert!(out["note"].as_str().unwrap().contains("fill in"), "{out}");
+    assert!(show(&repo, "paja/init", ".paja/checks").contains("# make test"));
 }
 
 #[test]

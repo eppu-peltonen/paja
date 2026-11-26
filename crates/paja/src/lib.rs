@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod events;
 pub mod home;
 pub mod hook;
+pub mod init;
 pub mod jono;
 pub mod mcp;
 pub mod mestari;
