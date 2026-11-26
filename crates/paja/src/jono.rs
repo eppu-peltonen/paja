@@ -108,6 +108,89 @@ impl Labels {
     }
 }
 
+/// The repository's queue settings, read from the default branch.
+pub const QUEUE_FILE: &str = ".paja/queue";
+
+/// Queue settings (`.paja/queue` on the default branch). Without the file, or without a line,
+/// every setting has its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueRules {
+    /// Whether Jono takes follow-up issues when no work item is ready (`follow-ups = on|off`).
+    pub follow_ups: bool,
+}
+
+impl Default for QueueRules {
+    fn default() -> Self {
+        QueueRules { follow_ups: true }
+    }
+}
+
+impl QueueRules {
+    /// Read the file's text: `follow-ups = on` or `follow-ups = off`, `#` starts a comment
+    /// line. Anything else is an error naming the line and the fix.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut rules = QueueRules::default();
+        let mut seen = false;
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let at = format!(
+                "{QUEUE_FILE} on the default branch, line {}: {line:?}",
+                i + 1
+            );
+            let (key, value) = line
+                .split_once('=')
+                .map(|(k, v)| (k.trim(), v.trim()))
+                .unwrap_or((line, ""));
+            if key != "follow-ups" {
+                bail!("{at}: unknown setting; the only one is `follow-ups = on` or `follow-ups = off`");
+            }
+            if std::mem::replace(&mut seen, true) {
+                bail!("{at}: `follow-ups` is set twice; keep one line");
+            }
+            rules.follow_ups = match value {
+                "on" => true,
+                "off" => false,
+                _ => bail!("{at}: write `follow-ups = on` or `follow-ups = off`"),
+            };
+        }
+        Ok(rules)
+    }
+
+    fn of_default_branch(ok: &Untampered) -> Result<Self> {
+        match crate::ahjo::show_on_default_branch(ok, QUEUE_FILE)? {
+            Some(text) => Self::parse(&text),
+            None => Ok(Self::default()),
+        }
+    }
+}
+
+/// How an item ranks in the queue: work items first, then follow-ups.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Priority {
+    #[default]
+    #[serde(rename = "work")]
+    Work,
+    /// An issue with the follow-up label (and not the work label), taken only when no work item
+    /// is ready.
+    #[serde(rename = "follow-up")]
+    FollowUp,
+}
+
+impl Priority {
+    fn is_work(&self) -> bool {
+        *self == Priority::Work
+    }
+}
+
+/// Jono's order: by repository, work items before follow-ups, then oldest first (the sort is
+/// stable and items arrive by number).
+fn queue_order(items: &mut [WorkItem]) {
+    items.sort_by(|a, b| (&a.repo, a.priority).cmp(&(&b.repo, b.priority)));
+}
+
 pub const EV_IMPORTED: &str = "work.imported";
 pub const EV_CHANGED: &str = "work.changed";
 pub const EV_CLOSED: &str = "work.closed";
@@ -178,6 +261,10 @@ pub struct WorkItem {
     /// at the last sync. Jono doesn't start an item until this is empty.
     #[serde(default)]
     pub waiting_on: Vec<u64>,
+    /// `work` for an issue with the work label, `follow-up` for one that only has the follow-up
+    /// label. Jono starts every ready `work` item before any `follow-up`.
+    #[serde(default)]
+    pub priority: Priority,
 }
 
 impl WorkItem {
@@ -273,6 +360,10 @@ pub struct Issue {
     #[serde(default)]
     pub body: String,
     pub url: String,
+    /// Not in `gh`'s output: a sync sets it from the label it listed the issue by. Events
+    /// record it only for follow-ups.
+    #[serde(default, skip_serializing_if = "Priority::is_work")]
+    pub priority: Priority,
 }
 
 /// What a sync changed.
@@ -419,6 +510,7 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                         usage: None,
                         answers: Vec::new(),
                         waiting_on: Vec::new(),
+                        priority: issue.priority,
                     },
                 );
             }
@@ -429,6 +521,7 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                     item.title = issue.title;
                     item.body = issue.body;
                     item.url = issue.url;
+                    item.priority = issue.priority;
                 }
             }
             EV_CLOSED | EV_REOPENED => {
@@ -564,19 +657,24 @@ fn name_of(ok: &Untampered) -> Result<String> {
     })
 }
 
-/// The work items of `repo`, oldest first.
+/// The work items of `repo` in the order Jono starts them: work items oldest first, then
+/// follow-ups oldest first.
 pub fn list(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
-    Ok(replay_repo(&home.events().read_all()?, repo)?
+    let mut items: Vec<WorkItem> = replay_repo(&home.events().read_all()?, repo)?
         .into_values()
-        .collect())
+        .collect();
+    queue_order(&mut items);
+    Ok(items)
 }
 
-/// Every repository's work items, by repository and then oldest first. `repo` is the
-/// checkout's repository, which events from before items carried one may belong to.
+/// Every repository's work items, by repository and then in Jono's order (see [`list`]). `repo`
+/// is the checkout's repository, which events from before items carried one may belong to.
 pub fn list_all(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
-    Ok(replay(&home.events().read_all()?, repo)?
+    let mut items: Vec<WorkItem> = replay(&home.events().read_all()?, repo)?
         .into_values()
-        .collect())
+        .collect();
+    queue_order(&mut items);
+    Ok(items)
 }
 
 /// Every repository's work items, as [`list_all`], for a command run in `checkout`. Only a log
@@ -597,7 +695,9 @@ pub fn list_all_from(home: &Home, checkout: &Path) -> Result<Vec<WorkItem>> {
     } else {
         String::new()
     };
-    Ok(replay(&events, &fallback)?.into_values().collect())
+    let mut items: Vec<WorkItem> = replay(&events, &fallback)?.into_values().collect();
+    queue_order(&mut items);
+    Ok(items)
 }
 
 pub fn get(home: &Home, repo: &str, number: u64) -> Result<WorkItem> {
@@ -782,8 +882,8 @@ fn cycle_search(items: &[&WorkItem], limit: usize) -> (Option<Vec<u64>>, usize) 
     (None, entered)
 }
 
-/// The next item of `repo` to work on: the oldest open, queued issue. None when the queue is
-/// empty.
+/// The next item of `repo` to work on: the oldest ready work item, else the oldest ready
+/// follow-up. None when nothing is ready.
 pub fn next(home: &Home, repo: &str) -> Result<Option<WorkItem>> {
     Ok(list(home, repo)?.into_iter().find(is_ready))
 }
@@ -794,10 +894,9 @@ pub fn claim(home: &Home, repo: &str) -> Result<Option<WorkItem>> {
     let lock = home.lock()?;
     let log = home.events();
     pin_legacy(&lock, &log, repo)?;
-    let Some(mut item) = replay_repo(&log.read_all()?, repo)?
-        .into_values()
-        .find(is_ready)
-    else {
+    let mut items: Vec<WorkItem> = replay_repo(&log.read_all()?, repo)?.into_values().collect();
+    queue_order(&mut items);
+    let Some(mut item) = items.into_iter().find(is_ready) else {
         return Ok(None);
     };
     log.append(
@@ -861,7 +960,12 @@ pub fn claim_for_run_item(home: &Home, repo: &str, only: Option<u64>) -> Result<
             }));
         }
     }
-    for item in items.values().filter(|item| is_ready(item) && wanted(item)) {
+    let mut ordered: Vec<&WorkItem> = items.values().collect();
+    ordered.sort_by_key(|item| item.priority);
+    for item in ordered
+        .into_iter()
+        .filter(|item| is_ready(item) && wanted(item))
+    {
         // A queued item a live run still holds (set back by hand mid-run) waits for that run.
         let Some(run_lock) = home.try_run_lock(repo, item.number)? else {
             continue;
@@ -929,11 +1033,17 @@ pub fn set_status(
 /// Import the open issues with the work label from the GitHub repository of the checkout at
 /// `repo`. The label is the one `.paja/labels` names on the default branch.
 pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
-    sync_with(home, repo, None)
+    sync_with(home, repo, None, None)
 }
 
-/// [`sync`] with the labels already read (`paja run` reads them from the commit it works on).
-pub fn sync_with(home: &Home, repo: &Path, labels: Option<&Labels>) -> Result<SyncReport> {
+/// [`sync`] with the labels and queue rules already read (`paja run` reads them from the commit
+/// it works on).
+pub fn sync_with(
+    home: &Home,
+    repo: &Path,
+    labels: Option<&Labels>,
+    rules: Option<&QueueRules>,
+) -> Result<SyncReport> {
     if !repo.is_dir() {
         bail!(
             "{} is not a directory; pass --repo with a path inside the checkout",
@@ -946,8 +1056,21 @@ pub fn sync_with(home: &Home, repo: &Path, labels: Option<&Labels>) -> Result<Sy
         Some(labels) => labels.clone(),
         None => Labels::of_default_branch(&ok)?,
     };
+    let rules = match rules {
+        Some(rules) => *rules,
+        None => QueueRules::of_default_branch(&ok)?,
+    };
     let name = name_of(&ok)?;
-    let issues = fetch_issues(&ok, &labels.work)?;
+    let mut issues = fetch_issues(&ok, &labels.work)?;
+    if rules.follow_ups {
+        // An issue with both labels is a work item.
+        let mut follow_ups = fetch_issues(&ok, &labels.follow_up)?;
+        follow_ups.retain(|f| !issues.iter().any(|i| i.number == f.number));
+        for issue in &mut follow_ups {
+            issue.priority = Priority::FollowUp;
+        }
+        issues.extend(follow_ups);
+    }
     // A dependency outside the queue (another label, or already closed) is asked about once
     // per sync; one in the queue is open by definition.
     let queued: BTreeSet<u64> = issues.iter().map(|issue| issue.number).collect();
@@ -1013,7 +1136,9 @@ pub fn apply_with(
                     )?;
                     report.reopened.push(issue.number);
                 }
-                if (&item.title, &item.body, &item.url) != (&issue.title, &issue.body, &issue.url) {
+                if (&item.title, &item.body, &item.url, item.priority)
+                    != (&issue.title, &issue.body, &issue.url, issue.priority)
+                {
                     log.append(&lock, EV_CHANGED, issue_data(issue)?)?;
                     report.changed.push(issue.number);
                 }
@@ -1319,6 +1444,7 @@ mod tests {
             title: title.into(),
             body: String::new(),
             url: format!("https://example.com/{number}"),
+            priority: Priority::Work,
         }
     }
 

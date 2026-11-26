@@ -379,13 +379,21 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
     let labels =
         jono::Labels::parse(&read_from_base(&repo, &base, jono::LABELS_FILE)?.unwrap_or_default())?;
+    let queue = jono::QueueRules::parse(
+        &read_from_base(&repo, &base, jono::QUEUE_FILE)?.unwrap_or_default(),
+    )?;
     progress(&format!(
-        "checking the queue (issues labelled {})",
-        labels.work
+        "checking the queue (issues labelled {}{})",
+        labels.work,
+        if queue.follow_ups {
+            format!(", then {}", labels.follow_up)
+        } else {
+            String::new()
+        }
     ));
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
-    let name = jono::sync_with(home, &repo, Some(&labels))?.repo;
+    let name = jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo;
     let config = read_config(&repo, &base, labels, target)?;
     // Before an item is claimed: waiting for CI that will never run fails after the whole build.
     if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
@@ -2456,6 +2464,7 @@ mod tests {
             usage: None,
             answers: Vec::new(),
             waiting_on: Vec::new(),
+            priority: Default::default(),
         };
         let checks: Vec<String> = ["cargo fmt --all --check", "cargo test"]
             .map(String::from)
