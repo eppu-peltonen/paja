@@ -132,10 +132,10 @@ failed. The MCP tool `doctor` returns the same JSON.
 The Claude Code plugin in `plugin/` starts `paja mcp`, so Paja's core shows up as MCP tools, and adds five skills:
 `/paja:init` (set up the repository, or start a new project, without the terminal: it runs `doctor`, then `init`, shows
 what was detected and the files, and links the pull request), `/paja:doctor` (check readiness and explain each failure
-with its fix), `/paja:status` (what is queued, active or waiting on you), `/paja:answer` (answer a question Paja asked on an issue and
-queue the item again) and `/paja:spec` (turn the conversation into an issue with the work label, shown to you to approve
-first). With `paja` installed on `PATH` as above, install the plugin with one command, the same on Windows, Linux and
-macOS:
+with its fix), `/paja:status` (what is queued, active or waiting on you), `/paja:answer` (answer a question Paja asked
+on an issue and queue the item again) and `/paja:spec` (turn the conversation into an issue with the work label, shown
+to you to approve first). With `paja` installed on `PATH` as above, install the plugin with one command, the same on
+Windows, Linux and macOS:
 
 ```sh
 claude plugin install paja --marketplace eppu-peltonen/paja
