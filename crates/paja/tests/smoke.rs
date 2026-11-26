@@ -773,6 +773,49 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
 }
 
 #[test]
+fn work_waits_on_open_dependencies_until_they_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let d = slash(tmp.path());
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        r#"[{"number": 2, "title": "Desk feature", "body": "Depends on #9", "url": "https://example.com/2"},
+            {"number": 4, "title": "Other", "body": "", "url": "https://example.com/4"}]"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("state-9"), "OPEN").unwrap();
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"issue list\") cat {d}/issues.json ;;\n\
+             \"issue view\") printf '{{\"state\": \"%s\"}}' \"$(cat {d}/state-$3)\" ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("issue view 9 --json state"), "{log}");
+    let (_, shown) = paja(&home, &repo, &["work", "show", "2"]);
+    assert_eq!(shown["waiting_on"], serde_json::json!([9]));
+    // #2 is older but waits on #9, so #4 comes first.
+    let (_, next) = paja(&home, &repo, &["work", "next"]);
+    assert_eq!(next["number"], 4);
+
+    std::fs::write(tmp.path().join("state-9"), "CLOSED").unwrap();
+    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    let (_, shown) = paja(&home, &repo, &["work", "show", "2"]);
+    assert_eq!(shown["waiting_on"], serde_json::json!([]));
+    let (_, next) = paja(&home, &repo, &["work", "next"]);
+    assert_eq!(next["number"], 2);
+}
+
+#[test]
 fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));

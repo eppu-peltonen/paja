@@ -33,7 +33,7 @@ flowchart TB
 | Unit | Job | First version built with |
 | --- | --- | --- |
 | **Ahjo** (environments) | An isolated environment per chunk: git worktree, ports, database, services, seed data. Each one sandboxed and failing closed (no run if the sandbox can't start, hooks block when they fail), with a GitHub token that reaches only the repository being worked on | git worktrees, Docker Compose |
-| **Jono** (queue and scheduler) | Work items with priority and dependencies; lease each chunk to one worker; pick the next one with plain rules; enforce a diff-size budget per chunk; pace work to the account's usage limits | GitHub issues labelled `paja`, event log |
+| **Jono** (queue and scheduler) | Work items with dependencies (`Depends on #N`); lease each chunk to one worker; pick the next one with plain rules; enforce a diff-size budget per chunk; pace work to the account's usage limits | GitHub issues labelled `paja`, event log |
 | **Kaava** (specs and harness) | Versioned specs with acceptance criteria and a risk tier; held-out scenarios the builder never sees; an eval suite of real chunks that tests the harness itself; the domain harness and canon rules, copied into each environment as `CLAUDE.md` and skills | Markdown in the repo |
 | **Mestari** (orchestrator) | Run workflow graphs: spec, plan, build, verify, review, land, post-land verify. Fix loops are capped at three rounds, after which the builder rethinks the approach instead of patching. Planner, builder, reviewer and evaluator are separate roles. A learn step after landing drafts harness rules from failures | YAML graphs; `claude -p` subprocesses |
 | **Vasara** (verifier) | Load rules and scenarios from `main`, never from the branch; boot the environment and run deterministic and end-to-end checks; an independent, skeptical evaluator agent grades the running app against the acceptance criteria and held-out scenarios; after landing, re-run on `main` and revert on failure | The app's own test commands, Playwright |
@@ -56,7 +56,13 @@ Jono's items are GitHub issues labelled `paja`. `paja work sync` reads the open 
 `work.imported`, `work.changed`, `work.closed` and `work.reopened` events. Whether an issue is open is kept apart from
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the oldest
-open, queued item and marks it active under the home lock, so two runs never share one. A sync that reads its full limit
+open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
+
+An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed
+by issue numbers (`Depends on #12, #14`). Each sync records a `work.waiting` event when the set of those still open
+changes: a dependency in the queue is open until it closes or Paja lands it, and one outside the queue is asked about
+with `gh issue view` (one that can't be read counts as open). An item with open dependencies is never claimed;
+`paja work list` shows them as `waiting_on`, and `paja run` says which items wait on what when nothing else is ready. A sync that reads its full limit
 of issues refuses to close anything rather than drop work it could not see.
 
 `paja work answer <issue> <text>` records a person's answer to an escalated item (`work.answered`, with the question it
