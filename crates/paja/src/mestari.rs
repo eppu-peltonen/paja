@@ -510,6 +510,9 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         resumed,
     }) = jono::claim_for_run(home)?
     else {
+        if let Some(waiting) = jono::waiting(home)? {
+            progress(&format!("nothing is ready: {waiting}"));
+        }
         return Ok(RunReport::Idle);
     };
     if resumed {
@@ -3321,6 +3324,7 @@ mod tests {
             note: None,
             usage: None,
             answers: Vec::new(),
+            waiting_on: Vec::new(),
         };
         let prompt = super::review_prompt(&item, "base1", "abc123", None);
         assert!(prompt.contains("already passed at abc123"), "{prompt}");

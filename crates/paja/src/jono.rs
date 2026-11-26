@@ -1,7 +1,7 @@
 //! Jono: the work queue. Work comes from GitHub issues labelled `paja`; `sync` imports them
 //! into the event log, and the queue's state is derived by replaying it like everything else.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -26,6 +26,8 @@ pub const EV_REOPENED: &str = "work.reopened";
 pub const EV_STATUS: &str = "work.status";
 /// A person answered an escalated item's question.
 pub const EV_ANSWERED: &str = "work.answered";
+/// A sync found which of an item's dependencies are still open: `{"number", "on": [...]}`.
+pub const EV_WAITING: &str = "work.waiting";
 
 /// Where an item is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +76,10 @@ pub struct WorkItem {
     /// them in its prompts, since agents can't read the issue's comments.
     #[serde(default)]
     pub answers: Vec<Answer>,
+    /// The issues this one depends on (`Depends on #N` lines in its body) that were still open
+    /// at the last sync. Jono doesn't start an item until this is empty.
+    #[serde(default)]
+    pub waiting_on: Vec<u64>,
 }
 
 /// A person's answer to a question Paja asked about an item.
@@ -144,6 +150,12 @@ pub struct SyncReport {
 }
 
 #[derive(Deserialize)]
+struct Waiting {
+    number: u64,
+    on: Vec<u64>,
+}
+
+#[derive(Deserialize)]
 struct Number {
     number: u64,
 }
@@ -196,6 +208,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                         note: None,
                         usage: None,
                         answers: Vec::new(),
+                        waiting_on: Vec::new(),
                     },
                 );
             }
@@ -226,6 +239,13 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                 if let Some(item) = items.get_mut(&change.number) {
                     item.status = change.status;
                     item.note = change.note;
+                }
+            }
+            EV_WAITING => {
+                let waiting: Waiting =
+                    serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
+                if let Some(item) = items.get_mut(&waiting.number) {
+                    item.waiting_on = waiting.on;
                 }
             }
             EV_ANSWERED => {
@@ -280,7 +300,47 @@ pub fn get(home: &Home, number: u64) -> Result<WorkItem> {
 }
 
 fn is_ready(item: &WorkItem) -> bool {
-    item.open && item.status == Status::Queued
+    item.open && item.status == Status::Queued && item.waiting_on.is_empty()
+}
+
+/// The issues an issue's body says it depends on: every `#N` on a line that starts with
+/// `Depends on` or `Blocked by` (any case, after an optional list marker), for example
+/// `Depends on #12, #14`. An issue never depends on itself.
+pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
+    let mut found = BTreeSet::new();
+    for line in body.lines() {
+        let line = line.trim_start().trim_start_matches(['-', '*', ' ']);
+        let lower = line.to_ascii_lowercase();
+        let Some(rest) = ["depends on", "blocked by"]
+            .iter()
+            .find_map(|lead| lower.strip_prefix(lead))
+        else {
+            continue;
+        };
+        for part in rest.split('#').skip(1) {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse::<u64>() {
+                if n != number {
+                    found.insert(n);
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Queued items that wait on open dependencies, as `#179 waits on #178`, for a run that found
+/// nothing ready. None when no queued item is waiting.
+pub fn waiting(home: &Home) -> Result<Option<String>> {
+    let waiting: Vec<String> = list(home)?
+        .into_iter()
+        .filter(|item| item.open && item.status == Status::Queued && !item.waiting_on.is_empty())
+        .map(|item| {
+            let on: Vec<String> = item.waiting_on.iter().map(|n| format!("#{n}")).collect();
+            format!("#{} waits on {}", item.number, on.join(", "))
+        })
+        .collect();
+    Ok((!waiting.is_empty()).then(|| waiting.join("; ")))
 }
 
 /// The next item to work on: the oldest open, queued issue. None when the queue is empty.
@@ -416,12 +476,31 @@ pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
     // gh runs git in the checkout to find its GitHub repository.
     crate::ahjo::ensure_untampered(home, repo)?;
     let issues = fetch_issues(repo)?;
-    apply(home, &issues)
+    // A dependency outside the queue (another label, or already closed) is asked about once
+    // per sync; one in the queue is open by definition.
+    let queued: BTreeSet<u64> = issues.iter().map(|issue| issue.number).collect();
+    let outside: BTreeSet<u64> = issues
+        .iter()
+        .flat_map(|issue| dependencies(issue.number, &issue.body))
+        .filter(|n| !queued.contains(n))
+        .collect();
+    let mut open_outside = BTreeSet::new();
+    for number in outside {
+        if issue_is_open(repo, number)? {
+            open_outside.insert(number);
+        }
+    }
+    apply_with(home, &issues, &open_outside)
 }
 
 /// Bring the queue in line with the current open issues. Separate from `sync` so it can be
 /// tested without GitHub.
 pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
+    apply_with(home, open, &BTreeSet::new())
+}
+
+/// [`apply`], where `open_outside` are the dependencies outside `open` that are still open.
+pub fn apply_with(home: &Home, open: &[Issue], open_outside: &BTreeSet<u64>) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
     let items = replay(&log.read_all()?)?;
@@ -442,6 +521,25 @@ pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
                     report.changed.push(issue.number);
                 }
             }
+        }
+        let on: Vec<u64> = dependencies(issue.number, &issue.body)
+            .into_iter()
+            // A dependency Paja has landed counts as done even before GitHub closes it.
+            .filter(|n| {
+                let landed = items.get(n).is_some_and(|i| i.status == Status::Landed);
+                !landed && (open.iter().any(|i| i.number == *n) || open_outside.contains(n))
+            })
+            .collect();
+        let before = items
+            .get(&issue.number)
+            .map(|item| item.waiting_on.as_slice())
+            .unwrap_or_default();
+        if on != before {
+            log.append(
+                &lock,
+                EV_WAITING,
+                json!({ "number": issue.number, "on": on }),
+            )?;
         }
     }
     for item in items.values() {
@@ -613,6 +711,23 @@ fn fetch_issues(repo: &Path) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
+/// Whether issue `number` of the checkout's GitHub repository is open. One that can't be read
+/// (a typo, a deleted issue) counts as open, so the item waits and `paja work list` shows why.
+fn issue_is_open(repo: &Path, number: u64) -> Result<bool> {
+    let gh = gh_program();
+    let output = Command::new(&gh)
+        .current_dir(repo)
+        .args(["issue", "view", &number.to_string(), "--json", "state"])
+        .output()
+        .with_context(|| {
+            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+        })?;
+    let state = serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .and_then(|v| v["state"].as_str().map(str::to_ascii_uppercase));
+    Ok(!(output.status.success() && state.as_deref() == Some("CLOSED")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +739,50 @@ mod tests {
             body: String::new(),
             url: format!("https://example.com/{number}"),
         }
+    }
+
+    #[test]
+    fn dependencies_come_from_depends_on_and_blocked_by_lines() {
+        let body = "Intro mentions #3.\nDepends on #12, #14\n- **Blocked by** #9 and #12\n\
+                    depends on #5 (itself)\nNot a dependency: see #20";
+        assert_eq!(dependencies(5, body), vec![9, 12, 14]);
+        assert!(dependencies(1, "").is_empty());
+    }
+
+    #[test]
+    fn an_item_waits_until_its_dependencies_close_or_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let first = issue(1, "Desk app");
+        let mut second = issue(2, "Desk feature");
+        second.body = "Depends on #1 and #7".into();
+        let third = issue(3, "Other");
+        let outside: BTreeSet<u64> = [7].into();
+        apply_with(
+            &home,
+            &[first.clone(), second.clone(), third.clone()],
+            &outside,
+        )
+        .unwrap();
+        assert_eq!(get(&home, 2).unwrap().waiting_on, vec![1, 7]);
+        // The oldest ready item comes first; #2 is skipped while it waits.
+        assert_eq!(claim(&home).unwrap().unwrap().number, 1);
+        assert_eq!(claim(&home).unwrap().unwrap().number, 3);
+        assert!(claim(&home).unwrap().is_none());
+        assert_eq!(
+            waiting(&home).unwrap().as_deref(),
+            Some("#2 waits on #1, #7")
+        );
+        // #7 closes outside the queue and #1 lands before GitHub closes it.
+        set_status(&home, 1, Status::Landed, None).unwrap();
+        apply_with(&home, &[first, second.clone(), third], &BTreeSet::new()).unwrap();
+        assert!(get(&home, 2).unwrap().waiting_on.is_empty());
+        assert_eq!(claim(&home).unwrap().unwrap().number, 2);
+        // An unchanged sync records nothing new.
+        let before = home.events().read_all().unwrap().len();
+        apply_with(&home, &[second], &BTreeSet::new()).unwrap();
+        let after = home.events().read_all().unwrap();
+        assert!(after[before..].iter().all(|e| e.kind != EV_WAITING));
     }
 
     #[test]
