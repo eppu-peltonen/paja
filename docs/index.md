@@ -6,6 +6,7 @@ owns it. Instructions for agents working on Paja's own code live in [`../CLAUDE.
 | File | When to read |
 | --- | --- |
 | [`setup.md`](./setup.md) | You want to install Paja and start it, on Windows, Linux or macOS |
+| [`safety.md`](./safety.md) | You are about to run Paja on your own machine and want to know what it can touch, how to limit it and how to undo it |
 | [`troubleshooting.md`](./troubleshooting.md) | Paja printed an error, or you want to update or uninstall it |
 | [`design/overview.md`](./design/overview.md) | You want to know what Paja is for and the principles every part follows |
 | [`design/architecture.md`](./design/architecture.md) | You need the parts (Jono, Kaava, Posti, Mestari, Ahjo, Vasara, Paja Desk), what each does and how they connect |
