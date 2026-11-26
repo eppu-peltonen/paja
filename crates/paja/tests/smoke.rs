@@ -390,76 +390,107 @@ fn force_does_not_delete_a_worktree_git_still_guards() {
     assert!(path.exists());
 }
 
-/// Drive `paja mcp` over stdio: initialize, list tools, then create, list and remove an env.
-#[test]
-fn the_mcp_server_serves_the_same_core() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::Stdio;
+/// A `paja mcp` server driven over stdio, as Claude Code drives it.
+struct Mcp {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    next_id: u64,
+}
 
-    let tmp = tempfile::tempdir().unwrap();
-    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
-    init_repo(&repo);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
-        .arg("mcp")
-        .current_dir(&repo)
-        .env("PAJA_HOME", &home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut next_id = 0;
-    let mut request = |method: &str, params: Value| -> Value {
-        next_id += 1;
-        let msg = serde_json::json!({"jsonrpc": "2.0", "id": next_id, "method": method, "params": params});
+impl Mcp {
+    fn start(home: &Path, repo: &Path, env: &[(&str, &Path)]) -> Mcp {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .arg("mcp")
+            .current_dir(repo)
+            .env("PAJA_HOME", home)
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        Mcp {
+            stdin: child.stdin.take(),
+            stdout: std::io::BufReader::new(child.stdout.take().unwrap()),
+            child,
+            next_id: 0,
+        }
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        use std::io::{BufRead, Write};
+        self.next_id += 1;
+        let id = self.next_id;
+        let msg =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let stdin = self.stdin.as_mut().unwrap();
         writeln!(stdin, "{msg}").unwrap();
         if method == "initialize" {
             let note = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
             // The client confirms only after the server's reply, as the protocol asks.
             let mut line = String::new();
-            stdout.read_line(&mut line).unwrap();
+            self.stdout.read_line(&mut line).unwrap();
             writeln!(stdin, "{note}").unwrap();
             return serde_json::from_str(&line).unwrap();
         }
         loop {
             let mut line = String::new();
             assert!(
-                stdout.read_line(&mut line).unwrap() > 0,
+                self.stdout.read_line(&mut line).unwrap() > 0,
                 "server closed stdout"
             );
             let reply: Value = serde_json::from_str(&line).unwrap();
-            if reply["id"] == next_id {
+            if reply["id"] == id {
                 return reply;
             }
         }
-    };
-    let call =
-        |request: &mut dyn FnMut(&str, Value) -> Value, tool: &str, args: Value| -> (bool, Value) {
-            let reply = request(
-                "tools/call",
-                serde_json::json!({"name": tool, "arguments": args}),
-            );
-            let result = &reply["result"];
-            let text = result["content"][0]["text"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{reply}"));
-            (
-                result["isError"] != true,
-                serde_json::from_str(text).unwrap(),
-            )
-        };
+    }
 
-    let init = request(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "smoke", "version": "0"}
-        }),
-    );
+    /// Call a tool: (succeeded, the JSON it returned).
+    fn call(&mut self, tool: &str, args: Value) -> (bool, Value) {
+        let reply = self.request(
+            "tools/call",
+            serde_json::json!({"name": tool, "arguments": args}),
+        );
+        let result = &reply["result"];
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{reply}"));
+        (
+            result["isError"] != true,
+            serde_json::from_str(text).unwrap(),
+        )
+    }
+
+    fn initialize(&mut self) -> Value {
+        self.request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "smoke", "version": "0"}
+            }),
+        )
+    }
+
+    /// Close stdin, as a client does, and check the server exits cleanly.
+    fn finish(mut self) {
+        drop(self.stdin.take());
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+/// Drive `paja mcp` over stdio: initialize, list tools, then create, list and remove an env.
+#[test]
+fn the_mcp_server_serves_the_same_core() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let mut mcp = Mcp::start(&home, &repo, &[]);
+
+    let init = mcp.initialize();
     assert_eq!(init["result"]["serverInfo"]["name"], "paja", "{init}");
-    let tools = request("tools/list", serde_json::json!({}));
+    let tools = mcp.request("tools/list", serde_json::json!({}));
     let names: Vec<&str> = tools["result"]["tools"]
         .as_array()
         .unwrap()
@@ -484,32 +515,20 @@ fn the_mcp_server_serves_the_same_core() {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
 
-    let (ok, env) = call(
-        &mut request,
-        "env_create",
-        serde_json::json!({"name": "via-mcp"}),
-    );
+    let (ok, env) = mcp.call("env_create", serde_json::json!({"name": "via-mcp"}));
     assert!(ok, "{env}");
     assert_eq!(env["branch"], "paja/via-mcp");
     // The CLI sees what the MCP server wrote: one event log, one truth.
     let (ok, listed) = paja(&home, &repo, &["env", "list"]);
     assert!(ok);
     assert_eq!(listed[0]["name"], "via-mcp");
-    let (ok, mcp_list) = call(&mut request, "env_list", serde_json::json!({}));
+    let (ok, mcp_list) = mcp.call("env_list", serde_json::json!({}));
     assert!(ok);
     assert_eq!(mcp_list, listed, "both doors give the same JSON");
-    let (ok, shown) = call(
-        &mut request,
-        "env_show",
-        serde_json::json!({"name": "via-mcp"}),
-    );
+    let (ok, shown) = mcp.call("env_show", serde_json::json!({"name": "via-mcp"}));
     assert!(ok);
     assert_eq!(shown, listed[0]);
-    let (ok, missing) = call(
-        &mut request,
-        "env_show",
-        serde_json::json!({"name": "nope"}),
-    );
+    let (ok, missing) = mcp.call("env_show", serde_json::json!({"name": "nope"}));
     assert!(!ok);
     assert!(
         missing["error"]
@@ -518,21 +537,17 @@ fn the_mcp_server_serves_the_same_core() {
             .contains("no environment"),
         "{missing}"
     );
-    let (ok, err) = call(
-        &mut request,
-        "env_create",
-        serde_json::json!({"name": "via-mcp"}),
-    );
+    let (ok, err) = mcp.call("env_create", serde_json::json!({"name": "via-mcp"}));
     assert!(!ok);
     assert!(
         err["error"].as_str().unwrap().contains("already exists"),
         "{err}"
     );
     // Jono over MCP: nothing imported yet, so next is null and show says how to import.
-    let (ok, next) = call(&mut request, "work_next", serde_json::json!({}));
+    let (ok, next) = mcp.call("work_next", serde_json::json!({}));
     assert!(ok);
     assert!(next.is_null(), "{next}");
-    let (ok, missing) = call(&mut request, "work_show", serde_json::json!({"number": 1}));
+    let (ok, missing) = mcp.call("work_show", serde_json::json!({"number": 1}));
     assert!(!ok);
     assert!(
         missing["error"]
@@ -541,8 +556,7 @@ fn the_mcp_server_serves_the_same_core() {
             .contains("paja work sync"),
         "{missing}"
     );
-    let (ok, missing) = call(
-        &mut request,
+    let (ok, missing) = mcp.call(
         "work_answer",
         serde_json::json!({"number": 1, "text": "Use v2"}),
     );
@@ -554,18 +568,69 @@ fn the_mcp_server_serves_the_same_core() {
             .contains("paja work sync"),
         "{missing}"
     );
-    let (ok, removed) = call(
-        &mut request,
-        "env_remove",
-        serde_json::json!({"name": "via-mcp"}),
-    );
+    let (ok, removed) = mcp.call("env_remove", serde_json::json!({"name": "via-mcp"}));
     assert!(ok, "{removed}");
-    let (ok, log) = call(&mut request, "log", serde_json::json!({"limit": 1}));
+    let (ok, log) = mcp.call("log", serde_json::json!({"limit": 1}));
     assert!(ok);
     assert_eq!(log[0]["kind"], "env.removed");
 
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
+    mcp.finish();
+}
+
+/// The MCP doors to `work answer` and `work file` do what the CLI's do, with the same JSON.
+#[test]
+fn the_mcp_server_answers_and_files_issues() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let d = slash(tmp.path());
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        r#"[{"number": 3, "title": "Add a plugin", "body": "", "url": "https://example.com/3"}]"#,
+    )
+    .unwrap();
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"issue list\") cat {d}/issues.json ;;\n\
+             \"issue create\") echo https://example.com/9 ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let mut mcp = Mcp::start(&home, &repo, &[("PAJA_GH", gh.as_path())]);
+    mcp.initialize();
+    let (ok, _) = mcp.call("work_sync", serde_json::json!({}));
+    assert!(ok);
+    let (ok, _) = mcp.call(
+        "work_set",
+        serde_json::json!({"number": 3, "status": "escalated", "note": "Which API?"}),
+    );
+    assert!(ok);
+    let (ok, item) = mcp.call(
+        "work_answer",
+        serde_json::json!({"number": 3, "text": "Use v2"}),
+    );
+    assert!(ok, "{item}");
+    assert_eq!(item["status"], "queued");
+    assert_eq!(
+        item["answers"],
+        serde_json::json!([{"question": "Which API?", "answer": "Use v2"}])
+    );
+    let (ok, filed) = mcp.call(
+        "work_file",
+        serde_json::json!({"title": "Add a status page", "body": "What to build."}),
+    );
+    assert!(ok, "{filed}");
+    assert_eq!(filed["url"], "https://example.com/9");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("issue comment 3 --body"), "{log}");
+    assert!(
+        log.contains("issue create --label paja --title Add a status page --body What to build."),
+        "{log}"
+    );
+    mcp.finish();
 }
 
 /// Install `body` as the program `name` in `dir`: a shell script, which on Windows the
@@ -712,6 +777,23 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
     let with_gh = [("PAJA_GH", gh.as_path())];
     paja_with(&home, &repo, &["work", "sync"], &with_gh);
 
+    // An empty answer or title is refused before anything is recorded or sent.
+    let (ok, err) = paja_with(&home, &repo, &["work", "answer", "3", "  "], &with_gh);
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("empty"), "{err}");
+    let (ok, err) = paja_with(
+        &home,
+        &repo,
+        &["work", "file", "--title", " ", "--body", "x"],
+        &with_gh,
+    );
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("--title"), "{err}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        !log.contains("issue create") && !log.contains("issue comment"),
+        "{log}"
+    );
     // Only an escalated item has a question to answer.
     let (ok, err) = paja_with(&home, &repo, &["work", "answer", "3", "Use v2"], &with_gh);
     assert!(!ok);
@@ -724,6 +806,16 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         &repo,
         &["work", "set", "3", "escalated", "--note", "Which API?"],
     );
+    // Read without --json, the item says how to answer it.
+    let shown = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .args(["work", "show", "3"])
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("note: Which API?"), "{shown}");
+    assert!(shown.contains("paja work answer 3"), "{shown}");
     // Queuing it by hand would start a run that never sees the answer.
     let (ok, err) = paja(&home, &repo, &["work", "set", "3", "queued"]);
     assert!(!ok);

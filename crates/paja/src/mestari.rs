@@ -477,8 +477,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         Err(err) => {
             let question = format!(
                 "Paja's run stopped with an error it can't fix by itself:\n\n```\n{err:#}\n```\n\n\
-                 Fix the cause, then answer with `paja work answer {n} \"<what you fixed>\"`.",
-                n = item.number
+                 Fix the cause, then answer with what you fixed."
             );
             // Park the item first, so it never stays active if GitHub is the thing failing.
             jono::set_status(home, item.number, Status::Escalated, Some(&question))?;
@@ -861,9 +860,7 @@ fn run_item(
     }
     let question = format!(
         "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
-         Clarify what should change or what is out of scope, then answer with \
-         `paja work answer {n} \"<your answer>\"`.",
-        n = item.number
+         Answer with what should change, or what is out of scope."
     );
     escalated(home, repo, &env, item, &question, MAX_ROUNDS)
 }
@@ -881,9 +878,7 @@ fn turn_limit_twice(
     let question = format!(
         "In this run {note}, the second time that step stopped at its turn limit. The issue may \
          be too big for one change: split it into smaller issues, or raise the limit with a \
-         `max-turns` line in `{MODELS_FILE}` on main, then answer with \
-         `paja work answer {n} \"<what you changed>\"`.",
-        n = item.number
+         `max-turns` line in `{MODELS_FILE}` on main, then answer with what you changed."
     );
     escalated(home, repo, env, item, &question, round)
 }
@@ -2040,9 +2035,9 @@ fn escalated(
 /// The progress line for a parked item: where the question is and how to retry come first,
 /// so a long gh error at the end can't push them out of the line.
 fn parked_line(what: &str, number: u64, comment_error: Option<anyhow::Error>) -> String {
-    let retry = format!("then `paja work answer {number} \"<your answer>\"`");
+    let retry = format!("answer with `paja work answer {number} \"<your answer>\"`");
     match comment_error {
-        None => format!("{what}; asked on the issue, answer there ({retry})"),
+        None => format!("{what}; asked on the issue ({retry})"),
         Some(err) => format!(
             "{what}; couldn't comment on the issue, so see `paja work show {number}` for the \
              question ({retry}); gh said: {err:#}"

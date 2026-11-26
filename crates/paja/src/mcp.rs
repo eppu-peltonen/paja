@@ -77,7 +77,7 @@ pub struct SetArgs {
 pub struct AnswerArgs {
     /// The GitHub issue number of an escalated item.
     number: u64,
-    /// The answer, posted as a comment on the issue.
+    /// The answer: recorded for the next run and posted as a comment on the issue.
     text: String,
     /// Any path inside the repository. Defaults to the directory the server runs in.
     repo: Option<String>,
@@ -223,7 +223,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: answer an escalated item. Posts the answer as a comment on its GitHub issue (uses gh) and queues the item again."
+        description = "Jono: answer an escalated item. Records the answer for Paja's next run (its agents get the question and answer) and queues the item again, then posts the answer as a comment on its GitHub issue (uses gh)."
     )]
     async fn work_answer(
         &self,
