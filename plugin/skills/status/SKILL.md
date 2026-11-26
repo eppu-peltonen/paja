@@ -8,8 +8,8 @@ description: Summarise Paja's queue (active, queued and escalated items), its la
 Use only the `paja` MCP tools and don't run shell commands. Apart from the sync in step 1, which imports new issues, change nothing.
 
 1. Call `work_sync` to import the latest issues with the work label. If it fails (for example `gh` isn't signed in), say so in one line and go on with the queue as it is.
-2. Call `work_list`. Group the open items by status: **active**, **queued** (oldest first, which is the order Paja takes them), and **escalated**. Leave out landed and closed items, but give their count.
-3. For each escalated item, show its number, title, link and its `note`, which is the question Paja asked. End that part with: answer with `/paja:answer`.
+2. Call `work_list`. Group the open items by status, starting with what waits on the person: **escalated** first, then **active**, then **queued** (oldest first, which is the order Paja takes them). Leave out landed and closed items, but give their count.
+3. For each escalated item, show its number, title, link and its `note`, which is the question Paja asked, with `paja work answer <number> "<your answer>"`. End that part with: or answer with `/paja:answer`.
 4. Call `log` with `limit` 10 and describe the latest events in plain words (for example "round 2 of #31: the checks failed", "landed #12"), newest first.
 5. Where an item has a `usage` total, give its estimated cost and turns in one short line.
 

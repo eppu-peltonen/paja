@@ -1466,6 +1466,7 @@ impl Factory {
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") if [ -f {d}/gh-down ]; then exit 1; fi ;;\n\
+                 \"issue edit\") if [ -f {d}/no-label ]; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -2904,6 +2905,76 @@ fn an_escalation_reaches_the_notifier() {
     assert_eq!(sent[0]["data"]["kind"], "escalated");
     assert_eq!(sent[0]["data"]["number"], 5);
     assert_eq!(sent[0]["data"]["channel"], "PAJA_NOTIFIER");
+}
+
+#[test]
+fn an_escalated_issue_is_labelled_until_it_is_answered() {
+    let f = Factory::new("true\n", "escalate");
+    // The repository doesn't have the label yet, so Paja creates it.
+    std::fs::write(f.tmp.path().join("no-label"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let log = f.gh_log();
+    let add = "issue edit 5 --add-label factory-needs-answer";
+    assert_eq!(log.matches(add).count(), 2, "{log}");
+    assert!(log.contains("label create factory-needs-answer"), "{log}");
+    // The text list puts what waits on the person first, with the command that answers it,
+    // ahead of an older issue imported since.
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 5, "title": "Add a feature file", "body": "Please.", "url": "https://example.com/5"},
+            {"number": 2, "title": "Older", "body": "", "url": "https://example.com/2"}]"#,
+    )
+    .unwrap();
+    let (ok, synced) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "sync"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{synced}");
+    let listed = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .args(["work", "list"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.starts_with("#5\tescalated"), "{text}");
+    assert!(text.contains("answer: paja work answer 5"), "{text}");
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Use v2"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(
+        f.gh_log()
+            .contains("issue edit 5 --remove-label factory-needs-answer"),
+        "{}",
+        f.gh_log()
+    );
+}
+
+#[test]
+fn the_needs_answer_label_follows_the_labels_file() {
+    let f = Factory::new("true\n", "escalate");
+    f.on_main(
+        ".paja/labels",
+        "work factory\nneeds-answer waiting-on-you\n",
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert!(
+        f.gh_log()
+            .contains("issue edit 5 --add-label waiting-on-you"),
+        "{}",
+        f.gh_log()
+    );
 }
 
 #[test]
