@@ -72,8 +72,74 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  desk:
+    # Paja Desk's installers, each carrying the matching `paja` as a Tauri sidecar so
+    # installing Desk also installs the CLI: NSIS on Windows (it puts paja on the user's PATH),
+    # a dmg on macOS, an AppImage and a deb on Linux. Unsigned for now.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bundles: nsis
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bundles: dmg
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            bundles: dmg
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            bundles: appimage,deb
+    runs-on: ${{ matrix.os }}
+    env:
+      PAJA_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install WebKitGTK
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: cargo install tauri-cli --version 2.12.6 --locked
+      - name: Build paja for the installer
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p paja
+          ext=""
+          [ "${{ runner.os }}" = Windows ] && ext=".exe"
+          mkdir -p desk/binaries
+          cp "target/${{ matrix.target }}/release/paja${ext}" "desk/binaries/paja-${{ matrix.target }}${ext}"
+      - name: Build Paja Desk
+        working-directory: desk
+        shell: bash
+        run: cargo tauri build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config tauri.bundle.json
+      - name: Collect the installers
+        shell: bash
+        run: |
+          mkdir -p dist
+          out="target/${{ matrix.target }}/release/bundle"
+          find "$out" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -exec cp {} dist/ \;
+          # Tauri names them after the product, "Paja Desk", and a release asset can't hold a
+          # space: paja-desk_<version>_<arch>.<ext>, as docs/setup.md lists them.
+          for f in dist/*; do
+            name=$(basename "$f")
+            case "$name" in "Paja Desk"*) mv "$f" "dist/paja-desk${name#Paja Desk}" ;; esac
+          done
+          ls -l dist
+          [ -n "$(ls dist)" ] || { echo "no installer under $out" >&2; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paja-desk-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   publish:
-    needs: build
+    needs: [build, desk]
     runs-on: ubuntu-latest
     permissions:
       contents: write

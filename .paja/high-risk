@@ -30,3 +30,5 @@ crates/paja/src/platform.rs
 Cargo.lock
 desk/capabilities/
 desk/tauri.conf.json
+desk/tauri.bundle.json
+desk/installer.nsh

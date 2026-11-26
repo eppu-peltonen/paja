@@ -102,3 +102,11 @@ pre { white-space: pre-wrap; font: inherit; }
 #notices li { display: flex; gap: 8px; align-items: flex-start; background: var(--error-bg); color: var(--error-fg); }
 #notices li span { flex: 1; white-space: pre-wrap; }
 #notices li button { padding: 0 8px; }
+footer { padding: 8px 20px 16px; }
+.warning {
+  margin: 12px 20px 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--error-bg);
+  color: var(--error-fg);
+}

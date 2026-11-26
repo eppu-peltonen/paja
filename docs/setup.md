@@ -200,15 +200,37 @@ default branch. With `none`, Paja lands on Vasara's checks and the reviewers alo
 Paja Desk shows the queue of every repository Paja knows in one window, with what waits on you first, and follows the
 event log as it changes. You can answer Paja's questions there and file new work (it shows the issue for approval
 before filing it). For a repository Paja hasn't run an item of on this machine yet, start Desk from inside its
-checkout so it knows where to run `gh`. Until it has installers, build and start it from a clone of Paja:
+checkout so it knows where to run `gh`. Its footer shows Desk's version and the `paja` it found, and it warns when the
+two differ.
+
+### Install Paja Desk
+
+Each release also has Desk's installers, listed in the same `SHA256SUMS`. Each one carries the matching `paja`, so
+installing Desk is enough to use the CLI and the Claude Code plugin too:
+
+- **Windows:** `paja-desk_<version>_x64-setup.exe` installs for your user only and puts its folder, which holds
+  `paja.exe`, on your `PATH` (uninstalling takes it off again). Open a new terminal to use `paja`. The installer isn't
+  signed yet, so SmartScreen may stop it: choose **More info**, then **Run anyway**. Desk uses WebView2, which
+  Windows 10 and 11 already have.
+- **macOS:** `paja-desk_<version>_aarch64.dmg` (Apple silicon) or `_x64.dmg` (Intel). Drag Paja Desk to
+  Applications. The app isn't signed yet, so open it the first time by right-clicking it in Applications and choosing
+  **Open**, then **Open** again (on newer macOS, if that isn't offered: System Settings, Privacy & Security,
+  **Open Anyway**). To use the `paja` inside it from a terminal:
+  `sudo ln -sf "/Applications/Paja Desk.app/Contents/MacOS/paja" /usr/local/bin/paja`.
+- **Linux:** `paja-desk_<version>_amd64.deb` installs `paja-desk` and `paja` in `/usr/bin`
+  (`sudo apt install ./paja-desk_<version>_amd64.deb`). The `.AppImage` runs without installing
+  (`chmod +x` it first), but its `paja` stays inside it, so install `paja` from its archive as well.
+
+### Run Desk from source
+
+From a clone of Paja:
 
 ```sh
 cargo run --release -p paja-desk
 ```
 
 On Linux it needs WebKitGTK's development packages first (on Debian or Ubuntu:
-`sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`). On Windows it uses WebView2, which Windows 10 and
-11 already have. It reads the same `PAJA_HOME` as `paja`.
+`sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`). It reads the same `PAJA_HOME` as `paja`.
 
 ## Notifications
 

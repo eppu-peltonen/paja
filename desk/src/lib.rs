@@ -92,6 +92,58 @@ fn checkout_of(home: &Home, repo: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
     )
 }
 
+/// Desk's version and the `paja` it found: the one installed next to Desk (an installer puts
+/// it there), else the one on `PATH`. `{"desk", "paja", "paja_path", "matches"}`; `paja` is
+/// null when none answered `paja --json --version`.
+#[tauri::command]
+async fn about() -> Value {
+    tauri::async_runtime::spawn_blocking(|| about_with(&paja_candidates()))
+        .await
+        .unwrap_or_else(|err| json!({ "error": format!("Desk's worker stopped: {err}") }))
+}
+
+/// The `paja` programs Desk tries, in order.
+fn paja_candidates() -> Vec<PathBuf> {
+    let name = if cfg!(windows) { "paja.exe" } else { "paja" };
+    let mut found = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+    {
+        found.push(dir.join(name));
+    }
+    found.push(PathBuf::from(name));
+    found
+}
+
+/// [`about`] with the `paja` programs to try.
+pub fn about_with(candidates: &[PathBuf]) -> Value {
+    let desk = env!("CARGO_PKG_VERSION");
+    for program in candidates {
+        let mut cmd = std::process::Command::new(program);
+        let Ok(out) = paja::platform::no_console(&mut cmd)
+            .args(["--json", "--version"])
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        let Ok(reply) = serde_json::from_slice::<Value>(&out.stdout) else {
+            continue;
+        };
+        if let Some(version) = reply["version"].as_str() {
+            return json!({
+                "desk": desk,
+                "paja": version,
+                "paja_commit": reply["commit"],
+                "paja_path": program,
+                "matches": version == desk,
+            });
+        }
+    }
+    json!({ "desk": desk, "paja": null, "paja_path": null, "matches": false })
+}
+
 /// The directory Desk was started in: the checkout, when started from one.
 fn checkout() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -130,7 +182,12 @@ fn watch(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![work_list, work_answer, work_file])
+        .invoke_handler(tauri::generate_handler![
+            work_list,
+            work_answer,
+            work_file,
+            about
+        ])
         .setup(|app| {
             watch(app.handle().clone());
             Ok(())
@@ -366,6 +423,52 @@ mod tests {
             error.contains("doesn't know where acme/app is checked out"),
             "{answered}"
         );
+    }
+
+    #[test]
+    fn desk_and_paja_share_one_version() {
+        // The installer carries both, and Desk warns when they differ.
+        let conf: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["version"],
+            env!("CARGO_PKG_VERSION"),
+            "desk/tauri.conf.json"
+        );
+        let core = include_str!("../../crates/paja/Cargo.toml");
+        let line = core.lines().find(|l| l.starts_with("version = ")).unwrap();
+        assert_eq!(
+            line,
+            format!("version = \"{}\"", env!("CARGO_PKG_VERSION")),
+            "crates/paja/Cargo.toml"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn about_names_the_paja_it_found_and_whether_it_matches() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |name: &str, version: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho '{{\"version\": \"{version}\", \"commit\": \"abc\"}}'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let same = fake("same", env!("CARGO_PKG_VERSION"));
+        let old = fake("old", "0.0.1");
+        let missing = dir.path().join("missing");
+        let found = about_with(&[missing.clone(), same.clone()]);
+        assert_eq!(found["paja"], env!("CARGO_PKG_VERSION"), "{found}");
+        assert_eq!(found["matches"], true, "{found}");
+        assert_eq!(found["paja_path"], json!(same));
+        let differs = about_with(&[old]);
+        assert_eq!(differs["matches"], false, "{differs}");
+        let none = about_with(&[missing]);
+        assert_eq!(none["paja"], Value::Null, "{none}");
     }
 
     #[test]
