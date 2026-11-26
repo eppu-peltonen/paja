@@ -339,7 +339,14 @@ pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
         let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
         let run = marker.map_or(0, |m| trimmed.chars().take_while(|c| *c == m).count());
         match (fence, marker) {
-            (None, Some(m)) if run >= 3 => fence = Some((m, run)),
+            // A backtick fence's info string can't hold a backtick (CommonMark), so such a line
+            // is text. The opening line is held with the fence's lines, so it counts too if the
+            // fence never closes.
+            (None, Some(m)) if run >= 3 && !(m == '`' && trimmed[run..].contains('`')) => {
+                fence = Some((m, run));
+                // Its info string, which is what would count.
+                inside.push(&trimmed[run..]);
+            }
             // Closed only by the same character, at least as many times, and nothing else.
             (Some((open, len)), Some(m))
                 if m == open && run >= len && trimmed[run..].trim().is_empty() =>
@@ -415,14 +422,25 @@ pub fn waiting(home: &Home) -> Result<Option<String>> {
             format!("#{} waits on {}", item.number, on.join(", "))
         })
         .collect();
-    if let Some(cycle) = cycle(&items) {
-        let shown: Vec<String> = cycle.iter().map(|n| format!("#{n}")).collect();
-        waiting.push(format!(
-            "{} wait on each other, so none can start; remove one `Depends on` line",
-            shown.join(" -> ")
-        ));
+    if let Some(note) = cycle_note(home)? {
+        waiting.push(note);
     }
     Ok((!waiting.is_empty()).then(|| waiting.join("; ")))
+}
+
+/// The "nothing can start" line for a dependency cycle among waiting items, for `paja work list`.
+pub fn cycle_note(home: &Home) -> Result<Option<String>> {
+    let items: Vec<WorkItem> = list(home)?
+        .into_iter()
+        .filter(|item| item.open && item.status == Status::Queued && !item.waiting_on.is_empty())
+        .collect();
+    Ok(cycle(&items).map(|cycle| {
+        let shown: Vec<String> = cycle.iter().map(|n| format!("#{n}")).collect();
+        format!(
+            "{} wait on each other, so none can start; remove one `Depends on` line",
+            shown.join(" -> ")
+        )
+    }))
 }
 
 /// A dependency cycle among waiting items, as the numbers along it with the first repeated at
@@ -895,6 +913,10 @@ mod tests {
         );
         // A number that isn't a list marker leaves the line alone.
         assert!(dependencies(1, "10 depends on #3").is_empty());
+        // An unclosed fence's opening line counts, and a backtick line with a backtick after
+        // its run isn't a fence, so it hides nothing.
+        assert_eq!(dependencies(1, "~~~ Depends on #3"), vec![3]);
+        assert_eq!(dependencies(1, "```x``` and\nDepends on #3\n```"), vec![3]);
     }
 
     #[test]
@@ -914,6 +936,28 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("#7 waits on #3"), "{shown}");
+        assert!(cycle_note(&home)
+            .unwrap()
+            .unwrap()
+            .starts_with("#3 -> #5 -> #3"));
+    }
+
+    #[test]
+    fn the_cycle_search_stays_fast_on_a_dense_graph() {
+        // Every item waits on every later one: no cycle, and many paths.
+        let items: Vec<WorkItem> = (1..=60u64)
+            .map(|n| {
+                serde_json::from_value(serde_json::json!({
+                    "number": n, "title": "", "body": "", "url": "",
+                    "open": true, "status": "queued",
+                    "waiting_on": (n + 1..=60).collect::<Vec<u64>>()
+                }))
+                .unwrap()
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        assert!(cycle(&items).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
