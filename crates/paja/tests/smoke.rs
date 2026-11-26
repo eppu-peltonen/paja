@@ -3297,6 +3297,181 @@ fn run_gives_up_after_three_failed_rounds_and_asks() {
     assert_eq!(rounds, 3);
 }
 
+/// A repository, a fake `gh` listing three open follow-up issues (#11, #12, #13) and no work
+/// items, and a fake `claude` that prints `answer` (the triage agent's `structured_output`) and
+/// counts its calls in `claude-calls`. Returns the factory and the fakes' directory.
+fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path().join("triage-fakes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = slash(&dir);
+    let issue = |n: u64, title: &str| {
+        format!(
+            r#"{{"number": {n}, "title": "{title}", "body": "details of {n}", "labels": [{{"name": "factory-follow-up"}}]}}"#
+        )
+    };
+    std::fs::write(
+        dir.join("followups.json"),
+        format!(
+            "[{}, {}, {}]",
+            issue(11, "Tidy the helper"),
+            issue(12, "Tidy the helper, again"),
+            issue(13, "Add a check file")
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(r#"{{"is_error": false, "num_turns": 1, "structured_output": {answer}}}"#),
+    )
+    .unwrap();
+    program(
+        &dir,
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             \"workflow list\") echo 'CI	active	1' ;;\n\
+             \"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/followups.json ;; *) echo '[]' ;; esac ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    program(
+        &dir,
+        "claude",
+        &format!(
+            "#!/bin/sh\ncat > {d}/prompt.txt\necho \"$@\" >> {d}/claude-args.log\necho x >> {d}/claude-calls\ncat {d}/answer.json\n"
+        ),
+    );
+    (f, dir)
+}
+
+/// The fake programs `triage_factory` made, as the files `paja_with` takes.
+fn triage_vars(dir: &Path) -> [(&'static str, std::path::PathBuf); 2] {
+    let exe = |name: &str| {
+        if cfg!(windows) {
+            dir.join(format!("{name}.exe"))
+        } else {
+            dir.join(name)
+        }
+    };
+    [("PAJA_GH", exe("gh")), ("PAJA_CLAUDE", exe("claude"))]
+}
+
+fn triage(f: &Factory, dir: &Path) -> (bool, Value) {
+    let vars = triage_vars(dir);
+    let vars: Vec<(&str, &Path)> = vars.iter().map(|(k, v)| (*k, v.as_path())).collect();
+    paja_with(&f.home, &f.repo, &["triage"], &vars)
+}
+
+#[test]
+fn triage_closes_a_duplicate_and_an_already_fixed_issue_and_reports_all_three() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same helper, same finding."},
+            {"number": 13, "verdict": "already_fixed", "file": ".paja/checks", "reason": "The check file exists."}
+        ]}"#,
+    );
+    f.on_main(".paja/models", "triage haiku\n");
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let verdicts: Vec<&str> = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["verdict"].as_str().unwrap())
+        .collect();
+    assert_eq!(verdicts, ["keep", "duplicate", "already_fixed"], "{report}");
+    assert_eq!(report["closed"], serde_json::json!([12, 13]), "{report}");
+    assert_eq!(report["items"][1]["duplicate_of"], 11, "{report}");
+    assert_eq!(
+        report["items"][2]["evidence"], "file `.paja/checks`",
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issue close 12 --comment"), "{log}");
+    assert!(log.contains("issue close 13 --comment"), "{log}");
+    assert!(!log.contains("issue close 11"), "{log}");
+    assert!(
+        log.contains("closed this issue as a duplicate of #11"),
+        "{log}"
+    );
+    assert!(log.contains("Same helper, same finding."), "{log}");
+    assert!(log.contains("Evidence: file `.paja/checks`"), "{log}");
+    // The agent is the cheap one `.paja/models` names, reads only, and sees every issue.
+    let args = std::fs::read_to_string(dir.join("claude-args.log")).unwrap();
+    assert!(args.contains("--model haiku"), "{args}");
+    assert!(args.contains("--read-only"), "{args}");
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    assert!(
+        prompt.contains("details of 11") && prompt.contains("details of 13"),
+        "{prompt}"
+    );
+    // The pass is in the log, with what it closed, and leaves no environment behind.
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert_eq!(ran[0]["data"]["closed"][0]["number"], 12, "{ran:?}");
+    assert_eq!(ran[0]["data"]["kept"], serde_json::json!([11]), "{ran:?}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]));
+}
+
+#[test]
+fn triage_never_closes_not_worth_doing_or_what_it_cannot_back_up() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "not_worth_doing", "reason": "Too small to matter."},
+            {"number": 12, "verdict": "already_fixed", "file": "nowhere.rs", "commit": "0123456", "reason": "Trust me."},
+            {"number": 13, "verdict": "duplicate", "duplicate_of": 99, "reason": "Some other issue."}
+        ]}"#,
+    );
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        report["not_worth_doing"],
+        serde_json::json!([11]),
+        "{report}"
+    );
+    assert_eq!(report["items"][1]["verdict"], "keep", "{report}");
+    assert_eq!(report["items"][2]["verdict"], "keep", "{report}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(!log.contains("issue close"), "{log}");
+}
+
+#[test]
+fn a_second_pass_of_run_every_the_same_day_does_not_triage_again() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // Follow-ups off, so the open follow-up issues don't count as work and the queue is idle.
+    f.on_main(".paja/queue", "follow-ups = off\n");
+    let vars = triage_vars(&dir);
+    let vars: Vec<(&str, &Path)> = vars.iter().map(|(k, v)| (*k, v.as_path())).collect();
+    let calls = || {
+        std::fs::read_to_string(dir.join("claude-calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let (_, running, first) = first_wait_of_every_with(&f, &vars);
+    assert!(running);
+    assert_eq!(first["outcome"], "idle", "{first}");
+    assert_eq!(calls(), 1);
+    assert_eq!(events_of(&f, "triage.ran").len(), 1);
+    // The next pass of a new loop, the same day: the log says a pass ran, so none starts.
+    let (_, running, first) = first_wait_of_every_with(&f, &vars);
+    assert!(running);
+    assert_eq!(first["outcome"], "idle", "{first}");
+    assert_eq!(calls(), 1, "triaged twice in a day");
+    assert_eq!(events_of(&f, "triage.ran").len(), 1);
+}
+
 #[test]
 fn run_checks_come_from_main_not_the_branch() {
     // The builder can't make its change pass by editing .paja/checks on its branch.

@@ -33,5 +33,36 @@ the follow-up label instead (the non-blocking findings reviewers leave behind), 
 risk tier and `Depends on` rules. Work items always come first: a work item that becomes ready is picked before any
 follow-up at the next pick. `follow-ups = off` in `.paja/queue` on the default branch turns this off.
 
+## Triage of follow-ups
+
+Follow-up issues go stale: later changes fix them, repeat them or make them moot. `paja triage` (and the MCP tool
+`triage`, which returns the same JSON) keeps the list short. One agent on the `triage` role in `.paja/models` (the
+cheapest model; a repository with no line runs it on the account's default) reads the open issues with the follow-up
+label, up to 60, oldest first, and sorts each into one of:
+
+- `keep`: still valid. Also what anything Paja can't back up becomes.
+- `duplicate`: the same as another open follow-up issue, which it names.
+- `already_fixed`: the default branch already fixes it, with a commit on that branch or a file there that shows it.
+- `not_worth_doing`: valid but not worth the effort, with the reason.
+
+Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. "Not worth doing"
+is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
+is left out.
+
+The agent reads the default branch only, in a checkout made from it for the pass, under the deny-list hook with
+read-only tools, like a reviewer. Its word is not enough to close anything: Paja closes a duplicate only when the
+original is another open issue that stays open, and an already-fixed issue only when the named commit is on the default
+branch or the named file exists there; otherwise the issue is kept. Issue text reaches the agent as data to judge.
+
+`--json` prints `{repo, base, items, closed, not_worth_doing}`; each item has its `verdict`, `reason`, `duplicate_of` or
+`evidence` when it has one, and `closed` (or the `error` that stopped a close). Each pass is recorded as `triage.ran`
+with what was closed, kept and left for the person.
+
+`paja run --every` triages at most once a day, when a pass finds the queue idle. It reads `triage.ran` (and
+`triage.failed`, recorded when a pass fails, so a broken pass isn't retried every few minutes) to know when the last
+one ran, and prints one more JSON line, `{"outcome": "triage", "triage": {...}}`, when it triaged. With follow-ups
+taken as work (the default), the queue is idle only once they are done, so a repository that wants stale ones closed
+before they are built sets `follow-ups = off` in `.paja/queue` or runs `paja triage` itself.
+
 After landing, the learn step turns any revert, escalation or human fix into a proposed harness rule or check. It is
 adopted when the eval suite shows it helps, and it appears in the next Posti digest.
