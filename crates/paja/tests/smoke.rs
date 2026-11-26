@@ -5624,6 +5624,27 @@ fn an_item_whose_files_overlap_a_running_one_waits_and_another_runs_instead() {
     assert_eq!(gamma["data"]["outside"], serde_json::json!(["feature.txt"]));
     assert_eq!(gamma["data"]["admitted"], serde_json::json!(["Gamma.txt"]));
 
+    // The planning agent plans an item again, as a new pool run does, and leaves no branch.
+    for _ in 0..2 {
+        let (ok, plan) = paja_with(
+            &f.home,
+            &f.repo,
+            &["pool", "plan", "7"],
+            &[
+                ("PAJA_GH", f.gh.as_path()),
+                ("PAJA_CLAUDE", f.claude.as_path()),
+            ],
+        );
+        assert!(ok, "{plan}");
+        assert_eq!(plan["source"], "plan", "{plan}");
+        assert_eq!(plan["paths"], serde_json::json!(["Gamma.txt"]));
+    }
+    let branches = Command::new("git")
+        .args(["branch", "--list", "paja/plan-*"])
+        .current_dir(&f.repo)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&branches.stdout).trim(), "");
     // `paja pool plan` and its MCP tool give the same plan.
     let (ok, plan) = paja(&f.home, &f.repo, &["pool", "plan", "6"]);
     assert!(ok, "{plan}");
