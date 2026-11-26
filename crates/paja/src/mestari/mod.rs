@@ -2357,11 +2357,21 @@ pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
     });
     let _ = git(repo, &["update-ref", "-d", &name]);
     // `origin/<branch>` still follows, as a plain fetch would move it: Jono reads `.paja/labels`
-    // and the queue file from it outside runs. Best effort: a lane updating it at the same
-    // moment wins, and the next fetch moves it again.
+    // and the queue file from it outside runs. Only forward, and only from the value just read,
+    // so a slower lane never moves it back; one updating it at the same moment wins.
     if let Ok(tip) = &fetched {
         let tracking = format!("refs/remotes/origin/{branch}");
-        let _ = git(repo, &["update-ref", &tracking, tip]);
+        match git(repo, &["rev-parse", "--verify", "-q", &tracking]) {
+            Ok(old) if old == *tip => {}
+            Ok(old) => {
+                if git(repo, &["merge-base", "--is-ancestor", &old, tip]).is_ok() {
+                    let _ = git(repo, &["update-ref", &tracking, tip, &old]);
+                }
+            }
+            Err(_) => {
+                let _ = git(repo, &["update-ref", &tracking, tip, ""]);
+            }
+        }
     }
     fetched
 }

@@ -156,6 +156,7 @@ impl Pool<'_> {
         let mut said_idle = false;
         let mut forwarded = 0;
         let mut fatal: Option<anyhow::Error> = None;
+        let mut told_fatal = false;
         loop {
             let level = crate::platform::interrupts();
             if level > forwarded {
@@ -183,10 +184,15 @@ impl Pool<'_> {
                 let err = crate::ahjo::ensure_untampered(self.home, self.repo)
                     .err()
                     .unwrap_or_else(|| anyhow::anyhow!("a lane's run stopped on a tamper"));
+                fatal = Some(err);
+            }
+            // However the pool learnt of it (this check, or its own sync refusing), every lane
+            // is told once.
+            if fatal.is_some() && !told_fatal {
                 for lane in self.lanes.values_mut() {
                     lane.tell("stop now");
                 }
-                fatal = Some(err);
+                told_fatal = true;
             }
             let stopping = level > 0 || fatal.is_some();
             if stopping && self.lanes.is_empty() {
