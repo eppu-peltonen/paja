@@ -266,6 +266,17 @@ impl Sbx {
         )
     }
 
+    /// Whether Claude Code's transcript of session `id` is in the sandbox's home, which a resume
+    /// needs. Only a plain id (letters, digits, `-`) is looked for; anything else says no.
+    pub fn has_transcript(&self, id: &str) -> bool {
+        id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && self
+                .exec_ok(&format!(
+                    "ls \"$HOME\"/.claude/projects/*/{id}.jsonl >/dev/null 2>&1"
+                ))
+                .is_ok()
+    }
+
     fn exec_ok(&self, script: &str) -> Result<()> {
         self.exec_as(None, script)
     }

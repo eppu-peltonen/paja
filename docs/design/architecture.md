@@ -84,8 +84,19 @@ says so on stderr. Items claimed with `paja work claim` are never taken over. Th
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, `cargo` and local git.
    A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own
    session from earlier in the same run with `--resume <session_id>` and sends only the feedback, so it keeps what it
-   learned and its earlier turns come from the prompt cache. It runs with the same flags and hook as any session. When
-   there is no session from this run (a new `paja run`, so a recreated environment too) or resuming fails, it starts a
+   learned and its earlier turns come from the prompt cache. It runs with the same flags and hook as any session.
+   Mestari names every fresh builder session itself (`--session-id <uuid>`) and records it as a `run.step_started`
+   event (item, round, role, session id, branch) under the home lock before the session starts, so a session that is
+   killed before it prints a result (Ctrl-C, the usage window running out) can still be resumed. The first build of a
+   later run resumes the item's last recorded builder session the same way, with a short prompt instead of the issue,
+   when the run resumes an interrupted item ("Your earlier session was interrupted. Check `git status` and `git log`,
+   finish the issue, and commit.") or runs it again after `paja work answer` (the person's question and answer, and
+   "Continue with that."). That needs the work still on its `paja/work-<issue>` branch: an environment made again from
+   `main` starts fresh, and so does a session whose work was thrown away because the hook never ran (recorded as
+   `run.step_discarded`). In the sandbox the transcript must still be in the sandbox's home; if it isn't, the run says
+   so on stderr and starts fresh. A resumed step's spend is only its own share: the recorded steps of that session
+   come off Claude Code's running totals, or none do when none were recorded. When
+   there is no session to resume or resuming fails, it starts a
    fresh session with the whole issue and says so in a progress line; the failed attempt's spend is recorded as a
    step of its own. A resume that fails on a usage or rate limit (`api_error_status` 429) or a refused sign-in (401,
    403) is not retried, since a fresh session would fail the same way: the run stops with an error that says what to
@@ -133,7 +144,8 @@ On `land`, Mestari pushes the exact commit the checks and reviewers judged as th
 for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
-recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`, plus a `run.follow_up` for each non-blocking
+recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
+`run.escalated`, plus a `run.follow_up` for each non-blocking
 review finding. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or
 `review` with its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and
 cache-creation tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p`
