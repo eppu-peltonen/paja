@@ -26,7 +26,38 @@ const NAME: &str = "paja";
 pub const SCRATCH: &str = "/tmp/paja-home";
 
 /// Puts rustup's directory on `PATH`, then runs the command it is given.
-const WRAP: &str = r#"PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec "$@""#;
+///
+/// When `PAJA_WT_GITDIR` is set (a linked worktree on Windows, whose `.git` file names a host path
+/// the sandbox can't resolve) it also puts a `git` shim first on `PATH`. The shim runs the real
+/// git unchanged, unless the command's target directory (the cwd, after any leading `-C dir`) is
+/// inside `PAJA_WT_ROOT` and git can't find a repository there by itself; only then does it set
+/// `GIT_DIR` and `GIT_WORK_TREE`, for that one git process. Git commands anywhere else, and
+/// repositories nested in the worktree, are never redirected.
+const WRAP: &str = r#"PATH="$HOME/.cargo/bin:$PATH"; export PATH
+if [ -n "$PAJA_WT_GITDIR" ]; then
+  PAJA_REAL_GIT=$(command -v git); shim=$(mktemp -d)
+  if [ -n "$PAJA_REAL_GIT" ] && [ -n "$shim" ]; then
+    cat >"$shim/git" <<'SHIM'
+#!/bin/sh
+target=$(
+  while [ "$1" = "-C" ] && [ $# -ge 2 ]; do cd "$2" 2>/dev/null || exit 0; shift 2; done
+  pwd -P
+)
+root=$(cd "$PAJA_WT_ROOT" 2>/dev/null && pwd -P)
+[ -n "$root" ] || exec "$PAJA_REAL_GIT" "$@"
+case "$target" in
+  "") ;;
+  "$root"|"$root"/*)
+    if ! "$PAJA_REAL_GIT" -C "$target" rev-parse --git-dir >/dev/null 2>&1; then
+      GIT_DIR="$PAJA_WT_GITDIR" GIT_WORK_TREE="$PAJA_WT_ROOT" exec "$PAJA_REAL_GIT" "$@"
+    fi ;;
+esac
+exec "$PAJA_REAL_GIT" "$@"
+SHIM
+    chmod +x "$shim/git"; PATH="$shim:$PATH"; export PATH PAJA_REAL_GIT
+  fi
+fi
+exec "$@""#;
 
 /// A shell function that runs a command (an `apt-get`), retrying while apt's lists or dpkg lock
 /// is held. A fresh sandbox runs its own `apt-get` just after it starts. It tries
@@ -195,16 +226,17 @@ pub fn in_sandbox_path(path: &Path) -> Result<String> {
     translate(&path.to_string_lossy())
 }
 
-/// `GIT_DIR` and `GIT_WORK_TREE` for a linked worktree at `dir`, spelled for the sandbox. A
-/// worktree's `.git` file holds the host's gitdir path (`C:/.../.git/worktrees/x`), which doesn't
-/// exist in the sandbox on Windows. Empty when `dir` is not a linked worktree, when the paths need
-/// no translation (not Windows), or when `env` already sets either variable.
-fn git_env(dir: &Path, env: &[(String, String)]) -> Vec<(String, String)> {
-    if !cfg!(windows)
-        || env
-            .iter()
-            .any(|(k, _)| k == "GIT_DIR" || k == "GIT_WORK_TREE")
-    {
+/// The gitdir and work tree of a linked worktree at `dir`, spelled for the sandbox, as
+/// `PAJA_WT_GITDIR` and `PAJA_WT_ROOT`. A worktree's `.git` file holds the host's gitdir path
+/// (`C:/.../.git/worktrees/x`), which doesn't exist in the sandbox on Windows. Empty when `dir`
+/// is not a linked worktree or when the paths need no translation (not Windows).
+///
+/// These are not `GIT_DIR`/`GIT_WORK_TREE`: git obeys those for every repository, so exporting
+/// them would point unrelated git commands (a check's temporary repositories) at the worktree.
+/// `WRAP` puts a `git` shim on `PATH` that applies them only to a git command whose target is
+/// this worktree and that git can't resolve by itself.
+fn git_env(dir: &Path) -> Vec<(String, String)> {
+    if !cfg!(windows) {
         return Vec::new();
     }
     let Ok(text) = std::fs::read_to_string(dir.join(".git")) else {
@@ -215,8 +247,8 @@ fn git_env(dir: &Path, env: &[(String, String)]) -> Vec<(String, String)> {
     };
     match (translate(gitdir.trim()), in_sandbox_path(dir)) {
         (Ok(git_dir), Ok(work_tree)) => vec![
-            ("GIT_DIR".to_string(), git_dir),
-            ("GIT_WORK_TREE".to_string(), work_tree),
+            ("PAJA_WT_GITDIR".to_string(), git_dir),
+            ("PAJA_WT_ROOT".to_string(), work_tree),
         ],
         _ => Vec::new(),
     }
@@ -278,7 +310,7 @@ impl Sbx {
         for (key, value) in env {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
-        for (key, value) in git_env(dir, env) {
+        for (key, value) in git_env(dir) {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
         cmd.arg(&self.name)
@@ -401,17 +433,95 @@ mod tests {
             "gitdir: C:/repo/.git/worktrees/x\n",
         )
         .unwrap();
-        let vars = git_env(dir.path(), &[]);
+        let vars = git_env(dir.path());
         assert_eq!(
             vars[0],
-            ("GIT_DIR".into(), "/c/repo/.git/worktrees/x".into())
+            ("PAJA_WT_GITDIR".into(), "/c/repo/.git/worktrees/x".into())
         );
-        assert_eq!(vars[1].0, "GIT_WORK_TREE");
+        assert_eq!(vars[1].0, "PAJA_WT_ROOT");
         assert!(vars[1].1.starts_with('/'));
-        // A plain checkout (no `.git` file) and an explicit GIT_DIR are left alone.
+        // A plain checkout (no `.git` file) is left alone.
         let plain = tempfile::tempdir().unwrap();
-        assert!(git_env(plain.path(), &[]).is_empty());
-        assert!(git_env(dir.path(), &[("GIT_DIR".into(), "/x".into())]).is_empty());
+        assert!(git_env(plain.path()).is_empty());
+
+        // Nothing git obeys on its own is exported to the sandbox's processes.
+        let cmd = sbx().command(dir.path(), &[], &["true".into()]).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a.starts_with("PAJA_WT_GITDIR=")));
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("GIT_DIR=") || a.starts_with("GIT_WORK_TREE=")));
+    }
+
+    /// Runs `WRAP` on the host with a fake `git` that reports the variables it was started with,
+    /// and says no to `rev-parse` (the untranslated gitdir). Returns what `git <args>` saw from
+    /// `cwd`.
+    fn shim_sees(root: &Path, cwd: &Path, args: &[&str]) -> String {
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bin.path().join("git"),
+            "#!/bin/sh\n[ \"$1\" = -C ] && shift 2\n[ \"$1\" = rev-parse ] && exit 1\n\
+             echo \"GIT_DIR=$GIT_DIR GIT_WORK_TREE=$GIT_WORK_TREE\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                bin.path().join("git"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let path = format!(
+            "{}{}{}",
+            bin.path().display(),
+            if cfg!(windows) { ";" } else { ":" },
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = Command::new("sh")
+            .args(["-c", WRAP, "sh", "git"])
+            .args(args)
+            .current_dir(cwd)
+            .env("PATH", path)
+            .env("PAJA_WT_GITDIR", "/sandbox/gitdir")
+            .env("PAJA_WT_ROOT", root)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn the_git_shim_redirects_only_git_commands_aimed_at_the_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let root_s = root.path().to_str().unwrap();
+        let hit = |s: &str| s.starts_with("GIT_DIR=/sandbox/gitdir GIT_WORK_TREE=");
+        // In the worktree, and in a subdirectory of it, git gets the sandbox gitdir.
+        assert!(hit(&shim_sees(root_s.as_ref(), root.path(), &["status"])));
+        assert!(hit(&shim_sees(root_s.as_ref(), &sub, &["status"])));
+        // Aimed elsewhere, git is left alone: from another directory, or with `-C` out of the
+        // worktree (and `-C` into it from outside is redirected).
+        let other = elsewhere.path().to_str().unwrap();
+        let plain = "GIT_DIR= GIT_WORK_TREE=";
+        assert_eq!(
+            shim_sees(root_s.as_ref(), elsewhere.path(), &["status"]),
+            plain
+        );
+        assert_eq!(
+            shim_sees(root_s.as_ref(), root.path(), &["-C", other, "status"]),
+            plain
+        );
+        assert!(hit(&shim_sees(
+            root_s.as_ref(),
+            elsewhere.path(),
+            &["-C", root_s, "status"]
+        )));
     }
 
     #[test]
