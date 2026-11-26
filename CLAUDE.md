@@ -72,7 +72,9 @@ the real repository, to the smoke tests.
 - **Checks stay out of reach of the change they judge.** A change that fixes a failing test must not edit that test;
   Vasara's rules and scenarios are read from `main`, never from the branch under review.
 - **Small changes.** One concern per pull request.
-- **This repository is public.** Never commit secrets, private links, personal details or internal hostnames.
+- **This repository is public.** Never commit secrets, private links, personal details or internal hostnames. A
+  test that needs a token-shaped string (`ghp_…`, `Bearer …`, a JWT) builds it at run time from parts, never writes it
+  as one literal, so secret scanners have nothing to flag.
 - **Docs describe Paja, nothing else.** `docs/` and other Markdown cover only how the system works and what agents
   need to work in it. Leave out references to other projects, research, and notes on inspiration or lineage.
 
