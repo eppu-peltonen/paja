@@ -63,8 +63,10 @@ events appends a `work.synced` event naming it, so a later command from another 
 
 Jono's items are GitHub issues with the work label (`.paja/labels`, `paja` in this repository), each belonging to a
 repository. `.paja/labels`, read from the default branch like `.paja/checks` and never from the branch under review,
-has two lines: `work <label>`, which Jono imports, and `follow-up <label>`, which Mestari files non-blocking findings
-with. Without the file they are `factory` and `factory-follow-up`; this repository keeps `paja` and `paja-follow-up`.
+has up to three lines: `work <label>`, which Jono imports, `follow-up <label>`, which Mestari files non-blocking
+findings with, and `needs-answer <label>`, which marks an escalated item's issue until `paja work answer` requeues it.
+Without the file they are `factory`, `factory-follow-up` and `factory-needs-answer`; this repository keeps `paja` and
+`paja-follow-up`. The three must differ.
 Changing the work label closes the queue as it was: the next sync no longer sees issues with the old label and closes
 every item it imported with it, so relabel the open issues to the new label in the same change.
 `paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
@@ -238,17 +240,22 @@ review and its verdict, waiting for CI, landed or asked, and with `--every` each
 
 The comment on the issue is posted with the person's own token, so GitHub doesn't notify them about it. Posti
 (`posti.rs`) tells them instead, next to that comment: when an item escalates (or is parked on an error), when a pass
-of `paja run --every` fails, and when the loop stops for a person. Each notice names the repository and, for an item,
-the issue and the answer command. It goes to two channels:
+of `paja run` fails (with or without `--every`; of failed passes in a row, only the first), and when a run stops
+for a person. Each notice names the repository
+and, for an item, the issue, its title and the answer command. An escalated item's issue also gets the `needs-answer`
+label (created when the repository lacks it), which `paja work answer` removes, so the person can filter or
+subscribe to it on GitHub; a label that can't be set is reported on stderr and the run carries on. `paja work list`
+shows escalated items first, each with its answer command. A notice goes to two channels:
 
 - **Local.** `PAJA_NOTIFIER` names a program, run with the title and the text as its two arguments; `desktop` asks for
   a desktop notification (a Windows toast through Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere,
   through `platform.rs`); `none` turns it off. Unset, it is a desktop notification only when stderr is a terminal, so
   scripts and tests never show one.
 - **Push.** `PAJA_NOTIFY`, else the first line of `.paja/notify` on the default branch that isn't empty or a `#`
-  comment, names an `https://` URL (an ntfy topic, say). Paja POSTs the title and text there with `curl`. The texts
-  hold no question, error, secret or local path, since a push leaves the machine; the question stays on the issue and
-  the error in the terminal. A repository the tamper lock holds isn't read for the URL.
+  comment, names an `https://` (or `http://`) URL, such as an ntfy topic. Paja POSTs the title and text there with
+  `curl`. The texts hold no question, error or local path, since a push leaves the machine; the question stays on the
+  issue and the error in the terminal. The issue's title is included, so pick a private topic for a private
+  repository. A repository the tamper lock holds isn't read for the URL.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed` or
 `stopped`, `channel`, and the `error`), so Paja Desk can show the same inbox. A notice that can't be delivered never

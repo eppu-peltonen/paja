@@ -415,6 +415,7 @@ fn run(cli: &Cli) -> Result<()> {
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
+            let mut failures = paja::posti::Failures::default();
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
             loop {
@@ -428,13 +429,24 @@ fn run(cli: &Cli) -> Result<()> {
                     },
                 );
                 let Some(minutes) = every else {
-                    let report = outcome?;
+                    let report = match outcome {
+                        Ok(report) => report,
+                        Err(err) => {
+                            if mestari::is_fatal(&err) {
+                                paja::posti::stopped(&home, repo);
+                            } else {
+                                paja::posti::pass_failed(&home, repo, false);
+                            }
+                            return Err(err);
+                        }
+                    };
                     emit(cli, run_json(&report)?, || describe_run(&report));
                     break;
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
                 let wait = match outcome {
                     Ok(report) => {
+                        failures.passed();
                         emit(cli, run_json(&report)?, || describe_run(&report));
                         matches!(report, mestari::RunReport::Idle)
                             .then_some("nothing to do right now")
@@ -449,7 +461,9 @@ fn run(cli: &Cli) -> Result<()> {
                         emit(cli, json!({ "error": format!("{err:#}") }), || {
                             format!("error: {err:#}")
                         });
-                        paja::posti::pass_failed(&home, repo);
+                        if failures.failed() {
+                            paja::posti::pass_failed(&home, repo, true);
+                        }
                         Some("that pass failed; Paja keeps going")
                     }
                 };
@@ -490,6 +504,9 @@ fn run(cli: &Cli) -> Result<()> {
                     jono::list(&home, &jono::repo_name(&home, &checkout)?)?
                 };
                 emit(cli, serde_json::to_value(&items)?, || {
+                    // The text puts what waits on the person first; the JSON keeps Jono's order.
+                    let mut items = items.clone();
+                    items.sort_by_key(|item| item.status != jono::Status::Escalated);
                     if items.is_empty() {
                         "no work items; run `paja work sync`".to_string()
                     } else if *all {

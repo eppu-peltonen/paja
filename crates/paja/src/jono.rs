@@ -22,12 +22,15 @@ pub const FETCH_LIMIT: usize = 1000;
 pub const LABELS_FILE: &str = ".paja/labels";
 
 /// The labels a repository names for its queue (`.paja/labels` on the default branch): `work`
-/// puts an issue in Jono, `follow-up` marks the non-blocking findings Mestari files. Without the
-/// file they are `factory` and `factory-follow-up`, which don't name any project.
+/// puts an issue in Jono, `follow-up` marks the non-blocking findings Mestari files, and
+/// `needs-answer` marks an escalated item until `paja work answer` requeues it. Without the
+/// file they are `factory`, `factory-follow-up` and `factory-needs-answer`, which don't name
+/// any project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Labels {
     pub work: String,
     pub follow_up: String,
+    pub needs_answer: String,
 }
 
 impl Default for Labels {
@@ -35,16 +38,17 @@ impl Default for Labels {
         Labels {
             work: "factory".into(),
             follow_up: "factory-follow-up".into(),
+            needs_answer: "factory-needs-answer".into(),
         }
     }
 }
 
 impl Labels {
-    /// Read the file's text: `work <label>` and `follow-up <label>` lines (either may be left
-    /// out), `#` starts a comment line. Anything else is an error naming the line and the fix.
+    /// Read the file's text: `work <label>`, `follow-up <label>` and `needs-answer <label>`
+    /// lines (any may be left out), `#` starts a comment line. Anything else is an error naming the line and the fix.
     pub fn parse(text: &str) -> Result<Self> {
         let mut labels = Labels::default();
-        let (mut work, mut follow_up) = (false, false);
+        let (mut work, mut follow_up, mut needs_answer) = (false, false, false);
         for (i, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -67,7 +71,8 @@ impl Labels {
             let (slot, seen) = match key {
                 "work" => (&mut labels.work, &mut work),
                 "follow-up" => (&mut labels.follow_up, &mut follow_up),
-                _ => bail!("{at}: unknown key {key:?}; use `work` or `follow-up`"),
+                "needs-answer" => (&mut labels.needs_answer, &mut needs_answer),
+                _ => bail!("{at}: unknown key {key:?}; use `work`, `follow-up` or `needs-answer`"),
             };
             if std::mem::replace(seen, true) {
                 bail!("{at}: `{key}` is named twice; keep one line");
@@ -79,6 +84,13 @@ impl Labels {
                 "{LABELS_FILE} on the default branch gives `work` and `follow-up` the same label {:?}; they \
                  must differ, or follow-ups would queue themselves",
                 labels.work
+            );
+        }
+        if labels.needs_answer == labels.work || labels.needs_answer == labels.follow_up {
+            bail!(
+                "{LABELS_FILE} on the default branch gives `needs-answer` the label {:?}, which \
+                 `work` or `follow-up` already uses; give it its own, since answering removes it",
+                labels.needs_answer
             );
         }
         Ok(labels)
@@ -1096,6 +1108,23 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         item.note = None;
         item
     };
+    // The item no longer waits on the person. An issue escalated before Paja labelled
+    // escalations has no label to remove, so a failure here only says so.
+    let needs_answer = Labels::of_default_branch(&ok)
+        .map(|labels| labels.needs_answer)
+        .unwrap_or_else(|_| Labels::default().needs_answer);
+    if let Err(err) = gh(
+        &ok,
+        &[
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--remove-label",
+            &needs_answer,
+        ],
+    ) {
+        eprintln!("paja: couldn't remove the `{needs_answer}` label from #{number}: {err:#}");
+    }
     gh(
         &ok,
         &[
@@ -1113,6 +1142,35 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         )
     })?;
     Ok(item)
+}
+
+/// Put the repository's `needs-answer` label on escalated item `number`'s issue, creating the
+/// label first when the repository doesn't have it yet. Returns the label.
+pub fn mark_needs_answer(home: &Home, repo: &Path, number: u64) -> Result<String> {
+    let ok = crate::ahjo::untampered(home, repo)?;
+    let label = Labels::of_default_branch(&ok)?.needs_answer;
+    let add = |ok: &Untampered| {
+        gh(
+            ok,
+            &["issue", "edit", &number.to_string(), "--add-label", &label],
+        )
+    };
+    if add(&ok).is_err() {
+        gh(
+            &ok,
+            &[
+                "label",
+                "create",
+                &label,
+                "--color",
+                "d93f0b",
+                "--description",
+                "Paja is waiting for an answer: paja work answer <number> \"<answer>\"",
+            ],
+        )?;
+        add(&ok)?;
+    }
+    Ok(label)
 }
 
 /// A GitHub issue filed for Jono.
@@ -1264,9 +1322,15 @@ mod tests {
             "nope x",
             "work a\nwork b",
             "work x\nfollow-up x",
+            "needs-answer factory",
+            "follow-up y\nneeds-answer y",
+            "needs-answer a\nneeds-answer b",
         ] {
             assert!(Labels::parse(bad).is_err(), "{bad}");
         }
+        assert_eq!(Labels::default().needs_answer, "factory-needs-answer");
+        let waiting = Labels::parse("needs-answer waiting on you\n").unwrap();
+        assert_eq!(waiting.needs_answer, "waiting on you");
     }
 
     // The queue of one repository, which most tests are about.
