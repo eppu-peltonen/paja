@@ -167,8 +167,10 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   git is not asked. `target` itself is still checked for being a link out. Nothing is left out when any of these
   could make ripgrep search it after all: a `!` line in that `.gitignore` or in one above the worktree, a ripgrep
   ignore file (`.ignore`, `.rgignore`) in the worktree's top directory or above it, `RIPGREP_CONFIG_PATH`, a worktree
-  without `.git`, a search that starts inside `target`, or a symlink into it. `Glob`, `LS` and a `Grep` with a `glob`
-  always walk the whole worktree. A file tool path may not
+  without `.git`, a `.gitignore` that isn't all UTF-8 (ripgrep stops reading at the first bad line), a search that
+  starts inside `target`, or a symlink into it. `Glob`, `LS` and a `Grep` with a `glob` always walk the whole
+  worktree. These conditions follow how ripgrep reads ignore files, so a ripgrep change means checking them again. A
+  file tool path may not
   start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
   (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.

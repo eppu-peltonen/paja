@@ -435,6 +435,7 @@ const RG_IGNORE_FILES: &[&str] = &[".ignore", ".rgignore"];
 /// - a ripgrep ignore file (`.ignore`, `.rgignore`) in the worktree's top directory or above it,
 ///   or a `.gitignore` above it with a `!` line;
 /// - no `.git` in the worktree, without which ripgrep ignores `.gitignore`;
+/// - a `.gitignore` that isn't all UTF-8, which ripgrep stops reading at the first bad line;
 /// - a search that starts inside `target`.
 fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
     let target = b.root.join("target");
@@ -449,14 +450,17 @@ fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
         RG_IGNORE_FILES.iter().any(|name| exists(dir.join(name)))
             || (dir != b.root && negates(dir.join(".gitignore")))
     });
-    if rg_config || rg_ignore || !exists(b.root.join(".git")) || resolve(base).starts_with(&target)
-    {
+    // ripgrep follows a `.git` link to see whether it exists.
+    let git = std::fs::metadata(b.root.join(".git")).is_ok();
+    if rg_config || rg_ignore || !git || resolve(base).starts_with(&target) {
         return Vec::new();
     }
-    let Ok(text) = std::fs::read(b.root.join(".gitignore")) else {
+    // ripgrep stops reading an ignore file at its first line that isn't UTF-8.
+    let Ok(text) = std::fs::read_to_string(b.root.join(".gitignore")) else {
         return Vec::new();
     };
     let lines: Vec<&[u8]> = text
+        .as_bytes()
         .split(|byte| *byte == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .collect();
@@ -1656,6 +1660,11 @@ mod tests {
                 std::fs::remove_file(dir.join(name)).unwrap();
             }
         }
+        std::fs::write(root.join(".gitignore"), b"\xff\ntarget/\n").unwrap();
+        assert!(
+            grep().is_some(),
+            "a line ripgrep can't read before `target/`"
+        );
         gitignore("target/\n!keep\n");
         assert!(grep().is_some(), "a `!` line");
         std::fs::write(tmp.join(".gitignore"), "!target\n").unwrap();
@@ -1665,6 +1674,9 @@ mod tests {
         // Without `.git`, ripgrep doesn't read `.gitignore` at all.
         std::fs::rename(root.join(".git"), root.join("git-moved")).unwrap();
         assert!(grep().is_some(), "no .git");
+        symlink(root.join("nowhere"), root.join(".git")).unwrap();
+        assert!(grep().is_some(), "a dangling .git link");
+        std::fs::remove_file(root.join(".git")).unwrap();
         std::fs::rename(root.join("git-moved"), root.join(".git")).unwrap();
         assert_eq!(grep(), None);
         // Nothing else is left out, however git reads it: a directory whose contents alone are
