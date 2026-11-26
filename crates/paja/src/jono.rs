@@ -203,6 +203,9 @@ pub const EV_WAITING: &str = "work.waiting";
 /// A repository's first appearance in a log that holds events from before work items carried
 /// one: `{"repo"}`. It pins those older events to that repository (see [`legacy_repo`]).
 pub const EV_SYNCED: &str = "work.synced";
+/// A sync ran in a checkout of the repository: `{"repo", "path"}`, recorded when the path
+/// differs from the last one recorded, so Paja Desk knows where to run `gh` and `paja run`.
+pub const EV_CHECKOUT: &str = "work.checkout";
 
 /// An item's identity: its repository (`owner/name`) and its issue number.
 pub type Key = (String, u64);
@@ -1096,7 +1099,26 @@ pub fn sync_with(
             open_outside.insert(number);
         }
     }
-    apply_with(home, &name, &issues, &open_outside)
+    let report = apply_with(home, &name, &issues, &open_outside)?;
+    record_checkout(home, &name, repo)?;
+    Ok(report)
+}
+
+/// Record that `path` is a checkout of `repo`, unless it is already the last one recorded.
+fn record_checkout(home: &Home, repo: &str, path: &Path) -> Result<()> {
+    let path = std::path::absolute(path)?;
+    let lock = home.lock()?;
+    let log = home.events();
+    let last = log
+        .read_all()?
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == EV_CHECKOUT && e.data["repo"] == repo);
+    if last.is_some_and(|e| e.data["path"].as_str().map(Path::new) == Some(path.as_path())) {
+        return Ok(());
+    }
+    log.append(&lock, EV_CHECKOUT, json!({ "repo": repo, "path": path }))?;
+    Ok(())
 }
 
 /// Bring the queue of `repo` in line with its current open issues. Separate from `sync` so it
@@ -1309,9 +1331,9 @@ pub fn mark_needs_answer(home: &Home, repo: &Path, number: u64) -> Result<String
     Ok(label)
 }
 
-/// The local checkout of `repo` (`owner/name`) that Paja last worked in: the repository an
-/// environment for one of its items was made from, newest first, when it still exists. None
-/// when no item of `repo` has had an environment yet. For a front end that starts outside any
+/// The local checkout of `repo` (`owner/name`) that Paja last worked in: the checkout it last
+/// synced in, or the repository an environment for one of its items was made from, newest
+/// first, when it still exists. None when neither happened yet. For a front end that starts outside any
 /// checkout, such as Paja Desk, so it can run the core's commands where `gh` finds `repo`.
 pub fn known_checkout(home: &Home, repo: &str) -> Result<Option<std::path::PathBuf>> {
     let events = home.events().read_all()?;
@@ -1320,14 +1342,19 @@ pub fn known_checkout(home: &Home, repo: &str) -> Result<Option<std::path::PathB
     Ok(events
         .iter()
         .rev()
-        .filter(|e| e.kind == crate::ahjo::EV_CREATED)
-        .filter(|e| {
-            e.data["name"].as_str().is_some_and(|name| {
-                name.strip_prefix(prefix)
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-            })
+        .filter_map(|e| match e.kind.as_str() {
+            EV_CHECKOUT if e.data["repo"] == repo => e.data["path"].as_str(),
+            crate::ahjo::EV_CREATED
+                if e.data["name"].as_str().is_some_and(|name| {
+                    name.strip_prefix(prefix)
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                }) =>
+            {
+                e.data["repo"].as_str()
+            }
+            _ => None,
         })
-        .filter_map(|e| e.data["repo"].as_str().map(std::path::PathBuf::from))
+        .map(std::path::PathBuf::from)
         .find(|path| path.is_dir()))
 }
 
@@ -1533,6 +1560,45 @@ mod tests {
             Some(dir.path().join(new))
         );
         assert_eq!(known_checkout(&home, "acme/none").unwrap(), None);
+    }
+
+    #[test]
+    fn a_synced_checkout_counts_and_the_newest_existing_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        for name in ["env-repo", "synced", "other"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        let lock = home.lock().unwrap();
+        let log = home.events();
+        let env = json!({
+            "name": env_name(R, 1), "repo": dir.path().join("env-repo"),
+            "path": dir.path().join("env"), "branch": "b", "base_commit": "0",
+            "port_base": 41000, "port_count": 10, "created_ms": 0,
+        });
+        log.append(&lock, crate::ahjo::EV_CREATED, env).unwrap();
+        let checkout =
+            |repo: &str, path: &str| json!({ "repo": repo, "path": dir.path().join(path) });
+        log.append(&lock, EV_CHECKOUT, checkout(R, "synced"))
+            .unwrap();
+        log.append(&lock, EV_CHECKOUT, checkout("acme/lib", "other"))
+            .unwrap();
+        drop(lock);
+        // A sync newer than the environment wins; another repository's never counts.
+        assert_eq!(
+            known_checkout(&home, R).unwrap(),
+            Some(dir.path().join("synced"))
+        );
+        assert_eq!(
+            known_checkout(&home, "acme/lib").unwrap(),
+            Some(dir.path().join("other"))
+        );
+        // Once its folder is gone, the older environment's repository is next.
+        std::fs::remove_dir(dir.path().join("synced")).unwrap();
+        assert_eq!(
+            known_checkout(&home, R).unwrap(),
+            Some(dir.path().join("env-repo"))
+        );
     }
 
     // The queue of one repository, which most tests are about.

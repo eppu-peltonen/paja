@@ -66,6 +66,11 @@ enum Command {
         /// again.
         #[arg(long)]
         tamper_checked: bool,
+        /// Read `stop` (stop after this step) or `stop now` lines on stdin, as the first and
+        /// second Ctrl-C do. For a program that starts runs without a terminal, such as Paja
+        /// Desk; never asks for confirmation.
+        #[arg(long)]
+        stop_on_stdin: bool,
     },
     /// Sort the open follow-up issues: one cheap agent reading the default branch marks each as
     /// keep, duplicate, already fixed or not worth doing. Duplicates and already-fixed issues
@@ -431,18 +436,24 @@ fn run(cli: &Cli) -> Result<()> {
             item,
             yes,
             tamper_checked,
+            stop_on_stdin,
         } => {
             // Only a single run on a terminal asks; a loop and a script never wait for a person.
             // `--once` is also what a run without `--every` does; the flag names it.
             let _ = once;
-            let confirm =
-                every.is_none() && !*yes && std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let confirm = every.is_none()
+                && !*yes
+                && !*stop_on_stdin
+                && std::io::IsTerminal::is_terminal(&std::io::stdin());
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
             let mut failures = paja::posti::Failures::default();
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
+            if *stop_on_stdin {
+                paja::platform::stop_on_stdin();
+            }
             loop {
                 let outcome = mestari::run_once(
                     &home,
