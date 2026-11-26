@@ -781,8 +781,9 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             '2' if !in_word && next_is(&mut chars, ">&1") => {
                 tokens.push(Token::StderrToStdout);
             }
-            // Bash expands `~` after an unquoted `=` or `:` in any word, not only in an
-            // assignment: `git commit -m a=~` would put a home path in the message.
+            // Bash expands `~` after an unquoted `=` or `:` in any assignment-like word, not
+            // only in a leading assignment: `git commit -m a=~` would put a home path in the
+            // message. Refused after every bare `=` or `:`, which is stricter than bash.
             '~' if matches!(before, Some('=' | ':')) => {
                 return Err(
                     "a `~` after `=` or `:`, which bash expands to a home directory (quote it)"
@@ -1452,6 +1453,7 @@ mod tests {
         for bad in [
             "git commit -m a=~",
             "git commit -m 'a'=~/x",
+            "cargo test -- x='':~",
             "cargo test -- a:~",
             "git log --format=~",
         ] {
@@ -2067,6 +2069,26 @@ mod windows_tests {
         for bad in ["'RUST_LOG=x' cargo test", "\"RUST_LOG=x\" cargo test"] {
             let reason = e.bash(bad).unwrap_or_else(|| panic!("{bad} was allowed"));
             assert!(reason.contains("quote only the value"), "{bad}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_tilde_after_an_unquoted_equals_or_colon_is_refused() {
+        let e = env();
+        // Bash expands it in any assignment-like word, a commit message included. A bare
+        // `a:~` with no `=` is refused too, which bash would leave alone: refused by design.
+        for bad in [
+            "git commit -m a=~",
+            "git commit -m 'a'=~/x",
+            "cargo test -- x='':~",
+            "cargo test -- a:~",
+            "git log --format=~",
+        ] {
+            let reason = e.bash(bad).unwrap_or_else(|| panic!("{bad} was allowed"));
+            assert!(reason.contains("has a `~` after"), "{bad}: {reason}");
+        }
+        for good in ["git commit -m 'a=~'", "git log HEAD~1", "git show HEAD~2:x"] {
+            assert_eq!(e.bash(good), None, "{good}");
         }
     }
 
