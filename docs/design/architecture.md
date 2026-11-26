@@ -120,7 +120,14 @@ While it works on an item the run holds an OS file lock,
 `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
 stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and
-says so on stderr. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git and gh run
+says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
+abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. It rebuilds where it stood
+from every run event of the item since it was last queued, claimed or answered, not only the last run's, so an item
+interrupted again before it records a round keeps its round count and blockers: the round, the feedback for the
+builder, and the reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on
+the branch's HEAD (`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no
+index flags, it skips the build; if the default branch is also unchanged it skips the checks too and goes straight to
+the review. Any other state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git and gh run
 in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the terminal's
 Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build, the
 checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
@@ -206,7 +213,10 @@ setting to change. On `escalate`, three failed rounds or
 an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
-`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. Each `run.round` event also lists the
+`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `run.checked` (`round`, `commit`, `base`)
+records that Vasara's checks passed on a commit. A `run.round` of a round after which the loop goes on carries
+`next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
+like `detail`) or null; older events without it stay readable. Each `run.round` event also lists the
 round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
 Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
 `duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
