@@ -31,6 +31,13 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
   builder without a review. High-risk changes are the exception: both
   reviewers read the whole change every round, since they must agree on all of it.
+- **The reviewer gets the diff in its prompt.** Mestari computes `git diff --stat` and the diff for the scope the
+  reviewer judges (`base...HEAD`, or `reviewed..HEAD` for a re-review) at the checked commit, so the reviewer spends no
+  turns running git to find the change. Above 60 000 characters the prompt holds the stat and whole files up to the
+  cap, and names the files the reviewer must read itself. The issue, answers and diff come first and the role-specific
+  text last, so a second reviewer on the same model reuses the cached prefix. Main's `CLAUDE.md` is already in the
+  reviewer's system prompt, so the prompt doesn't ask for it again. The reviewer's tools, hook and verdict schema are
+  unchanged.
 - **Cheaper models where the review reads less.** The first reviewer of a round runs as the `review` role in
   `.paja/models` (Opus here). A normal-risk re-review, which judges only the fix against a fixed list of blockers, runs
   as `re-review`, and the second high-risk reviewer, a second opinion on a change the first also reads in full, runs as

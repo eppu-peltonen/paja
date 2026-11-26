@@ -1704,7 +1704,11 @@ fn agents_run_on_the_models_main_names() {
         "{}",
         reviews[1]
     );
-    assert!(!reviews.iter().any(|r| r.contains("haiku")), "{reviews:?}");
+    // The branch's own models file is in the reviewers' diff, so look at the flags only.
+    assert!(
+        !reviews.iter().any(|r| r.contains("--model haiku")),
+        "{reviews:?}"
+    );
     // The step records name the role and model.
     let (_, log) = paja(&f.home, &f.repo, &["log"]);
     let steps: Vec<Value> = log
@@ -1979,9 +1983,13 @@ fn a_second_review_judges_only_the_fix() {
     assert!(rereview.contains("found these blockers"), "{args}");
     assert!(rereview.contains("add more"), "{args}");
     assert!(
-        rereview.contains("Judge only the fix: `git diff "),
+        rereview.contains("Judge only the fix, the diff above (`git diff "),
         "{args}"
     );
+    // The diff itself is in the prompt, so the reviewer needn't run git to find the change.
+    assert!(rereview.contains("Diff stat for `"), "{args}");
+    assert!(rereview.contains("+++ b/feature.txt"), "{args}");
+    assert!(!rereview.contains(":CLAUDE.md"), "{args}");
 }
 
 #[test]
