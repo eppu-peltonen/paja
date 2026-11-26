@@ -373,11 +373,16 @@ fn announce(now: u32) {
     static ANNOUNCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let now = now.min(2);
     let before = ANNOUNCED.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+    // Not `eprintln!`: after a hangup stderr may be gone, and a failed write must not panic
+    // before the children are ended.
+    let say = |text: &str| {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), text.as_bytes());
+    };
     if before < 1 && now >= 1 {
-        eprintln!("paja: stopping after this step; press Ctrl-C again to stop now");
+        say("paja: stopping after this step; press Ctrl-C again to stop now\n");
     }
     if before < 2 && now >= 2 {
-        eprintln!("paja: stopping now");
+        say("paja: stopping now\n");
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(10));
             std::process::exit(130);
@@ -389,25 +394,44 @@ fn interrupted() {
     INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// The terminal closed or the process was asked to end: stop now, as a second Ctrl-C does,
+/// so the agents and checks in their own process groups end with Paja.
+#[cfg(unix)]
+fn hung_up() {
+    INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Count Ctrl-C instead of dying on it, for `paja run`. The first says on stderr that the run
 /// stops after this step; the second that it stops now, and if the process is still alive
-/// ten seconds later (stuck on something that isn't a child Paja can end) it exits.
+/// ten seconds later (stuck on something that isn't a child Paja can end) it exits. On Unix
+/// a hangup (the terminal closed) or SIGTERM stops now too, ending the agents and checks that
+/// run in their own process groups; on Windows closing the console reaches them itself.
 pub fn catch_interrupts() -> Result<()> {
     #[cfg(unix)]
     {
         extern "C" fn on_sigint(_: std::ffi::c_int) {
             interrupted();
         }
+        extern "C" fn on_sighup(_: std::ffi::c_int) {
+            hung_up();
+        }
         extern "C" {
             fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
         }
+        const SIGHUP: std::ffi::c_int = 1;
         const SIGINT: std::ffi::c_int = 2;
+        const SIGTERM: std::ffi::c_int = 15;
         const SIG_ERR: usize = usize::MAX;
-        // SAFETY: the handler only increments an atomic, which is async-signal-safe.
-        if unsafe { signal(SIGINT, on_sigint as extern "C" fn(std::ffi::c_int) as usize) }
-            == SIG_ERR
-        {
-            bail!("can't catch Ctrl-C: {}", std::io::Error::last_os_error());
+        let handlers = [
+            (SIGINT, on_sigint as extern "C" fn(std::ffi::c_int)),
+            (SIGHUP, on_sighup as extern "C" fn(std::ffi::c_int)),
+            (SIGTERM, on_sighup as extern "C" fn(std::ffi::c_int)),
+        ];
+        for (signum, handler) in handlers {
+            // SAFETY: the handlers only update an atomic, which is async-signal-safe.
+            if unsafe { signal(signum, handler as usize) } == SIG_ERR {
+                bail!("can't catch Ctrl-C: {}", std::io::Error::last_os_error());
+            }
         }
     }
     #[cfg(windows)]

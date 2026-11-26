@@ -499,7 +499,10 @@ fn validate_name(name: &str) -> Result<()> {
 pub(crate) fn git_command() -> Command {
     let mut cmd = Command::new("git");
     // Ctrl-C on `paja run` stops it between steps; git must not die mid-command meanwhile.
+    // Outside the terminal's process group git can't prompt (it would stop, waiting on the
+    // terminal), so it fails instead of asking.
     crate::platform::own_process_group(&mut cmd);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     // `/dev/null` works on Windows too: Git for Windows maps it to `NUL`.
     // Replacement refs would let code in a worktree change the history Paja judges.
     cmd.env("GIT_NO_REPLACE_OBJECTS", "1")

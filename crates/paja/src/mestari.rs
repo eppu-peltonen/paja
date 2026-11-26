@@ -2815,13 +2815,14 @@ fn tail(output: &Output) -> String {
 
 fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
     let gh = jono::gh_program();
-    let output = crate::platform::own_process_group(&mut Command::new(&gh))
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .with_context(|| {
-            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
-        })?;
+    let output =
+        crate::platform::own_process_group(Command::new(&gh).env("GH_PROMPT_DISABLED", "1"))
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .with_context(|| {
+                format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+            })?;
     if !output.status.success() {
         bail!("`{gh} {}` failed: {}", args.join(" "), tail(&output));
     }

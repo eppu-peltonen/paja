@@ -1358,6 +1358,36 @@ fn a_second_ctrl_c_stops_at_once_and_ends_the_agent() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn closing_the_terminal_ends_the_agent_with_paja() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    let run = slow_run(&f);
+    // A closed terminal sends SIGHUP to the whole process group.
+    let group = format!("-{}", run.id());
+    let sent = Command::new("kill")
+        .args(["-HUP", "--", &group])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let output = run.wait_with_output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    // The builder, in its own process group, was ended too: it never gets to commit.
+    std::fs::remove_file(dir.join("slow")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (_, env) = paja(&f.home, &f.repo, &["env", "show", "work-5"]);
+    let path = env["path"].as_str().unwrap();
+    assert!(
+        !std::path::Path::new(path).join("feature.txt").exists(),
+        "the builder outlived paja"
+    );
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+}
+
 /// The session ids Mestari recorded before starting builder sessions, oldest first.
 fn recorded_sessions(f: &Factory) -> Vec<String> {
     let (_, log) = paja(&f.home, &f.repo, &["log"]);

@@ -72,7 +72,7 @@ queue is empty it checks again every five minutes.
 Stop it with Ctrl+C. The first Ctrl+C lets the step in flight (an agent or a check) finish and keeps it, then stops; the
 item stays active, and the next `paja run` resumes it where its environment left off. Press Ctrl+C again to stop at
 once: Paja ends the agent or check and everything it started, and the item still resumes next time, without that
-step's unfinished work. Closing the terminal or a reboot is like the second Ctrl+C.
+step's unfinished work. Closing the terminal is like the second Ctrl+C; after a reboot the item resumes the same way.
 
 After pulling a newer Paja, run
 `cargo install --path crates/paja` again.
