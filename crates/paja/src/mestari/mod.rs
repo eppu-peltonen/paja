@@ -30,7 +30,6 @@ use follow_ups::*;
 use land::*;
 use usage::*;
 
-pub use follow_ups::FOLLOW_UP_LABEL;
 pub use progress::progress;
 use progress::*;
 pub use usage::{ModelUsage, StepUsage};
@@ -353,11 +352,16 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
     crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
-    progress("checking the queue (issues labelled paja)");
+    let labels =
+        jono::Labels::parse(&read_from_base(&repo, &base, jono::LABELS_FILE)?.unwrap_or_default())?;
+    progress(&format!(
+        "checking the queue (issues labelled {})",
+        labels.work
+    ));
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
-    let name = jono::sync(home, &repo)?.repo;
-    let config = read_config(&repo, &base)?;
+    let name = jono::sync_with(home, &repo, Some(&labels))?.repo;
+    let config = read_config(&repo, &base, labels)?;
     // Before an item is claimed: waiting for CI that will never run fails after the whole build.
     if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
         bail!(
@@ -517,11 +521,12 @@ struct Config {
     high_risk: Vec<String>,
     models: Models,
     commands: crate::hook::Commands,
+    labels: jono::Labels,
 }
 
 /// Read and check `main`'s configuration once, before an item is claimed: a mistake there is
 /// one fix on `main`, so it stops the pass instead of parking every item in turn.
-fn read_config(repo: &Path, base: &str) -> Result<Config> {
+fn read_config(repo: &Path, base: &str, labels: jono::Labels) -> Result<Config> {
     let checks = read_from_base(repo, base, CHECKS_FILE)?.with_context(|| {
         format!("{CHECKS_FILE} is missing on main; add the check commands there")
     })?;
@@ -542,6 +547,7 @@ fn read_config(repo: &Path, base: &str) -> Result<Config> {
         high_risk,
         models,
         commands,
+        labels,
     })
 }
 
@@ -560,6 +566,7 @@ fn run_item(
         high_risk,
         models,
         commands,
+        labels,
     } = config;
     let (env, kept) = environment(home, repo, base, item)?;
     // An earlier run's builder session is resumed only for work still on its branch: an
@@ -888,7 +895,7 @@ fn run_item(
             let report = land(home, repo, &env, item, round, &checked, ci);
             match &report {
                 Ok(RunReport::Landed { pr, .. }) => {
-                    file_follow_ups(home, repo, item, pr, &follow_ups)
+                    file_follow_ups(home, repo, item, pr, &follow_ups, &labels)
                 }
                 // Not landed after all: keep the findings in the log, for later.
                 _ => {

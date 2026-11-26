@@ -23,7 +23,7 @@ Settled decisions, newest first within each date. Change one only by adding a ne
 - **The core is written in Rust.** Workers are `claude -p` subprocesses with streamed JSON output, so no Agent SDK is
   needed. The MCP server uses the official Rust MCP SDK, and Paja Desk gets TypeScript types generated from the core's
   API.
-- **Work comes from GitHub issues.** Jono imports issues labelled `paja`; `/paja-spec` creates them. The approved spec
+- **Work comes from GitHub issues.** Jono imports issues with the work label (`.paja/labels`, `paja` in this repository); `/paja-spec` creates them. The approved spec
   version lives in Kaava and is linked from the issue, and status and Posti questions are mirrored as issue comments.
 - **Workers run on the owner's machine only** for now. Ahjo uses git worktrees with their own ports; no cloud VMs yet.
 - **The budget is the account's Claude usage limits, not money.** Jono paces work so a chunk doesn't start when too
