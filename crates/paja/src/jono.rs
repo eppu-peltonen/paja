@@ -294,7 +294,8 @@ pub fn parse_status(name: &str) -> Result<Status> {
     })
 }
 
-/// Record a status change, for example when a run picks an item up or escalates it.
+/// Record a status change, for example when a run picks an item up or escalates it. An
+/// escalated item is queued again only through [`answer`], so its next run gets the answer.
 pub fn set_status(
     home: &Home,
     number: u64,
@@ -306,6 +307,14 @@ pub fn set_status(
     let mut item = replay(&log.read_all()?)?.remove(&number).with_context(|| {
         format!("no work item #{number}; run `paja work sync` to import issues labelled `{LABEL}`")
     })?;
+    if item.status == Status::Escalated && status == Status::Queued {
+        // Queuing it this way would start a run that never sees the person's answer.
+        bail!(
+            "work item #{number} is waiting on an answer; answer with `paja work answer {number} \
+             \"<your answer>\"` so the next run sees it (if you changed the issue instead, run \
+             `paja work sync` and answer \"see the updated issue\")"
+        );
+    }
     log.append(
         &lock,
         EV_STATUS,
@@ -582,6 +591,27 @@ mod tests {
             "reverted work is queued"
         );
         assert!(format!("{:#}", get(&home, 9).unwrap_err()).contains("paja work sync"));
+    }
+
+    #[test]
+    fn an_escalated_item_is_queued_again_only_by_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        apply(&home, &[issue(1, "a")]).unwrap();
+        set_status(&home, 1, Status::Escalated, Some("which API?")).unwrap();
+        let err = format!(
+            "{:#}",
+            set_status(&home, 1, Status::Queued, None).unwrap_err()
+        );
+        assert!(err.contains("paja work answer 1"), "{err}");
+        let item = get(&home, 1).unwrap();
+        assert_eq!(item.status, Status::Escalated, "nothing was recorded");
+        assert_eq!(item.note.as_deref(), Some("which API?"));
+        // Other moves out of escalated still work, for example closing the matter by hand.
+        assert_eq!(
+            set_status(&home, 1, Status::Landed, None).unwrap().status,
+            Status::Landed
+        );
     }
 
     #[test]

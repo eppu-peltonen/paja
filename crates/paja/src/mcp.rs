@@ -206,7 +206,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note."
+        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note. An escalated item can't be set to queued: use work_answer, so the next run gets the answer."
     )]
     async fn work_set(&self, Parameters(args): Parameters<SetArgs>) -> Result<String, String> {
         let home = self.home.clone();
