@@ -4,6 +4,9 @@ Settled decisions, newest first within each date. Change one only by adding a ne
 
 ## 2026-11-26
 
+- **A project's Paja files live in its own repository.** `.paja/` and `CLAUDE.md` sit on the default branch, and Paja
+  reads them from there, never from the branch under review. This replaces "factory files live outside the app repo":
+  reading them from the default branch is what keeps checks out of reach of the change they judge.
 - **Paja is licensed under Apache-2.0.** The full text is in `LICENSE` at the repository root, and the crate's
   `license` field says the same.
 

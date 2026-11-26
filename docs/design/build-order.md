@@ -35,11 +35,27 @@ for now. Autonomy widens only after each step's exit test passes.
    no longer earning their cost.
    - *Exit:* a chunk lands in another repo without any Paja-specific change to that repo.
 
+## First release
+
+Before Paja Desk's phone exit (step 6) and before step 7's full scope, v0.1 ships Paja for other people's projects:
+
+- any language, not only Rust;
+- many repositories, not one;
+- `paja init` to add Paja's files to a project and `paja doctor` to check the setup;
+- safe defaults, so a fresh install is fail-closed;
+- usage pacing inside the account's limits;
+- Paja Desk as a desktop app;
+- prebuilt binaries;
+- a quickstart.
+
 ## Status
 
-Step 1 is done. Its exit test is `evals/step1-exit.py`: headless Claude Code, in a fresh environment made from
+Steps 1 and 2 are done; step 3 is in progress.
+
+Step 1's exit test is Its exit test is `evals/step1-exit.py`: headless Claude Code, in a fresh environment made from
 `origin/main` and guided only by `CLAUDE.md`, must run fmt, clippy and the tests, each passing on its first command and
 without editing any file. Clippy and the tests both compile Paja first, so they cover the build. The verdict comes from
 a log of the cargo processes Claude really started and a re-run of the checks, never from the model's own report. It
 needs a signed-in `claude`, so it runs on the owner's machine, not in CI; its latest passing output is in the pull
-request that added it. Step 2 is in progress: `paja mcp` has landed; Jono's import and `paja run` are next.
+request that added it. Step 2 is done: `paja mcp`, Jono's import and `paja run` have landed. Step 3 is in progress: Paja's own changes now
+go through the queue.
