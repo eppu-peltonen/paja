@@ -362,7 +362,27 @@ static INTERRUPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// [`catch_interrupts`]: 0 while nobody did, 1 to stop after the current step, 2 or more to
 /// stop now.
 pub fn interrupts() -> u32 {
-    INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst)
+    let now = INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst);
+    announce(now);
+    now
+}
+
+/// Say on stderr, once each, what the Ctrl-Cs so far will do. Called by the watcher and by
+/// every reader of [`interrupts`], so the message is out before Paja acts on it.
+fn announce(now: u32) {
+    static ANNOUNCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let now = now.min(2);
+    let before = ANNOUNCED.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+    if before < 1 && now >= 1 {
+        eprintln!("paja: stopping after this step; press Ctrl-C again to stop now");
+    }
+    if before < 2 && now >= 2 {
+        eprintln!("paja: stopping now");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            std::process::exit(130);
+        });
+    }
 }
 
 fn interrupted() {
@@ -392,26 +412,9 @@ pub fn catch_interrupts() -> Result<()> {
     }
     #[cfg(windows)]
     win::catch_ctrl_c()?;
-    std::thread::spawn(|| {
-        let mut seen = 0;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let now = interrupts();
-            if now == seen {
-                continue;
-            }
-            if seen == 0 {
-                eprintln!("paja: stopping after this step; press Ctrl-C again to stop now");
-            }
-            if now >= 2 && seen < 2 {
-                eprintln!("paja: stopping now");
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    std::process::exit(130);
-                });
-            }
-            seen = now;
-        }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        interrupts();
     });
     Ok(())
 }
