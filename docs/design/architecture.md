@@ -161,11 +161,14 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
   followed, and are blocked while the worktree holds a symlink out of the worktree. To keep that scan fast, a `Grep`
-  without a `glob` leaves out the directories the worktree's `.gitignore` files ignore (matched with case, as ripgrep
-  does), since ripgrep never enters them either; each ignored name is still checked for being a link out. Nothing is
-  left out when the search starts inside an ignored directory, when git fails, when `RIPGREP_CONFIG_PATH` is set, or
-  when a ripgrep ignore file (`.ignore`, `.rgignore`) or a symlink into an ignored directory could bring one back.
-  `Glob`, `LS` and a `Grep` with a `glob` always walk the whole worktree. A file tool path may not
+  without a `glob` leaves out the worktree's top-level `target` directory, which ripgrep never enters either, when the
+  worktree's `.gitignore` names it in a line git and ripgrep read the same way (`target`, `target/`, `/target`,
+  `/target/`). Git and ripgrep match ignore patterns with different engines, so no other directory is left out, and
+  git is not asked. `target` itself is still checked for being a link out. Nothing is left out when any of these
+  could make ripgrep search it after all: a `!` line in that `.gitignore` or in one above the worktree, a ripgrep
+  ignore file (`.ignore`, `.rgignore`) in the worktree's top directory or above it, `RIPGREP_CONFIG_PATH`, a worktree
+  without `.git`, a search that starts inside `target`, or a symlink into it. `Glob`, `LS` and a `Grep` with a `glob`
+  always walk the whole worktree. A file tool path may not
   start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
   (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.
