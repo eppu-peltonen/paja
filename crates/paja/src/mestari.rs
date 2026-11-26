@@ -2628,9 +2628,13 @@ impl GitGuard {
             // Mestari's own git reads a relative one here, gh's in the main checkout.
             for base in [worktree, main_checkout.as_path()] {
                 let path = base.join(&attributes);
+                // Attributes are compared byte for byte, even in a file also watched as
+                // configuration: their lines aren't config entries.
+                if !guard.raw.contains(&path) {
+                    guard.raw.push(path.clone());
+                }
                 if !guard.files.contains(&path) {
-                    guard.files.push(path.clone());
-                    guard.raw.push(path);
+                    guard.files.push(path);
                 }
             }
         }
@@ -2870,8 +2874,9 @@ mod tests {
 
     #[test]
     fn guard_watches_a_relative_attributes_file_in_the_main_checkout() {
-        let dir = std::env::temp_dir().join(format!("paja-attributes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Removed when the test ends, passing or not.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let main = dir.join("main");
         std::fs::create_dir_all(&main).unwrap();
         let run = |args: &[&str]| {
@@ -2910,7 +2915,24 @@ mod tests {
                 expected.display()
             );
         }
-        std::fs::remove_dir_all(&dir).unwrap();
+        // An attributes file that is also watched as configuration is still compared byte
+        // for byte.
+        // Spelled as git spells the common directory, so it is the very path the guard
+        // already watches as configuration.
+        let common = git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap();
+        let config = format!("{common}/config");
+        run(&["config", "core.attributesFile", &config]);
+        let guard = GitGuard::new(&worktree).unwrap();
+        assert!(guard.files.contains(&PathBuf::from(&common).join("config")));
+        let watched: Vec<_> = guard.raw.iter().filter_map(|p| canonical(p)).collect();
+        assert!(
+            watched.contains(&canonical(Path::new(&config)).unwrap()),
+            "{watched:?}"
+        );
     }
 
     #[test]
