@@ -835,6 +835,24 @@ fn work_waits_on_open_dependencies_until_they_close() {
         .unwrap();
     let text = String::from_utf8_lossy(&listed.stdout);
     assert!(text.contains("#2 -> #8 -> #2 wait on each other"), "{text}");
+    // `--json` stays the items alone.
+    let (ok, listed) = paja(&home, &repo, &["work", "list"]);
+    assert!(ok, "{listed}");
+    let numbers: Vec<u64> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["number"].as_u64().unwrap())
+        .collect();
+    assert!(numbers.contains(&2) && numbers.contains(&8), "{listed}");
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.is_object()),
+        "{listed}"
+    );
 }
 
 #[test]

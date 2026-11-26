@@ -341,7 +341,6 @@ fn run(cli: &Cli) -> Result<()> {
             }
             WorkCommand::List => {
                 let items = jono::list(&home)?;
-                let cycle = jono::cycle_note(&home)?;
                 emit(cli, serde_json::to_value(&items)?, || {
                     if items.is_empty() {
                         "no work items; run `paja work sync`".to_string()
@@ -349,7 +348,7 @@ fn run(cli: &Cli) -> Result<()> {
                         items
                             .iter()
                             .map(describe_item)
-                            .chain(cycle.clone())
+                            .chain(jono::cycle_note(&items))
                             .collect::<Vec<_>>()
                             .join("\n")
                     }
