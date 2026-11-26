@@ -63,6 +63,14 @@ claude plugin install paja --marketplace eppu-peltonen/paja
 Inside Claude Code, `/plugin install paja --marketplace eppu-peltonen/paja` does the same. Start Claude Code from inside
 the repository's checkout, because the MCP tools work on the checkout they run in.
 
+## CI
+
+Paja waits for the pull request's CI before it lands. `.paja/ci`, read from the default branch next to `.paja/checks`,
+says whether the repository has any: `required` (the default when the file is missing) or `none`. With `required`, a
+repository with no GitHub Actions workflow (`gh workflow list` is empty) stops the pass before an item is claimed, with an
+error that names the two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the
+default branch. With `none`, Paja lands on Vasara's checks and the reviewers alone, and says so in the pull request body.
+
 ## What happens next
 
 `paja run --every 5` takes the oldest open issue labelled `paja`. It builds the change, runs Vasara's checks, has it

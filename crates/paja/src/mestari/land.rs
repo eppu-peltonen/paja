@@ -10,6 +10,7 @@ pub(super) fn land(
     item: &WorkItem,
     rounds: u32,
     judged: &str,
+    ci: CiMode,
 ) -> Result<RunReport> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
@@ -26,11 +27,17 @@ pub(super) fn land(
         ],
     )?;
     let title = format!("{} (#{})", item.title, item.number);
-    let body = format!(
+    let mut body = format!(
         "Closes #{}.\n\nBuilt and landed by Paja: Vasara's checks passed and an independent \
          reviewer agent approved it.",
         item.number
     );
+    if ci == CiMode::None {
+        body.push_str(&format!(
+            "\n\nThis repository has no CI (`{CI_FILE}` is `none`), so Paja landed it on \
+             Vasara's checks and the reviewers alone."
+        ));
+    }
     // Reuse this branch's pull request only while it is still open.
     let pr = match run_gh(
         repo,
@@ -54,10 +61,14 @@ pub(super) fn land(
         )?,
     };
     // CI must be green before landing; a red CI is a failed check, not a merge.
-    progress(&format!("opened {pr}; waiting for CI"));
-    if let Err(err) = wait_for_ci(repo, &pr) {
-        let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
-        return escalated(home, repo, env, item, &question, rounds);
+    if ci == CiMode::None {
+        progress(&format!("opened {pr}; the repository has no CI, landing"));
+    } else {
+        progress(&format!("opened {pr}; waiting for CI"));
+        if let Err(err) = wait_for_ci(repo, &pr) {
+            let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
+            return escalated(home, repo, env, item, &question, rounds);
+        }
     }
     // Free the worktree first: gh deletes the local branch too, which git refuses while a
     // worktree has it checked out.
