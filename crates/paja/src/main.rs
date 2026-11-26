@@ -76,11 +76,29 @@ enum Command {
         repo: PathBuf,
         /// When the repository has no GitHub Actions workflow, write one that runs the checks on
         /// pull requests. Without it, `.paja/ci` says `none`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "new")]
         ci: bool,
         /// Write the files again on the branch although `.paja/checks` is on the default branch.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "new")]
         force: bool,
+        /// Start a new project instead: create this GitHub repository under the signed-in
+        /// account, clone it, and push a walking skeleton (a minimal app with a passing test, a
+        /// formatter, a linter, a CI workflow, and the `.paja/` files and `CLAUDE.md`) as the
+        /// first commit on the default branch. Needs --stack.
+        #[arg(long, value_name = "NAME", requires = "stack")]
+        new: Option<String>,
+        /// The skeleton's stack, with --new.
+        #[arg(long, value_parser = paja::init::STACKS, requires = "new")]
+        stack: Option<String>,
+        /// With --new: make the repository public (the default is private).
+        #[arg(long, requires = "new", conflicts_with = "private")]
+        public: bool,
+        /// With --new: make the repository private (the default).
+        #[arg(long, requires = "new")]
+        private: bool,
+        /// With --new: clone into this directory instead of `<name>` here.
+        #[arg(long, requires = "new")]
+        dir: Option<PathBuf>,
     },
     /// Check that this machine and repository are ready for `paja run`: git, `gh`, `claude`,
     /// the deny-list hook, the repository's labels and `.paja` files, and the sandbox. Each
@@ -289,7 +307,30 @@ fn run(cli: &Cli) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Init { repo, ci, force } => {
+        Command::Init {
+            new: Some(name),
+            stack,
+            public,
+            dir,
+            ..
+        } => {
+            let report = paja::init::run_new(
+                &home,
+                &std::env::current_dir()?,
+                paja::init::NewOptions {
+                    name: name.clone(),
+                    stack: stack.clone().unwrap_or_default(),
+                    private: !*public,
+                    dir: dir.clone(),
+                },
+            )?;
+            emit(cli, serde_json::to_value(&report)?, || {
+                describe_new(&report)
+            });
+        }
+        Command::Init {
+            repo, ci, force, ..
+        } => {
             let report = paja::init::run(
                 &home,
                 &std::path::absolute(repo)?,
@@ -580,6 +621,24 @@ fn describe_run(report: &mestari::RunReport) -> String {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
         }
     }
+}
+
+fn describe_new(report: &paja::init::NewReport) -> String {
+    let mut text = format!(
+        "created {} ({}): {}\ncloned to {}\nstack: {}\nchecks: {}\nwrote: {}\npushed the first commit to {}\n\nNext:\n",
+        report.repo,
+        if report.private { "private" } else { "public" },
+        report.url,
+        report.directory,
+        report.stack,
+        report.checks.join("; "),
+        report.files.join(", "),
+        report.default_branch
+    );
+    for step in &report.next_steps {
+        text.push_str(&format!("  {step}\n"));
+    }
+    text.trim_end().to_string()
 }
 
 fn describe_init(report: &paja::init::Report) -> String {

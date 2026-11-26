@@ -117,6 +117,16 @@ pub struct InitArgs {
     /// Write the files again on the branch although .paja/checks is on the default branch.
     #[serde(default)]
     force: bool,
+    /// Start a new project instead: the name of a GitHub repository to create under the
+    /// signed-in account. Needs `stack`; `repo`, `ci` and `force` are not used.
+    new: Option<String>,
+    /// With `new`: rust, node or python.
+    stack: Option<String>,
+    /// With `new`: make the repository public (default: private).
+    #[serde(default)]
+    public: bool,
+    /// With `new`: the directory to clone into (default: the name, in the server's directory).
+    dir: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -322,11 +332,27 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Set an existing repository up for Paja in one pull request: detects the stack, writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true."
+        description = "Set an existing repository up for Paja in one pull request: detects the stack, writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true. With new (a repository name) and stack (rust, node or python) it instead creates that GitHub repository, clones it (to dir, or the name) and pushes a walking skeleton as the first commit on the default branch, returning {repo, url, directory, files, next_steps}."
     )]
     async fn init(&self, Parameters(args): Parameters<InitArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
+            if let Some(name) = args.new {
+                let Some(stack) = args.stack else {
+                    anyhow::bail!("`new` needs `stack`: rust, node or python");
+                };
+                let report = crate::init::run_new(
+                    &home,
+                    &std::env::current_dir()?,
+                    crate::init::NewOptions {
+                        name,
+                        stack,
+                        private: !args.public,
+                        dir: args.dir.map(PathBuf::from),
+                    },
+                )?;
+                return Ok(serde_json::to_value(report)?);
+            }
             let report = crate::init::run(
                 &home,
                 &checkout(args.repo)?,

@@ -4181,6 +4181,141 @@ fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
 }
 
 #[test]
+fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo create\") echo \"https://github.com/acme/$3\" ;;\n\
+             \"repo clone\") git clone -q {d}/origin-$(basename \"$3\").git \"$4\" ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let identity = [
+        ("GIT_AUTHOR_NAME", Path::new("test")),
+        ("GIT_AUTHOR_EMAIL", Path::new("test@example.com")),
+        ("GIT_COMMITTER_NAME", Path::new("test")),
+        ("GIT_COMMITTER_EMAIL", Path::new("test@example.com")),
+        ("PAJA_GH", gh.as_path()),
+    ];
+    for (name, stack, extra) in [
+        ("rusty", "rust", "--private"),
+        ("nody", "node", "--public"),
+        ("pyish", "python", "--private"),
+    ] {
+        let origin = tmp.path().join(format!("origin-{name}.git"));
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        let (ok, out) = paja_with(
+            &home,
+            &work,
+            &["init", "--new", name, "--stack", stack, extra],
+            &identity,
+        );
+        assert!(ok, "{out}");
+        let dir = work.join(name);
+        assert_eq!(out["repo"], format!("acme/{name}"));
+        assert_eq!(out["directory"], dir.display().to_string());
+        assert_eq!(out["default_branch"], "main");
+        assert_eq!(out["private"], extra == "--private");
+        let files: Vec<&str> = out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        for file in [
+            ".paja/checks",
+            ".paja/commands",
+            ".paja/models",
+            ".paja/high-risk",
+            ".paja/labels",
+            "CLAUDE.md",
+            ".github/workflows/paja.yml",
+            ".gitignore",
+        ] {
+            assert!(files.contains(&file), "{file} missing from {files:?}");
+            assert!(dir.join(file).is_file(), "{file} not written");
+        }
+        // The first commit reached the default branch of origin.
+        let pushed = show(&origin, "main", ".paja/checks");
+        assert_eq!(
+            pushed,
+            std::fs::read_to_string(dir.join(".paja/checks"))
+                .unwrap()
+                .replace("\r\n", "\n")
+        );
+        assert!(show(&origin, "main", "CLAUDE.md").contains("## Working with Paja"));
+        assert!(out["next_steps"].to_string().contains("paja run --once"));
+    }
+
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("repo create rusty --private"), "{log}");
+    assert!(log.contains("repo create nody --public"), "{log}");
+    assert!(log.contains("label create paja "), "{log}");
+
+    // The Rust skeleton passes the checks Paja will run.
+    let dir = work.join("rusty");
+    let checks = std::fs::read_to_string(dir.join(".paja/checks")).unwrap();
+    let checks: Vec<&str> = checks
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            "cargo fmt --all --check",
+            "cargo clippy --all-targets -- -D warnings",
+            "cargo test"
+        ]
+    );
+    for check in checks {
+        let mut words = check.split_whitespace();
+        let output = Command::new(words.next().unwrap())
+            .args(words)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "`{check}` failed in the Rust skeleton: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // A name Paja can't use is refused before anything is created.
+    let (ok, out) = paja_with(
+        &home,
+        &work,
+        &["init", "--new", "bad name", "--stack", "rust"],
+        &identity,
+    );
+    assert!(!ok, "{out}");
+    assert!(out["error"]
+        .as_str()
+        .unwrap()
+        .contains("not a usable project name"));
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(!log.contains("bad name"), "{log}");
+}
+
+#[test]
 fn a_run_merges_a_default_branch_that_moved_while_it_built() {
     let f = Factory::new("test -f feature.txt && test -f other.txt\n", "land");
     f.main_moves("other.txt", "elsewhere");
