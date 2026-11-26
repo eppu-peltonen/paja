@@ -5,6 +5,10 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
+/// The environment (and branch, `paja/<name>`) of issue #5 of `acme/app`, the repository the
+/// fake `gh` names: its repository name, a hash of `acme/app`, then `work-5`.
+const WORK_5: &str = "app-a9afab-work-5";
+
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -17,8 +21,23 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// Run `paja --json <args>` and parse its stdout. Returns (success, json).
+///
+/// Commands that act on a repository's work items ask `gh` which repository the checkout is, so
+/// this points `PAJA_GH` at a fake that names it `acme/app` (a test that needs more passes its
+/// own to [`paja_with`]).
 fn paja(home: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
-    paja_with(home, cwd, args, &[])
+    static GH: std::sync::OnceLock<(tempfile::TempDir, std::path::PathBuf)> =
+        std::sync::OnceLock::new();
+    let (_, gh) = GH.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = program(
+            dir.path(),
+            "gh",
+            "#!/bin/sh\necho '{\"nameWithOwner\": \"acme/app\"}'\n",
+        );
+        (dir, gh)
+    });
+    paja_with(home, cwd, args, &[("PAJA_GH", gh.as_path())])
 }
 
 /// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
@@ -505,7 +524,12 @@ fn the_mcp_server_serves_the_same_core() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
     init_repo(&repo);
-    let mut mcp = Mcp::start(&home, &repo, &[]);
+    let gh = program(
+        tmp.path(),
+        "gh",
+        "#!/bin/sh\necho '{\"nameWithOwner\": \"acme/app\"}'\n",
+    );
+    let mut mcp = Mcp::start(&home, &repo, &[("PAJA_GH", gh.as_path())]);
 
     let init = mcp.initialize();
     assert_eq!(init["result"]["serverInfo"]["name"], "paja", "{init}");
@@ -614,6 +638,7 @@ fn the_mcp_server_answers_and_files_issues() {
         &format!(
             "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"issue create\") echo https://example.com/9 ;;\n\
              *) ;;\nesac\n"
         ),
@@ -690,7 +715,9 @@ fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
         dir,
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {log}\ncat {issues}\n",
+            "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             *) cat {issues} ;;\nesac\n",
             log = slash(&dir.join("gh.log")),
             issues = slash(&dir.join("issues.json"))
         ),
@@ -793,6 +820,7 @@ fn work_waits_on_open_dependencies_until_they_close() {
         &format!(
             "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"api repos/\"*) cat {d}/state-${{2##*/}} ;;\n\
              *) ;;\nesac\n"
         ),
@@ -830,6 +858,7 @@ fn work_waits_on_open_dependencies_until_they_close() {
     let listed = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
         .args(["work", "list"])
         .output()
         .unwrap();
@@ -865,6 +894,7 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         &format!(
             "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"issue create\") echo https://example.com/9 ;;\n\
              *) ;;\nesac\n"
         ),
@@ -906,6 +936,7 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         .args(["work", "show", "3"])
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
         .output()
         .unwrap();
     let shown = String::from_utf8_lossy(&shown.stdout);
@@ -956,6 +987,231 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         log.contains("issue create --label paja --title Add a status page --body What to build."),
         "{log}"
     );
+}
+
+/// A fake `gh` for a repository called `name` (`owner/name`) whose open issues are `issues`
+/// (JSON, in `issues.json` beside it, so a test can change them); it logs its arguments.
+fn gh_naming(dir: &Path, name: &str, issues: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("issues.json"), issues).unwrap();
+    let d = slash(dir);
+    program(
+        dir,
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"{name}\"}}' ;;\n\
+             \"issue list\") cat {d}/issues.json ;;\n\
+             *) ;;\nesac\n"
+        ),
+    )
+}
+
+#[test]
+fn two_repositories_in_one_home_keep_their_own_items() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (app, site) = (tmp.path().join("app"), tmp.path().join("site"));
+    init_repo(&app);
+    init_repo(&site);
+    let gh_app = gh_naming(
+        &tmp.path().join("gh-app"),
+        "acme/app",
+        r#"[{"number": 1, "title": "App one", "body": "", "url": "https://example.com/app/1"}]"#,
+    );
+    let gh_site = gh_naming(
+        &tmp.path().join("gh-site"),
+        "acme/site",
+        r#"[{"number": 1, "title": "Site one", "body": "", "url": "https://example.com/site/1"}]"#,
+    );
+    let (in_app, in_site) = (
+        [("PAJA_GH", gh_app.as_path())],
+        [("PAJA_GH", gh_site.as_path())],
+    );
+
+    // Both repositories have an issue #1; each sync imports its own.
+    let (ok, report) = paja_with(&home, &app, &["work", "sync"], &in_app);
+    assert!(ok, "{report}");
+    assert_eq!(
+        (&report["repo"], &report["imported"]),
+        (&"acme/app".into(), &serde_json::json!([1]))
+    );
+    let (ok, report) = paja_with(&home, &site, &["work", "sync"], &in_site);
+    assert!(ok, "{report}");
+    assert_eq!(
+        (&report["repo"], &report["imported"]),
+        (&"acme/site".into(), &serde_json::json!([1]))
+    );
+
+    // The app's item is escalated and answered; the site's one is untouched by it.
+    let (ok, esc) = paja_with(
+        &home,
+        &app,
+        &["work", "set", "1", "escalated", "--note", "Which API?"],
+        &in_app,
+    );
+    assert!(ok, "{esc}");
+    let (ok, site_one) = paja_with(&home, &site, &["work", "show", "1"], &in_site);
+    assert!(ok, "{site_one}");
+    assert_eq!(
+        (&site_one["repo"], &site_one["title"], &site_one["status"]),
+        (&"acme/site".into(), &"Site one".into(), &"queued".into())
+    );
+    let (ok, answered) = paja_with(&home, &app, &["work", "answer", "1", "Use v2"], &in_app);
+    assert!(ok, "{answered}");
+    assert_eq!(
+        answered["answers"],
+        serde_json::json!([{"question": "Which API?", "answer": "Use v2"}])
+    );
+    let (_, site_one) = paja_with(&home, &site, &["work", "show", "1"], &in_site);
+    assert_eq!(site_one["answers"], serde_json::json!([]));
+    assert_eq!(site_one["note"], Value::Null);
+
+    // The app's issue closes upstream: only the app's item closes, and the site's next sync
+    // changes nothing of the app's.
+    std::fs::write(tmp.path().join("gh-app/issues.json"), "[]").unwrap();
+    let (_, report) = paja_with(&home, &app, &["work", "sync"], &in_app);
+    assert_eq!(report["closed"], serde_json::json!([1]), "{report}");
+    let (_, report) = paja_with(&home, &site, &["work", "sync"], &in_site);
+    assert_eq!(
+        (&report["closed"], &report["changed"], &report["imported"]),
+        (
+            &serde_json::json!([]),
+            &serde_json::json!([]),
+            &serde_json::json!([])
+        ),
+        "{report}"
+    );
+    let (_, app_one) = paja_with(&home, &app, &["work", "show", "1"], &in_app);
+    let (_, site_one) = paja_with(&home, &site, &["work", "show", "1"], &in_site);
+    assert_eq!(
+        (&app_one["open"], &site_one["open"]),
+        (&false.into(), &true.into())
+    );
+    assert_eq!(app_one["status"], "queued");
+
+    // Each checkout's queue holds its own items; `--all` lists every repository's.
+    let (_, listed) = paja_with(&home, &site, &["work", "list"], &in_site);
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["repo"], "acme/site");
+    let (_, next) = paja_with(&home, &app, &["work", "next"], &in_app);
+    assert!(next.is_null(), "the app's only item is closed: {next}");
+    let (ok, all) = paja_with(&home, &site, &["work", "list", "--all"], &in_site);
+    assert!(ok, "{all}");
+    let seen: Vec<(&str, u64)> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["repo"].as_str().unwrap(), i["number"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(seen, [("acme/app", 1), ("acme/site", 1)]);
+    let (_, claimed) = paja_with(&home, &site, &["work", "claim"], &in_site);
+    assert_eq!(
+        (&claimed["repo"], &claimed["status"]),
+        (&"acme/site".into(), &"active".into())
+    );
+}
+
+#[test]
+fn run_never_claims_another_repositorys_item() {
+    // The factory's repository is `acme/app` and has an issue #5.
+    let f = Factory::new("true\n", "land");
+    let other = f.tmp.path().join("other");
+    init_repo(&other);
+    // Another repository sharing the home has a #5 of its own, and an older #1.
+    let gh_other = gh_naming(
+        &f.tmp.path().join("gh-other"),
+        "acme/other",
+        r#"[{"number": 1, "title": "Other one", "body": "", "url": "https://example.com/o/1"},
+            {"number": 5, "title": "Other five", "body": "", "url": "https://example.com/o/5"}]"#,
+    );
+    let in_other = [("PAJA_GH", gh_other.as_path())];
+    let (ok, report) = paja_with(&f.home, &other, &["work", "sync"], &in_other);
+    assert!(ok, "{report}");
+
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["number"], 5);
+    let (_, mine) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(
+        (&mine["repo"], &mine["status"]),
+        (&"acme/app".into(), &"landed".into())
+    );
+    // Nothing is left for this checkout, and the other repository's items stay queued.
+    let (ok, again) = f.run();
+    assert!(ok, "{again}");
+    assert_eq!(again["outcome"], "idle", "{again}");
+    let (_, theirs) = paja_with(&f.home, &other, &["work", "list"], &in_other);
+    let theirs: Vec<(&str, &str)> = theirs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["title"].as_str().unwrap(), i["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(theirs, [("Other one", "queued"), ("Other five", "queued")]);
+}
+
+#[test]
+fn a_log_written_before_repositories_replays_to_the_same_items() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    // Events as Paja wrote them before work items carried a repository.
+    let old = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.imported","data":{"number":7,"title":"Later","body":"Depends on #3","url":"https://example.com/7"}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"work.status","data":{"number":3,"status":"escalated","note":"Which API?"}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":4,"kind":"work.answered","data":{"number":3,"question":"Which API?","answer":"Use v2"}}"#,
+        r#"{"v":1,"seq":5,"ts_ms":5,"kind":"work.status","data":{"number":3,"status":"queued","note":null}}"#,
+        r#"{"v":1,"seq":6,"ts_ms":6,"kind":"run.round","data":{"number":3,"round":1,"verdict":"changes","detail":"","steps":[{"step":"build","input_tokens":10,"output_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"cost_usd":0.5,"num_turns":3,"duration_ms":1000,"session_id":"a"}]}}"#,
+        r#"{"v":1,"seq":7,"ts_ms":7,"kind":"work.changed","data":{"number":3,"title":"Add a plugin!","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":8,"ts_ms":8,"kind":"work.closed","data":{"number":7}}"#,
+    ];
+    let log = home.join("events.jsonl");
+    std::fs::write(&log, old.join("\n") + "\n").unwrap();
+    let before = std::fs::read(&log).unwrap();
+
+    // They belong to the checkout's repository, and read exactly as they did.
+    let (ok, items) = paja(&home, &repo, &["work", "list"]);
+    assert!(ok, "{items}");
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 2, "{items:?}");
+    let three = &items[0];
+    assert_eq!(
+        (
+            three["repo"].as_str(),
+            three["number"].as_u64(),
+            three["title"].as_str()
+        ),
+        (Some("acme/app"), Some(3), Some("Add a plugin!"))
+    );
+    assert_eq!(
+        (&three["status"], &three["open"]),
+        (&"queued".into(), &true.into())
+    );
+    assert_eq!(
+        three["answers"],
+        serde_json::json!([{"question": "Which API?", "answer": "Use v2"}])
+    );
+    assert_eq!(three["usage"]["steps"], 1);
+    assert_eq!(three["usage"]["input_tokens"], 10);
+    let seven = &items[1];
+    assert_eq!(
+        (&seven["open"], &seven["waiting_on"]),
+        (&false.into(), &serde_json::json!([3]))
+    );
+    // Reading rewrote nothing, and a writer only appends.
+    assert_eq!(std::fs::read(&log).unwrap(), before);
+    let (ok, claimed) = paja(&home, &repo, &["work", "claim"]);
+    assert!(ok, "{claimed}");
+    assert_eq!(claimed["number"], 3);
+    let after = std::fs::read(&log).unwrap();
+    assert!(after.starts_with(&before), "the old events are untouched");
+    let (_, shown) = paja(&home, &repo, &["work", "show", "3"]);
+    assert_eq!(shown["status"], "active");
+    assert_eq!(shown["repo"], "acme/app");
 }
 
 #[test]
@@ -1020,6 +1276,7 @@ impl Factory {
             format!(
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
+                 \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
                  \"pr view\") exit 1 ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  echo https://example.com/pull/1 ;;\n\
@@ -1113,7 +1370,7 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(report["pr"], "https://example.com/pull/1");
     let log = f.gh_log();
     assert!(
-        log.contains("pr create --base main --head paja/work-5"),
+        log.contains(&format!("pr create --base main --head paja/{WORK_5}")),
         "{log}"
     );
     assert!(
@@ -1125,7 +1382,10 @@ fn run_builds_reviews_and_lands_an_issue() {
         "{log}"
     );
     // The branch reached origin, the item is landed, and the environment is gone.
-    git(&f.repo, &["fetch", "-q", "origin", "paja/work-5"]);
+    git(
+        &f.repo,
+        &["fetch", "-q", "origin", &format!("paja/{WORK_5}")],
+    );
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
@@ -1170,7 +1430,7 @@ fn run_builds_reviews_and_lands_an_issue() {
         );
     }
     assert!(
-        args.contains("PreToolUse") && args.contains("hook --root") && args.contains("work-5"),
+        args.contains("PreToolUse") && args.contains("hook --root") && args.contains(WORK_5),
         "{args}"
     );
     // Agents never see the factory's own PAJA_HOME.
@@ -1383,7 +1643,7 @@ fn a_second_ctrl_c_stops_at_once_and_ends_the_agent() {
     std::thread::sleep(std::time::Duration::from_millis(500));
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "active", "{item}");
-    let (_, env) = paja(&f.home, &f.repo, &["env", "show", "work-5"]);
+    let (_, env) = paja(&f.home, &f.repo, &["env", "show", WORK_5]);
     let path = env["path"].as_str().unwrap();
     assert!(
         !std::path::Path::new(path).join("feature.txt").exists(),
@@ -1411,7 +1671,7 @@ fn closing_the_terminal_ends_the_agent_with_paja() {
     // The builder, in its own process group, was ended too: it never gets to commit.
     std::fs::remove_file(dir.join("slow")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let (_, env) = paja(&f.home, &f.repo, &["env", "show", "work-5"]);
+    let (_, env) = paja(&f.home, &f.repo, &["env", "show", WORK_5]);
     let path = env["path"].as_str().unwrap();
     assert!(
         !std::path::Path::new(path).join("feature.txt").exists(),
@@ -2406,7 +2666,7 @@ fn checks_that_change_git_configuration_stop_the_run() {
     let synced_before = sync_runs();
     for args in [
         &["work", "sync"][..],
-        &["env", "remove", "work-5", "--force"],
+        &["env", "remove", WORK_5, "--force"],
         &["env", "create", "other"],
     ] {
         let (ok, refused) = paja_with(&f.home, &f.repo, args, &with_gh);
@@ -2437,7 +2697,7 @@ fn checks_that_change_git_configuration_stop_the_run() {
     assert_eq!(checked["outcome"], "idle", "{checked}");
     let (ok, synced) = paja_with(&f.home, &f.repo, &["work", "sync"], &with_gh);
     assert!(ok, "{synced}");
-    let (ok, removed) = paja(&f.home, &f.repo, &["env", "remove", "work-5", "--force"]);
+    let (ok, removed) = paja(&f.home, &f.repo, &["env", "remove", WORK_5, "--force"]);
     assert!(ok, "{removed}");
 }
 
@@ -2460,7 +2720,7 @@ fn work_from_an_agent_the_hook_never_saw_does_not_land() {
     let log = std::process::Command::new("git")
         .arg("-C")
         .arg(&f.repo)
-        .args(["log", "--oneline", "paja/work-5"])
+        .args(["log", "--oneline", &format!("paja/{WORK_5}")])
         .output()
         .unwrap();
     assert!(

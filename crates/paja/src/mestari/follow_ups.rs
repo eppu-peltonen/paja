@@ -96,6 +96,7 @@ pub(super) fn record_follow_up(
         home,
         EV_FOLLOW_UP,
         json!({
+            "repo": item.repo,
             "number": item.number,
             "finding": finding,
             "issue": issue,

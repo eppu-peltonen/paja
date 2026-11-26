@@ -308,16 +308,18 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // the person's to fix, and must not park an item.
     crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
     progress("checking the queue (issues labelled paja)");
-    jono::sync(home, &repo)?;
+    // The work items of this checkout's repository only: other repositories' items sharing the
+    // home are never claimed.
+    let name = jono::sync(home, &repo)?.repo;
     let config = read_config(&repo, &base)?;
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
         lock: _working,
         resumed,
-    }) = jono::claim_for_run(home)?
+    }) = jono::claim_for_run(home, &name)?
     else {
-        if let Some(waiting) = jono::waiting(home)? {
+        if let Some(waiting) = jono::waiting(home, &name)? {
             progress(&format!("nothing is ready: {waiting}"));
         }
         return Ok(RunReport::Idle);
@@ -359,7 +361,13 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                  Fix the cause, then answer with what you fixed."
             );
             // Park the item first, so it never stays active if GitHub is the thing failing.
-            jono::set_status(home, item.number, Status::Escalated, Some(&question))?;
+            jono::set_status(
+                home,
+                &item.repo,
+                item.number,
+                Status::Escalated,
+                Some(&question),
+            )?;
             // The steps that ran before the error were spent too; keep them in the item's usage.
             if !run.steps.is_empty() {
                 let error = format!("{err:#}");
@@ -368,7 +376,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
             record(
                 home,
                 EV_ESCALATED,
-                json!({ "number": item.number, "rounds": rounds }),
+                json!({ "repo": item.repo, "number": item.number, "rounds": rounds }),
             )?;
             if is_tampered(&err) {
                 // gh would run git in the repository to find it, and removing the environment
@@ -377,7 +385,14 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 record(
                     home,
                     EV_TAMPERED,
-                    json!({ "repo": key, "number": item.number, "error": format!("{err:#}") }),
+                    // `repo` is the git directory the tamper lock keys on; `work_repo` is the
+                    // item's repository, so the queue can still be read there without gh.
+                    json!({
+                        "repo": key,
+                        "work_repo": item.repo,
+                        "number": item.number,
+                        "error": format!("{err:#}")
+                    }),
                 )?;
                 return Err(err);
             }
@@ -387,7 +402,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 item.number,
                 asked.err(),
             ));
-            let _ = ahjo::remove(home, &format!("work-{}", item.number), true);
+            let _ = ahjo::remove(home, &item.env_name(), true);
             Ok(RunReport::Escalated {
                 number: item.number,
                 question,
@@ -463,7 +478,7 @@ fn run_item(
     record(
         home,
         EV_STARTED,
-        json!({ "number": item.number, "env": env.name, "base": base }),
+        json!({ "repo": item.repo, "number": item.number, "env": env.name, "base": base }),
     )?;
 
     let mut feedback = String::new();
@@ -856,7 +871,7 @@ fn turn_limit_twice(
 /// The flag says whether the branch (and so the work on it) was kept from an earlier run, as
 /// opposed to made again from the base.
 fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<(Env, bool)> {
-    let name = format!("work-{}", item.number);
+    let name = item.env_name();
     if let Ok(env) = ahjo::get(home, &name) {
         return Ok((env, true));
     }
@@ -921,11 +936,12 @@ fn new_session_id() -> String {
 /// the run after it ended by asking a person.
 fn earlier_session(
     events: &[crate::events::Event],
+    repo: &str,
     number: u64,
     branch: &str,
 ) -> Option<(String, bool)> {
     let mut last: Option<(String, bool)> = None;
-    for event in events.iter().filter(|e| e.data["number"] == number) {
+    for event in jono::item_events(events, repo, number) {
         match event.kind.as_str() {
             EV_STEP_STARTED => {
                 let id = event.data["session_id"]
@@ -960,7 +976,8 @@ fn earlier_session(
 /// when the log holds none, or when the sandbox lost its transcript.
 fn carried_session(home: &Home, item: &WorkItem, branch: &str) -> Result<Option<Carried>> {
     let events = home.events().read_all()?;
-    let Some((session_id, escalated)) = earlier_session(&events, item.number, branch) else {
+    let Some((session_id, escalated)) = earlier_session(&events, &item.repo, item.number, branch)
+    else {
         return Ok(None);
     };
     if let Some(sbx) = crate::sandbox::active() {
@@ -983,7 +1000,7 @@ fn carried_session(home: &Home, item: &WorkItem, branch: &str) -> Result<Option<
     };
     progress("resuming the builder's own session from the earlier run");
     Ok(Some(Carried {
-        totals: recorded_totals(&events, item.number, &session_id),
+        totals: recorded_totals(&events, &item.repo, item.number, &session_id),
         session_id,
         prompt,
     }))
@@ -1003,6 +1020,7 @@ fn record_step_started(
         home,
         EV_STEP_STARTED,
         json!({
+            "repo": item.repo,
             "number": item.number,
             "round": round,
             "role": role,
@@ -1025,7 +1043,7 @@ fn note_discarded<T>(
             let _ = record(
                 home,
                 EV_STEP_DISCARDED,
-                json!({ "number": item.number, "session_id": session_id }),
+                json!({ "repo": item.repo, "number": item.number, "session_id": session_id }),
             );
         }
     }
@@ -1525,6 +1543,7 @@ fn record_round(
         home,
         EV_ROUND,
         json!({
+            "repo": item.repo,
             "number": item.number,
             "round": round,
             "verdict": verdict,
@@ -1809,6 +1828,7 @@ mod tests {
     #[test]
     fn the_review_prompt_names_the_checked_commit_and_skips_the_suite() {
         let item = crate::jono::WorkItem {
+            repo: "acme/app".into(),
             number: 9,
             title: "T".into(),
             body: "B".into(),

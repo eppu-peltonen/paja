@@ -65,11 +65,11 @@ pub(super) fn land(
     run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
         .with_context(|| format!("{gh} pr merge {pr}"))?;
     // Merged: from here nothing may turn this into an escalation.
-    let _ = jono::set_status(home, item.number, Status::Landed, Some(&pr));
+    let _ = jono::set_status(home, &item.repo, item.number, Status::Landed, Some(&pr));
     let _ = record(
         home,
         EV_LANDED,
-        json!({ "number": item.number, "pr": pr, "rounds": rounds }),
+        json!({ "repo": item.repo, "number": item.number, "pr": pr, "rounds": rounds }),
     );
     progress(&format!("landed #{} ({pr})", item.number));
     Ok(RunReport::Landed {
@@ -125,11 +125,17 @@ pub(super) fn escalate(
     rounds: u32,
 ) -> Result<Option<anyhow::Error>> {
     // Park the item first, so it never stays active if the comment fails.
-    jono::set_status(home, item.number, Status::Escalated, Some(question))?;
+    jono::set_status(
+        home,
+        &item.repo,
+        item.number,
+        Status::Escalated,
+        Some(question),
+    )?;
     record(
         home,
         EV_ESCALATED,
-        json!({ "number": item.number, "rounds": rounds }),
+        json!({ "repo": item.repo, "number": item.number, "rounds": rounds }),
     )?;
     // The item is parked either way; a failed comment must not escalate it a second time.
     // The caller reports it, cleaned for the terminal.
