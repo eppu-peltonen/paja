@@ -120,6 +120,10 @@ pub(super) fn not_retried(out: &Value) -> Option<&'static str> {
     }
 }
 
+/// The most characters a `claude` command line may hold: well under Windows' 32,767, since
+/// the harness (`CLAUDE.md`), the hook settings and the schema all travel on it.
+pub(super) const COMMAND_LINE_BUDGET: usize = 30_000;
+
 /// Run headless Claude Code in the environment and return its JSON result.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude(
@@ -159,7 +163,9 @@ pub(super) fn claude(
             }
         }
     };
-    let mut args: Vec<String> = ["-p", prompt, "--output-format", "json", "--permission-mode"]
+    // The prompt goes on stdin, not the command line: a review prompt holds the diff, and
+    // Windows refuses a command line over 32,767 characters (os error 206).
+    let mut args: Vec<String> = ["-p", "--output-format", "json", "--permission-mode"]
         .into_iter()
         .map(String::from)
         // The sandbox image defaults to bypassPermissions, which is never acceptable.
@@ -191,11 +197,28 @@ pub(super) fn claude(
     if let Some(schema) = schema {
         args.extend(["--json-schema".to_string(), schema.to_string()]);
     }
+    let line: usize = args.iter().map(|arg| arg.len() + 3).sum();
+    if line > COMMAND_LINE_BUDGET {
+        let longest = args
+            .iter()
+            .max_by_key(|arg| arg.len())
+            .cloned()
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&scratch);
+        bail!(
+            "the `claude` command line would be {line} characters, over Paja's budget of \
+             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
+            longest.chars().take(60).collect::<String>()
+        );
+    }
     let mut cmd = match &sbx {
         Some(sbx) => {
             let mut argv = vec![program.clone()];
             argv.extend(args);
-            in_sandbox(sbx, &env.path, git_identity, Err(&argv))?
+            let mut cmd = in_sandbox(sbx, &env.path, git_identity, Err(&argv))?;
+            // `sbx exec` passes stdin through only when asked to.
+            crate::sandbox::keep_stdin(&mut cmd);
+            cmd
         }
         None => {
             let mut cmd = Command::new(&program);
@@ -207,7 +230,10 @@ pub(super) fn claude(
     };
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
-    let output = crate::platform::output_until_stopped(cmd.stdin(std::process::Stdio::null()));
+    let output = crate::platform::output_until_stopped_with_input(
+        &mut cmd,
+        Some(prompt.as_bytes().to_vec()),
+    );
     let _ = std::fs::remove_dir_all(&scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);

@@ -482,12 +482,33 @@ pub fn own_process_group(cmd: &mut Command) -> &mut Command {
 /// [`Command::output`] for a long step (an agent or a check), in its own process group, ended
 /// with everything it started when the person presses Ctrl-C a second time.
 pub fn output_until_stopped(cmd: &mut Command) -> std::io::Result<std::process::Output> {
-    use std::io::Read;
+    output_until_stopped_with_input(cmd, None)
+}
+
+/// [`output_until_stopped`], writing `input` to the child's stdin and then closing it. Long
+/// text goes this way rather than on the command line, which Windows limits to 32,767
+/// characters.
+pub fn output_until_stopped_with_input(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Write};
     use std::process::Stdio;
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     let mut child = own_process_group(cmd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Written on its own thread, so a child that doesn't read all of it can't stall Paja; a
+    // child that exits early just closes the pipe.
+    let writer = match (input, child.stdin.take()) {
+        (Some(bytes), Some(mut stdin)) => Some(std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        })),
+        _ => None,
+    };
     // Drain both pipes while waiting, so a chatty child can't fill one and stall.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -524,6 +545,9 @@ pub fn output_until_stopped(cmd: &mut Command) -> std::io::Result<std::process::
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
     Ok(std::process::Output {
         status,
         stdout: stdout.join().unwrap_or_default(),

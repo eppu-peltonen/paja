@@ -1289,6 +1289,7 @@ impl Factory {
             "claude",
             format!(
                 "#!/bin/sh\necho \"$PAJA_HOME\" >> {d}/claude-homes.log\n\
+                 input=$(cat); [ -n \"$input\" ] && : > {d}/prompt-on-stdin; first=$1; shift; set -- \"$first\" \"$input\" \"$@\"\n\
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
                  *--json-schema*) if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
@@ -1357,6 +1358,19 @@ impl Factory {
 }
 
 #[test]
+fn run_lands_an_issue_whose_prompt_is_longer_than_a_windows_command_line() {
+    // Windows refuses a command line over 32,767 characters (os error 206). The prompt goes on
+    // stdin, so an issue body longer than that still builds, reviews and lands.
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let body = "Please add the feature. ".repeat(2_000);
+    let issues = serde_json::json!([{"number": 5, "title": "Add a feature file", "body": body, "url": "https://example.com/5"}]);
+    std::fs::write(f.tmp.path().join("issues.json"), issues.to_string()).unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+}
+
+#[test]
 fn run_builds_reviews_and_lands_an_issue() {
     // Vasara's checks run the branch's code, so they get no GitHub access either: Mestari's
     // `PAJA_GH` is gone, and so is its PAJA_HOME.
@@ -1397,6 +1411,8 @@ fn run_builds_reviews_and_lands_an_issue() {
         log.contains("issue create --label paja-follow-up --title Tidy the helper"),
         "{log}"
     );
+    // The prompt reaches `claude` on stdin, not on its command line.
+    assert!(f.tmp.path().join("prompt-on-stdin").exists());
     // A token in a finding never reaches the public issue.
     assert!(
         !log.contains("ghp_ABCDEFGHIJKLMNOPQRSTuvwx") && log.contains("logs <redacted>"),
