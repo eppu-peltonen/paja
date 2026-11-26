@@ -102,11 +102,12 @@ prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, 
 (`progress.rs`), follow-ups (`follow_ups.rs`) and the builder's question and answers (`builder.rs`) are normal risk.
 A unit test keeps the three high-risk files on the list.
 
-`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`
-and `.paja/models` from `main` and checks them, claims the next item of the checkout's repository and creates an Ahjo environment named
+`paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once per pass
+(`gh repo view`), fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`
+and `.paja/models` from the default branch and checks them, claims the next item of the checkout's repository and creates an Ahjo environment named
 `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of `owner/name`, so two repositories' item #5
-never share a worktree, branch or port block) from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
-claims anything, with an error naming the file and line, so one fix on `main` is all it takes; a `--every` loop
+never share a worktree, branch or port block) from the default branch (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
+claims anything, with an error naming the file and line, so one fix on the default branch is all it takes; a `--every` loop
 reports it and tries again after its wait. While it works on an item the run holds an OS file lock,
 `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
@@ -179,8 +180,10 @@ finished verdict is kept. If it hits the limit again, its worktree is put back a
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
-On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
-for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
+On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request against the
+default branch, waits for CI with `gh pr checks --watch`, merges it (squash when the repository allows it, otherwise
+rebase, otherwise a merge commit) and marks the item landed. If the repository allows no merge method, or GitHub
+refuses the merge for permission, the item is escalated with the setting to change. On `escalate`, three failed rounds, a
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or

@@ -134,7 +134,7 @@ pub(super) fn claude(
 ) -> Result<Value> {
     let program = claude_program();
     let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
-        Some(text) => format!("The project's CLAUDE.md, as it is on main:\n\n{text}"),
+        Some(text) => format!("The project's CLAUDE.md, as it is on the default branch:\n\n{text}"),
         None => String::new(),
     };
     let git_identity = git_identity(&env.path);

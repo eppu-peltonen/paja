@@ -1246,12 +1246,33 @@ struct Factory {
 
 impl Factory {
     fn new(checks: &str, verdict: &str) -> Self {
+        Self::on(checks, verdict, "main", true, true, true)
+    }
+
+    /// Like `new`, with the repository's default branch and the merge methods its settings
+    /// allow (squash, merge commit, rebase).
+    fn on(
+        checks: &str,
+        verdict: &str,
+        branch: &str,
+        squash: bool,
+        merge: bool,
+        rebase: bool,
+    ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
         let origin = tmp.path().join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&origin, &["init", "-q", "--bare", "-b", branch]);
         init_repo(&repo);
+        git(&repo, &["branch", "-m", branch]);
+        std::fs::write(
+            tmp.path().join("repo.json"),
+            format!(
+                r#"{{"nameWithOwner": "acme/app", "defaultBranchRef": {{"name": "{branch}"}}, "squashMergeAllowed": {squash}, "mergeCommitAllowed": {merge}, "rebaseMergeAllowed": {rebase}}}"#
+            ),
+        )
+        .unwrap();
         std::fs::create_dir_all(repo.join(".paja")).unwrap();
         std::fs::write(repo.join(".paja/checks"), checks).unwrap();
         git(&repo, &["add", "."]);
@@ -1260,7 +1281,7 @@ impl Factory {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
-        git(&repo, &["push", "-q", "origin", "main"]);
+        git(&repo, &["push", "-q", "origin", branch]);
 
         let dir = tmp.path();
         std::fs::write(
@@ -1276,7 +1297,7 @@ impl Factory {
             format!(
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
-                 \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+                 \"repo view\") cat {d}/repo.json ;;\n\
                  \"pr view\") exit 1 ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  echo https://example.com/pull/1 ;;\n\
@@ -1353,6 +1374,62 @@ impl Factory {
     fn gh_log(&self) -> String {
         std::fs::read_to_string(self.tmp.path().join("gh.log")).unwrap_or_default()
     }
+}
+
+#[test]
+fn run_bases_work_on_the_default_branch_whatever_its_name() {
+    let f = Factory::on("test -f feature.txt\n", "land", "trunk", true, true, true);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(
+        log.contains(&format!("pr create --base trunk --head paja/{WORK_5}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("pr merge https://example.com/pull/1 --squash"),
+        "{log}"
+    );
+}
+
+#[test]
+fn run_lands_with_the_merge_method_the_repository_allows() {
+    let f = Factory::on("test -f feature.txt\n", "land", "main", false, true, false);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(
+        log.contains("pr merge https://example.com/pull/1 --merge"),
+        "{log}"
+    );
+
+    let f = Factory::on("test -f feature.txt\n", "land", "main", false, false, true);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert!(
+        f.gh_log()
+            .contains("pr merge https://example.com/pull/1 --rebase"),
+        "{}",
+        f.gh_log()
+    );
+}
+
+#[test]
+fn run_escalates_when_the_repository_allows_no_merge_method() {
+    let f = Factory::on("test -f feature.txt\n", "land", "main", false, false, false);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("allows no merge method"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr merge"), "{}", f.gh_log());
 }
 
 #[test]

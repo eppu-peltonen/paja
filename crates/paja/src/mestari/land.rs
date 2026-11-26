@@ -10,6 +10,7 @@ pub(super) fn land(
     item: &WorkItem,
     rounds: u32,
     judged: &str,
+    target: &Target,
 ) -> Result<RunReport> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
@@ -48,7 +49,15 @@ pub(super) fn land(
         _ => run_gh(
             repo,
             &[
-                "pr", "create", "--base", "main", "--head", branch, "--title", &title, "--body",
+                "pr",
+                "create",
+                "--base",
+                &target.branch,
+                "--head",
+                branch,
+                "--title",
+                &title,
+                "--body",
                 &body,
             ],
         )?,
@@ -59,11 +68,42 @@ pub(super) fn land(
         let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
         return escalated(home, repo, env, item, &question, rounds);
     }
+    let Some(method) = target.merge_flag() else {
+        let question = format!(
+            "{pr} is approved and CI is green, but the repository allows no merge method \
+             (squash, rebase or merge commit), so Paja did not land it. Allow one under \
+             Settings > General > Pull Requests in the repository, then answer that it is done."
+        );
+        return escalated(home, repo, env, item, &question, rounds);
+    };
     // Free the worktree first: gh deletes the local branch too, which git refuses while a
     // worktree has it checked out.
     ahjo::remove(home, &env.name, true)?;
-    run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
-        .with_context(|| format!("{gh} pr merge {pr}"))?;
+    if let Err(err) = run_gh(repo, &["pr", "merge", &pr, method, "--delete-branch"]) {
+        let text = format!("{err:#}");
+        let lower = text.to_lowercase();
+        let denied = [
+            "permission",
+            "403",
+            "not allowed",
+            "not permitted",
+            "forbidden",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        if denied {
+            let question = format!(
+                "GitHub refused `{gh} pr merge {pr} {method}`, so Paja did not land it:\n\n{text}\n\n\
+                 Check the repository's merge settings (Settings > General > Pull Requests: \
+                 allow {allowed}) and the branch protection on {branch}, then answer that it is \
+                 fixed.",
+                allowed = method.trim_start_matches("--"),
+                branch = target.branch
+            );
+            return escalated(home, repo, env, item, &question, rounds);
+        }
+        return Err(err).with_context(|| format!("{gh} pr merge {pr}"));
+    }
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, &item.repo, item.number, Status::Landed, Some(&pr));
     let _ = record(

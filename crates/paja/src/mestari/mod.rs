@@ -300,9 +300,14 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         ahjo::clear_tampered(home, &repo)?;
     }
     let key = ahjo::ensure_untampered(home, &repo)?;
-    git(&repo, &["fetch", "-q", "origin", "main"]).context(
-        "fetching origin/main; check the network and that `origin` is the GitHub repository",
-    )?;
+    // Once per pass: the default branch and the merge methods the repository allows.
+    let target = read_target(&repo)?;
+    let branch = target.branch.as_str();
+    git(&repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+        format!(
+            "fetching origin/{branch}; check the network and that `origin` is the GitHub repository"
+        )
+    })?;
     let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
@@ -311,7 +316,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
     let name = jono::sync(home, &repo)?.repo;
-    let config = read_config(&repo, &base)?;
+    let config = read_config(&repo, &base, target)?;
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
@@ -420,24 +425,86 @@ struct Unrecorded {
     steps: Vec<StepUsage>,
 }
 
-/// Vasara's check commands, the high-risk paths and the model per role, as `main` has them.
+/// The repository's default branch and the merge methods its settings allow.
+#[derive(Clone, Debug)]
+pub(super) struct Target {
+    pub(super) branch: String,
+    squash: bool,
+    merge: bool,
+    rebase: bool,
+}
+
+impl Target {
+    /// The `gh pr merge` flag to land with: squash when allowed, otherwise rebase, otherwise a
+    /// merge commit. `None` when the repository allows none of them.
+    pub(super) fn merge_flag(&self) -> Option<&'static str> {
+        if self.squash {
+            Some("--squash")
+        } else if self.rebase {
+            Some("--rebase")
+        } else if self.merge {
+            Some("--merge")
+        } else {
+            None
+        }
+    }
+}
+
+/// Read the default branch and the allowed merge methods from `gh repo view`.
+fn read_target(repo: &Path) -> Result<Target> {
+    let gh = jono::gh_program();
+    let out = run_gh(
+        repo,
+        &[
+            "repo",
+            "view",
+            "--json",
+            "defaultBranchRef,squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed",
+        ],
+    )?;
+    let v: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+    let branch = v["defaultBranchRef"]["name"]
+        .as_str()
+        .filter(|b| !b.is_empty())
+        .with_context(|| {
+            format!(
+                "`{gh} repo view` did not name the default branch of {}; check `gh auth status` \
+                 and that the repository has a commit on its default branch",
+                repo.display()
+            )
+        })?
+        .to_string();
+    let flag = |key: &str| v[key].as_bool().unwrap_or(false);
+    Ok(Target {
+        branch,
+        squash: flag("squashMergeAllowed"),
+        merge: flag("mergeCommitAllowed"),
+        rebase: flag("rebaseMergeAllowed"),
+    })
+}
+
+/// Vasara's check commands, the high-risk paths and the model per role, as the default branch
+/// has them.
 struct Config {
     checks: Vec<String>,
     high_risk: Vec<String>,
     models: Models,
     commands: crate::hook::Commands,
+    target: Target,
 }
 
-/// Read and check `main`'s configuration once, before an item is claimed: a mistake there is
-/// one fix on `main`, so it stops the pass instead of parking every item in turn.
-fn read_config(repo: &Path, base: &str) -> Result<Config> {
+/// Read and check the default branch's configuration once, before an item is claimed: a
+/// mistake there is one fix on that branch, so it stops the pass instead of parking every item
+/// in turn.
+fn read_config(repo: &Path, base: &str, target: Target) -> Result<Config> {
+    let branch = target.branch.as_str();
     let checks = read_from_base(repo, base, CHECKS_FILE)?.with_context(|| {
-        format!("{CHECKS_FILE} is missing on main; add the check commands there")
+        format!("{CHECKS_FILE} is missing on {branch}; add the check commands there")
     })?;
     let checks: Vec<String> = lines(&checks);
     if checks.is_empty() {
-        // An empty gate would pass everything; that is never what main meant.
-        bail!("{CHECKS_FILE} on main has no commands; add the check commands there");
+        // An empty gate would pass everything; that is never what the branch meant.
+        bail!("{CHECKS_FILE} on {branch} has no commands; add the check commands there");
     }
     let high_risk = lines(&read_from_base(repo, base, HIGH_RISK_FILE)?.unwrap_or_default());
     let models = Models::parse(&read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default())?;
@@ -449,6 +516,7 @@ fn read_config(repo: &Path, base: &str) -> Result<Config> {
         high_risk,
         models,
         commands,
+        target,
     })
 }
 
@@ -466,10 +534,11 @@ fn run_item(
         high_risk,
         models,
         commands,
+        target,
     } = config;
     let (env, kept) = environment(home, repo, base, item)?;
     // An earlier run's builder session is resumed only for work still on its branch: an
-    // environment made again from `main` starts a fresh one.
+    // environment made again from the default branch starts a fresh one.
     let mut carried = if kept && (resumed || !item.answers.is_empty()) {
         carried_session(home, item, &env.branch)?
     } else {
@@ -791,7 +860,7 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = land(home, repo, &env, item, round, &checked);
+            let report = land(home, repo, &env, item, round, &checked, &target);
             match &report {
                 Ok(RunReport::Landed { pr, .. }) => {
                     file_follow_ups(home, repo, item, pr, &follow_ups)
@@ -861,7 +930,7 @@ fn turn_limit_twice(
     let question = format!(
         "In this run {note}, the second time that step stopped at its turn limit. The issue may \
          be too big for one change: split it into smaller issues, or raise the limit with a \
-         `max-turns` line in `{MODELS_FILE}` on main, then answer with what you changed."
+         `max-turns` line in `{MODELS_FILE}` on the default branch, then answer with what you changed."
     );
     escalated(home, repo, env, item, &question, round)
 }
@@ -1259,8 +1328,8 @@ fn review_prompt(
         "Issue #{number}: {title}\n\n{body}\n{answers}\n{diff}\n\n\
          You are an independent reviewer for this project. You did not write this change; decide \
          whether it lands.\n\n{scope} You already have the diff, so read only the surrounding \
-         code you need. Judge it by the rules in CLAUDE.md as they are on main: the CLAUDE.md in \
-         your system prompt is main's copy, not the branch's, so don't read it again.\n\n\
+         code you need. Judge it by the rules in CLAUDE.md as they are on the default branch: the CLAUDE.md in \
+         your system prompt is the default branch's copy, not the branch's, so don't read it again.\n\n\
          Verdicts: `land` if it does what the issue asks and has no blocker; `changes` only for \
          blockers, naming every blocker in the whole diff in `comments` (a later review reads \
          only the fix); `escalate` with a question only when the issue's \
@@ -1271,7 +1340,7 @@ fn review_prompt(
          finding each, starting with a short title line, at most five; Paja files them as public \
          issues after landing, so never copy secrets, environment details or run output into \
          them. They never hold the change up.\n\n\
-         Vasara's checks (every command in `.paja/checks` on main: {checks}) already passed at \
+         Vasara's checks (every command in `.paja/checks` on the default branch: {checks}) already passed at \
          {checked}, the commit you are judging, so don't run them again. To probe a behaviour, \
          run one named test or the project itself, with Bash limited to {programs} and long \
          output piped through `tail -n 80` or `grep`. Read-only git is fine; you can't change \
@@ -1884,7 +1953,7 @@ mod tests {
 
         assert!(prompt.contains("DIFF-TEXT"), "{prompt}");
         assert!(!prompt.contains("git show base1:CLAUDE.md"), "{prompt}");
-        assert!(prompt.contains("CLAUDE.md in your system prompt is main's copy"));
+        assert!(prompt.contains("CLAUDE.md in your system prompt is the default branch's copy"));
         assert!(prompt.find("Issue #9").unwrap() < prompt.find("independent reviewer").unwrap());
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         // A re-review judges only the fix, at the checked commit, against the earlier blockers.
