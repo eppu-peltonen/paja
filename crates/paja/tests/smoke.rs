@@ -1191,6 +1191,155 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert_eq!(item["status"], "landed", "{item}");
 }
 
+/// The session ids Mestari recorded before starting builder sessions, oldest first.
+fn recorded_sessions(f: &Factory) -> Vec<String> {
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    log.as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.step_started")
+        .map(|e| e["data"]["session_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn an_interrupted_builder_session_is_resumed_by_the_next_run() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("hang"), "").unwrap();
+    let vars = [
+        ("PAJA_GH", f.gh.as_path()),
+        ("PAJA_CLAUDE", f.claude.as_path()),
+    ];
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .envs(vars.iter().copied())
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join("hanging").exists() {
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the builder never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run.kill().unwrap();
+    run.wait().unwrap();
+    std::fs::remove_file(dir.join("hang")).unwrap();
+
+    // The session never printed a result, but its id was in the log before it started.
+    let ids = recorded_sessions(&f);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let first = &f.claude_calls()[0];
+    assert!(
+        first.contains(&format!("--session-id {}", ids[0])),
+        "{first}"
+    );
+
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let builds: Vec<String> = f
+        .claude_calls()
+        .into_iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{builds:?}");
+    // The same session, the short prompt, and every other flag as for a fresh session.
+    assert!(
+        builds[1].contains(&format!("--resume {}", ids[0])),
+        "{}",
+        builds[1]
+    );
+    assert!(
+        builds[1]
+            .contains("Your earlier session was interrupted. Check `git status` and `git log`"),
+        "{}",
+        builds[1]
+    );
+    assert!(
+        !builds[1].contains("Implement this GitHub issue"),
+        "{}",
+        builds[1]
+    );
+    assert!(!builds[1].contains("--session-id"), "{}", builds[1]);
+    assert!(
+        builds[1].contains("--setting-sources  --settings") && builds[1].contains("--max-turns"),
+        "{}",
+        builds[1]
+    );
+    // It was resumed, not started again.
+    assert_eq!(recorded_sessions(&f).len(), 2);
+}
+
+#[test]
+fn an_answered_item_resumes_the_builders_session_with_the_answer() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("ask"), "").unwrap();
+    let (_, asked) = f.run();
+    assert_eq!(asked["outcome"], "escalated", "{asked}");
+    let ids = recorded_sessions(&f);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+
+    std::fs::remove_file(f.tmp.path().join("ask")).unwrap();
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Use A"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let builds: Vec<String> = f
+        .claude_calls()
+        .into_iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{builds:?}");
+    assert!(
+        builds[1].contains(&format!("--resume {}", ids[0])),
+        "{}",
+        builds[1]
+    );
+    assert!(builds[1].contains("Which API, A or B?"), "{}", builds[1]);
+    assert!(builds[1].contains("Answer: Use A"), "{}", builds[1]);
+    assert!(builds[1].contains("Continue with that."), "{}", builds[1]);
+    assert!(
+        !builds[1].contains("Implement this GitHub issue"),
+        "{}",
+        builds[1]
+    );
+}
+
+#[test]
+fn a_session_whose_work_was_discarded_is_never_resumed() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("unhooked"), "").unwrap();
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    std::fs::remove_file(f.tmp.path().join("unhooked")).unwrap();
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Hooks are on now"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let calls = f.claude_calls();
+    assert!(calls.iter().all(|c| !c.contains("--resume")), "{calls:?}");
+    assert_eq!(recorded_sessions(&f).len(), 2);
+}
+
 #[test]
 fn a_step_records_when_its_fallback_model_served_it() {
     // The fake builder's `modelUsage` names `claude-test`, so a `fallback test` line served it.

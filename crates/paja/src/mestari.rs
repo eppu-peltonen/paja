@@ -32,6 +32,11 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 pub const EV_STARTED: &str = "run.started";
 pub const EV_ROUND: &str = "run.round";
+/// A builder session is about to start: its session id, recorded before it runs, so a run
+/// that is killed mid-session can resume it.
+pub const EV_STEP_STARTED: &str = "run.step_started";
+/// A builder session's work was thrown away (the hook never ran), so it is never resumed.
+pub const EV_STEP_DISCARDED: &str = "run.step_discarded";
 pub const EV_LANDED: &str = "run.landed";
 pub const EV_ESCALATED: &str = "run.escalated";
 /// A non-blocking review finding filed as a `paja-follow-up` issue after landing.
@@ -517,7 +522,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     }
     // Anything that goes wrong from here is reported on the issue, not lost.
     let mut run = Unrecorded::default();
-    match run_item(home, &repo, &base, &item, config, &mut run) {
+    match run_item(home, &repo, &base, &item, config, resumed, &mut run) {
         Ok(report) => Ok(report),
         Err(err) => {
             let rounds = run.round;
@@ -605,6 +610,7 @@ fn run_item(
     base: &str,
     item: &WorkItem,
     config: Config,
+    resumed: bool,
     run: &mut Unrecorded,
 ) -> Result<RunReport> {
     let Config {
@@ -612,7 +618,14 @@ fn run_item(
         high_risk,
         models,
     } = config;
-    let env = environment(home, repo, base, item)?;
+    let (env, kept) = environment(home, repo, base, item)?;
+    // An earlier run's builder session is resumed only for work still on its branch: an
+    // environment made again from `main` starts a fresh one.
+    let mut carried = if kept && (resumed || !item.answers.is_empty()) {
+        carried_session(home, item, &env.branch)?
+    } else {
+        None
+    };
     record(
         home,
         EV_STARTED,
@@ -623,8 +636,8 @@ fn run_item(
     let mut prior: Option<Prior> = None;
     let mut follow_ups: Vec<String> = Vec::new();
     // The builder's last result in this run: its session is resumed for a fix round, and its
-    // running totals come off the next step's. Never kept across runs, so an environment made
-    // again (or a later `paja run`) always starts a fresh session.
+    // running totals come off the next step's. Not kept across runs: an earlier run's session
+    // comes from the event log instead (`carried`).
     let mut builder: Option<StepUsage> = None;
     // How often each kind of step hit its turn limit in this run: a second hit escalates.
     let (mut builder_limits, mut review_limits) = (0u32, 0u32);
@@ -637,6 +650,8 @@ fn run_item(
             "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
         ));
         let role = if round == 1 { "build" } else { "fix" };
+        // An earlier run's session is offered to the first build only.
+        let earlier = carried.take();
         let built = build(
             home,
             &env,
@@ -645,7 +660,9 @@ fn run_item(
             &feedback,
             &models,
             role,
+            round,
             builder.as_ref(),
+            earlier.as_ref(),
             steps,
         );
         let (step, raw, asked) = match built {
@@ -656,11 +673,14 @@ fn run_item(
                 };
                 let raw = StepUsage::from_result("build", None, &models, role, &limit.0);
                 // A resumed session's totals include its earlier rounds.
-                let step = match &builder {
-                    Some(earlier)
-                        if earlier.session_id.is_some() && earlier.session_id == raw.session_id =>
+                let basis = builder
+                    .as_ref()
+                    .or(earlier.as_ref().and_then(|c| c.totals.as_ref()));
+                let step = match basis {
+                    Some(before)
+                        if before.session_id.is_some() && before.session_id == raw.session_id =>
                     {
-                        raw.since(earlier)
+                        raw.since(before)
                     }
                     _ => raw.clone(),
                 };
@@ -993,21 +1013,241 @@ fn turn_limit_twice(
 
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
 /// run of the same item is resumed, so its work isn't thrown away.
-fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<Env> {
+/// The flag says whether the branch (and so the work on it) was kept from an earlier run, as
+/// opposed to made again from the base.
+fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<(Env, bool)> {
     let name = format!("work-{}", item.number);
     if let Ok(env) = ahjo::get(home, &name) {
-        return Ok(env);
+        return Ok((env, true));
     }
     let branch = format!("refs/heads/paja/{name}");
     let resume = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
-    ahjo::create(
+    let env = ahjo::create(
         home,
         CreateOptions {
             name: &name,
             repo,
             base: if resume { None } else { Some(base) },
         },
+    )?;
+    Ok((env, resume))
+}
+
+/// A builder session of an earlier run of the item, which the next run may resume.
+struct Carried {
+    session_id: String,
+    /// The short prompt the resumed session gets instead of the whole issue.
+    prompt: String,
+    /// What the recorded steps of that session add up to, to take off its running totals.
+    totals: Option<StepUsage>,
+}
+
+/// Whether `id` is safe to hand to `claude --resume` (and to a sandbox shell): a UUID-like word.
+fn is_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// A new version 4 UUID, for a session Mestari names itself.
+fn new_session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        // `RandomState` is seeded by the operating system; time, process and a counter keep two
+        // ids apart even if it were not.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(crate::events::now_ms());
+        hasher.write_u32(std::process::id());
+        hasher.write_u64(COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    bytes[6] = bytes[6] & 0x0f | 0x40;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
     )
+}
+
+/// The builder session an earlier run left for the item on `branch`, from the event log: the
+/// last one started, unless its work was discarded or the item landed since. `escalated` says
+/// the run after it ended by asking a person.
+fn earlier_session(
+    events: &[crate::events::Event],
+    number: u64,
+    branch: &str,
+) -> Option<(String, bool)> {
+    let mut last: Option<(String, bool)> = None;
+    for event in events.iter().filter(|e| e.data["number"] == number) {
+        match event.kind.as_str() {
+            EV_STEP_STARTED => {
+                let id = event.data["session_id"]
+                    .as_str()
+                    .filter(|id| is_session_id(id));
+                last = match (id, event.data["branch"].as_str()) {
+                    (Some(id), Some(b)) if b == branch => Some((id.to_string(), false)),
+                    _ => None,
+                };
+            }
+            EV_STEP_DISCARDED => {
+                if last
+                    .as_ref()
+                    .is_some_and(|(id, _)| event.data["session_id"].as_str() == Some(id))
+                {
+                    last = None;
+                }
+            }
+            EV_ESCALATED => {
+                if let Some((_, escalated)) = &mut last {
+                    *escalated = true;
+                }
+            }
+            EV_LANDED => last = None,
+            _ => {}
+        }
+    }
+    last
+}
+
+/// What the recorded `run.round` steps of `session` add up to, or None when none was recorded
+/// (a session that was killed before its result) or a figure is unknown.
+fn recorded_totals(
+    events: &[crate::events::Event],
+    number: u64,
+    session: &str,
+) -> Option<StepUsage> {
+    fn plus<T: std::ops::Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
+        Some(a? + b?)
+    }
+    let mut total: Option<StepUsage> = None;
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EV_ROUND && e.data["number"] == number)
+    {
+        let Some(steps) = event.data["steps"].as_array() else {
+            continue;
+        };
+        for step in steps {
+            let Ok(step) = serde_json::from_value::<StepUsage>(step.clone()) else {
+                continue;
+            };
+            if step.step != "build" || step.session_id.as_deref() != Some(session) {
+                continue;
+            }
+            total = Some(match total {
+                None => step,
+                Some(mut sum) => {
+                    sum.cost_usd = plus(sum.cost_usd, step.cost_usd);
+                    for (name, used) in step.models {
+                        let slot = sum.models.entry(name).or_insert_with(|| ModelUsage {
+                            input_tokens: Some(0),
+                            output_tokens: Some(0),
+                            cache_read_input_tokens: Some(0),
+                            cache_creation_input_tokens: Some(0),
+                            cost_usd: Some(0.0),
+                        });
+                        slot.input_tokens = plus(slot.input_tokens, used.input_tokens);
+                        slot.output_tokens = plus(slot.output_tokens, used.output_tokens);
+                        slot.cache_read_input_tokens =
+                            plus(slot.cache_read_input_tokens, used.cache_read_input_tokens);
+                        slot.cache_creation_input_tokens = plus(
+                            slot.cache_creation_input_tokens,
+                            used.cache_creation_input_tokens,
+                        );
+                        slot.cost_usd = plus(slot.cost_usd, used.cost_usd);
+                    }
+                    sum
+                }
+            });
+        }
+    }
+    total.map(|mut sum| {
+        sum.session_id = Some(session.to_string());
+        sum
+    })
+}
+
+/// The earlier builder session to resume in this run, with the short prompt it gets. Nothing
+/// when the log holds none, or when the sandbox lost its transcript.
+fn carried_session(home: &Home, item: &WorkItem, branch: &str) -> Result<Option<Carried>> {
+    let events = home.events().read_all()?;
+    let Some((session_id, escalated)) = earlier_session(&events, item.number, branch) else {
+        return Ok(None);
+    };
+    if let Some(sbx) = crate::sandbox::active() {
+        if !sbx.has_transcript(&session_id) {
+            progress(&format!(
+                "the builder's earlier session {session_id} has no transcript in the sandbox; \
+                 starting a fresh one"
+            ));
+            return Ok(None);
+        }
+    }
+    let prompt = match (escalated, item.answers.last()) {
+        (true, Some(answer)) => format!(
+            "A person answered Paja's question about this issue.\n{}\nContinue with that.",
+            show_answer(answer)
+        ),
+        _ => "Your earlier session was interrupted. Check `git status` and `git log`, finish the \
+              issue, and commit."
+            .to_string(),
+    };
+    progress("resuming the builder's own session from the earlier run");
+    Ok(Some(Carried {
+        totals: recorded_totals(&events, item.number, &session_id),
+        session_id,
+        prompt,
+    }))
+}
+
+/// Record that a builder session is about to start, before it does.
+fn record_step_started(
+    home: &Home,
+    env: &Env,
+    item: &WorkItem,
+    round: u32,
+    role: &str,
+    session_id: &str,
+    resumed: bool,
+) -> Result<()> {
+    record(
+        home,
+        EV_STEP_STARTED,
+        json!({
+            "number": item.number,
+            "round": round,
+            "role": role,
+            "session_id": session_id,
+            "branch": env.branch,
+            "resumed": resumed,
+        }),
+    )
+}
+
+/// When the session's work was thrown away, say so in the log: that session is never resumed.
+fn note_discarded<T>(
+    home: &Home,
+    item: &WorkItem,
+    session_id: &str,
+    result: Result<T>,
+) -> Result<T> {
+    if let Err(err) = &result {
+        if err.chain().any(|e| e.is::<HookNeverRan>()) {
+            let _ = record(
+                home,
+                EV_STEP_DISCARDED,
+                json!({ "number": item.number, "session_id": session_id }),
+            );
+        }
+    }
+    result
 }
 
 /// The `.paja/models` role a review runs as. The first reviewer of a round reads the most and
@@ -1050,7 +1290,9 @@ fn build(
     feedback: &str,
     models: &Models,
     role: &str,
+    round: u32,
     resume: Option<&StepUsage>,
+    carried: Option<&Carried>,
     spent: &mut Vec<StepUsage>,
 ) -> Result<Built> {
     let mut prompt = format!(
@@ -1100,14 +1342,29 @@ fn build(
     // A fix round resumes the builder's own session, which keeps what it learned and, on a
     // subscription, reads its earlier turns from the prompt cache. It gets only the feedback.
     // Every other flag, the hook included, is the same as for a fresh session.
+    // The first build of a run resumes an earlier run's session the same way (an interruption
+    // or an answer), with the short prompt `carried` holds instead of the issue.
     let session = resume.and_then(|earlier| earlier.session_id.as_deref());
-    if let (Some(id), false) = (session, feedback.is_empty()) {
+    let attempt = match (session, feedback.is_empty(), carried) {
+        (Some(id), false, _) => Some((id, again.as_str(), resume)),
+        (_, true, Some(c)) => Some((c.session_id.as_str(), c.prompt.as_str(), c.totals.as_ref())),
+        _ => None,
+    };
+    if let Some((id, resume_prompt, basis)) = attempt {
         let mut args = models.args(role);
         args.extend(["--resume".to_string(), id.to_string()]);
-        match claude(home, env, base, &again, &tools, None, false, &args) {
+        record_step_started(home, env, item, round, role, id, true)?;
+        let tried = claude(home, env, base, resume_prompt, &tools, None, false, &args);
+        match note_discarded(home, item, id, tried) {
             Ok(out) => {
                 let raw = StepUsage::from_result("build", None, models, role, &out);
-                let step = resume.map_or_else(|| raw.clone(), |earlier| raw.since(earlier));
+                let step = match basis {
+                    Some(earlier) => raw.since(earlier),
+                    None => StepUsage {
+                        resumed: true,
+                        ..raw.clone()
+                    },
+                };
                 return Ok((step, raw, builder_question(&out)));
             }
             Err(err) => {
@@ -1120,7 +1377,7 @@ fn build(
                     // The failed attempt may still have spent something; it counts too, whether
                     // or not a fresh session follows.
                     let raw = StepUsage::from_result("build", None, models, role, out);
-                    spent.push(match resume {
+                    spent.push(match basis {
                         Some(earlier)
                             if earlier.session_id.is_some()
                                 && earlier.session_id == raw.session_id =>
@@ -1143,15 +1400,17 @@ fn build(
     } else if !feedback.is_empty() {
         progress("no builder session to resume; starting a fresh one");
     }
-    let out = claude(
+    // Mestari names the session itself and records it first, so a run that is killed before
+    // the session prints its result can still resume it.
+    let id = new_session_id();
+    let mut args = vec!["--session-id".to_string(), id.clone()];
+    args.extend(models.args(role));
+    record_step_started(home, env, item, round, role, &id, false)?;
+    let out = note_discarded(
         home,
-        env,
-        base,
-        &prompt,
-        &tools,
-        None,
-        false,
-        &models.args(role),
+        item,
+        &id,
+        claude(home, env, base, &prompt, &tools, None, false, &args),
     )?;
     let raw = StepUsage::from_result("build", None, models, role, &out);
     Ok((raw.clone(), raw, builder_question(&out)))
@@ -1219,11 +1478,19 @@ fn answers(item: &WorkItem) -> String {
          the issue leaves open; follow them:\n",
     );
     for answer in &item.answers {
-        if let Some(question) = &answer.question {
-            text.push_str(&format!("\nQuestion: {question}\n"));
-        }
-        text.push_str(&format!("Answer: {}\n", answer.answer));
+        text.push('\n');
+        text.push_str(&show_answer(answer));
     }
+    text
+}
+
+/// One answer with the question it settles, as the prompts show it.
+fn show_answer(answer: &jono::Answer) -> String {
+    let mut text = String::new();
+    if let Some(question) = &answer.question {
+        text.push_str(&format!("Question: {question}\n"));
+    }
+    text.push_str(&format!("Answer: {}\n", answer.answer));
     text
 }
 
@@ -1356,6 +1623,19 @@ impl std::error::Error for TurnLimit {}
 fn turn_limit(err: &anyhow::Error) -> Option<&TurnLimit> {
     err.chain().find_map(|e| e.downcast_ref::<TurnLimit>())
 }
+
+/// The deny-list hook never ran during a session, so its work was not trusted and thrown away.
+/// Its session is never resumed.
+#[derive(Debug)]
+struct HookNeverRan(String);
+
+impl std::fmt::Display for HookNeverRan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HookNeverRan {}
 
 /// Claude Code ran and exited with an error or reported one: nothing Paja itself refused, so a
 /// failed resume may be tried again as a fresh session. Holds the JSON result when Claude Code
@@ -1517,14 +1797,15 @@ fn claude(
                 env.branch
             ),
         };
-        bail!(
+        return Err(HookNeverRan(format!(
             "Claude Code never called Paja's deny-list hook during the agent's run in {}, or the \
              hook's copy {} changed during it, so its work is not trusted and {fate}; check for \
              settings that disable hooks (such as `disableAllHooks` in managed settings) and run \
              again",
             env.path.display(),
             exe.display()
-        );
+        ))
+        .into());
     }
     let output = output.with_context(|| {
         format!(
