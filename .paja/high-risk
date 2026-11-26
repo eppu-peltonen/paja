@@ -22,5 +22,7 @@ crates/paja/Cargo.toml
 Cargo.toml
 build.rs
 crates/paja/src/ahjo.rs
+crates/paja/src/sandbox.rs
+crates/paja/src/platform.rs
 .gitattributes
 Cargo.lock
