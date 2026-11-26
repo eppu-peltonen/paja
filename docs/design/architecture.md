@@ -160,7 +160,12 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
-  followed, and are blocked while the worktree holds a symlink out of the worktree. A file tool path may not
+  followed, and are blocked while the worktree holds a symlink out of the worktree. To keep that scan fast, a `Grep`
+  without a `glob` leaves out the directories the worktree's `.gitignore` files ignore (matched with case, as ripgrep
+  does), since ripgrep never enters them either; each ignored name is still checked for being a link out. Nothing is
+  left out when the search starts inside an ignored directory, when git fails, when `RIPGREP_CONFIG_PATH` is set, or
+  when a ripgrep ignore file (`.ignore`, `.rgignore`) or a symlink into an ignored directory could bring one back.
+  `Glob`, `LS` and a `Grep` with a `glob` always walk the whole worktree. A file tool path may not
   start with `~`, a search pattern may not hold `..` or a path inside braces, and no tool may name a credential path
   (`.ssh`, `.config/gh` and the like).
 - **Network tools** (`WebFetch`, `WebSearch`) are blocked.

@@ -382,8 +382,19 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
                 }
             }
             // A wildcard can walk into a symlink the literal prefix never names, and an absolute
-            // pattern can start anywhere in the worktree, so the whole worktree is checked.
-            if let Some(link) = link_out(&bounds.root, bounds, 0) {
+            // pattern can start anywhere in the worktree, so the whole worktree is checked. A
+            // Grep without a `glob` skips what git ignores, as ripgrep does, which keeps a large
+            // `target/` from slowing every search.
+            let skip = if input.tool_name == "Grep" && t["glob"].is_null() {
+                grep_skips(
+                    bounds,
+                    &base,
+                    std::env::var_os("RIPGREP_CONFIG_PATH").is_some(),
+                )
+            } else {
+                Vec::new()
+            };
+            if let Some(link) = scan(bounds, &skip) {
                 return Ok(Some(format!(
                     "{} is a symlink out of the worktree (or nested too deep to check), and \
                      searches here could follow it; search a directory without it, or Read \
@@ -411,9 +422,83 @@ pub fn check(input: &HookInput, bounds: &Bounds) -> Result<Option<String>> {
     }
 }
 
+/// ripgrep's own ignore files. A `!` line in one can bring back a directory git ignores.
+const RG_IGNORE_FILES: &[&str] = &[".ignore", ".rgignore"];
+
+/// The directories a Grep without a `glob` never enters, so the symlink scan may leave them out:
+/// what the worktree's own `.gitignore` files ignore, which ripgrep skips too. Anything that
+/// could make ripgrep search more than that leaves nothing out:
+/// - a ripgrep config file (`rg_config`, from `RIPGREP_CONFIG_PATH`), which can turn ignores off;
+/// - a ripgrep ignore file in a directory above the worktree (the scan catches the ones inside);
+/// - git failing.
+///
+/// Only the `.gitignore` files are used, not git's global excludes, which ripgrep may read
+/// differently, and matching keeps case, as ripgrep's does. A search that starts inside an
+/// ignored directory searches it, so that one is walked.
+fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
+    let rg_ignore_above = b.root.ancestors().skip(1).any(|dir| {
+        RG_IGNORE_FILES
+            .iter()
+            .any(|name| std::fs::symlink_metadata(dir.join(name)).is_ok())
+    });
+    if rg_config || rg_ignore_above {
+        return Vec::new();
+    }
+    let Ok(output) = crate::ahjo::git_command()
+        .arg("-C")
+        .arg(&b.root)
+        .args([
+            "-c",
+            "core.ignoreCase=false",
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--directory",
+            "--exclude-per-directory=.gitignore",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let base = resolve(base);
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.strip_suffix('/'))
+        .map(|dir| b.root.join(dir))
+        .filter(|dir| !base.starts_with(dir))
+        .collect()
+}
+
+/// The first symlink out of the worktree, leaving out the directories in `skip`. If the walk
+/// finds a ripgrep ignore file, or a symlink into a skipped directory, the skipped directories
+/// may be searched after all, so the whole worktree is walked.
+fn scan(b: &Bounds, skip: &[PathBuf]) -> Option<PathBuf> {
+    let mut unsure = false;
+    if let Some(found) = link_out(&b.root, b, skip, &mut unsure, 0) {
+        return Some(found);
+    }
+    if !unsure || skip.is_empty() {
+        return None;
+    }
+    link_out(&b.root, b, &[], &mut unsure, 0)
+}
+
 /// The first symlink under `dir` that leads out of the worktree, if any. Git's own directory
-/// is skipped: nothing in it links out, and it is large.
-fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
+/// is skipped: nothing in it links out, and it is large. So are the directories in `skip`;
+/// `unsure` is set when something seen means they shouldn't have been.
+fn link_out(
+    dir: &Path,
+    b: &Bounds,
+    skip: &[PathBuf],
+    unsure: &mut bool,
+    depth: usize,
+) -> Option<PathBuf> {
     // Deeper than any real source tree: treat it as one, since it can't be checked.
     if depth > 32 {
         return Some(dir.to_path_buf());
@@ -433,12 +518,21 @@ fn link_out(dir: &Path, b: &Bounds, depth: usize) -> Option<PathBuf> {
         let Ok(kind) = entry.file_type() else {
             return Some(path);
         };
+        // Compared as NTFS and macOS do, where `.IGNORE` (or `.ıgnore`) opens `.ignore`.
+        let name = entry.file_name().to_string_lossy().to_uppercase();
+        if RG_IGNORE_FILES.iter().any(|rg| rg.to_uppercase() == name) {
+            *unsure = true;
+        }
         if kind.is_symlink() {
-            if !resolve(&path).starts_with(&b.root) {
+            let target = resolve(&path);
+            if !target.starts_with(&b.root) {
                 return Some(path);
             }
-        } else if kind.is_dir() && entry.file_name() != ".git" {
-            if let Some(found) = link_out(&path, b, depth + 1) {
+            if skip.iter().any(|dir| target.starts_with(dir)) {
+                *unsure = true;
+            }
+        } else if kind.is_dir() && entry.file_name() != ".git" && !skip.contains(&path) {
+            if let Some(found) = link_out(&path, b, skip, unsure, depth + 1) {
                 return Some(found);
             }
         }
@@ -1116,6 +1210,46 @@ pub fn self_test_inputs(root: &Path, read_only: bool) -> (String, String) {
 }
 
 // The cases use Unix paths; `windows_tests` below covers the Windows spellings.
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_large_ignored_target_keeps_searches_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("home").join("envs").join("a");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init");
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        // About as many entries as a few builds leave behind.
+        for d in 0..100 {
+            let dir = root.join("target").join("debug").join(format!("d{d}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..1000 {
+                std::fs::write(dir.join(format!("f{f}")), "").unwrap();
+            }
+        }
+        let b = Bounds::new(Some(root.clone()), Some(tmp.path().join("home"))).unwrap();
+        let input = HookInput {
+            tool_name: "Grep".into(),
+            tool_input: json!({"pattern": "x"}),
+            cwd: root.clone(),
+        };
+        let start = std::time::Instant::now();
+        assert_eq!(check(&input, &b).unwrap(), None);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1471,6 +1605,79 @@ mod tests {
         };
         assert!(check(&grep, &b).unwrap().is_some());
         assert_eq!(call("Write", "src/new/x.rs"), None);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_grep_skips_only_what_ripgrep_skips_too() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("paja-hook-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("home/envs/a");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        // A link out inside the ignored directory, where a Grep without a glob never goes.
+        symlink(&outside, root.join("target/debug/out")).unwrap();
+        let b = Bounds::new(Some(root.clone()), Some(tmp.join("home"))).unwrap();
+        let search = |tool: &str, input: Value| {
+            let input = HookInput {
+                tool_name: tool.into(),
+                tool_input: input,
+                cwd: root.clone(),
+            };
+            check(&input, &b).unwrap()
+        };
+        let grep = || search("Grep", json!({"pattern": "x"}));
+        assert_eq!(grep(), None);
+        // Globs override ignores in ripgrep, and Glob and LS don't use them at all.
+        assert!(search("Grep", json!({"pattern": "x", "glob": "*.rs"})).is_some());
+        assert!(search("Glob", json!({"pattern": "*/debug/**"})).is_some());
+        assert!(search("LS", json!({"path": "."})).is_some());
+        // A search that starts inside the ignored directory searches it.
+        assert!(search("Grep", json!({"pattern": "x", "path": "target"})).is_some());
+        assert!(search("Grep", json!({"pattern": "x", "path": "target/debug"})).is_some());
+        // ripgrep's own ignore files can bring it back, in any spelling the file system opens.
+        for name in ["src/.ignore", ".rgignore", "src/.IGNORE"] {
+            std::fs::write(root.join(name), "!target/\n").unwrap();
+            assert!(grep().is_some(), "{name}");
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        // So can one above the worktree, and a ripgrep config file.
+        std::fs::write(tmp.join(".ignore"), "!target/\n").unwrap();
+        assert!(grep().is_some(), "an ignore file above the worktree");
+        std::fs::remove_file(tmp.join(".ignore")).unwrap();
+        assert!(grep_skips(&b, &root, true).is_empty());
+        assert!(!grep_skips(&b, &root, false).is_empty());
+        // A link inside the worktree into the ignored directory reaches it by another name.
+        symlink(root.join("target"), root.join("src/via")).unwrap();
+        assert!(grep().is_some(), "a link into the ignored directory");
+        std::fs::remove_file(root.join("src/via")).unwrap();
+        // git matching without case would skip `TARGET`, which ripgrep searches.
+        git(&["config", "core.ignoreCase", "true"]);
+        std::fs::create_dir_all(root.join("TARGET")).unwrap();
+        symlink(&outside, root.join("TARGET/out")).unwrap();
+        assert!(grep().is_some(), "TARGET is not ignored by ripgrep");
+        std::fs::remove_dir_all(root.join("TARGET")).unwrap();
+        assert_eq!(grep(), None);
+        // The ignored name itself may be the link out.
+        std::fs::remove_dir_all(root.join("target")).unwrap();
+        symlink(&outside, root.join("target")).unwrap();
+        assert!(grep().is_some(), "target as a link out");
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
