@@ -278,10 +278,35 @@ fn help_and_version_are_json_under_json() {
     let tmp = tempfile::tempdir().unwrap();
     let (ok, version) = paja(tmp.path(), tmp.path(), &["--version"]);
     assert!(ok);
-    assert!(version["version"].as_str().unwrap().contains("paja"));
+    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"), "{version}");
+    let commit = version["commit"].as_str().unwrap();
+    assert!(!commit.is_empty(), "{version}");
+    // The text names both too.
+    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert_eq!(
+        text.trim(),
+        format!("paja {} ({commit})", env!("CARGO_PKG_VERSION"))
+    );
     let (ok, help) = paja(tmp.path(), tmp.path(), &["--help"]);
     assert!(ok);
     assert!(help["help"].as_str().unwrap().contains("env"));
+}
+
+#[test]
+fn the_plugin_version_is_the_crates() {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/.claude-plugin/plugin.json");
+    let plugin: Value = serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        plugin["version"],
+        env!("CARGO_PKG_VERSION"),
+        "set \"version\" in {} to the crate's version in crates/paja/Cargo.toml",
+        manifest.display()
+    );
 }
 
 #[test]

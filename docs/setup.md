@@ -5,12 +5,53 @@ How to install Paja and start it on its own queue. Paja runs natively on Windows
 ## What Paja needs
 
 - **Git.** On Windows, Git for Windows, whose shell runs Vasara's checks.
-- **Rust**, through rustup, to build Paja. On Windows, Rust also needs Microsoft's C++ build tools, which provide the
-  linker (`link.exe`).
 - **The GitHub CLI** (`gh`), signed in to an account that can push to the repository and merge its pull requests.
 - **Claude Code**, signed in. On Windows use the native `claude.exe` from the installer below, not the npm package.
+- **Paja itself:** a prebuilt `paja` from a GitHub release, or built from source with Rust.
 
-## Windows
+## Install a release
+
+Each release on <https://github.com/eppu-peltonen/paja/releases> has a `paja` archive per platform and a
+`SHA256SUMS` file: `x86_64-pc-windows-msvc` (`.zip`), `aarch64-apple-darwin` (Apple silicon), `x86_64-apple-darwin`
+(Intel Macs) and `x86_64-unknown-linux-gnu` (`.tar.gz`). Each archive holds `paja` (`paja.exe` on Windows), the
+license, the README and the changelog.
+
+On Windows, in PowerShell, install the other tools, then put `paja.exe` in a folder on your `PATH`:
+
+```powershell
+winget install Git.Git GitHub.cli
+irm https://claude.ai/install.ps1 | iex
+$v = (irm https://api.github.com/repos/eppu-peltonen/paja/releases/latest).tag_name
+$name = "paja-$($v.TrimStart('v'))-x86_64-pc-windows-msvc"
+$dir = Join-Path $env:LOCALAPPDATA "Programs\paja"
+irm "https://github.com/eppu-peltonen/paja/releases/download/$v/$name.zip" -OutFile "$env:TEMP\$name.zip"
+Expand-Archive "$env:TEMP\$name.zip" $env:TEMP -Force
+New-Item -ItemType Directory $dir -Force | Out-Null
+Copy-Item "$env:TEMP\$name\paja.exe" $dir
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+```
+
+On macOS or Linux, install Git, the GitHub CLI and Claude Code, then (with the archive for your machine):
+
+```sh
+v=$(curl -fsSL https://api.github.com/repos/eppu-peltonen/paja/releases/latest | sed -n 's/.*"tag_name": *"\(.*\)".*/\1/p')
+name="paja-${v#v}-aarch64-apple-darwin"   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
+curl -fsSLO "https://github.com/eppu-peltonen/paja/releases/download/$v/$name.tar.gz"
+curl -fsSLO "https://github.com/eppu-peltonen/paja/releases/download/$v/SHA256SUMS"
+grep " $name.tar.gz\$" SHA256SUMS | shasum -a 256 -c -
+tar -xzf "$name.tar.gz" && mkdir -p ~/.local/bin && cp "$name/paja" ~/.local/bin/
+```
+
+`~/.local/bin` must be on your `PATH`. Open a new terminal (on Windows, a new PowerShell window), sign in with
+`gh auth login` and `claude`, and check with `paja --version`, which names the version and the commit it was built
+from. To update, install the newer release the same way.
+
+## Build from source
+
+Contributors, and anyone who wants Paja's latest `main`, build it with Rust, through rustup. On Windows, Rust also
+needs Microsoft's C++ build tools, which provide the linker (`link.exe`).
+
+### Windows
 
 In PowerShell:
 
@@ -41,7 +82,7 @@ The clone can go anywhere. Keep Paja's home in its default place (`.paja` in you
 deny-list hook's binary there, and other accounts must not be able to write to it. A drive without permissions, such
 as FAT32 or exFAT, won't work.
 
-## Linux and macOS
+### Linux and macOS
 
 Install Git, rustup (<https://rustup.rs>), the GitHub CLI and Claude Code, sign in to `gh` and `claude`, then:
 
