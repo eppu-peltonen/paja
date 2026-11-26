@@ -86,9 +86,12 @@ says so on stderr. Items claimed with `paja work claim` are never taken over. Th
    session from earlier in the same run with `--resume <session_id>` and sends only the feedback, so it keeps what it
    learned and its earlier turns come from the prompt cache. It runs with the same flags and hook as any session. When
    there is no session from this run (a new `paja run`, so a recreated environment too) or resuming fails, it starts a
-   fresh session with the whole issue and says so in a progress line. Reviewers never resume: each review is a fresh
-   session reading cold. A resumed step records `resumed: true` and only its own share of the session's running
-   `total_cost_usd` and `modelUsage`. When the issue leaves a decision only the person can make, the builder commits
+   fresh session with the whole issue and says so in a progress line; the failed attempt's spend is recorded as a
+   step of its own. A resume that fails on a usage or rate limit (`api_error_status` 429) or a refused sign-in (401,
+   403) is not retried, since a fresh session would fail the same way: the run stops with an error that says what to
+   do, and that attempt's spend is recorded too. Reviewers never resume: each review is a fresh session reading cold.
+   A resumed step records `resumed: true` and only its own share of the session's running `total_cost_usd` and
+   `modelUsage`. When the issue leaves a decision only the person can make, the builder commits
    nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
    and its recommendation. Mestari then escalates at once with that question: no checks run and no more rounds are
    spent, and the round is recorded with verdict `question`.

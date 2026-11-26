@@ -615,6 +615,7 @@ fn run_item(
             &models,
             role,
             builder.as_ref(),
+            steps,
         );
         let (step, raw, asked) = match built {
             Ok(built) => built,
@@ -1005,6 +1006,7 @@ fn build(
     models: &Models,
     role: &str,
     resume: Option<&StepUsage>,
+    spent: &mut Vec<StepUsage>,
 ) -> Result<Built> {
     let mut prompt = format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
@@ -1063,11 +1065,35 @@ fn build(
                 let step = resume.map_or_else(|| raw.clone(), |earlier| raw.since(earlier));
                 return Ok((step, raw, builder_question(&out)));
             }
-            Err(err) if err.chain().any(|e| e.is::<ClaudeFailed>()) => progress(&format!(
-                "resuming the builder's session failed ({}); starting a fresh one",
-                shown_line(&format!("{err:#}"))
-            )),
-            Err(err) => return Err(err),
+            Err(err) => {
+                let Some(ClaudeFailed(_, result)) =
+                    err.chain().find_map(|e| e.downcast_ref::<ClaudeFailed>())
+                else {
+                    return Err(err);
+                };
+                if let Some(out) = result {
+                    // The failed attempt may still have spent something; it counts too, whether
+                    // or not a fresh session follows.
+                    let raw = StepUsage::from_result("build", None, models, role, out);
+                    spent.push(match resume {
+                        Some(earlier)
+                            if earlier.session_id.is_some()
+                                && earlier.session_id == raw.session_id =>
+                        {
+                            raw.since(earlier)
+                        }
+                        _ => raw,
+                    });
+                    // A fresh session would fail the same way: stop and say what to do.
+                    if let Some(fix) = not_retried(out) {
+                        return Err(err.context(fix));
+                    }
+                }
+                progress(&format!(
+                    "resuming the builder's session failed ({}); starting a fresh one",
+                    shown_line(&format!("{err:#}"))
+                ));
+            }
         }
     } else if !feedback.is_empty() {
         progress("no builder session to resume; starting a fresh one");
@@ -1268,9 +1294,10 @@ fn turn_limit(err: &anyhow::Error) -> Option<&TurnLimit> {
 }
 
 /// Claude Code ran and exited with an error or reported one: nothing Paja itself refused, so a
-/// failed resume may be tried again as a fresh session.
+/// failed resume may be tried again as a fresh session. Holds the JSON result when Claude Code
+/// printed one.
 #[derive(Debug)]
-struct ClaudeFailed(String);
+struct ClaudeFailed(String, Option<Value>);
 
 impl std::fmt::Display for ClaudeFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1279,6 +1306,23 @@ impl std::fmt::Display for ClaudeFailed {
 }
 
 impl std::error::Error for ClaudeFailed {}
+
+/// Why a failed `claude -p` result must not be retried as a fresh session, and what the person
+/// does about it: a usage or rate limit, or a sign-in that no longer works, fails a new session
+/// the same way.
+fn not_retried(out: &Value) -> Option<&'static str> {
+    match out["api_error_status"].as_u64() {
+        Some(429) => Some(
+            "Claude Code hit a usage or rate limit; wait until it resets, then answer the item to \
+             run it again",
+        ),
+        Some(401 | 403) => Some(
+            "Claude Code's sign-in was refused; run `claude` and sign in again (or check \
+             ANTHROPIC_API_KEY), then answer the item to run it again",
+        ),
+        _ => None,
+    }
+}
 
 /// Run headless Claude Code in the environment and return its JSON result.
 #[allow(clippy::too_many_arguments)]
@@ -1431,20 +1475,23 @@ fn claude(
         }
     }
     if !output.status.success() {
-        return Err(ClaudeFailed(format!(
-            "`{program} -p` failed in {}: {}",
-            env.path.display(),
-            tail(&output)
-        ))
+        return Err(ClaudeFailed(
+            format!(
+                "`{program} -p` failed in {}: {}",
+                env.path.display(),
+                tail(&output)
+            ),
+            serde_json::from_slice(&output.stdout).ok(),
+        )
         .into());
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("`{program} -p` printed something that is not JSON"))?;
     if value.get("is_error") == Some(&Value::Bool(true)) {
-        return Err(ClaudeFailed(format!(
-            "`{program} -p` reported an error: {}",
-            value["result"]
-        ))
+        return Err(ClaudeFailed(
+            format!("`{program} -p` reported an error: {}", value["result"]),
+            Some(value),
+        )
         .into());
     }
     Ok(value)
