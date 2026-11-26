@@ -32,5 +32,11 @@ paja work list                   # the queue, imported from issues labelled paja
 paja log                         # the append-only event log
 ```
 
+To work with Paja from Claude Code (`/paja:status`, `/paja:answer`, `/paja:spec` and the MCP tools), install the plugin:
+
+```sh
+claude plugin install paja --marketplace eppu-peltonen/paja
+```
+
 State lives in `$PAJA_HOME` (default `.paja` in your home directory). See [CLAUDE.md](CLAUDE.md) for how to work on
 Paja.
