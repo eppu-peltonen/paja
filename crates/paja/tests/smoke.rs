@@ -793,7 +793,7 @@ fn work_waits_on_open_dependencies_until_they_close() {
         &format!(
             "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
-             \"api repos/{{owner}}/{{repo}}/issues/\"*) cat {d}/state-${{2##*/}} ;;\n\
+             \"api repos/\"*) cat {d}/state-${{2##*/}} ;;\n\
              *) ;;\nesac\n"
         ),
     );
@@ -802,10 +802,8 @@ fn work_waits_on_open_dependencies_until_they_close() {
     let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
     assert!(ok, "{report}");
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
-    assert!(
-        log.contains("api repos/{owner}/{repo}/issues/9 --jq .state"),
-        "{log}"
-    );
+    // On Windows the fake's shell reads `{owner}` as a brace expansion, so match the rest.
+    assert!(log.contains("/issues/9 --jq .state"), "{log}");
     let (_, shown) = paja(&home, &repo, &["work", "show", "2"]);
     assert_eq!(shown["waiting_on"], serde_json::json!([9]));
     // #2 is older but waits on #9, so #4 comes first.
