@@ -1716,7 +1716,23 @@ fn doctor_reports_each_check_and_the_fix_for_a_failure() {
 
     // Everything is in place; only the missing sandbox is a warning, and it doesn't fail.
     let (success, report) = doctor();
-    assert!(success && report["ok"] == true, "{report}");
+    // On a Windows account that runs elevated (CI runners do), a folder this user creates is
+    // owned by the Administrators group, so no ACL change makes the home folder pass. Whatever
+    // the machine's temp-folder permissions are, the check must say which, and only it may fail.
+    let home_check = check(&report, "home folder");
+    if home_check["status"] != "ok" {
+        if !cfg!(windows) {
+            panic!("a private home failed the check: {home_check}");
+        }
+        assert_eq!(home_check["status"], "failed", "{home_check}");
+        assert!(
+            home_check["fix"].as_str().unwrap().contains("icacls"),
+            "{home_check}"
+        );
+    }
+    let home_ok = home_check["status"] == "ok";
+    assert_eq!(success, home_ok, "{report}");
+    assert_eq!(report["ok"] == true, home_ok, "{report}");
     for name in [
         "git",
         "gh",
@@ -1725,7 +1741,6 @@ fn doctor_reports_each_check_and_the_fix_for_a_failure() {
         "claude",
         "claude sign-in",
         "deny-list hook",
-        "home folder",
         "origin",
         "work label",
         "checks",
