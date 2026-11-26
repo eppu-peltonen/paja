@@ -822,6 +822,24 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
         "{log}"
     );
 
+    // The sync remembers its checkout once, so Paja Desk knows where the repository lives.
+    let (ok, again) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{again}");
+    let (_, events) = paja(&home, &repo, &["log"]);
+    let checkouts: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .collect();
+    assert_eq!(checkouts.len(), 1, "{events}");
+    assert_eq!(checkouts[0]["data"]["repo"], "acme/app", "{events}");
+    assert_eq!(
+        checkouts[0]["data"]["path"],
+        serde_json::json!(repo),
+        "{events}"
+    );
+
     let (ok, next) = paja(&home, &repo, &["work", "next"]);
     assert!(ok);
     assert_eq!(next["number"], 3);
@@ -2369,6 +2387,113 @@ fn slow_run(f: &Factory) -> std::process::Child {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     child
+}
+
+/// A `stop` line on stdin, as Paja Desk sends it, stops the run after its step, like the first
+/// Ctrl-C; the run's own lock and log are the CLI's.
+#[cfg(unix)]
+#[test]
+fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
+    use std::io::Write as _;
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("slow"), "").unwrap();
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run", "--once", "--yes", "--stop-on-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join("slowing").exists() {
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the builder never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut stdin = run.stdin.take().unwrap();
+    writeln!(stdin, "hello").unwrap();
+    writeln!(stdin, "stop").unwrap();
+    stdin.flush().unwrap();
+    // Closing stdin afterwards doesn't stop it any further.
+    drop(stdin);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        run.try_wait().unwrap().is_none(),
+        "paja ended before its step did"
+    );
+    std::fs::remove_file(dir.join("slow")).unwrap();
+    let output = run.wait_with_output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    assert!(stderr.contains("stopping after this step"), "{stderr}");
+    assert!(!stderr.contains("running Vasara's checks"), "{stderr}");
+}
+
+/// `stop now` on stdin stops at once and ends the agent, like a second Ctrl-C, also in a loop.
+#[cfg(unix)]
+#[test]
+fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
+    use std::io::Write as _;
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("slow"), "").unwrap();
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run", "--every", "1", "--stop-on-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join("slowing").exists() {
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the builder never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut stdin = run.stdin.take().unwrap();
+    writeln!(stdin, "stop now").unwrap();
+    stdin.flush().unwrap();
+    let stopping = std::time::Instant::now();
+    let output = run.wait_with_output().unwrap();
+    assert!(
+        stopping.elapsed().as_secs() < 30,
+        "paja didn't stop at once"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stopping now"), "{stderr}");
+    let report: Value = serde_json::from_slice(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .as_bytes(),
+    )
+    .unwrap_or(Value::Null);
+    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    // The builder ended with paja: it never got to commit.
+    std::fs::remove_file(dir.join("slow")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (_, env) = paja(&f.home, &f.repo, &["env", "show", WORK_5]);
+    let path = env["path"].as_str().unwrap();
+    assert!(
+        !std::path::Path::new(path).join("feature.txt").exists(),
+        "the builder kept running after paja stopped"
+    );
 }
 
 /// Ctrl-C as a terminal sends it: to the whole foreground process group.

@@ -421,6 +421,37 @@ fn interrupted() {
     INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Read stop requests from stdin, for a `paja run` started by a program instead of a terminal
+/// (Paja Desk): a `stop` line counts as the first Ctrl-C (stop after this step) and `stop now`
+/// as the second. The same on every platform, since a windowed program has no console to send
+/// Ctrl-C through. Other lines are ignored, and stdin closing (the program that started the
+/// run exited) leaves the run going.
+pub fn stop_on_stdin() {
+    std::thread::spawn(|| {
+        let mut stdin = std::io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            // Bytes, not text, so a line that isn't UTF-8 is skipped rather than ending the
+            // reader; 0 bytes is stdin closing.
+            match std::io::BufRead::read_until(&mut stdin, b'\n', &mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            match String::from_utf8_lossy(&line).trim() {
+                "stop" => {
+                    INTERRUPTS.fetch_max(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                "stop now" => {
+                    INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            interrupts();
+        }
+    });
+}
+
 /// Open `path` for reading only if it is a plain file, checked on the open handle, so a file
 /// swapped for a FIFO after a check can't make the read wait. On Unix the open itself doesn't
 /// wait for a FIFO's writer; Windows has no named pipes in a directory tree.

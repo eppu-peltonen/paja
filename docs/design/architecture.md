@@ -70,7 +70,9 @@ Without the file they are `factory`, `factory-follow-up` and `factory-needs-answ
 Changing the work label closes the queue as it was: the next sync no longer sees issues with the old label and closes
 every item it imported with it, so relabel the open issues to the new label in the same change.
 `paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
-events; it never touches another repository's items, even when their issue numbers are the same. `paja work
+events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than the last one recorded (every
+`paja run` syncs first, so runs record it too); it never touches another repository's items, even when their issue
+numbers are the same. `paja work
 list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
 in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with its
 `repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no
@@ -146,8 +148,10 @@ Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boun
 checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
 `stopped`, the item stays active for the next run, and the run reports `{"outcome": "stopped"}`; `--every` stops its
 loop too. Any error after a Ctrl-C ends the same way rather than parking the item, unless the repository was tampered
-with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. Then, for at
-most three rounds:
+with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. A program that
+starts `paja run` without a terminal (Paja Desk) passes `--stop-on-stdin` and writes a `stop` or `stop now` line to
+its stdin instead, which counts as the first or second Ctrl-C on every platform; stdin closing leaves the run going.
+Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, local git and the programs `.paja/commands` lists (`cargo` by default).
    A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own
@@ -498,7 +502,9 @@ The person's two jobs are answering and writing work, and Desk does both through
 answer box that calls `jono::answer` (as `paja work answer`: it records `work.answered`, queues the item and posts the
 answer on the issue), and "New work" takes a repository, a title and a body, shows them for approval, then calls
 `jono::file` (as `paja work file`: an issue with the work label). Both run where `gh` finds the repository: the
-checkout Paja last made an environment from for it (`jono::known_checkout`, from the log's `env.created` events), else
+checkout Paja last synced in or made an environment from for it (`jono::known_checkout`, from the log's
+`work.checkout` and `env.created` events; each sync records `work.checkout` with its path when it differs from the
+last one), else
 the directory Desk started in when it is a checkout of that repository, else an error that says where to start. The
 person's text stays in the window across refreshes and errors. Desk's Tauri permissions
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
