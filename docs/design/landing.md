@@ -30,7 +30,8 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   changes anyway, the builder gets them to fix if a line or two does it, and otherwise they are dropped, kept only in
   the event log. Jono doesn't import the follow-up label, so a person queues the issue by relabelling it with the work
   label (`paja` here): reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and
-  repeats the ones that still apply. If the change doesn't land after all (CI fails), the follow-ups stay in the event log unfiled.
+  repeats the ones that still apply. If the change doesn't land in that round (CI fails and the builder gets another round), the follow-ups stay
+  in the event log unfiled, and the next round's reviewers file their own.
   Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them, and
   Mestari checks for itself too: before filing, it replaces values that start like a known credential (GitHub,
   GitLab, Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI, JSON Web Tokens) or follow `Bearer`, `token`,

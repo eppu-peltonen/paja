@@ -1,5 +1,13 @@
 use super::*;
 
+/// How a landing attempt ended.
+pub(super) enum Landing {
+    /// Landed, or parked as a question for the person.
+    Done(RunReport),
+    /// CI failed on the pull request: what the builder needs to fix it in another round.
+    Retry(String),
+}
+
 /// Push `judged`, the commit Vasara's checks and the reviewers saw, as the environment's
 /// branch, and land it. Not whatever the branch points at now: code run in the worktree could
 /// have moved it.
@@ -13,11 +21,12 @@ pub(super) fn land(
     judged: &str,
     ci: CiMode,
     target: &RepoSettings,
-) -> Result<RunReport> {
+) -> Result<Landing> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
     let Some(merge_flag) = target.merge_flag() else {
-        return escalated(home, repo, env, item, &no_merge_method(&item.repo), rounds);
+        return escalated(home, repo, env, item, &no_merge_method(&item.repo), rounds)
+            .map(Landing::Done);
     };
     git(
         &env.path,
@@ -78,9 +87,19 @@ pub(super) fn land(
         progress(&format!("opened {pr}; the repository has no CI, landing"));
     } else {
         progress(&format!("opened {pr}; waiting for CI"));
+        // A red CI is the builder's to fix, like a failed check: the pull request stays open
+        // and the next round pushes to it.
         if let Err(err) = wait_for_ci(repo, &pr) {
-            let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
-            return escalated(home, repo, env, item, &question, rounds);
+            let err = format!("{err:#}");
+            let mut why = format!(
+                "CI failed on {pr}, so Paja did not land it. CI runs on GitHub's machines, which \
+                 differ from this one (no git identity, a fresh checkout, other temp folders), so \
+                 fix the cause so the change passes there too:\n\n{err}"
+            );
+            if let Some(log) = failed_log(repo, &err) {
+                why.push_str(&format!("\n\nThe end of the failed job's log:\n\n{log}"));
+            }
+            return Ok(Landing::Retry(why));
         }
     }
     // Free the worktree first: gh deletes the local branch too, which git refuses while a
@@ -93,7 +112,7 @@ pub(super) fn land(
                 "GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{}",
                 no_merge_method(&item.repo)
             );
-            return escalated(home, repo, env, item, &question, rounds);
+            return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
         }
         return Err(err).with_context(|| format!("{gh} pr merge {pr}"));
     }
@@ -105,11 +124,26 @@ pub(super) fn land(
         json!({ "repo": item.repo, "number": item.number, "pr": pr, "rounds": rounds }),
     );
     progress(&format!("landed #{} ({pr})", item.number));
-    Ok(RunReport::Landed {
+    Ok(Landing::Done(RunReport::Landed {
         number: item.number,
         pr,
         rounds,
-    })
+    }))
+}
+
+/// The last lines of the first failed job's log that `gh pr checks` linked to, if `gh` can
+/// read it.
+fn failed_log(repo: &Path, checks: &str) -> Option<String> {
+    const LINES: usize = 60;
+    let job = checks.split("/job/").nth(1)?;
+    let job: String = job.chars().take_while(char::is_ascii_digit).collect();
+    if job.is_empty() {
+        return None;
+    }
+    let log = run_gh(repo, &["run", "view", "--job", &job, "--log-failed"]).ok()?;
+    let lines: Vec<&str> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    (!tail.trim().is_empty()).then_some(tail)
 }
 
 /// The question for a repository whose settings leave Paja no way to merge.

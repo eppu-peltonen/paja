@@ -1431,6 +1431,8 @@ impl Factory {
                  \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
+                 \"pr checks\") if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
+                 \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") if [ -f {d}/gh-down ]; then exit 1; fi ;;\n\
@@ -1454,6 +1456,7 @@ impl Factory {
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
+                 if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
@@ -1510,6 +1513,21 @@ impl Factory {
         git(&self.repo, &["add", "."]);
         git(&self.repo, &["commit", "-q", "-m", path]);
         git(&self.repo, &["push", "-q", "origin", "main"]);
+    }
+
+    /// Have the fake builder's next call push `text` as `path` to origin's main from another
+    /// clone first, as a change landing elsewhere while this one is built.
+    fn main_moves(&self, path: &str, text: &str) {
+        let d = slash(self.tmp.path());
+        std::fs::write(
+            self.tmp.path().join("main-moves.sh"),
+            format!(
+                "git clone -q {d}/origin.git {d}/other && cd {d}/other && printf '{text}\\n' > {path} \
+                 && git add {path} && git -c user.name=t -c user.email=t@example.com commit -qm moved \
+                 && git push -q origin HEAD:main >/dev/null 2>&1\n"
+            ),
+        )
+        .unwrap();
     }
 
     /// Each `claude` call the fake logged, in order.
@@ -3758,5 +3776,78 @@ fn the_deny_list_hook_blocks_and_fails_closed() {
     assert_eq!(
         hook_with(&inside, &read(&w("/w/home/envs/a/src/lib.rs"))).0,
         Some(0)
+    );
+}
+
+#[test]
+fn a_run_merges_a_default_branch_that_moved_while_it_built() {
+    let f = Factory::new("test -f feature.txt && test -f other.txt\n", "land");
+    f.main_moves("other.txt", "elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("main moved on; merged it into the branch"),
+        "{stderr}"
+    );
+    let origin = f.tmp.path().join("origin.git");
+    git(
+        &origin,
+        &["cat-file", "-e", &format!("paja/{WORK_5}:other.txt")],
+    );
+}
+
+#[test]
+fn a_conflict_with_the_default_branch_goes_back_to_the_builder() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.main_moves("feature.txt", "landed elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("the branch conflicts with main"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("merging it conflicts in: feature.txt"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("another round"), "{fix}");
+    // The round after the conflict builds on main as it is now.
+    let origin = f.tmp.path().join("origin.git");
+    let merged = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            "main",
+            &format!("paja/{WORK_5}"),
+        ])
+        .status()
+        .unwrap();
+    assert!(merged.success(), "the landed branch holds main");
+}
+
+#[test]
+fn red_ci_goes_back_to_the_builder_with_the_failed_log() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-red-once"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    assert!(
+        stderr.contains("CI failed; sending the failure back to the builder"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("CI failed on https://example.com/pull/1"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("Author identity unknown"), "{fix}");
+    assert!(
+        f.gh_log().contains("run view --job 8 --log-failed"),
+        "{}",
+        f.gh_log()
     );
 }

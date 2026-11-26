@@ -188,11 +188,20 @@ finished verdict is kept. If it hits the limit again, its worktree is put back a
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
+Before Vasara's checks in every round, Mestari fetches the default branch and merges it into the environment's branch
+when the branch doesn't hold its tip yet, so the checks, the reviewers and CI judge the change as it would land, and a
+branch built on an old default branch never reaches the pull request. The diffs reviewers read then start from that
+tip. A merge that conflicts is left in progress and the round goes back to the builder, naming the conflicted files;
+the builder resolves them and commits, which finishes the merge, and a merge it leaves with conflicts is undone and asked
+for again.
+
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
-for CI with `gh pr checks --watch`, merges it and marks the item landed. The merge is a squash when the repository allows it, otherwise a rebase,
+for CI with `gh pr checks --watch`, merges it and marks the item landed. A red CI goes back to the builder as another
+round, like a failed check, with the failing checks and the end of the first failed job's log (`gh run view --job <id>
+--log-failed`); the pull request stays open and the next round pushes to it. The merge is a squash when the repository allows it, otherwise a rebase,
 otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
-setting to change. On `escalate`, three failed rounds, a
-red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
+setting to change. On `escalate`, three failed rounds or
+an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
 `run.escalated`, plus a `run.follow_up` for each non-blocking review finding. Each `run.round` event also lists the
