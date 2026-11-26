@@ -2,9 +2,9 @@
 //! under. It keeps an agent inside its Ahjo environment: no pushing or GitHub, no network, no
 //! credentials, no factory state, and no changes to files outside its worktree.
 //!
-//! Mestari passes the environment's root and the factory's home explicitly
-//! (`paja hook --root <env> --home <home>`), because the `cwd` Claude Code reports moves when
-//! the agent runs `cd`.
+//! Mestari passes the environment's root, the factory's home and the programs agents may run
+//! explicitly (`paja hook --root <env> --home <home> --programs <list>`), because the `cwd`
+//! Claude Code reports moves when the agent runs `cd`.
 //!
 //! Shell commands are not parsed in general, since a shell has too many ways to hide a denied
 //! command. Instead a command must have one plain shape: an optional `cd` to the worktree's
@@ -1563,13 +1563,10 @@ mod commands_tests {
     }
 
     #[test]
-    fn without_a_list_the_hook_blocks_everything() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("h");
-        // `run` reads stdin, so only its decision on a missing list is checked through
-        // `decode_programs`' refusal of anything Mestari did not write.
+    fn an_empty_programs_list_is_not_one_mestari_wrote() {
+        // That the hook then blocks every call is proved end to end by the smoke test
+        // `a_hook_without_mestaris_list_blocks_everything`.
         assert!(decode_programs("").is_err());
-        assert!(Bounds::new(Some(tmp.path().to_path_buf()), Some(home)).is_ok());
     }
 }
 
