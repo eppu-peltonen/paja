@@ -844,15 +844,8 @@ fn work_waits_on_open_dependencies_until_they_close() {
         .iter()
         .map(|item| item["number"].as_u64().unwrap())
         .collect();
-    assert!(numbers.contains(&2) && numbers.contains(&8), "{listed}");
-    assert!(
-        listed
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item.is_object()),
-        "{listed}"
-    );
+    // Every item synced so far, once each, and nothing else.
+    assert_eq!(numbers, [2, 4, 6, 8], "{listed}");
 }
 
 #[test]
