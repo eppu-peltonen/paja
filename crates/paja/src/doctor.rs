@@ -212,8 +212,10 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
                     format!("{a}, so another account could change what's in it")
                 });
             let fix = if cfg!(windows) {
+                // The owner first: an elevated account's folders belong to Administrators.
                 format!(
-                    "run `icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"`",
+                    "run `icacls \"{0}\" /setowner \"%USERNAME%\"` and then `icacls \"{0}\" \
+                     /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"`",
                     dir.display()
                 )
             } else {

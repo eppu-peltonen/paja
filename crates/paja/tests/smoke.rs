@@ -1767,6 +1767,14 @@ fn make_private(dir: &Path) {
     #[cfg(windows)]
     {
         let user = std::env::var("USERNAME").unwrap();
+        // An elevated account's new folders belong to Administrators; take ownership as the
+        // doctor's fix says. It may be refused, in which case the test tolerates the check.
+        let _ = Command::new("icacls")
+            .arg(dir)
+            .args(["/setowner", &user])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let status = Command::new("icacls")
             .arg(dir)
             .args(["/inheritance:r", "/grant:r"])
