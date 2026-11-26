@@ -504,7 +504,9 @@ fn describe_run(report: &mestari::RunReport) -> String {
         }
         mestari::RunReport::Escalated {
             number, question, ..
-        } => format!("#{number} escalated:\n{question}"),
+        } => format!(
+            "#{number} escalated:\n{question}\n  answer: paja work answer {number} \"<your answer>\""
+        ),
         mestari::RunReport::Stopped { number, .. } => {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
         }

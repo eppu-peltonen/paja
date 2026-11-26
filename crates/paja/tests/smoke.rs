@@ -2220,6 +2220,28 @@ fn run_says_when_it_needs_a_decision() {
 }
 
 #[test]
+fn run_text_says_how_to_answer_an_escalation() {
+    let f = Factory::new("true\n", "escalate");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .arg("run")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("#5 escalated:"), "{stdout}");
+    assert!(
+        stdout.contains("answer: paja work answer 5 \"<your answer>\""),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("paja work answer 5"), "{stderr}");
+    assert!(!stderr.contains("answer there"), "{stderr}");
+}
+
+#[test]
 fn the_builder_can_ask_for_a_decision() {
     // Checks that always fail: if they ran, the item would go another round first.
     let f = Factory::new("false\n", "land");
