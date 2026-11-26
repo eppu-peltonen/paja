@@ -330,9 +330,15 @@ while it starts.
 - **Permissions.** Claude Code is always started with `--permission-mode auto` in the sandbox; the sandbox image's
   default, `bypassPermissions`, is never used. The deny-list hook is a host program and does not run in the sandbox, so
   there the sandbox is the guard; `--allowedTools`, GitGuard and the reset after a review still apply.
-- **Toolchain.** Vasara's checks need Rust and a C compiler. On first start Paja checks for `cc`, `cargo` and `rustfmt`
-  in the sandbox and installs what is missing (`build-essential` through `apt`, Rust through rustup, minimal profile
-  with `rustfmt` and `clippy`). If that fails, the error says to open `sbx exec -it paja sh` and install them by hand.
+- **Toolchain.** The project installs what its checks need in `.paja/setup`, read from the default branch (never from
+  the branch under review): a POSIX shell script that Paja runs inside the sandbox as the sandbox user, before any
+  agent starts. If the sandbox has no `cc` or `curl`, Paja first installs `build-essential`, `curl`, `ca-certificates`
+  and `git` through `apt` as root, because the sandbox user can't. The sandbox keeps the script's hash in its home
+  (`~/.paja-setup-hash`), so the script runs once and again only when it changes. A script that exits non-zero stops
+  the run, before the queue is read, with an error that holds the last lines of its output and says to fix
+  `.paja/setup` on the default branch; agents never run in a half-set-up sandbox. Without `.paja/setup`, Paja checks
+  for `cc`, `cargo` and `rustfmt` and installs what is missing (Rust through rustup, minimal profile with `rustfmt`
+  and `clippy`); this repository's own `.paja/setup` does that, so the default is only a fallback.
 - **Signing in.** Sign in once, inside the sandbox: `sbx exec -it paja claude`, then `/login`. When Claude Code in the
   sandbox reports it is not signed in, the item is parked with that command in the question, rather than failing as a
   check.
