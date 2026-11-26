@@ -148,28 +148,10 @@ pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
         .with_context(|| format!("environment path {} is not UTF-8", path.display()))?
         .to_string();
 
-    // Relative gitdir paths (git 2.48+; older git ignores the setting) make the worktree's `.git`
-    // file read the same on the host and in the sandbox, where a Windows host path doesn't exist.
     let add: Vec<&str> = if resume {
-        vec![
-            "-c",
-            "worktree.useRelativePaths=true",
-            "worktree",
-            "add",
-            &path_str,
-            &branch,
-        ]
+        vec!["worktree", "add", &path_str, &branch]
     } else {
-        vec![
-            "-c",
-            "worktree.useRelativePaths=true",
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            &path_str,
-            &base_commit,
-        ]
+        vec!["worktree", "add", "-b", &branch, &path_str, &base_commit]
     };
     git(&repo, &add).with_context(|| format!("creating worktree for {:?}", opts.name))?;
 
@@ -521,58 +503,6 @@ mod tests {
             port_count: PORT_BLOCK,
             created_ms: 0,
         }
-    }
-
-    #[test]
-    fn a_worktree_records_a_relative_gitdir_so_the_sandbox_can_resolve_it() {
-        let out = git_command().arg("--version").output().unwrap();
-        let version = String::from_utf8_lossy(&out.stdout).to_string();
-        let nums: Vec<u32> = version
-            .split_whitespace()
-            .nth(2)
-            .unwrap_or("")
-            .split('.')
-            .map_while(|p| p.parse().ok())
-            .collect();
-        if nums.len() < 2 || (nums[0], nums[1]) < (2, 48) {
-            return; // this git has no relative worktree paths
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q"]).unwrap();
-        git(
-            &repo,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "x",
-            ],
-        )
-        .unwrap();
-        let home = Home::at(dir.path().join("home")).unwrap();
-        let env = create(
-            &home,
-            CreateOptions {
-                name: "rel",
-                repo: &repo,
-                base: None,
-            },
-        )
-        .unwrap();
-        let text = std::fs::read_to_string(env.path.join(".git")).unwrap();
-        let target = text.trim().strip_prefix("gitdir:").unwrap().trim();
-        assert!(
-            target.starts_with("..") && !target.contains(':'),
-            "the .git file should hold a relative path, got {target:?}"
-        );
-        // And it still resolves on the host.
-        git(&env.path, &["status", "--short"]).unwrap();
     }
 
     #[test]
