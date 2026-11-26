@@ -9,12 +9,12 @@ for now. Autonomy widens only after each step's exit test passes.
    - *Exit:* Claude Code, inside a fresh environment, can build Paja and run its tests with one command each.
 2. **The smallest loop that can build Paja, still by hand.** Only what self-hosting needs, nothing more:
    - `paja mcp`, the core as MCP tools (done).
-   - Jono: `paja work sync` imports open GitHub issues labelled `paja` as work items, and `paja work next` picks one.
+   - Jono: `paja work sync` imports open GitHub issues with the work label (`.paja/labels`, `paja` in this repository) as work items, and `paja work next` picks one.
    - Mestari's first graph, `paja run`: build the item in a fresh Ahjo environment with headless Claude Code, run the
      checks, have an independent reviewer agent read the diff cold, then land it or loop back (at most three rounds),
      and escalate as an issue comment when it can't decide.
    - The deny-list hook, blocking when it errors, so the first unattended run is already fail-closed.
-   - *Exit:* an issue labelled `paja` lands on `main` through `paja run`, with no human touching the code.
+   - *Exit:* an issue with the work label lands on `main` through `paja run`, with no human touching the code.
 3. **Paja builds Paja.** From here every change to Paja is an issue run through the loop on the owner's machine; the
    owner writes issues and answers escalations. The backlog starts with what step 2 left out: the Claude Code plugin,
    per-chunk metrics, Jono's diff-size budget, plan and verify steps in the graph, and saving each clean landing as a

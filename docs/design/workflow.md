@@ -6,7 +6,7 @@ green `main` is one Mestari graph, with each step a fresh headless Claude Code r
 
 ```mermaid
 flowchart TB
-    idea["Issue labelled paja"] --> spec["Agent drafts spec"]
+    idea["Issue with the work label"] --> spec["Agent drafts spec"]
     spec --> approve{"Person approves spec?"}
     approve -- "no: revise" --> spec
     approve -- yes --> plan["Plan and review plan"]

@@ -1,21 +1,19 @@
 use super::*;
 
-/// The label follow-up issues get. Jono imports only `paja`, so a follow-up waits until a
-/// person relabels it: reviewers suggest work, people set intent.
-pub const FOLLOW_UP_LABEL: &str = "paja-follow-up";
-
 /// At most this many follow-up issues per change; the rest are folded into the last one.
 pub(super) const MAX_FOLLOW_UPS: usize = 5;
 
-/// File each non-blocking review finding as a `paja-follow-up` issue, once the change has
-/// landed. A failure here is recorded, never turned into an escalation: the change is already
-/// merged.
+/// File each non-blocking review finding as an issue with the repository's follow-up label,
+/// once the change has landed. Jono imports only the work label, so a follow-up waits until a
+/// person relabels it: reviewers suggest work, people set intent. A failure here is recorded,
+/// never turned into an escalation: the change is already merged.
 pub(super) fn file_follow_ups(
     home: &Home,
     repo: &Path,
     item: &WorkItem,
     pr: &str,
     findings: &[String],
+    labels: &jono::Labels,
 ) {
     // Review text came from an agent that read untrusted code: keep each finding short, never
     // let it mention anyone, and keep tokens and local paths out of a public issue.
@@ -60,8 +58,9 @@ pub(super) fn file_follow_ups(
             .collect();
         let body = format!(
             "{finding}\n\nA reviewer found this while reviewing #{number} ({pr}). It did not \
-             block landing. Relabel it `paja` to queue it.",
-            number = item.number
+             block landing. Relabel it `{work}` to queue it.",
+            number = item.number,
+            work = labels.work
         );
         let filed = run_gh(
             repo,
@@ -69,7 +68,7 @@ pub(super) fn file_follow_ups(
                 "issue",
                 "create",
                 "--label",
-                FOLLOW_UP_LABEL,
+                &labels.follow_up,
                 "--title",
                 &title,
                 "--body",
@@ -85,7 +84,8 @@ pub(super) fn file_follow_ups(
                 None,
                 &format!(
                     "{err:#}; if the label is missing, create it with `gh label create \
-                     {FOLLOW_UP_LABEL}` and file this finding by hand"
+                     {}` and file this finding by hand",
+                    labels.follow_up
                 ),
             ),
         }

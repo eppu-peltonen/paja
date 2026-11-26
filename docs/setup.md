@@ -57,7 +57,7 @@ Then `paja run --every 5` keeps going, as described below.
 
 The Claude Code plugin in `plugin/` starts `paja mcp`, so Paja's core shows up as MCP tools, and adds three skills:
 `/paja:status` (what is queued, active or waiting on you), `/paja:answer` (answer a question Paja asked on an issue and
-queue the item again) and `/paja:spec` (turn the conversation into an issue labelled `paja`, shown to you to approve
+queue the item again) and `/paja:spec` (turn the conversation into an issue with the work label, shown to you to approve
 first). With `paja` installed on `PATH` as above, install the plugin with one command, the same on Windows, Linux and
 macOS:
 
@@ -78,7 +78,7 @@ default branch. With `none`, Paja lands on Vasara's checks and the reviewers alo
 
 ## What happens next
 
-`paja run --once` takes the oldest open issue labelled `paja` (or the one named with `--item <number>`) and exits when
+`paja run --once` takes the oldest open issue with the work label (`.paja/labels`, `paja` in this repository; or the one named with `--item <number>`) and exits when
 it is done. Before the first agent starts, every `paja run` prints on stderr the repository, the item, the default
 branch it merges into (by squash), whether CI is required and whether a sandbox is in use. Without a sandbox it adds
 that agents and the checks run as you, with your files and sign-ins, and that the deny-list hook is a guardrail, not a

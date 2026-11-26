@@ -23,7 +23,7 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
 - **Only blockers hold a change up.** A blocker is a bug in what the issue asks for, a security hole the change opens, a
   broken `CLAUDE.md` rule, or missing tests for the new behaviour. Every other finding (hardening ideas, edge cases
   outside the issue, nits) is a follow-up: once the change lands, Mestari files the landing round's follow-ups (at most
-  five) as `paja-follow-up` issues. Jono doesn't import that label, so a person queues one by relabelling it `paja`:
+  five) as follow-up issues (the follow-up label of `.paja/labels`, `paja-follow-up` in this repository). Jono doesn't import that label, so a person queues one by relabelling it with the work label (`paja` here):
   reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and repeats the ones
   that still apply. If the change doesn't land after all (CI fails), the follow-ups stay in the event log unfiled.
   Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them, and
