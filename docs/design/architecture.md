@@ -276,7 +276,8 @@ the tool call, because the reported `cwd` moves when the agent runs `cd`.
   directory is created that way or, if it exists, checked before every run to be owned by this user and closed to
   everyone else. Keep `PAJA_HOME` under the user profile (the default), so nobody else can rename the hook directory
   away. Hook command lines are quoted so `cmd.exe`, which Claude Code uses for
-  hooks on Windows, and Git Bash read them the same way.
+  hooks on Windows, and Git Bash read them the same way. Agent prompts reach `claude` on stdin, because a review
+  prompt holds the diff and Windows refuses a command line over 32,767 characters.
 
 It fails closed: unreadable input, missing bounds, a crash and running past its own 20-second deadline all block, and
 the hook command ends in `|| exit 2` so a binary that can't start or is killed blocks too. Claude Code's own hook

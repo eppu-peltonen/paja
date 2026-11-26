@@ -252,6 +252,27 @@ fn windows_spelling(path: &str) -> Result<String> {
     Ok(path.replace('\\', "/"))
 }
 
+/// Make an `sbx exec` command from [`Sbx::command`] pass Paja's stdin to the program in the
+/// sandbox (`exec -i`), for a prompt written there. Any other command is left as it is.
+pub fn keep_stdin(cmd: &mut Command) {
+    let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
+    if args.first().map(|a| a == "exec") != Some(true) {
+        return;
+    }
+    let mut kept = Command::new(cmd.get_program());
+    kept.arg("exec").arg("-i").args(&args[1..]);
+    for (key, value) in cmd.get_envs() {
+        match value {
+            Some(value) => kept.env(key, value),
+            None => kept.env_remove(key),
+        };
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        kept.current_dir(dir);
+    }
+    *cmd = kept;
+}
+
 impl Sbx {
     fn unavailable(&self) -> String {
         format!(
@@ -447,6 +468,25 @@ mod tests {
             program: "sbx".into(),
             name: "paja".into(),
         }
+    }
+
+    #[test]
+    fn keep_stdin_asks_sbx_exec_for_stdin() {
+        let mut cmd = sbx()
+            .command(Path::new("/work"), &[], &["claude".into(), "-p".into()])
+            .unwrap();
+        keep_stdin(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..2], ["exec", "-i"]);
+        assert_eq!(&args[args.len() - 2..], ["claude", "-p"]);
+        // Anything else is untouched.
+        let mut other = Command::new("sbx");
+        other.args(["ls"]);
+        keep_stdin(&mut other);
+        assert_eq!(other.get_args().collect::<Vec<_>>(), ["ls"]);
     }
 
     #[test]
