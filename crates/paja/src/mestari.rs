@@ -410,6 +410,44 @@ fn shown_line(message: &str) -> String {
     line
 }
 
+/// The sandbox agents and checks run in, when `PAJA_SBX` turns it on. Refuses when it is on but
+/// can't start; says so when it is off.
+fn start_sandbox(home: &Home, repo: &Path) -> Result<Option<crate::sandbox::Sbx>> {
+    if crate::sandbox::configured().is_none() {
+        progress(&format!(
+            "no sandbox ({} is not set): agents and checks run as you, behind the deny-list hook only",
+            crate::sandbox::PROGRAM_VAR
+        ));
+        return Ok(None);
+    }
+    progress("starting the sandbox");
+    let envs = home.envs_dir();
+    std::fs::create_dir_all(&envs).with_context(|| format!("creating {}", envs.display()))?;
+    // The worktrees keep their git data in the repository's own `.git`, which commits need.
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    crate::sandbox::start(&[envs, PathBuf::from(common)])
+}
+
+/// `argv` run in `sbx`, in `dir`, with the throwaway variables [`without_credentials`] gives
+/// code on the host, and nothing else.
+fn in_sandbox(
+    sbx: &crate::sandbox::Sbx,
+    dir: &Path,
+    identity: Vec<(&str, String)>,
+    script_or_argv: Result<&str, &[String]>,
+) -> Result<Command> {
+    let mut vars = Command::new("env");
+    without_credentials(&mut vars, Path::new(crate::sandbox::SCRATCH), identity);
+    let env = crate::sandbox::env_of(&vars);
+    match script_or_argv {
+        Ok(script) => sbx.script(dir, &env, script),
+        Err(argv) => sbx.command(dir, &env, argv),
+    }
+}
+
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let repo = std::path::absolute(opts.repo)?;
@@ -419,6 +457,9 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         ahjo::clear_tampered(home, &repo)?;
     }
     let key = ahjo::ensure_untampered(home, &repo)?;
+    // Before the queue is touched: a sandbox that can't start is the person's to fix, and must
+    // not park an item.
+    crate::sandbox::activate(start_sandbox(home, &repo)?);
     git(&repo, &["fetch", "-q", "origin", "main"]).context(
         "fetching origin/main; check the network and that `origin` is the GitHub repository",
     )?;
@@ -1179,47 +1220,65 @@ fn claude(
     let guard = GitGuard::new(&env.path)?;
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
     let scratch = tempfile_dir(&env.path)?;
-    let (settings, stamp, exe) = match hook_settings(&env.path, home, read_only) {
-        Ok(made) => made,
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&scratch);
-            return Err(err);
+    // In the sandbox the deny-list hook (a host program) doesn't run; the sandbox is the guard.
+    let sbx = crate::sandbox::active();
+    let (settings, stamp, exe) = if sbx.is_some() {
+        (String::new(), PathBuf::new(), PathBuf::new())
+    } else {
+        match hook_settings(&env.path, home, read_only) {
+            Ok(made) => made,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Err(err);
+            }
         }
     };
-    let mut cmd = Command::new(&program);
-    cmd.current_dir(&env.path);
-    without_credentials(&mut cmd, &scratch, git_identity);
-    cmd.args([
-        "-p",
-        prompt,
-        "--output-format",
-        "json",
-        "--permission-mode",
-        "acceptEdits",
-    ])
-    // No settings files at all, only the deny-list hook: neither the owner's settings nor
-    // a settings file on the branch can loosen or switch it off.
-    .args(["--setting-sources", "", "--settings", &settings])
+    let mut args: Vec<String> = ["-p", prompt, "--output-format", "json", "--permission-mode"]
+        .into_iter()
+        .map(String::from)
+        // The sandbox image defaults to bypassPermissions, which is never acceptable.
+        .chain([if sbx.is_some() { "auto" } else { "acceptEdits" }.to_string()])
+        // No settings files at all, only the deny-list hook: neither the owner's settings nor
+        // a settings file on the branch can loosen or switch it off.
+        .chain(["--setting-sources".to_string(), String::new()])
+        .collect();
+    if sbx.is_none() {
+        args.extend(["--settings".to_string(), settings]);
+    }
     // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
     // main: the branch under review can't rewrite the rules its agents follow.
-    .args(["--append-system-prompt", &harness])
+    args.extend(["--append-system-prompt".to_string(), harness]);
     // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
-    .arg("--strict-mcp-config")
+    args.push("--strict-mcp-config".to_string());
     // Only the built-in tools the role uses are defined at all, so no other tool (subagents,
     // web tools) reaches the agent or spends prompt tokens on its definition.
-    .args(["--tools", agent_tools(read_only)])
+    args.extend(["--tools".to_string(), agent_tools(read_only).to_string()]);
     // Per-machine details (the worktree's path, its git status) go in the first message
     // instead of the system prompt, so sessions in different environments share a cached
     // prompt prefix.
-    .arg("--exclude-dynamic-system-prompt-sections")
+    args.push("--exclude-dynamic-system-prompt-sections".to_string());
     // The model and effort come from `.paja/models` on main, so a change can't pick the models
     // that judge it.
-    .args(model_args)
-    .arg("--allowedTools")
-    .args(tools);
+    args.extend(model_args.iter().cloned());
+    args.push("--allowedTools".to_string());
+    args.extend(tools.iter().map(|t| t.to_string()));
     if let Some(schema) = schema {
-        cmd.args(["--json-schema", &schema.to_string()]);
+        args.extend(["--json-schema".to_string(), schema.to_string()]);
     }
+    let mut cmd = match &sbx {
+        Some(sbx) => {
+            let mut argv = vec![program.clone()];
+            argv.extend(args);
+            in_sandbox(sbx, &env.path, git_identity, Err(&argv))?
+        }
+        None => {
+            let mut cmd = Command::new(&program);
+            cmd.current_dir(&env.path);
+            without_credentials(&mut cmd, &scratch, git_identity);
+            cmd.args(&args);
+            cmd
+        }
+    };
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
     let output = cmd.stdin(std::process::Stdio::null()).output();
@@ -1231,7 +1290,16 @@ fn claude(
     }
     guard.check("the agent")?;
     // Code the agent ran could also have swapped the hook's copy during the session.
-    let hooked = hooked && hook_copy_intact(&exe);
+    let hooked = sbx.is_some() || hooked && hook_copy_intact(&exe);
+    if let (Some(sbx), Ok(out)) = (&sbx, &output) {
+        // Not a failed check or session: the person has to sign in, once.
+        if crate::sandbox::signed_out(
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ) {
+            bail!("{}", sbx.sign_in_hint());
+        }
+    }
     // A session that took more than one turn, or changed the worktree, used tools, so the hook
     // must have run. If it didn't, something (such as an administrator's policy) switched it
     // off and nothing the agent did can be trusted: throw it away, so a later run can't resume
@@ -1780,7 +1848,7 @@ fn commit_leftovers(env: &Env, item: &WorkItem) -> Result<()> {
 /// login, git's credential helpers and askpass programs, and registry tokens). Agents keep
 /// the owner's `HOME`, which Claude Code needs to sign in, so code they run can still read
 /// credential files there (`.netrc`, say), and a token written into the remote's URL is not
-/// covered. Determined code run by `cargo test` is the sandbox's job.
+/// covered. Determined code run by `cargo test` is the sandbox's job (`PAJA_SBX`).
 fn without_credentials(cmd: &mut Command, scratch: &Path, git_identity: Vec<(&str, String)>) {
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
@@ -1839,13 +1907,20 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     // Read before any check runs: later, the branch's code may have changed the configuration.
     let identity = git_identity(dir);
     let scratch = tempfile_dir(dir)?;
+    let sbx = crate::sandbox::active();
     let result = (|| {
         for check in checks {
-            let mut cmd = crate::platform::shell(check)?;
-            cmd.current_dir(dir);
-            without_credentials(&mut cmd, &scratch, identity.clone());
-            // The checks keep the owner's HOME, as agents do: toolchain managers find cargo
-            // through it. Credential files there stay reachable until the sandbox.
+            let mut cmd = match &sbx {
+                Some(sbx) => in_sandbox(sbx, dir, identity.clone(), Ok(check))?,
+                None => {
+                    let mut cmd = crate::platform::shell(check)?;
+                    cmd.current_dir(dir);
+                    without_credentials(&mut cmd, &scratch, identity.clone());
+                    cmd
+                }
+            };
+            // Without the sandbox the checks keep the owner's HOME, as agents do: toolchain
+            // managers find cargo through it, and credential files there stay reachable.
             let output = cmd
                 .stdin(std::process::Stdio::null())
                 .output()

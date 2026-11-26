@@ -1683,6 +1683,292 @@ fn an_empty_checks_file_is_an_error_not_a_pass() {
     assert!(!f.gh_log().contains("pr merge"));
 }
 
+/// A fake `sbx` that logs its arguments and runs the command after `--` on the host, in the
+/// directory `-w` names and with the variables `-e` sets. Nothing else of the host's
+/// environment is dropped, which is all the real one adds that these tests can't.
+fn fake_sbx(dir: &Path) -> std::path::PathBuf {
+    let d = slash(dir);
+    program(
+        dir,
+        "sbx",
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {d}/sbx.log\n\
+             case \"$1\" in\ncreate) : > {d}/created; exit 0 ;;\nexec) shift\n\
+             [ -f {d}/created ] || {{ echo 'no such sandbox' >&2; exit 1; }}\n\
+             while [ \"$1\" != \"--\" ]; do case \"$1\" in -w) cd \"$2\"; shift 2 ;; -e) export \"$2\"; shift 2 ;; *) shift ;; esac; done\n\
+             shift\n\
+             case \"$*\" in *\"cc --version\"*) exit 0 ;; esac\n\
+             exec \"$@\" ;;\nesac\n"
+        ),
+    )
+}
+
+#[test]
+fn run_refuses_to_start_agents_when_the_sandbox_cannot_start() {
+    let f = Factory::new("true\n", "land");
+    let missing = f.tmp.path().join("no-such-sbx");
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", missing.as_path()),
+        ],
+    );
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap();
+    assert!(
+        error.contains("install Docker Sandboxes") && error.contains("PAJA_SBX"),
+        "{report}"
+    );
+    // Fail closed: no agent ran, and the item was not claimed or parked.
+    assert!(!f.tmp.path().join("claude-args.log").exists());
+    let (_, item) = paja(&f.home, &f.repo, &["work", "list"]);
+    assert!(!item.to_string().contains("escalated"), "{item}");
+}
+
+/// Runs `paja run` with the fake `sbx` script `body`; returns the error and checks no agent ran.
+fn run_with_sbx_body(body: &str) -> (String, std::path::PathBuf) {
+    let f = Factory::new("true\n", "land");
+    let sbx = program(f.tmp.path(), "sbx", body);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(!ok, "{report}");
+    assert!(!f.tmp.path().join("claude-args.log").exists());
+    let error = report["error"].as_str().unwrap().to_string();
+    (error, sbx)
+}
+
+#[test]
+fn a_left_behind_sandbox_that_will_not_run_says_how_to_remove_it() {
+    let (error, sbx) = run_with_sbx_body(
+        "#!/bin/sh\ncase \"$1\" in\n\
+         create) echo \"sandbox 'paja' already exists\" >&2; exit 1 ;;\n\
+         *) echo 'mounts are gone' >&2; exit 1 ;;\nesac\n",
+    );
+    assert!(error.contains("already exists"), "{error}");
+    assert!(
+        error.contains("`paja`") && error.contains(&format!("{} rm paja", sbx.display())),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_running_sandbox_with_other_mounts_says_how_to_remove_it() {
+    // It answers in `/` but has none of this factory's directories.
+    let (error, sbx) = run_with_sbx_body(
+        "#!/bin/sh\ncase \"$1\" in\n\
+         exec) [ \"$3\" = \"/\" ] || { echo 'no such directory' >&2; exit 1; }; exit 0 ;;\n\
+         *) exit 0 ;;\nesac\n",
+    );
+    assert!(error.contains("is not mounted"), "{error}");
+    assert!(
+        error.contains(&format!("{} rm paja", sbx.display())),
+        "{error}"
+    );
+}
+
+#[test]
+fn agents_and_checks_run_through_the_sandbox() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let sbx = fake_sbx(f.tmp.path());
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    // The sandbox is created once with the factory's environments mounted, and the agent, the
+    // check and the reviewer all went through `exec`.
+    assert_eq!(log.matches("create --name paja claude").count(), 1, "{log}");
+    assert!(log.contains("test -f feature.txt"), "{log}");
+    assert!(log.matches("--output-format json").count() >= 2, "{log}");
+    // The agents run in the sandbox's own permission mode, never the image's default, and
+    // without the host-only deny-list hook.
+    for call in f.claude_calls() {
+        assert!(call.contains("--permission-mode auto"), "{call}");
+        assert!(!call.contains("--settings"), "{call}");
+    }
+    // Their throwaway PAJA_HOME is inside the sandbox, not a host path.
+    let homes = std::fs::read_to_string(f.tmp.path().join("claude-homes.log")).unwrap();
+    // (Git Bash on Windows rewrites `/tmp` to its own directory on the way in.)
+    assert!(
+        homes.lines().all(|l| l.ends_with("/tmp/paja-home")
+            || l == "/tmp/paja-home"
+            || l.ends_with("Temp/paja-home")),
+        "{homes}"
+    );
+}
+
+#[test]
+fn a_signed_out_claude_in_the_sandbox_says_how_to_sign_in() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx(f.tmp.path());
+    let claude = program(
+        f.tmp.path(),
+        "claude-out",
+        "#!/bin/sh\necho '{\"is_error\": true, \"result\": \"Not logged in · Please run /login\"}'\nexit 1\n",
+    );
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("not signed in") && question.contains("/login"),
+        "{question}"
+    );
+}
+
+/// With a real `sbx` (`PAJA_SBX_TEST` names it; skipped otherwise, as CI has none): a check
+/// can't read a file planted in the owner's home, or write outside the worktree.
+#[test]
+fn a_real_sandbox_hides_the_owners_files() {
+    let Some(sbx) = std::env::var_os("PAJA_SBX_TEST") else {
+        eprintln!("skipped: set PAJA_SBX_TEST to the `sbx` program to run this");
+        return;
+    };
+    /// Removes the sandbox `paja` when dropped, pass or fail, and once up front in case an
+    /// earlier run left one whose mounts no longer exist. Each removal is verified with
+    /// `sbx ls`: if the sandbox is still listed, the test fails (or, while already failing,
+    /// says so on stderr).
+    struct RemoveSandbox(std::ffi::OsString);
+    impl RemoveSandbox {
+        fn listed(&self) -> bool {
+            let out = Command::new(&self.0)
+                .arg("ls")
+                .stdin(std::process::Stdio::null())
+                .output();
+            match out {
+                Ok(out) => String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .any(|word| word == "paja"),
+                Err(_) => false,
+            }
+        }
+        /// Try the ways `sbx rm` is spelled (some ask for confirmation) until it is gone.
+        fn remove(&self) -> bool {
+            use std::io::Write;
+            for args in [
+                &["rm", "--force", "paja"][..],
+                &["rm", "-f", "paja"][..],
+                &["rm", "paja"][..],
+            ] {
+                if !self.listed() {
+                    return true;
+                }
+                let child = Command::new(&self.0)
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+                if let Ok(mut child) = child {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(b"y\n");
+                    }
+                    let _ = child.wait_with_output();
+                }
+            }
+            !self.listed()
+        }
+    }
+    impl Drop for RemoveSandbox {
+        fn drop(&mut self) {
+            if !self.remove() {
+                let message = "the test's sandbox `paja` is still listed by `sbx ls`; remove it with `sbx rm paja`";
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
+        }
+    }
+    let cleanup = RemoveSandbox(sbx.clone());
+    assert!(
+        cleanup.remove(),
+        "an earlier sandbox `paja` can't be removed; run `sbx rm paja`"
+    );
+    let secrets = tempfile::tempdir().unwrap();
+    let planted = secrets.path().join(".netrc");
+    std::fs::write(&planted, "machine example.com password hunter2\n").unwrap();
+    let outside = secrets.path().join("written-by-a-check");
+    // The sandbox is Linux: the checks name these host files the way it spells them, and they
+    // are in no mount.
+    let spell = |p: &Path| paja::sandbox::in_sandbox_path(p).unwrap();
+    // The write outside must fail without failing the check; the host is asserted below.
+    let checks = format!(
+        "test ! -e {}\ntouch {} || true\n",
+        spell(&planted),
+        spell(&outside)
+    );
+    let f = Factory::new(&checks, "land");
+    // The fake `claude` is a POSIX-shell script in a directory the sandbox mounts (the
+    // repository's `.git`, which is neither tracked nor the worktree), run by its in-sandbox path.
+    let bin = f.repo.join(".git").join("paja-test-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         *--json-schema*) echo '{\"is_error\": false, \"structured_output\": {\"verdict\": \"land\", \"summary\": \"fake review\", \"comments\": \"\", \"question\": \"\", \"follow_ups\": []}}' ;;\n\
+         *) echo built >> feature.txt\n\
+         git add feature.txt\n\
+         git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
+         echo '{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4}' ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let claude_in_sandbox = std::path::PathBuf::from(spell(&claude));
+    let sbx = std::path::PathBuf::from(sbx);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", claude_in_sandbox.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert!(!outside.exists(), "a check wrote outside its sandbox");
+    assert!(planted.exists(), "the planted file should be untouched");
+}
+
 /// `path` (`/w/...`) as an absolute path on this platform: on a drive on Windows.
 fn w(path: &str) -> String {
     if cfg!(windows) {
