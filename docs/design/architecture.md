@@ -468,10 +468,19 @@ door to the one core. Desk keeps no state of its own. Everything it shows comes 
 log, and any write it makes later goes through the core and holds the home lock. The HTTP API, so Desk's view reaches a
 phone, comes after v0.1.
 
-The first window is read-only. For every repository in the log it lists the work items, grouped as waiting on you
-(escalated, with the question and the answer command), active, queued and the latest landed, each linking to its issue
-(opened in the browser). It reads the queue again whenever `events.jsonl` changes, polling its size and time, and an
-error from the core shows in the window with the text the CLI prints. Desk's Tauri permissions
+For every repository in the log the window lists the work items, grouped as waiting on you (escalated, with the
+question), active, queued and the latest landed, each linking to its issue (opened in the browser). It reads the queue
+again whenever `events.jsonl` changes, polling its size and time; the commands run off the window's thread, and a
+refresh that finishes late never draws over a newer one. An error from the core shows in the window with the text the
+CLI prints.
+
+The person's two jobs are answering and writing work, and Desk does both through the core: an escalated item has an
+answer box that calls `jono::answer` (as `paja work answer`: it records `work.answered`, queues the item and posts the
+answer on the issue), and "New work" takes a repository, a title and a body, shows them for approval, then calls
+`jono::file` (as `paja work file`: an issue with the work label). Both run where `gh` finds the repository: the
+checkout Paja last made an environment from for it (`jono::known_checkout`, from the log's `env.created` events), else
+the directory Desk started in when it is a checkout of that repository, else an error that says where to start. The
+person's text stays in the window across refreshes and errors. Desk's Tauri permissions
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
 `https://github.com/` links, nothing else.
 

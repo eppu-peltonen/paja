@@ -1173,6 +1173,28 @@ pub fn mark_needs_answer(home: &Home, repo: &Path, number: u64) -> Result<String
     Ok(label)
 }
 
+/// The local checkout of `repo` (`owner/name`) that Paja last worked in: the repository an
+/// environment for one of its items was made from, newest first, when it still exists. None
+/// when no item of `repo` has had an environment yet. For a front end that starts outside any
+/// checkout, such as Paja Desk, so it can run the core's commands where `gh` finds `repo`.
+pub fn known_checkout(home: &Home, repo: &str) -> Result<Option<std::path::PathBuf>> {
+    let events = home.events().read_all()?;
+    let prefix = env_name(repo, 0);
+    let prefix = prefix.strip_suffix('0').unwrap_or(&prefix);
+    Ok(events
+        .iter()
+        .rev()
+        .filter(|e| e.kind == crate::ahjo::EV_CREATED)
+        .filter(|e| {
+            e.data["name"].as_str().is_some_and(|name| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .filter_map(|e| e.data["repo"].as_str().map(std::path::PathBuf::from))
+        .find(|path| path.is_dir()))
+}
+
 /// A GitHub issue filed for Jono.
 #[derive(Debug, Clone, Serialize)]
 pub struct Filed {

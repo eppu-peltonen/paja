@@ -17,11 +17,8 @@ pub const CHANGED: &str = "paja://events-changed";
 /// Every repository's work items, as `paja --json work list --all` prints them. An error is
 /// `{"error": "..."}` with the text the CLI prints.
 #[tauri::command]
-fn work_list() -> Value {
-    match Home::from_env() {
-        Ok(home) => work_list_in(&home, &checkout()),
-        Err(err) => error(err),
-    }
+async fn work_list() -> Value {
+    off_main(|home| work_list_in(home, &checkout())).await
 }
 
 /// [`work_list`] for `home`. `checkout` is only asked for its repository when the log still
@@ -31,6 +28,63 @@ pub fn work_list_in(home: &Home, checkout: &Path) -> Value {
         Ok(items) => items,
         Err(err) => error(err),
     }
+}
+
+/// Answer escalated item `number` of `repo`, as `paja --json work answer` does: it records the
+/// answer, queues the item again and posts the answer on the issue. Returns the item's JSON.
+#[tauri::command]
+async fn work_answer(repo: String, number: u64, text: String) -> Value {
+    off_main(move |home| work_answer_in(home, &repo, number, &text, &checkout())).await
+}
+
+/// [`work_answer`] for `home`.
+pub fn work_answer_in(home: &Home, repo: &str, number: u64, text: &str, cwd: &Path) -> Value {
+    let answered = checkout_of(home, repo, cwd)
+        .and_then(|path| jono::answer(home, &path, number, text))
+        .and_then(|item| Ok(serde_json::to_value(item)?));
+    answered.unwrap_or_else(error)
+}
+
+/// File a new issue with `repo`'s work label, as `paja --json work file` does. Returns
+/// `{"url": ...}`.
+#[tauri::command]
+async fn work_file(repo: String, title: String, body: String) -> Value {
+    off_main(move |home| work_file_in(home, &repo, &title, &body, &checkout())).await
+}
+
+/// Run a core call on a blocking thread, so replaying a long log or waiting for `gh` never
+/// freezes the window.
+async fn off_main(call: impl FnOnce(&Home) -> Value + Send + 'static) -> Value {
+    let ran = tauri::async_runtime::spawn_blocking(move || match Home::from_env() {
+        Ok(home) => call(&home),
+        Err(err) => error(err),
+    })
+    .await;
+    ran.unwrap_or_else(|err| json!({ "error": format!("Desk's worker stopped: {err}") }))
+}
+
+/// [`work_file`] for `home`.
+pub fn work_file_in(home: &Home, repo: &str, title: &str, body: &str, cwd: &Path) -> Value {
+    let filed = checkout_of(home, repo, cwd)
+        .and_then(|path| jono::file(home, &path, title, body))
+        .and_then(|filed| Ok(serde_json::to_value(filed)?));
+    filed.unwrap_or_else(error)
+}
+
+/// Where to run the core's commands for `repo`: the checkout Paja last worked in for it, else
+/// the directory Desk started in when that is a checkout of `repo`.
+fn checkout_of(home: &Home, repo: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(path) = jono::known_checkout(home, repo)? {
+        return Ok(path);
+    }
+    if jono::repo_name(home, cwd).is_ok_and(|name| name == repo) {
+        return Ok(cwd.to_path_buf());
+    }
+    anyhow::bail!(
+        "Paja Desk doesn't know where {repo} is checked out yet: Paja hasn't run an item of it \
+         on this machine. Start Desk from inside its checkout, or run the same command there with \
+         `paja work`"
+    )
 }
 
 /// The directory Desk was started in: the checkout, when started from one.
@@ -71,7 +125,7 @@ fn watch(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![work_list])
+        .invoke_handler(tauri::generate_handler![work_list, work_answer, work_file])
         .setup(|app| {
             watch(app.handle().clone());
             Ok(())
@@ -136,6 +190,144 @@ mod tests {
         let listed = work_list_in(&home, dir.path());
         let cli = jono::list_all_from(&home, dir.path()).unwrap_err();
         assert_eq!(listed, json!({ "error": format!("{cli:#}") }));
+    }
+
+    /// A fake `gh` for every test (the variable is process-wide): it logs its arguments to
+    /// `gh.log` in the checkout it runs in, fails when that checkout has a `gh-down` file, names
+    /// the repository `acme/app` and prints a URL for a new issue. A shell script, so Unix only.
+    #[cfg(unix)]
+    fn fake_gh() {
+        use std::os::unix::fs::PermissionsExt;
+        static GH: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        GH.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let gh = dir.path().join("gh");
+            std::fs::write(
+                &gh,
+                "#!/bin/sh\n[ -f gh-down ] && { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }\n\
+                 echo \"$@\" >> gh.log\n\
+                 case \"$1 $2\" in\n\
+                 \"repo view\") echo '{\"nameWithOwner\": \"acme/app\"}' ;;\n\
+                 \"issue create\") echo https://github.com/acme/app/issues/9 ;;\n\
+                 esac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::env::set_var("PAJA_GH", &gh);
+            dir
+        });
+    }
+
+    /// A home with item 3 of acme/app escalated, and an environment Paja made for it from the
+    /// checkout it returns.
+    #[cfg(unix)]
+    fn escalated_with_checkout(dir: &Path) -> (Home, PathBuf) {
+        fake_gh();
+        let home = Home::at(dir.join("home")).unwrap();
+        let checkout = dir.join("app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        import(&home, "acme/app", 3, "Add a login page");
+        let lock = home.lock().unwrap();
+        let log = home.events();
+        log.append(
+            &lock,
+            jono::EV_STATUS,
+            json!({"repo": "acme/app", "number": 3, "status": "escalated", "note": "A or B?"}),
+        )
+        .unwrap();
+        log.append(
+            &lock,
+            paja::ahjo::EV_CREATED,
+            json!({
+                "name": jono::env_name("acme/app", 3),
+                "repo": checkout,
+                "path": dir.join("env"),
+                "branch": "paja/x",
+                "base_commit": "0",
+                "port_base": 41000,
+                "port_count": 10,
+                "created_ms": 0,
+            }),
+        )
+        .unwrap();
+        (home, checkout)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn answering_records_the_answer_and_queues_the_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        let item = work_answer_in(&home, "acme/app", 3, "Use A", dir.path());
+        assert_eq!(item["status"], "queued", "{item}");
+        assert_eq!(item["answers"][0]["answer"], "Use A", "{item}");
+        let answered = home
+            .events()
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == jono::EV_ANSWERED)
+            .count();
+        assert_eq!(answered, 1);
+        let log = std::fs::read_to_string(checkout.join("gh.log")).unwrap();
+        assert!(log.contains("issue comment 3"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filing_opens_an_issue_with_the_work_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        let filed = work_file_in(&home, "acme/app", "Add search", "Goal: ...", dir.path());
+        assert_eq!(
+            filed["url"], "https://github.com/acme/app/issues/9",
+            "{filed}"
+        );
+        let log = std::fs::read_to_string(checkout.join("gh.log")).unwrap();
+        assert!(
+            log.contains("issue create --label factory --title Add search"),
+            "{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_gh_is_an_error_and_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        std::fs::write(checkout.join("gh-down"), "").unwrap();
+        let before = home.events().read_all().unwrap().len();
+        let answered = work_answer_in(&home, "acme/app", 3, "Use A", dir.path());
+        let error = answered["error"].as_str().unwrap_or_default();
+        assert!(error.contains("HTTP 502"), "{answered}");
+        let filed = work_file_in(&home, "acme/app", "Add search", "Goal", dir.path());
+        assert!(
+            filed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("HTTP 502"),
+            "{filed}"
+        );
+        assert_eq!(home.events().read_all().unwrap().len(), before);
+    }
+
+    #[test]
+    fn a_repository_desk_has_no_checkout_for_says_where_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        import(&home, "acme/app", 3, "Add a login page");
+        let answered = work_answer_in(&home, "acme/app", 3, "Use A", dir.path());
+        let error = answered["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("doesn't know where acme/app is checked out"),
+            "{answered}"
+        );
     }
 
     #[test]

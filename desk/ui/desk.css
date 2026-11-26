@@ -63,3 +63,39 @@ li code { font-size: 12px; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .waiting li { border-left: 3px solid var(--accent); }
+header button { margin-left: auto; }
+button {
+  font: inherit;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+button.quiet { background: transparent; color: var(--accent); }
+button:disabled { opacity: 0.6; cursor: default; }
+label { display: block; margin: 8px 0; }
+input, textarea, select {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--fg);
+}
+textarea { resize: vertical; }
+.actions { display: flex; gap: 8px; margin-top: 8px; }
+#filing {
+  margin: 12px 20px 0;
+  padding: 4px 16px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+}
+pre { white-space: pre-wrap; font: inherit; }
+.answer { margin-top: 8px; }
+.answer .error, #file-result.error { margin-top: 6px; }
