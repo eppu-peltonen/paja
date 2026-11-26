@@ -1103,11 +1103,15 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
                 .is_some_and(u8::is_ascii_alphabetic)
     };
     for arg in args {
-        let value = match arg.strip_prefix('-') {
-            // `--flag=value`: the value may be a path.
-            Some(rest) if rest.starts_with('-') => rest.split_once('=').map_or("", |(_, v)| v),
+        // The words to check as paths: a bare word, the value of `--flag=value`, and for a
+        // short flag both its glued value and what follows its first `=` (`-o=.git`).
+        let mut values = Vec::new();
+        match arg.strip_prefix('-') {
+            Some(rest) if rest.starts_with('-') => {
+                values.extend(rest.split_once('=').map(|(_, v)| v))
+            }
             // A value glued to a short flag (`-o/tmp/x`, `-C../other`, `-o/tmp/x=1`) is a path
-            // too. A `=` inside it is part of the name, so it is not split off.
+            // too, `=` and all.
             Some(rest) => {
                 let glued = rest.char_indices().nth(1).map_or("", |(at, _)| &rest[at..]);
                 let starts_as_path = glued.starts_with(['/', '\\', '.', '~']) || has_drive(glued);
@@ -1119,24 +1123,27 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
                          its value so the hook can check the path"
                     ));
                 }
-                glued
+                values.push(glued);
+                values.extend(rest.split_once('=').map(|(_, v)| v));
             }
-            None => arg,
-        };
-        if !(value.contains(['/', '\\']) || value.starts_with('.') || has_drive(value)) {
-            continue;
+            None => values.push(arg),
         }
-        if let Some(why) = crate::platform::path_problem(value, false) {
-            return Some(why);
-        }
-        let target = here.join(crate::platform::shell_path(value));
-        let reason = if b.read_only {
-            within_root(&format!("use {program}"), &target, b)
-        } else {
-            inside_root(&format!("use {program}"), &target, b)
-        };
-        if reason.is_some() {
-            return reason;
+        for value in values {
+            if !(value.contains(['/', '\\']) || value.starts_with('.') || has_drive(value)) {
+                continue;
+            }
+            if let Some(why) = crate::platform::path_problem(value, false) {
+                return Some(why);
+            }
+            let target = here.join(crate::platform::shell_path(value));
+            let reason = if b.read_only {
+                within_root(&format!("use {program}"), &target, b)
+            } else {
+                inside_root(&format!("use {program}"), &target, b)
+            };
+            if reason.is_some() {
+                return reason;
+            }
         }
     }
     None
@@ -1665,6 +1672,8 @@ mod program_tests {
             "npm test -o/tmp/x=1",
             "npm test -C../other=a",
             "npm test -xC..",
+            "npm test -o=.git",
+            "npm test -Dx=.github",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
