@@ -190,11 +190,12 @@ Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, t
 `duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
 already ran, as a `run.round` with verdict `error` and the error as its detail, before the item is parked. A field the
 result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying those events gives
-each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching MCP tools; steps
-with missing fields count in its `unknown_steps` and add nothing, and so does a recorded step Jono can't read, so a bad
-usage record never stops the queue. While it works, `paja run` prints one progress line per step on stderr (the issue it
-picked, each build round, the checks, each review and its verdict, waiting for CI, landed or asked, and with `--every`
-each wait), so stdout keeps its JSON. `paja run --every 5` keeps going, checking an empty queue every five minutes.
+each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching MCP tools; a step
+with missing fields counts in its `unknown_steps` and adds only the fields it has, so each sum is a lower bound; a
+recorded step Jono can't read counts as unknown and adds nothing, so a bad usage record never stops the queue. While it
+works, `paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each
+review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON.
+`paja run --every 5` keeps going, checking an empty queue every five minutes.
 
 ## The deny-list hook
 

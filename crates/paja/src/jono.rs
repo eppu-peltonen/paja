@@ -133,9 +133,10 @@ pub struct Answer {
     pub answer: String,
 }
 
-/// An item's agent usage, totalled over every recorded step. Steps whose result had no usage
-/// fields (or no cost) count in `unknown_steps` and add nothing, so a total is never padded
-/// with zeros it didn't see.
+/// An item's agent usage, totalled over every recorded step. A step whose result lacked a token
+/// field or the cost counts in `unknown_steps` and still adds the fields it has, so while
+/// `unknown_steps` is above zero each sum is a lower bound. A missing field adds nothing rather
+/// than a zero it didn't see.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub steps: u64,
