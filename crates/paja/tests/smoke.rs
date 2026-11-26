@@ -1662,11 +1662,15 @@ impl Factory {
                  \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
-                 \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi ;;\n\
-                 \"pr checks\") if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
+                 \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi\n\
+                 if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
+                 && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
+                 \"pr checks\") while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
+                 if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
+                 if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") if [ -f {d}/gh-down ]; then exit 1; fi ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ]; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
@@ -1695,7 +1699,8 @@ impl Factory {
                  for w in $(ls {d}/holds 2>/dev/null); do case \"$*\" in *\"$w feature\"*) : > {d}/holding-$w; while [ -f {d}/holds/$w ]; do sleep 0.1; done ;; esac; done\n\
                  if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/leave-merge ]; then rm {d}/leave-merge; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
-                 echo built >> feature.txt\n\
+                 tag=; file=feature.txt; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) tag=\" $t\"; if [ -f {d}/own-files ]; then file=$t.txt; fi ;; esac; done\n\
+                 echo \"built$tag\" >> $file\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
@@ -1704,7 +1709,7 @@ impl Factory {
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
-                 git add feature.txt\n\
+                 git add $file\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
                  if [ -f {d}/no-session ]; then echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi\n\
                  echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4, \"duration_ms\": 900, \"session_id\": \"s-1\", \"total_cost_usd\": 0.25, \"usage\": {{\"input_tokens\": 100, \"output_tokens\": 20, \"cache_read_input_tokens\": 3000, \"cache_creation_input_tokens\": 400}}, \"modelUsage\": {{\"claude-test\": {{\"inputTokens\": 100, \"outputTokens\": 20, \"cacheReadInputTokens\": 3000, \"cacheCreationInputTokens\": 400, \"costUSD\": 0.25}}}}}}' ;;\nesac\n"
@@ -5192,6 +5197,7 @@ fn pool_factory_with(four: bool, checks: &str) -> Factory {
         .collect();
     std::fs::write(dir.join("issues.json"), Value::Array(issues).to_string()).unwrap();
     std::fs::create_dir_all(dir.join("holds")).unwrap();
+    std::fs::write(dir.join("titles"), titles.join("\n")).unwrap();
     for t in titles {
         std::fs::write(dir.join("holds").join(t), "").unwrap();
     }
@@ -5274,7 +5280,8 @@ fn landed(f: &Factory) -> usize {
         .count()
 }
 
-/// Stop the pool with a `stop` line and return its stdout lines, one report per item.
+/// Stop the pool with a `stop` line and return its stdout lines, one report per item. A pool that
+/// went idle first may also have run the daily triage: that line is not an item's.
 #[cfg(unix)]
 fn stop_pool(f: &Factory, mut pool: std::process::Child) -> Vec<Value> {
     use std::io::Write as _;
@@ -5286,7 +5293,8 @@ fn stop_pool(f: &Factory, mut pool: std::process::Child) -> Vec<Value> {
     assert!(output.status.success(), "{err}");
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|report| report["outcome"] != "triage")
         .collect()
 }
 
@@ -5384,7 +5392,150 @@ fn pool_lanes_changes_a_running_pools_lanes() {
         release(&f, t);
     }
     wait_until(&f, "all four landing", || landed(&f) == 4);
-    assert_eq!(stop_pool(&f, pool).len(), 4);
+    let r = stop_pool(&f, pool);
+    assert_eq!(r.len(), 4, "{r:#?}");
+}
+
+/// A pool whose fake `gh` really merges each pull request into origin's main, with CI held until
+/// `ci-hold` is removed, and Alpha and Beta released at once. Returns once one lane holds the
+/// turn to land and the other waits for it, as (landing, waiting).
+#[cfg(unix)]
+fn two_lanes_at_the_land_turn(f: &Factory) -> (u64, u64) {
+    for flag in ["real-merge", "ci-hold"] {
+        std::fs::write(f.tmp.path().join(flag), "").unwrap();
+    }
+    wait_until(f, "two lanes building", || {
+        holding(f, "Alpha") && holding(f, "Beta")
+    });
+    release(f, "Alpha");
+    release(f, "Beta");
+    let mut turn = (0, 0);
+    wait_until(f, "one lane landing and one waiting for its turn", || {
+        let (_, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+        match (status["landing"].as_u64(), status["merging"].as_array()) {
+            (Some(landing), Some(merging)) if merging.len() == 1 => {
+                turn = (landing, merging[0].as_u64().unwrap());
+                true
+            }
+            _ => false,
+        }
+    });
+    turn
+}
+
+/// What origin's main holds at `path`, or None.
+#[cfg(unix)]
+fn on_origin(f: &Factory, rev: &str, path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(f.tmp.path().join("origin.git"))
+        .args(["show", &format!("{rev}:{path}")])
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(unix)]
+#[test]
+fn two_lanes_ready_at_once_land_one_after_the_other_each_on_the_latest_main() {
+    let f = pool_factory(false);
+    std::fs::write(f.tmp.path().join("own-files"), "").unwrap();
+    let pool = start_pool(&f, "2");
+    let (first, second) = two_lanes_at_the_land_turn(&f);
+    assert_ne!(first, second);
+    // While the first waits for CI, the second has not pushed or opened anything.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    assert!(!f.tmp.path().join("prs/2").exists(), "{}", f.gh_log());
+    std::fs::remove_file(f.tmp.path().join("ci-hold")).unwrap();
+    wait_until(&f, "both landing", || landed(&f) == 2);
+    release(&f, "Gamma");
+    wait_until(&f, "Gamma landing", || landed(&f) == 3);
+    let reports = stop_pool(&f, pool);
+    assert!(
+        reports.iter().all(|r| r["outcome"] == "landed"),
+        "{reports:?}"
+    );
+
+    let title = |n: u64| ["Alpha", "Beta", "Gamma"][(n - 5) as usize];
+    for t in ["Alpha", "Beta", "Gamma"] {
+        assert_eq!(
+            on_origin(&f, "main", &format!("{t}.txt")).as_deref(),
+            Some(format!("built {t}\n").as_str())
+        );
+    }
+    // The second landed after the first, on a branch that holds the first's change.
+    let log = paja(&f.home, &f.repo, &["log"]).1;
+    let seq = |kind: &str, n: u64| {
+        log.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == kind && e["data"]["number"] == n)
+            .map(|e| e["seq"].as_u64().unwrap())
+            .unwrap_or_else(|| panic!("no {kind} for #{n}"))
+    };
+    assert!(seq("run.landed", first) < seq("pool.landing", second));
+    assert!(seq("pool.merging", second) < seq("run.landed", first));
+    let branch = std::fs::read_to_string(f.tmp.path().join("prs/2")).unwrap();
+    let held = on_origin(&f, branch.trim(), &format!("{}.txt", title(first)));
+    assert!(held.is_some(), "the second branch lacks the first change");
+    let err = std::fs::read_to_string(f.tmp.path().join("pool.err")).unwrap();
+    assert!(
+        err.contains("moved on while this change waited to land; merged it in, checking again"),
+        "{err}"
+    );
+    // Each item took one round: catching up needed no builder.
+    let rounds = events_of(&f, "run.round");
+    assert!(rounds.iter().all(|r| r["data"]["round"] == 1), "{rounds:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lane_that_conflicts_with_the_landing_before_it_goes_back_for_a_round_then_lands() {
+    let f = pool_factory(false);
+    let pool = start_pool(&f, "2");
+    let (first, second) = two_lanes_at_the_land_turn(&f);
+    std::fs::remove_file(f.tmp.path().join("ci-hold")).unwrap();
+    wait_until(&f, "both landing", || landed(&f) == 2);
+    release(&f, "Gamma");
+    wait_until(&f, "Gamma landing", || landed(&f) == 3);
+    let reports = stop_pool(&f, pool);
+    let report = |n: u64| {
+        reports
+            .iter()
+            .find(|r| r["number"] == n)
+            .unwrap_or_else(|| panic!("{reports:?}"))
+            .clone()
+    };
+    assert_eq!(report(first)["outcome"], "landed");
+    assert_eq!(report(first)["rounds"], 1, "{reports:?}");
+    assert_eq!(report(second)["outcome"], "landed", "{reports:?}");
+    assert_eq!(report(second)["rounds"], 2, "{reports:?}");
+    let rounds = events_of(&f, "run.round");
+    let conflict = rounds
+        .iter()
+        .find(|r| r["data"]["number"] == second && r["data"]["verdict"] == "conflict")
+        .unwrap_or_else(|| panic!("{rounds:?}"));
+    // The round the review approved in, sent back for the conflict at its turn to land.
+    assert_eq!(conflict["data"]["round"], 1, "{conflict}");
+    assert!(conflict["data"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("feature.txt"));
+    // The builder was told what conflicts, and its fix landed on top of the first change.
+    let calls = f.claude_calls();
+    assert!(
+        calls.iter().any(|c| c.contains(
+            "moved on since this branch was made, and merging it conflicts in: feature.txt"
+        )),
+        "{calls:#?}"
+    );
+    let landed = on_origin(&f, "main", "feature.txt").unwrap();
+    assert!(
+        landed.contains("built Alpha") && landed.contains("built Beta"),
+        "{landed}"
+    );
 }
 
 #[test]

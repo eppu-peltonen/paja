@@ -19,6 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use super::land::{EV_LANDING, EV_MERGING};
 use super::{progress, EV_LANDED, EV_ROUND, EV_STEP};
 use crate::events::Event;
 use crate::home::Home;
@@ -576,6 +577,10 @@ pub struct PoolStatus {
     pub held: usize,
     /// How many waiting items are ready and wait only for a free lane.
     pub ready: usize,
+    /// The item whose lane holds the repository's turn to land, if one does.
+    pub landing: Option<u64>,
+    /// The merging queue: items whose lanes wait for that turn, longest waiting first.
+    pub merging: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -614,6 +619,37 @@ pub fn status(home: &Home, repo: &str) -> Result<PoolStatus> {
     let items = jono::list(home, repo)?;
     let running = pool_running(home, repo)?;
     Ok(from_events(&events, repo, running, &items))
+}
+
+/// Which of `lanes` holds the repository's turn to land, and which wait for it, longest first.
+/// A lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed` since its item
+/// started says: a round or a landing after the turn ends it.
+fn land_turns(
+    events: &[Event],
+    repo: &str,
+    lanes: &[LaneStatus],
+    begun: &[u64],
+) -> (Option<u64>, Vec<u64>) {
+    let mut landing = None;
+    let mut merging: Vec<(u64, u64)> = Vec::new();
+    for (lane, begun) in lanes.iter().zip(begun) {
+        let latest = events
+            .iter()
+            .rev()
+            .take_while(|e| e.seq > *begun)
+            .find(|e| {
+                e.data["repo"] == repo
+                    && e.data["number"] == lane.number
+                    && [EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&e.kind.as_str())
+            });
+        match latest {
+            Some(e) if e.kind == EV_LANDING => landing = Some(lane.number),
+            Some(e) if e.kind == EV_MERGING => merging.push((e.seq, lane.number)),
+            _ => {}
+        }
+    }
+    merging.sort();
+    (landing, merging.into_iter().map(|(_, n)| n).collect())
 }
 
 /// How many landings [`status`] shows.
@@ -659,7 +695,7 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             .map(|item| item.title.clone())
             .unwrap_or_default()
     };
-    let lanes: Vec<LaneStatus> = lanes
+    let (lanes, begun): (Vec<LaneStatus>, Vec<u64>) = lanes
         .into_iter()
         .filter(|(_, (event, _))| event.data["stage"] != "done")
         .filter_map(|(lane, (event, begun))| {
@@ -677,7 +713,7 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
                 .sum::<f64>()
                 // An empty sum is -0.0, which JSON shows as such.
                 + 0.0;
-            Some(LaneStatus {
+            let lane = LaneStatus {
                 lane,
                 number,
                 title: title(number),
@@ -685,10 +721,12 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
                 step: event.data["step"].as_str().map(str::to_string),
                 since_ms: event.ts_ms,
                 spent_usd,
-            })
+            };
+            Some((lane, begun))
         })
-        .collect();
+        .unzip();
     let admitted: Vec<u64> = lanes.iter().map(|lane| lane.number).collect();
+    let (landing, merging) = land_turns(events, repo, &lanes, &begun);
     let waiting: Vec<WaitingItem> = items
         .iter()
         .filter(|item| item.open && item.status == Status::Queued)
@@ -755,6 +793,8 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         landed_since_start,
         held,
         ready,
+        landing,
+        merging,
     }
 }
 
@@ -794,6 +834,13 @@ pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
                 lane.spent_usd
             ));
         }
+    }
+    if let Some(number) = status.landing {
+        out.push(format!("landing: #{number}"));
+    }
+    if !status.merging.is_empty() {
+        let queue: Vec<String> = status.merging.iter().map(|n| format!("#{n}")).collect();
+        out.push(format!("waiting to land: {}", queue.join(", ")));
     }
     for item in &status.waiting {
         out.push(format!(
@@ -894,6 +941,48 @@ mod tests {
         let text = describe(&status, 67_000);
         assert!(text.contains("running, 1 busy of 3 lanes"), "{text}");
         assert!(text.contains("1m00s"), "{text}");
+    }
+
+    #[test]
+    fn the_land_turn_and_the_merging_queue_come_from_the_lanes_latest_turn_events() {
+        let turn = |seq, kind, number| {
+            event(
+                seq,
+                kind,
+                json!({"repo": "acme/app", "number": number, "round": 1}),
+            )
+        };
+        let round = |seq, number| {
+            event(
+                seq,
+                EV_ROUND,
+                json!({"repo": "acme/app", "number": number, "round": 1, "steps": []}),
+            )
+        };
+        let mut events = vec![
+            event(1, EV_POOL_STARTED, json!({"repo": "acme/app", "lanes": 3})),
+            lane(2, 1, 5, "starting", None),
+            lane(3, 2, 6, "starting", None),
+            lane(4, 3, 7, "starting", None),
+            round(5, 5),
+            round(6, 6),
+            round(7, 7),
+            turn(8, EV_LANDING, 5),
+            turn(9, EV_MERGING, 7),
+            turn(10, EV_MERGING, 6),
+        ];
+        let status = from_events(&events, "acme/app", true, &[]);
+        assert_eq!(status.landing, Some(5));
+        assert_eq!(status.merging, vec![7, 6]);
+        let text = describe(&status, 10_000);
+        assert!(
+            text.contains("landing: #5\nwaiting to land: #7, #6"),
+            "{text}"
+        );
+        // #5 went back for a round; #7 took the turn.
+        events.extend([round(11, 5), turn(12, EV_LANDING, 7)]);
+        let status = from_events(&events, "acme/app", true, &[]);
+        assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
     }
 
     #[test]

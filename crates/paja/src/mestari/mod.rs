@@ -962,19 +962,7 @@ fn run_item(
             }
             CatchUp::Conflict(files) => {
                 let branch = &target.branch;
-                feedback = format!(
-                    "{branch} moved on since this branch was made, and merging it conflicts in: \
-                     {}. Paja started the merge: the conflicted files hold conflict markers. \
-                     Resolve each one, keeping what both sides meant, then `git add` the files \
-                     and `git commit -m '<message>'` to finish the merge.",
-                    files.join(", ")
-                );
-                if let Some(prior) = &prior {
-                    feedback.push_str(&format!(
-                        "\n\nThe review's blockers still need fixing too:\n\n{}",
-                        prior.blockers
-                    ));
-                }
+                feedback = conflict_feedback(branch, &files, prior.as_ref());
                 progress(&format!(
                     "the branch conflicts with {branch}; sending the merge to the builder"
                 ));
@@ -999,43 +987,8 @@ fn run_item(
         if skip_checks {
             progress("Vasara's checks already passed on this commit; skipping them");
         }
-        // Files marked assume-unchanged or skip-worktree hide from `git status`. Sparse
-        // checkout marks every file outside its cone skip-worktree, so the checks are judged
-        // by whether they changed the flags. Any flag the builder's code set goes first: a
-        // fresh index keeps only the ones sparse checkout gives.
         if !skip_checks {
-            let mut flags = git(&env.path, &["ls-files", "-v"])?;
-            if has_index_flags(&flags) {
-                put_back(&env, &checked)?;
-                flags = git(&env.path, &["ls-files", "-v"])?;
-            }
-            stop_point()?;
-            let guard = GitGuard::new(&env.path)?;
-            progress(&format!(
-                "running Vasara's checks ({} command{})",
-                checks.len(),
-                if checks.len() == 1 { "" } else { "s" }
-            ));
-            record_step(home, item, round, "checks", None, None)?;
-            let result = run_checks(&env.path, &checks);
-            guard.check("Vasara's checks")?;
-            // The checks run the branch's code, which could change the tree or even commit. Put it
-            // back, and fail the round, so nothing lands that the checks didn't judge.
-            let mut failed = result;
-            let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
-                || git(&env.path, &["ls-files", "-v"])? != flags
-                || !git(&env.path, &["status", "--porcelain"])?.is_empty();
-            if moved {
-                put_back(&env, &checked)?;
-                if let Ok(failure) = &mut failed {
-                    failure.get_or_insert_with(|| {
-                    "Running the checks changed the worktree or its commits; the change was put \
-                 back. Tests and builds must not write to the source tree or commit."
-                        .into()
-                });
-                }
-            }
-            let failed = failed?;
+            let failed = vasara(home, &env, item, round, &checks, &checked)?;
             if let Some(failure) = failed {
                 feedback =
                     format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
@@ -1223,12 +1176,71 @@ fn run_item(
             return escalated(home, repo, &env, item, &esc.question, round);
         }
         if verdicts.iter().all(|v| *v == "land") {
-            let report = match land(home, repo, &env, item, round, &checked, ci, &target) {
+            // One change lands at a time per repository, each on the latest default branch: a
+            // lane that waited while another landed merges that landing in and is checked again.
+            let landing = land_turn(home, item, round)?;
+            let mut judged = checked.clone();
+            match catch_up(repo, &env, &target.branch)? {
+                CatchUp::Current(_) => {}
+                CatchUp::Merged(tip) => {
+                    progress(&format!(
+                        "{} moved on while this change waited to land; merged it in, checking again",
+                        target.branch
+                    ));
+                    base = tip;
+                    judged = git(&env.path, &["rev-parse", "HEAD"])?;
+                    if let Some(failure) = vasara(home, &env, item, round, &checks, &judged)? {
+                        drop(landing);
+                        feedback = format!(
+                            "{} moved on after the review, and with it merged in Vasara's checks \
+                             fail. Fix the cause, not the check:\n\n{failure}",
+                            target.branch
+                        );
+                        // The next review reads all of it: the fix comes after a merge.
+                        prior = None;
+                        progress("the checks failed on the latest default branch; sending the failure back to the builder");
+                        let next = Next {
+                            feedback: &feedback,
+                            prior: None,
+                        };
+                        record_round_next(
+                            home,
+                            item,
+                            round,
+                            "checks_failed",
+                            &failure,
+                            steps,
+                            Some(next),
+                        )?;
+                        continue;
+                    }
+                    record_checked(home, item, round, &judged, &base)?;
+                }
+                CatchUp::Conflict(files) => {
+                    drop(landing);
+                    let branch = &target.branch;
+                    feedback = conflict_feedback(branch, &files, None);
+                    prior = None;
+                    progress(&format!(
+                        "{branch} moved on after the review and conflicts with the branch; sending the merge to the builder"
+                    ));
+                    let next = Next {
+                        feedback: &feedback,
+                        prior: None,
+                    };
+                    let detail = files.join(", ");
+                    record_round_next(home, item, round, "conflict", &detail, steps, Some(next))?;
+                    continue;
+                }
+            }
+            let landed = land(home, repo, &env, item, round, &judged, ci, &target);
+            drop(landing);
+            let report = match landed {
                 Ok(Landing::Retry(why)) => {
                     progress("CI failed; sending the failure back to the builder");
                     feedback = why.clone();
                     prior = Some(Prior {
-                        reviewed: checked,
+                        reviewed: judged,
                         blockers: why.clone(),
                         follow_ups: follow_ups.clone(),
                     });
@@ -2010,6 +2022,53 @@ fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
 
 /// Run each check in the environment. Returns the first failure's command and output. The
 /// checks run the branch's code, so they get no more credentials than the agent that wrote it.
+/// Run Vasara's checks on `checked` in the environment, under a `GitGuard`. The failure to send
+/// the builder, or None when they pass. The checks run the branch's code, which could change the
+/// tree or even commit: that is put back and fails them, so nothing lands that they didn't judge.
+fn vasara(
+    home: &Home,
+    env: &Env,
+    item: &WorkItem,
+    round: u32,
+    checks: &[String],
+    checked: &str,
+) -> Result<Option<String>> {
+    // Files marked assume-unchanged or skip-worktree hide from `git status`. Sparse checkout
+    // marks every file outside its cone skip-worktree, so the checks are judged by whether they
+    // changed the flags. Any flag the builder's code set goes first: a fresh index keeps only
+    // the ones sparse checkout gives.
+    let mut flags = git(&env.path, &["ls-files", "-v"])?;
+    if has_index_flags(&flags) {
+        put_back(env, checked)?;
+        flags = git(&env.path, &["ls-files", "-v"])?;
+    }
+    stop_point()?;
+    let guard = GitGuard::new(&env.path)?;
+    progress(&format!(
+        "running Vasara's checks ({} command{})",
+        checks.len(),
+        if checks.len() == 1 { "" } else { "s" }
+    ));
+    record_step(home, item, round, "checks", None, None)?;
+    let result = run_checks(&env.path, checks);
+    guard.check("Vasara's checks")?;
+    let mut failed = result;
+    let moved = git(&env.path, &["rev-parse", "HEAD"])? != checked
+        || git(&env.path, &["ls-files", "-v"])? != flags
+        || !git(&env.path, &["status", "--porcelain"])?.is_empty();
+    if moved {
+        put_back(env, checked)?;
+        if let Ok(failure) = &mut failed {
+            failure.get_or_insert_with(|| {
+                "Running the checks changed the worktree or its commits; the change was put back. \
+                 Tests and builds must not write to the source tree or commit."
+                    .into()
+            });
+        }
+    }
+    failed
+}
+
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     // Read before any check runs: later, the branch's code may have changed the configuration.
     let identity = git_identity(dir);
@@ -2289,6 +2348,25 @@ fn catch_up(repo: &Path, env: &Env, branch: &str) -> Result<CatchUp> {
             Ok(CatchUp::Conflict(files))
         }
     }
+}
+
+/// What the builder is told when merging the latest `branch` conflicts in `files`, with the
+/// review's blockers when they still need fixing.
+fn conflict_feedback(branch: &str, files: &[String], prior: Option<&Prior>) -> String {
+    let mut feedback = format!(
+        "{branch} moved on since this branch was made, and merging it conflicts in: {}. Paja \
+         started the merge: the conflicted files hold conflict markers. Resolve each one, keeping \
+         what both sides meant, then `git add` the files and `git commit -m '<message>'` to \
+         finish the merge.",
+        files.join(", ")
+    );
+    if let Some(prior) = prior {
+        feedback.push_str(&format!(
+            "\n\nThe review's blockers still need fixing too:\n\n{}",
+            prior.blockers
+        ));
+    }
+    feedback
 }
 
 /// Whether a merge is in progress in `dir`.
