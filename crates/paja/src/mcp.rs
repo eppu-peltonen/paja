@@ -211,7 +211,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: import open GitHub issues labelled paja into the work queue (uses gh)."
+        description = "Jono: import open GitHub issues with the repository's work label (.paja/labels on the default branch, factory when missing) into the work queue (uses gh)."
     )]
     async fn work_sync(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
         let home = self.home.clone();
@@ -315,7 +315,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: file a new GitHub issue labelled paja (uses gh), for example an approved spec. The next sync queues it. Returns its url."
+        description = "Jono: file a new GitHub issue with the repository's work label (uses gh), for example an approved spec. The next sync queues it. Returns its url."
     )]
     async fn work_file(&self, Parameters(args): Parameters<FileArgs>) -> Result<String, String> {
         let home = self.home.clone();

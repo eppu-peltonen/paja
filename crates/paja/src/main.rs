@@ -29,7 +29,7 @@ enum Command {
         #[command(subcommand)]
         command: EnvCommand,
     },
-    /// Jono: the work queue, imported from GitHub issues labelled `paja`.
+    /// Jono: the work queue, imported from GitHub issues with the work label (`.paja/labels`).
     Work {
         #[command(subcommand)]
         command: WorkCommand,
@@ -145,7 +145,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WorkCommand {
-    /// Import open issues labelled `paja` from the checkout's GitHub repository (uses `gh`).
+    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`).
     Sync {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
@@ -188,7 +188,7 @@ enum WorkCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// File a new GitHub issue labelled `paja` (uses `gh`); the next sync queues it.
+    /// File a new GitHub issue with the work label (uses `gh`); the next sync queues it.
     File {
         #[arg(long)]
         title: String,

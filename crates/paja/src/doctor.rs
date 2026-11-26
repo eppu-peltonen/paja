@@ -226,20 +226,9 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     }
 }
 
-/// `path` as `rev` has it: `None` when the file isn't there.
+/// `path` as `rev` has it: `None` when the file isn't there (see [`ahjo::show_at`]).
 fn show(repo: &Path, rev: &str, path: &str) -> std::result::Result<Option<String>, String> {
-    let out = run(ahjo::git_command()
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &format!("{rev}:{path}")]))?;
-    if out.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
-    }
-    let err = String::from_utf8_lossy(&out.stderr).into_owned();
-    if err.contains("does not exist in") || err.contains("exists on disk, but not in") {
-        return Ok(None);
-    }
-    Err(err.trim().to_string())
+    ahjo::show_at(repo, rev, path).map_err(|e| format!("{e:#}"))
 }
 
 fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {

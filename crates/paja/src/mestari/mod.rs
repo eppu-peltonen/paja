@@ -59,7 +59,7 @@ pub const EV_CHECKED: &str = "run.checked";
 pub const EV_STEP_DISCARDED: &str = "run.step_discarded";
 pub const EV_LANDED: &str = "run.landed";
 pub const EV_ESCALATED: &str = "run.escalated";
-/// A non-blocking review finding filed as a `paja-follow-up` issue after landing.
+/// A non-blocking review finding filed as a follow-up issue (the `follow-up` label) after landing.
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// The tamper lock lives in Ahjo, next to the git every command runs.
 pub use crate::ahjo::{Tampered, EV_TAMPERED, EV_TAMPER_CHECKED};
@@ -2132,28 +2132,9 @@ fn summaries(reviews: &[Review]) -> String {
         .join("\n")
 }
 
-/// Read a file as it is on the base commit, or None if it isn't there. Any other git failure
-/// is an error: a check file that can't be read must never count as an empty one.
+/// Read a file as it is on the base commit, or None if it isn't there (see [`ahjo::show_at`]).
 fn read_from_base(repo: &Path, base: &str, path: &str) -> Result<Option<String>> {
-    let spec = format!("{base}:{path}");
-    let output = git_command()
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &spec])
-        .output()
-        .context("running git (is it installed?)")?;
-    if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
-    }
-    let err = String::from_utf8_lossy(&output.stderr);
-    if err.contains("does not exist in") || err.contains("exists on disk, but not in") {
-        return Ok(None);
-    }
-    bail!(
-        "git show {spec} failed in {}: {}",
-        repo.display(),
-        err.trim()
-    )
+    ahjo::show_at(repo, base, path)
 }
 
 /// Non-empty lines that are not `#` comments.
