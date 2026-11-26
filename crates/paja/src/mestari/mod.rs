@@ -3,7 +3,7 @@
 //! reviewer agents read the diff cold, then land it or loop back, and escalate when stuck.
 //!
 //! Every step is a fresh headless `claude -p` run. The checks and the high-risk paths are read
-//! from the base commit on `main`, never from the branch under review, so a change can't
+//! from the base commit on the default branch, never from the branch under review, so a change can't
 //! loosen the checks that judge it.
 
 use std::path::{Path, PathBuf};
@@ -130,7 +130,7 @@ pub struct RoleModel {
     pub effort: Option<String>,
 }
 
-/// `.paja/models` as it is on main: one line per role, `role model [effort]`, plus an optional
+/// `.paja/models` as it is on the default branch: one line per role, `role model [effort]`, plus an optional
 /// `fallback model` line. A role with no line runs on the account's default model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Models {
@@ -315,10 +315,19 @@ impl std::fmt::Display for Declined {
 impl std::error::Error for Declined {}
 
 /// What a run is about to do, on stderr, before the first agent starts.
-fn summary(item: &jono::WorkItem, ci: CiMode, sandbox: bool) {
+fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bool) {
     progress(&format!("repository: {}", item.repo));
     progress(&format!("item: #{} {}", item.number, item.title));
-    progress("merges into: main (default branch), by squash");
+    let method = match target.merge_flag() {
+        Some("--squash") => "by squash",
+        Some("--rebase") => "by rebase",
+        Some(_) => "by a merge commit",
+        None => "no merge method allowed, so landing escalates",
+    };
+    progress(&format!(
+        "merges into: {} (default branch), {method}",
+        target.branch
+    ));
     progress(&match ci {
         CiMode::Required => "CI: required before landing".to_string(),
         CiMode::None => format!(
@@ -401,7 +410,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
-    summary(&item, config.ci, crate::sandbox::active().is_some());
+    summary(
+        &item,
+        &config.target,
+        config.ci,
+        crate::sandbox::active().is_some(),
+    );
     if opts.confirm && !confirmed()? {
         // Put the item back, so declining leaves the queue as it was. A resumed item was
         // active already and stays so.
@@ -506,7 +520,8 @@ struct Unrecorded {
     steps: Vec<StepUsage>,
 }
 
-/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on `main`).
+/// Whether the repository has CI Paja waits for before landing (`.paja/ci` on the default
+/// branch).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CiMode {
     /// Wait for the pull request's CI checks to pass (the default).
@@ -516,13 +531,13 @@ enum CiMode {
 }
 
 impl CiMode {
-    fn parse(text: Option<&str>) -> Result<CiMode> {
+    fn parse(text: Option<&str>, branch: &str) -> Result<CiMode> {
         let words = lines(text.unwrap_or_default());
         match words.as_slice() {
             [] => Ok(CiMode::Required),
             [w] if w == "required" => Ok(CiMode::Required),
             [w] if w == "none" => Ok(CiMode::None),
-            _ => bail!("{CI_FILE} on main must hold `required` or `none`; fix it on main"),
+            _ => bail!("{CI_FILE} on {branch} must hold `required` or `none`; fix it on {branch}"),
         }
     }
 }
@@ -624,7 +639,7 @@ fn read_config(
     let commands = crate::hook::Commands::parse(
         read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
     )?;
-    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref())?;
+    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref(), branch)?;
     Ok(Config {
         ci,
         checks,

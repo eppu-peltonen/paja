@@ -1483,6 +1483,20 @@ impl Factory {
         )
     }
 
+    /// `run`, with the progress lines it wrote on stderr.
+    fn run_with_stderr(&self) -> (Value, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&self.repo)
+            .env("PAJA_HOME", &self.home)
+            .env("PAJA_GH", &self.gh)
+            .env("PAJA_CLAUDE", &self.claude)
+            .args(["--json", "run"])
+            .output()
+            .unwrap();
+        let report = serde_json::from_slice(&output.stdout).unwrap();
+        (report, String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
     /// Commit `text` as `path` on main and push it, as a person changing the factory would.
     fn on_main(&self, path: &str, text: &str) {
         std::fs::write(self.repo.join(path), text).unwrap();
@@ -1538,9 +1552,12 @@ fn a_run_uses_the_labels_main_names() {
 fn run_lands_on_the_default_branch_with_an_allowed_merge_method() {
     let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "trunk"}, "squashMergeAllowed": false, "mergeCommitAllowed": true, "rebaseMergeAllowed": false}"#;
     let f = Factory::on_branch("test -f feature.txt\n", "land", "trunk", view);
-    let (ok, report) = f.run();
-    assert!(ok, "{report}");
-    assert_eq!(report["outcome"], "landed", "{report}");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("merges into: trunk (default branch), by a merge commit"),
+        "{stderr}"
+    );
     let log = f.gh_log();
     assert!(
         log.contains(&format!("pr create --base trunk --head paja/{WORK_5}")),
