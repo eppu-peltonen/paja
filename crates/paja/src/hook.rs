@@ -705,11 +705,12 @@ fn check_read(path: &Path, b: &Bounds) -> Option<String> {
 /// One piece of a command line.
 #[derive(Debug, PartialEq)]
 enum Token {
-    /// A word, and whether any part of it was quoted. Bash never reads a word with quotes
-    /// as an assignment: `'RUST_LOG=x' cargo` runs a program named `RUST_LOG=x`.
+    /// A word, and whether bash could read it as an assignment: its first `=` is unquoted
+    /// and nothing before it was quoted. So `RUST_LOG='x' cargo` sets `RUST_LOG`, while
+    /// `'RUST_LOG=x' cargo` and `RUST_LOG"=x" cargo` run a program named `RUST_LOG=x`.
     Word {
         text: String,
-        quoted: bool,
+        assigns: bool,
     },
     And,
     Pipe,
@@ -722,23 +723,26 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
-    let mut quoted = false;
+    // Per word: `None` until its first unquoted `=` or quote, then whether that came first.
+    let mut assigns: Option<bool> = None;
     let mut chars = command.chars().peekable();
-    let flush =
-        |word: &mut String, in_word: &mut bool, quoted: &mut bool, tokens: &mut Vec<Token>| {
-            if *in_word {
-                tokens.push(Token::Word {
-                    text: std::mem::take(word),
-                    quoted: std::mem::take(quoted),
-                });
-                *in_word = false;
-            }
-        };
+    let flush = |word: &mut String,
+                 in_word: &mut bool,
+                 assigns: &mut Option<bool>,
+                 tokens: &mut Vec<Token>| {
+        if *in_word {
+            tokens.push(Token::Word {
+                text: std::mem::take(word),
+                assigns: assigns.take() == Some(true),
+            });
+            *in_word = false;
+        }
+    };
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
                 in_word = true;
-                quoted = true;
+                assigns.get_or_insert(false);
                 loop {
                     match chars.next() {
                         Some('\'') => break,
@@ -749,7 +753,7 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             }
             '"' => {
                 in_word = true;
-                quoted = true;
+                assigns.get_or_insert(false);
                 loop {
                     match chars.next() {
                         Some('"') => break,
@@ -761,14 +765,14 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
                     }
                 }
             }
-            ' ' | '\t' => flush(&mut word, &mut in_word, &mut quoted, &mut tokens),
+            ' ' | '\t' => flush(&mut word, &mut in_word, &mut assigns, &mut tokens),
             '&' if chars.peek() == Some(&'&') => {
                 chars.next();
-                flush(&mut word, &mut in_word, &mut quoted, &mut tokens);
+                flush(&mut word, &mut in_word, &mut assigns, &mut tokens);
                 tokens.push(Token::And);
             }
             '|' if chars.peek() != Some(&'|') => {
-                flush(&mut word, &mut in_word, &mut quoted, &mut tokens);
+                flush(&mut word, &mut in_word, &mut assigns, &mut tokens);
                 tokens.push(Token::Pipe);
             }
             '2' if !in_word && next_is(&mut chars, ">&1") => {
@@ -779,6 +783,9 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
                 || "-_./=:,+@%^".contains(c)
                 || (c == '~' && in_word) =>
             {
+                if c == '=' {
+                    assigns.get_or_insert(true);
+                }
                 in_word = true;
                 word.push(c);
             }
@@ -786,7 +793,7 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             c => return Err(format!("`{c}` outside quotes")),
         }
     }
-    flush(&mut word, &mut in_word, &mut quoted, &mut tokens);
+    flush(&mut word, &mut in_word, &mut assigns, &mut tokens);
     Ok(tokens)
 }
 
@@ -834,12 +841,19 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
         let moves = i == 0 && stages.len() == 1;
         for (j, stage) in stages.into_iter().enumerate() {
             let mut words: Vec<&str> = Vec::new();
-            // Leading unquoted `NAME=value` words, which bash reads as assignments.
+            // Leading `NAME=value` words that bash reads as assignments.
             let mut assignments = 0;
             for (k, token) in stage.iter().enumerate() {
                 match token {
-                    Token::Word { text, quoted } => {
-                        if words.len() == assignments && !quoted && is_assignment(text) {
+                    Token::Word { text, assigns } => {
+                        if words.len() == assignments && is_assignment(text) {
+                            if !assigns {
+                                return Some(format!(
+                                    "`{text}` has a quote before its `=`, so bash runs it as a \
+                                     program, not an assignment; quote only the value, as in \
+                                     `NAME='value'`"
+                                ));
+                            }
                             assignments += 1;
                         }
                         words.push(text);
@@ -1370,15 +1384,37 @@ mod tests {
     }
 
     #[test]
-    fn a_quoted_word_is_never_an_assignment() {
-        assert_eq!(bash("RUST_LOG=debug cargo test"), None);
+    fn only_a_quote_before_the_equals_sign_stops_an_assignment() {
+        for good in [
+            "RUST_LOG=debug cargo test",
+            "RUST_LOG='debug' cargo test",
+            "RUST_LOG=\"debug\" cargo test",
+            "RUST_LOG=paja='debug' RUST_BACKTRACE=1 cargo test",
+        ] {
+            assert_eq!(bash(good), None, "{good}");
+        }
         for bad in [
             "'RUST_LOG=x' cargo test",
             "\"RUST_LOG=x\" cargo test",
             "RUST_LOG'=x' cargo test",
+            "RUST_LOG\"=\"x cargo test",
+            "'RUST'_LOG=x cargo test",
         ] {
-            assert!(bash(bad).is_some(), "{bad}");
+            let reason = bash(bad).unwrap_or_else(|| panic!("{bad} was allowed"));
+            assert!(reason.contains("quote only the value"), "{bad}: {reason}");
         }
+        // A quoted variable that isn't allowed is still refused for its name.
+        assert!(bash("PAJA_HOME='x' cargo test")
+            .is_some_and(|r| r.contains("agents don't set PAJA_HOME")));
+    }
+
+    #[test]
+    fn a_quoted_word_between_assignments_ends_them() {
+        let reason = bash("RUST_LOG=debug 'RUST_BACKTRACE=1' cargo test").expect("refused");
+        assert!(
+            reason.contains("`RUST_BACKTRACE=1` has a quote"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1953,9 +1989,10 @@ mod windows_tests {
     }
 
     #[test]
-    fn a_quoted_word_is_never_an_assignment() {
+    fn only_a_quoted_name_stops_an_assignment() {
         let e = env();
         assert_eq!(e.bash("RUST_LOG=debug cargo test"), None);
+        assert_eq!(e.bash("RUST_LOG='debug' cargo test"), None);
         for bad in ["'RUST_LOG=x' cargo test", "\"RUST_LOG=x\" cargo test"] {
             assert!(e.bash(bad).is_some(), "{bad}");
         }

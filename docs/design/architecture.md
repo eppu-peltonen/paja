@@ -166,7 +166,8 @@ from the tool call, because the reported `cwd` moves when the agent runs `cd`.
   drops `..` as text before following links), then `cargo`, local `git` and `pwd` commands joined by `&&`, each
   optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading `~`
   or `=`, redirections other than `2>&1`, or other separators outside single quotes. Only `RUST_BACKTRACE` and
-  `RUST_LOG` may be set in front of a command.
+  `RUST_LOG` may be set in front of a command, and only the value may be quoted (`RUST_LOG='debug'`): bash runs a
+  word with a quote before its `=` as a program, so the hook refuses it and says to quote only the value.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
