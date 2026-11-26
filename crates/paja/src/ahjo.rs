@@ -314,7 +314,13 @@ pub fn repo_key(path: &Path) -> Result<String> {
         path,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
-    .with_context(|| format!("finding the git repository at {}", path.display()))?;
+    .with_context(|| {
+        format!(
+            "{} is not inside a git checkout; run paja from the repository's checkout, or pass \
+             `--repo` (the `repo` argument of the MCP tools) a path inside it",
+            path.display()
+        )
+    })?;
     Ok(std::fs::canonicalize(&common)
         .unwrap_or_else(|_| PathBuf::from(&common))
         .display()
