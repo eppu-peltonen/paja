@@ -165,8 +165,11 @@ error waits for the next timed sync, as `--every` waits after a failed pass. The
 is `starting`, `build`, `checks`, `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja
 pool status` and its MCP tool `pool_status` rebuild the pool from them and the lock alone. Ctrl-C or a `stop` line
 stops admitting and is passed on to every lane's run, which finishes its step as one run does; the pool stops when
-the lanes have. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
-(`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes.
+the lanes have. A tamper stop any lane's run records (`run.tampered` for the checkout) is seen on the next tick: every
+lane is told `stop now`, none starts, and the pool ends with the tamper error, as `--every` would. A pool that ends on
+any other error stops its lanes the same way first. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
+(`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes;
+`origin/<branch>` is then moved to that tip, as a plain fetch would.
 
 Then, for at most three rounds:
 

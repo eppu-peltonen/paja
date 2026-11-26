@@ -5171,7 +5171,12 @@ fn a_merge_github_refuses_escalates_naming_the_setting() {
 /// builder held until its `holds/<title>` file is removed.
 #[cfg(unix)]
 fn pool_factory(four: bool) -> Factory {
-    let f = Factory::new("true\n", "land");
+    pool_factory_with(four, "true\n")
+}
+
+#[cfg(unix)]
+fn pool_factory_with(four: bool, checks: &str) -> Factory {
+    let f = Factory::new(checks, "land");
     let dir = f.tmp.path();
     let mut titles = vec!["Alpha", "Beta", "Gamma"];
     if four {
@@ -5391,4 +5396,50 @@ fn workers_needs_every_and_pool_lanes_has_a_limit() {
     let (ok, err) = paja(tmp.path(), tmp.path(), &["pool", "lanes", "33"]);
     assert!(!ok);
     assert!(err["error"].as_str().unwrap().contains("33"), "{err}");
+}
+
+/// A lane whose checks change git's configuration stops the whole pool: the other lanes stop at
+/// once, no new one starts, and the pool ends with the tamper error.
+#[cfg(unix)]
+#[test]
+fn a_tamper_in_one_lane_stops_every_lane() {
+    let tmp_flag = tempfile::tempdir().unwrap();
+    let flag = tmp_flag.path().join("tamper");
+    let f = pool_factory_with(
+        false,
+        &format!(
+            "if [ -f {} ]; then git config paja.planted yes; fi\n",
+            slash(&flag)
+        ),
+    );
+    let mut pool = start_pool(&f, "2");
+    wait_until(&f, "two lanes building", || {
+        holding(&f, "Alpha") && holding(&f, "Beta")
+    });
+    std::fs::write(&flag, "").unwrap();
+    release(&f, "Alpha");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = pool.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the pool kept running after a tamper"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(!status.success());
+    assert!(!holding(&f, "Gamma"), "a lane started after the tamper");
+    let stopped = events_of(&f, "pool.stopped");
+    assert!(
+        stopped[0]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("--tamper-checked"),
+        "{stopped:?}"
+    );
+    // Beta's run was stopped, not left building.
+    let (_, beta) = paja(&f.home, &f.repo, &["work", "show", "6"]);
+    assert_ne!(beta["run"]["state"], "running", "{beta}");
 }

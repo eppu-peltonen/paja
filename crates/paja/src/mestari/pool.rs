@@ -82,7 +82,16 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
     }
     let repo = std::path::absolute(opts.repo)?;
     let name = super::sync_queue(home, &repo)?;
-    let Some(_pool) = home.try_pool_lock(&name)? else {
+    // The key the tamper lock uses for this checkout, read once: the pool looks for a tamper
+    // stop on every tick without running git.
+    let key = crate::ahjo::repo_key(&repo)?;
+    // Under the home lock, as `paja pool status` probes it, so a probe never makes a starting
+    // pool think another one runs.
+    let pool_lock = {
+        let _home = home.lock()?;
+        home.try_pool_lock(&name)?
+    };
+    let Some(_pool) = pool_lock else {
         bail!(
             "a pool is already running for {name} (see `paja pool status`); change its lanes \
              with `paja pool lanes <N>`, or stop it first"
@@ -102,15 +111,20 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         "pool of {name}: up to {} lanes (`paja pool lanes <N>` changes it; Ctrl+C stops)",
         opts.lanes
     ));
-    let outcome = Pool {
+    let mut pool = Pool {
         home,
         repo: &repo,
         name: &name,
+        key: &key,
         opts: &opts,
         lanes: BTreeMap::new(),
         held_back: BTreeSet::new(),
+    };
+    let outcome = pool.run();
+    // A pool that ends on an error leaves no lane running unsupervised.
+    if outcome.is_err() {
+        pool.stop_all();
     }
-    .run();
     let stopped = match &outcome {
         Ok(()) => json!({ "repo": name }),
         Err(err) => json!({ "repo": name, "error": format!("{err:#}") }),
@@ -124,6 +138,8 @@ struct Pool<'a> {
     home: &'a Home,
     repo: &'a Path,
     name: &'a str,
+    /// The checkout's key in the tamper lock.
+    key: &'a str,
     opts: &'a PoolOptions<'a>,
     lanes: BTreeMap<u32, Lane>,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
@@ -160,11 +176,22 @@ impl Pool<'_> {
                     need_sync = true;
                 }
             }
+            let events = self.home.events().read_all()?;
+            // A lane's run that found the repository's git configuration changed recorded a
+            // tamper stop: no lane may run git or gh there again, so all of them stop now.
+            if fatal.is_none() && tampered(&events, self.key) {
+                let err = crate::ahjo::ensure_untampered(self.home, self.repo)
+                    .err()
+                    .unwrap_or_else(|| anyhow::anyhow!("a lane's run stopped on a tamper"));
+                for lane in self.lanes.values_mut() {
+                    lane.tell("stop now");
+                }
+                fatal = Some(err);
+            }
             let stopping = level > 0 || fatal.is_some();
             if stopping && self.lanes.is_empty() {
                 return fatal.map_or(Ok(()), Err);
             }
-            let events = self.home.events().read_all()?;
             self.follow_stages(&events)?;
             if !stopping {
                 let target = target_lanes(&events, self.name).unwrap_or(self.opts.lanes);
@@ -323,6 +350,17 @@ impl Pool<'_> {
         Ok(())
     }
 
+    /// Stop every lane's run at once and wait for it to end.
+    fn stop_all(&mut self) {
+        for lane in self.lanes.values_mut() {
+            lane.tell("stop now");
+        }
+        for lane in self.lanes.values_mut() {
+            let _ = lane.child.wait();
+        }
+        self.lanes.clear();
+    }
+
     fn say_error(&self, err: &anyhow::Error) {
         if self.opts.json {
             println!("{}", json!({ "error": format!("{err:#}") }));
@@ -444,6 +482,18 @@ fn record_lane(
     )
 }
 
+/// Whether the latest tamper event for the checkout `key` is a stop, not a person's check.
+fn tampered(events: &[Event], key: &str) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|e| {
+            (e.kind == crate::ahjo::EV_TAMPERED || e.kind == crate::ahjo::EV_TAMPER_CHECKED)
+                && e.data["repo"] == key
+        })
+        .is_some_and(|e| e.kind == crate::ahjo::EV_TAMPERED)
+}
+
 /// The lane count `repo`'s pool keeps: its latest `pool.lanes`, or None when none was set.
 fn target_lanes(events: &[Event], repo: &str) -> Option<u32> {
     events
@@ -486,7 +536,7 @@ pub fn lanes(home: &Home, repo: &str, lanes: Option<u32>) -> Result<Lanes> {
 }
 
 /// Whether a live pool holds `repo`'s pool lock: taken and let go of at once, under the home
-/// lock as pools take it... a probe only.
+/// lock, under which a pool takes it too.
 fn pool_running(home: &Home, repo: &str) -> Result<bool> {
     let _home = home.lock()?;
     Ok(home.try_pool_lock(repo)?.is_none())
@@ -799,6 +849,22 @@ mod tests {
         let died = from_events(&events[..2], "acme/app", false, &[item(9, &[])]);
         assert_eq!((died.state.as_str(), died.busy), ("stopped", 0));
         assert_eq!(died.waiting[0].why, "no pool is running");
+    }
+
+    #[test]
+    fn a_tamper_stop_counts_until_a_person_checked() {
+        let stop = |seq| event(seq, crate::ahjo::EV_TAMPERED, json!({"repo": "/r/.git"}));
+        let checked = |seq| {
+            event(
+                seq,
+                crate::ahjo::EV_TAMPER_CHECKED,
+                json!({"repo": "/r/.git"}),
+            )
+        };
+        assert!(!tampered(&[], "/r/.git"));
+        assert!(tampered(&[stop(1)], "/r/.git"));
+        assert!(!tampered(&[stop(1)], "/other/.git"));
+        assert!(!tampered(&[stop(1), checked(2)], "/r/.git"));
     }
 
     #[test]
