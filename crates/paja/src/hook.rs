@@ -443,10 +443,12 @@ const RG_IGNORE_FILES: &[&str] = &[".ignore", ".rgignore"];
 fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
     let target = b.root.join("target");
     let exists = |path: PathBuf| std::fs::symlink_metadata(path).is_ok();
-    let negates = |gitignore: PathBuf| match std::fs::read(&gitignore) {
-        Ok(text) => text
+    // A file too big to judge counts as one that could bring `target` back.
+    let negates = |gitignore: PathBuf| match read_small(&gitignore) {
+        Ok(Some(text)) => text
             .split(|byte| *byte == b'\n')
             .any(|line| line.starts_with(b"!")),
+        Ok(None) => true,
         Err(err) => err.kind() != std::io::ErrorKind::NotFound,
     };
     let rg_ignore = b.root.ancestors().any(|dir| {
@@ -459,7 +461,10 @@ fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
         return Vec::new();
     }
     // ripgrep stops reading an ignore file at its first line that isn't UTF-8.
-    let Ok(text) = std::fs::read_to_string(b.root.join(".gitignore")) else {
+    let Ok(Some(bytes)) = read_small(&b.root.join(".gitignore")) else {
+        return Vec::new();
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
         return Vec::new();
     };
     let lines: Vec<&[u8]> = text
@@ -477,7 +482,7 @@ fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
                 .iter()
                 .all(|c| c.is_ascii_alphanumeric() || b"._-/*?".contains(c))
     };
-    if text.len() > 4096 || !lines.iter().all(plain) {
+    if !lines.iter().all(plain) {
         return Vec::new();
     }
     let names = lines
@@ -488,6 +493,20 @@ fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
     } else {
         Vec::new()
     }
+}
+
+/// The largest `.gitignore` the Grep skip reads.
+const SMALL_FILE: u64 = 4096;
+
+/// A file's bytes if it holds at most [`SMALL_FILE`] of them, or `None` if it holds more. Only
+/// that much is read, so a huge file can't use up the hook's memory.
+fn read_small(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(SMALL_FILE + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= SMALL_FILE).then_some(bytes))
 }
 
 /// The first symlink out of the worktree, leaving out the directories in `skip`. If the walk
@@ -1226,6 +1245,18 @@ mod scan_tests {
     use serde_json::json;
 
     #[test]
+    fn read_small_reads_at_most_4_kib() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+        assert_eq!(read_small(&path).unwrap().map(|b| b.len()), Some(4096));
+        std::fs::write(&path, vec![b'x'; 1 << 20]).unwrap();
+        assert_eq!(read_small(&path).unwrap(), None);
+        let missing = read_small(&tmp.path().join("none")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn a_large_ignored_target_keeps_searches_fast() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("home").join("envs").join("a");
@@ -1687,6 +1718,16 @@ mod tests {
             gitignore(&text);
             assert!(grep().is_some(), "{}", &text[..20]);
         }
+        // Exactly 4 KiB is read; one byte more is not.
+        let padded = |len: usize| format!("target/\n#{}\n", "x".repeat(len - 10));
+        gitignore(&padded(4096));
+        assert_eq!(grep(), None, "a 4 KiB file");
+        gitignore(&padded(4097));
+        assert!(grep().is_some(), "a file over 4 KiB");
+        gitignore("target/\n");
+        std::fs::write(tmp.join(".gitignore"), padded(4097)).unwrap();
+        assert!(grep().is_some(), "a file over 4 KiB above the worktree");
+        std::fs::remove_file(tmp.join(".gitignore")).unwrap();
         gitignore("# build output\n/target\n__pycache__/\n*.pyc\n**/out?.log\n");
         assert_eq!(grep(), None, "comments, names and simple wildcards");
         std::fs::write(root.join(".gitignore"), b"\xff\ntarget/\n").unwrap();
@@ -2053,5 +2094,67 @@ mod windows_tests {
         assert!(made.status.success(), "{made:?}");
         assert!(e.decide("Glob", json!({"pattern": "**/*.rs"})).is_some());
         assert!(e.write(&e.at("out\\x.rs")).is_some());
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+    }
+
+    /// A worktree whose `.gitignore` ignores `target`, with CRLF line ends as a Windows checkout
+    /// may have them.
+    fn ignoring_target() -> Env {
+        let e = env();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&e.root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init");
+        std::fs::write(e.root.join(".gitignore"), "/target\r\n").unwrap();
+        e
+    }
+
+    #[test]
+    fn a_grep_skips_target_only_when_ripgrep_does() {
+        let e = ignoring_target();
+        let outside = e.home.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(e.root.join("target").join("debug")).unwrap();
+        junction(&e.root.join("target").join("debug").join("out"), &outside);
+        let grep = |input: Value| e.decide("Grep", input);
+        // CRLF line ends are read the way ripgrep reads them, so `target` is left out.
+        assert_eq!(grep(json!({"pattern": "x"})), None);
+        // A search that starts in `target`, typed in any case, searches it, so it is checked.
+        for path in ["target\\debug", "TARGET\\debug", "Target"] {
+            assert!(
+                grep(json!({"pattern": "x", "path": path})).is_some(),
+                "{path}"
+            );
+        }
+        // Globs override ignores, so the whole worktree is checked.
+        assert!(grep(json!({"pattern": "x", "glob": "*.rs"})).is_some());
+        // A junction elsewhere in the worktree into `target` reaches it by another name.
+        junction(&e.root.join("src").join("via"), &e.root.join("target"));
+        assert!(
+            grep(json!({"pattern": "x"})).is_some(),
+            "a junction into target"
+        );
+    }
+
+    #[test]
+    fn a_target_that_is_a_junction_out_blocks_a_grep() {
+        let e = ignoring_target();
+        let outside = e.home.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        junction(&e.root.join("target"), &outside);
+        assert!(e.decide("Grep", json!({"pattern": "x"})).is_some());
     }
 }
