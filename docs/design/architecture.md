@@ -389,6 +389,12 @@ while it starts.
 - **Assumptions about `sbx`.** Everything Paja assumes about it is in `crates/paja/src/sandbox.rs`: `sbx exec`
   with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, and that a mounted path has the same absolute
   path inside the sandbox.
+- **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
+  which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
+  needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
+  of the real one on `PATH` sets `GIT_DIR` and `GIT_WORK_TREE` for git commands aimed at the worktree (current
+  directory or `-C`, compared by identity, not spelling). Other git commands run unchanged. The `.git` file on the
+  host is never rewritten.
 - **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
   Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The
   other worktrees under `envs/` are mounted too, so code in one worktree can reach another.
