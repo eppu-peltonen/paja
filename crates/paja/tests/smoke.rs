@@ -939,6 +939,7 @@ impl Factory {
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
                  *--json-schema*) if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
+                 if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt)\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper\\\"]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\"}}'; exit 0; fi ;; esac\n\
@@ -1079,6 +1080,40 @@ fn run_builds_reviews_and_lands_an_issue() {
     let (ok, idle) = f.run();
     assert!(ok);
     assert_eq!(idle["outcome"], "idle");
+}
+
+#[test]
+fn a_round_that_errors_still_records_what_it_spent() {
+    // The reviewer's answer is broken, so the round stops on an error after the build ran.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("review-broken"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let rounds: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .collect();
+    assert_eq!(rounds.len(), 1, "{log}");
+    let round = &rounds[0]["data"];
+    assert_eq!(round["verdict"], "error", "{round}");
+    // The error is the round's detail, as the item's question also says.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    let detail = round["detail"].as_str().unwrap();
+    assert!(!detail.is_empty(), "{round}");
+    assert!(
+        report["question"].as_str().unwrap().contains(&detail[..40]),
+        "{report}"
+    );
+    let steps = round["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{round}");
+    assert_eq!(steps[0]["step"], "build");
+    assert_eq!(item["status"], "escalated", "{item}");
+    assert_eq!(item["usage"]["steps"], 1, "{item}");
+    assert_eq!(item["usage"]["input_tokens"], 100, "{item}");
 }
 
 #[test]

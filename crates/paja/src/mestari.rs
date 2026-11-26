@@ -472,16 +472,22 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     };
     progress(&format!("picked #{}: {}", item.number, item.title));
     // Anything that goes wrong from here is reported on the issue, not lost.
-    let mut rounds = 0;
-    match run_item(home, &repo, &base, &item, config, &mut rounds) {
+    let mut run = Unrecorded::default();
+    match run_item(home, &repo, &base, &item, config, &mut run) {
         Ok(report) => Ok(report),
         Err(err) => {
+            let rounds = run.round;
             let question = format!(
                 "Paja's run stopped with an error it can't fix by itself:\n\n```\n{err:#}\n```\n\n\
                  Fix the cause, then answer with what you fixed."
             );
             // Park the item first, so it never stays active if GitHub is the thing failing.
             jono::set_status(home, item.number, Status::Escalated, Some(&question))?;
+            // The steps that ran before the error were spent too; keep them in the item's usage.
+            if !run.steps.is_empty() {
+                let error = format!("{err:#}");
+                record_round(home, &item, rounds, "error", &error, &mut run.steps)?;
+            }
             record(
                 home,
                 EV_ESCALATED,
@@ -512,6 +518,14 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
             })
         }
     }
+}
+
+/// Where a run is, so an error can still record what the round spent: the round it is in and
+/// the steps that ran in it but are not yet in a `run.round` event.
+#[derive(Default)]
+struct Unrecorded {
+    round: u32,
+    steps: Vec<StepUsage>,
 }
 
 /// Vasara's check commands, the high-risk paths and the model per role, as `main` has them.
@@ -547,7 +561,7 @@ fn run_item(
     base: &str,
     item: &WorkItem,
     config: Config,
-    rounds: &mut u32,
+    run: &mut Unrecorded,
 ) -> Result<RunReport> {
     let Config {
         checks,
@@ -572,7 +586,9 @@ fn run_item(
     let (mut builder_limits, mut review_limits) = (0u32, 0u32);
     progress(&format!("working in {}", env.path.display()));
     for round in 1..=MAX_ROUNDS {
-        *rounds = round;
+        run.round = round;
+        let steps = &mut run.steps;
+        steps.clear();
         progress(&format!(
             "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
         ));
@@ -609,7 +625,8 @@ fn run_item(
                     models.max_turns(role)
                 );
                 builder_limits += 1;
-                record_round(home, item, round, "turn_limit", &note, &[step])?;
+                steps.push(step);
+                record_round(home, item, round, "turn_limit", &note, steps)?;
                 if builder_limits > 1 {
                     return turn_limit_twice(home, repo, &env, item, &note, round);
                 }
@@ -629,11 +646,11 @@ fn run_item(
             }
         };
         builder = Some(raw);
-        let mut steps = vec![step];
+        steps.push(step);
         // A question goes to the person at once: no checks run and no rounds are spent on it.
         if let Some(asked) = asked {
             progress("the builder asked for a decision");
-            record_round(home, item, round, "question", &asked, &steps)?;
+            record_round(home, item, round, "question", &asked, steps)?;
             let question =
                 format!("Paja's builder needs a decision before it can go on:\n\n{asked}");
             return escalated(home, repo, &env, item, &question, round);
@@ -646,7 +663,7 @@ fn run_item(
         {
             feedback = "The previous round made no commits. Make the change and commit it.".into();
             progress("the builder committed nothing; asking again");
-            record_round(home, item, round, "no_change", &feedback, &steps)?;
+            record_round(home, item, round, "no_change", &feedback, steps)?;
             continue;
         }
         // A round after a review must commit a fix; an empty fix is never reviewed.
@@ -657,7 +674,7 @@ fn run_item(
                     prior.blockers
                 );
                 progress("the builder committed no fix; asking again");
-                record_round(home, item, round, "no_change", &feedback, &steps)?;
+                record_round(home, item, round, "no_change", &feedback, steps)?;
                 continue;
             }
         }
@@ -706,7 +723,7 @@ fn run_item(
                 ));
             }
             progress("the checks failed; sending the failure back to the builder");
-            record_round(home, item, round, "checks_failed", &failure, &steps)?;
+            record_round(home, item, round, "checks_failed", &failure, steps)?;
             continue;
         }
         // --no-renames lists both sides of a rename, so moving a high-risk file keeps it high risk.
@@ -796,7 +813,7 @@ fn run_item(
         }
         if let Some(note) = limited {
             review_limits += 1;
-            record_round(home, item, round, "turn_limit", &note, &steps)?;
+            record_round(home, item, round, "turn_limit", &note, steps)?;
             if review_limits > 1 {
                 return turn_limit_twice(home, repo, &env, item, &note, round);
             }
@@ -833,7 +850,7 @@ fn run_item(
             round,
             &verdicts.join(","),
             &summaries(&reviews),
-            &steps,
+            steps,
         )?;
 
         if let Some(esc) = reviews.iter().find(|r| r.verdict == "escalate") {
@@ -2267,8 +2284,10 @@ fn record_round(
     round: u32,
     verdict: &str,
     detail: &str,
-    steps: &[StepUsage],
+    steps: &mut Vec<StepUsage>,
 ) -> Result<()> {
+    // Recorded once: an error later in the run must not count these steps again.
+    let steps = std::mem::take(steps);
     record(
         home,
         EV_ROUND,

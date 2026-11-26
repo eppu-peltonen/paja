@@ -126,7 +126,9 @@ recorded as `run.started`, `run.round`, `run.landed` or `run.escalated`, plus a 
 review finding. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or
 `review` with its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and
 cache-creation tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p`
-result. A field the result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying
+result. A round that stops on an error still records the steps that already ran, as a `run.round` with verdict
+`error` and the error as its detail, before the item is parked. A field the result lacks is `null`, never zero, and
+rounds recorded before steps were kept have none. Replaying
 those events gives each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching
 MCP tools; steps with missing fields count in its `unknown_steps` and add nothing, and so does a recorded step Jono can't read,
 so a bad usage record never stops the queue. While it works, `paja run` prints one progress line per step on stderr (the issue it picked, each build
