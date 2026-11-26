@@ -96,6 +96,17 @@ impl Home {
     /// it is an OS file lock, so it is free again once that run's process is gone, however it
     /// stopped.
     pub fn try_run_lock(&self, repo: &str, number: u64) -> Result<Option<RunLock>> {
+        self.try_runs_lock(repo, &number.to_string())
+    }
+
+    /// Take the lock a `paja run --workers` pool holds for `repo` for as long as it runs,
+    /// without waiting. None when a live pool holds it, so one repository has one pool.
+    pub fn try_pool_lock(&self, repo: &str) -> Result<Option<RunLock>> {
+        self.try_runs_lock(repo, "pool")
+    }
+
+    /// A lock file `runs/<owner>@<name>@<tail>.lock`, taken without waiting.
+    fn try_runs_lock(&self, repo: &str, tail: &str) -> Result<Option<RunLock>> {
         let dir = self.root.join("runs");
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         // `owner/name` as one file name: GitHub names hold only letters, digits and `-_.`, and
@@ -108,7 +119,7 @@ impl Home {
                 _ => '_',
             })
             .collect();
-        let path = dir.join(format!("{repo}@{number}.lock"));
+        let path = dir.join(format!("{repo}@{tail}.lock"));
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -125,7 +136,8 @@ impl Home {
     }
 }
 
-/// Held by the `paja run` working on an item, for as long as it works on it.
+/// Held by the `paja run` working on an item, for as long as it works on it (or by a pool, for
+/// as long as it runs).
 #[derive(Debug)]
 pub struct RunLock {
     _file: File,

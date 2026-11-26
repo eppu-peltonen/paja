@@ -152,10 +152,7 @@ pub(super) fn land(
 /// Whether `branch` on origin has moved past what `judged` holds. A fetch that fails counts
 /// as not moved, so the caller escalates rather than spending a round.
 fn default_branch_moved(repo: &Path, branch: &str, judged: &str) -> bool {
-    if git(repo, &["fetch", "-q", "origin", branch]).is_err() {
-        return false;
-    }
-    let Ok(tip) = git(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"]) else {
+    let Ok(tip) = super::fetch_tip(repo, branch) else {
         return false;
     };
     git(repo, &["merge-base", "--is-ancestor", &tip, judged]).is_err()

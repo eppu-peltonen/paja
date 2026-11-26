@@ -130,6 +130,15 @@ pub struct InitArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct LanesArgs {
+    /// The number of lanes, 0 to 32 (0 lets the busy lanes finish and starts none). Leave it
+    /// out to show the current number.
+    lanes: Option<u32>,
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
     /// Only the last N events.
     limit: Option<usize>,
@@ -247,6 +256,34 @@ impl PajaMcp {
         call(move || {
             let name = jono::repo_name(&home, &checkout(args.repo)?)?;
             jono::show(&home, &name, args.number)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Mestari: set the number of lanes the repository's worker pool (paja run --workers) keeps busy, or show it without lanes. A running pool reads it on its next tick; fewer lanes let running items finish."
+    )]
+    async fn pool_lanes(&self, Parameters(args): Parameters<LanesArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            Ok(serde_json::to_value(crate::mestari::pool::lanes(
+                &home, &name, args.lanes,
+            )?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Mestari: the repository's worker pool: running or stopped, its lanes (item, stage, step, since when, spend), the items waiting and why, and the latest landings."
+    )]
+    async fn pool_status(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            Ok(serde_json::to_value(crate::mestari::pool::status(
+                &home, &name,
+            )?)?)
         })
         .await
     }

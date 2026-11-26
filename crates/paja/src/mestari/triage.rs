@@ -307,13 +307,12 @@ pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
     ahjo::ensure_untampered(home, &repo)?;
     let target = RepoSettings::read(&repo)?;
     let branch = target.branch.as_str();
-    git(&repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+    let base = super::fetch_tip(&repo, branch).with_context(|| {
         format!(
             "fetching origin/{branch}; check the network and that `origin` is the GitHub \
              repository"
         )
     })?;
-    let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     let labels =
         jono::Labels::parse(&read_from_base(&repo, &base, jono::LABELS_FILE)?.unwrap_or_default())?;
     let models = Models::parse_on(

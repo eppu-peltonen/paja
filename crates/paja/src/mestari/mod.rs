@@ -22,6 +22,7 @@ mod builder;
 mod follow_ups;
 mod land;
 pub mod live;
+pub mod pool;
 mod progress;
 mod triage;
 mod usage;
@@ -314,6 +315,8 @@ pub struct RunOptions<'a> {
     pub item: Option<u64>,
     /// Ask the person, after the summary, before the first agent starts.
     pub confirm: bool,
+    /// Sync Jono with GitHub before claiming. A pool's lane doesn't: its pool synced already.
+    pub sync: bool,
 }
 
 /// The person did not confirm the run, so nothing was started.
@@ -378,13 +381,12 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // Once per pass: the default branch and the merge methods the repository allows.
     let target = RepoSettings::read(&repo)?;
     let branch = target.branch.as_str();
-    git(&repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+    let base = fetch_tip(&repo, branch).with_context(|| {
         format!(
             "fetching origin/{branch}; check the network and that `origin` is the GitHub \
              repository"
         )
     })?;
-    let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
     crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
@@ -404,7 +406,11 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     ));
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
-    let name = jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo;
+    let name = if opts.sync {
+        jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo
+    } else {
+        jono::repo_name(home, &repo)?
+    };
     let config = read_config(&repo, &base, labels, target)?;
     // Before an item is claimed: waiting for CI that will never run fails after the whole build.
     if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
@@ -533,6 +539,28 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
             })
         }
     }
+}
+
+/// Sync Jono for the repository of the checkout `repo` as a run does before it claims: with the
+/// labels and queue rules on the fetched default branch, never on a repository whose git
+/// configuration was tampered with. Returns the repository's name (`owner/name`).
+pub fn sync_queue(home: &Home, repo: &Path) -> Result<String> {
+    let repo = std::path::absolute(repo)?;
+    ahjo::ensure_untampered(home, &repo)?;
+    let target = RepoSettings::read(&repo)?;
+    let branch = target.branch.as_str();
+    let base = fetch_tip(&repo, branch).with_context(|| {
+        format!(
+            "fetching origin/{branch}; check the network and that `origin` is the GitHub \
+             repository"
+        )
+    })?;
+    let labels =
+        jono::Labels::parse(&read_from_base(&repo, &base, jono::LABELS_FILE)?.unwrap_or_default())?;
+    let queue = jono::QueueRules::parse(
+        &read_from_base(&repo, &base, jono::QUEUE_FILE)?.unwrap_or_default(),
+    )?;
+    Ok(jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo)
 }
 
 /// For `paja doctor`: the deny-list hook a builder would run under passes its self-test in
@@ -2230,10 +2258,9 @@ fn catch_up(repo: &Path, env: &Env, branch: &str) -> Result<CatchUp> {
     if merging(&env.path) {
         git(&env.path, &["merge", "--abort"])?;
     }
-    git(repo, &["fetch", "-q", "origin", branch]).with_context(|| {
+    let tip = fetch_tip(repo, branch).with_context(|| {
         format!("fetching origin/{branch}; check the network and that `origin` is the GitHub repository")
     })?;
-    let tip = git(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     if git(&env.path, &["merge-base", "--is-ancestor", &tip, "HEAD"]).is_ok() {
         return Ok(CatchUp::Current(tip));
     }
@@ -2298,6 +2325,55 @@ fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
 /// the rest of a planted configuration.
 fn git_command() -> Command {
     ahjo::git_command()
+}
+
+/// Fetch `branch` from origin and return its tip. The tip goes through a ref of this call's
+/// own, never `FETCH_HEAD` or `origin/<branch>`, which every fetch in the checkout writes: runs
+/// of a pool's lanes fetch in one checkout at once, and one fetch must not read another's
+/// result or fail on its ref lock.
+pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!(
+        "refs/paja/fetch/{}-{}-{n}",
+        std::process::id(),
+        crate::events::now_ms()
+    );
+    let fetched = git(
+        repo,
+        &[
+            "fetch",
+            "-q",
+            "--refmap=",
+            "origin",
+            &format!("+refs/heads/{branch}:{name}"),
+        ],
+    )
+    .and_then(|_| {
+        git(
+            repo,
+            &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
+        )
+    });
+    let _ = git(repo, &["update-ref", "-d", &name]);
+    // `origin/<branch>` still follows, as a plain fetch would move it: Jono reads `.paja/labels`
+    // and the queue file from it outside runs. Only forward, and only from the value just read,
+    // so a slower lane never moves it back; one updating it at the same moment wins.
+    if let Ok(tip) = &fetched {
+        let tracking = format!("refs/remotes/origin/{branch}");
+        match git(repo, &["rev-parse", "--verify", "-q", &tracking]) {
+            Ok(old) if old == *tip => {}
+            Ok(old) => {
+                if git(repo, &["merge-base", "--is-ancestor", &old, tip]).is_ok() {
+                    let _ = git(repo, &["update-ref", &tracking, tip, &old]);
+                }
+            }
+            Err(_) => {
+                let _ = git(repo, &["update-ref", &tracking, tip, ""]);
+            }
+        }
+    }
+    fetched
 }
 
 /// Whether a long-running loop must stop on `err`: today only a tampered repository.

@@ -267,6 +267,12 @@ a terminal never ask. With `--json`, the report gains a `sandbox` field.
 reviewed and lands it, or asks a question on the issue when it can't decide. Then it takes the next issue. When the
 queue is empty it checks again every five minutes.
 
+To work several issues at once, give the loop lanes: `paja run --every 5 --workers 2` keeps up to two items going,
+each in its own environment, and starts the next one as soon as a lane is free. Change the number while it runs with
+`paja pool lanes 3` (lowering it lets the running items finish first), and see the lanes, the stage and step each is
+in, what it has spent and what is waiting with `paja pool status`. Every lane uses your Claude subscription at the
+same time, so more lanes reach its limits sooner.
+
 Stop it with Ctrl+C. The first Ctrl+C lets the step in flight (an agent or a check) finish and keeps it, then stops; the
 item stays active, and the next `paja run` resumes it where its environment left off. Press Ctrl+C again to stop at
 once: Paja ends the agent or check and everything it started, and the item still resumes next time, without that
