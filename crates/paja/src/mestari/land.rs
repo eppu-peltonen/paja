@@ -1,0 +1,178 @@
+use super::*;
+
+/// Push `judged`, the commit Vasara's checks and the reviewers saw, as the environment's
+/// branch, and land it. Not whatever the branch points at now: code run in the worktree could
+/// have moved it.
+pub(super) fn land(
+    home: &Home,
+    repo: &Path,
+    env: &Env,
+    item: &WorkItem,
+    rounds: u32,
+    judged: &str,
+) -> Result<RunReport> {
+    let gh = jono::gh_program();
+    let branch = env.branch.as_str();
+    git(
+        &env.path,
+        &[
+            "push",
+            "-q",
+            // No `-u`: that would write the branch into the shared git configuration, which
+            // other runs' guards watch.
+            "origin",
+            &format!("{judged}:refs/heads/{branch}"),
+            &format!("--force-with-lease=refs/heads/{branch}"),
+        ],
+    )?;
+    let title = format!("{} (#{})", item.title, item.number);
+    let body = format!(
+        "Closes #{}.\n\nBuilt and landed by Paja: Vasara's checks passed and an independent \
+         reviewer agent approved it.",
+        item.number
+    );
+    // Reuse this branch's pull request only while it is still open.
+    let pr = match run_gh(
+        repo,
+        &[
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "url,state",
+            "--jq",
+            "select(.state == \"OPEN\") | .url",
+        ],
+    ) {
+        Ok(url) if !url.is_empty() => url,
+        _ => run_gh(
+            repo,
+            &[
+                "pr", "create", "--base", "main", "--head", branch, "--title", &title, "--body",
+                &body,
+            ],
+        )?,
+    };
+    // CI must be green before landing; a red CI is a failed check, not a merge.
+    progress(&format!("opened {pr}; waiting for CI"));
+    if let Err(err) = wait_for_ci(repo, &pr) {
+        let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
+        return escalated(home, repo, env, item, &question, rounds);
+    }
+    // Free the worktree first: gh deletes the local branch too, which git refuses while a
+    // worktree has it checked out.
+    ahjo::remove(home, &env.name, true)?;
+    run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
+        .with_context(|| format!("{gh} pr merge {pr}"))?;
+    // Merged: from here nothing may turn this into an escalation.
+    let _ = jono::set_status(home, item.number, Status::Landed, Some(&pr));
+    let _ = record(
+        home,
+        EV_LANDED,
+        json!({ "number": item.number, "pr": pr, "rounds": rounds }),
+    );
+    progress(&format!("landed #{} ({pr})", item.number));
+    Ok(RunReport::Landed {
+        number: item.number,
+        pr,
+        rounds,
+    })
+}
+
+pub(super) fn escalated(
+    home: &Home,
+    repo: &Path,
+    env: &Env,
+    item: &WorkItem,
+    question: &str,
+    rounds: u32,
+) -> Result<RunReport> {
+    // The branch keeps the work; the worktree and its ports are freed.
+    let _ = ahjo::remove(home, &env.name, true);
+    let failed = escalate(home, repo, item, question, rounds)?;
+    progress(&parked_line(
+        &format!("#{} needs a decision", item.number),
+        item.number,
+        failed,
+    ));
+    Ok(RunReport::Escalated {
+        number: item.number,
+        question: question.to_string(),
+        rounds,
+    })
+}
+
+/// The progress line for a parked item: where the question is and how to retry come first,
+/// so a long gh error at the end can't push them out of the line.
+pub(super) fn parked_line(what: &str, number: u64, comment_error: Option<anyhow::Error>) -> String {
+    let retry = format!("answer with `paja work answer {number} \"<your answer>\"`");
+    match comment_error {
+        None => format!("{what}; asked on the issue ({retry})"),
+        Some(err) => format!(
+            "{what}; couldn't comment on the issue, so see `paja work show {number}` for the \
+             question ({retry}); gh said: {err:#}"
+        ),
+    }
+}
+
+/// Ask the person on the issue, and park the item until they answer. Returns the comment's
+/// error when it didn't reach the issue.
+pub(super) fn escalate(
+    home: &Home,
+    repo: &Path,
+    item: &WorkItem,
+    question: &str,
+    rounds: u32,
+) -> Result<Option<anyhow::Error>> {
+    // Park the item first, so it never stays active if the comment fails.
+    jono::set_status(home, item.number, Status::Escalated, Some(question))?;
+    record(
+        home,
+        EV_ESCALATED,
+        json!({ "number": item.number, "rounds": rounds }),
+    )?;
+    // The item is parked either way; a failed comment must not escalate it a second time.
+    // The caller reports it, cleaned for the terminal.
+    Ok(comment(repo, item, question).err())
+}
+
+/// Ask the person on the issue.
+pub(super) fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
+    let body = format!(
+        "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer with \
+         `paja work answer {n} \"<your answer>\"` (or `/paja:answer` in Claude Code). That records \
+         the answer for Paja's next run and queues the item again; a reply here alone doesn't \
+         reach the next run.",
+        n = item.number
+    );
+    run_gh(
+        repo,
+        &[
+            "issue",
+            "comment",
+            &item.number.to_string(),
+            "--body",
+            &body,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Wait until GitHub has registered checks on the pull request, then until they finish.
+/// A pull request that gets no checks at all is not treated as green.
+pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
+    const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    loop {
+        match run_gh(repo, &["pr", "checks", pr, "--watch", "--fail-fast"]) {
+            Ok(_) => return Ok(()),
+            Err(err) if format!("{err:#}").contains("no checks reported") => {
+                if start.elapsed() > APPEAR {
+                    bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}

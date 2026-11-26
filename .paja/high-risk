@@ -3,7 +3,9 @@
 # An entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches at any depth, in any
 # letter case.
 crates/paja/src/events.rs
-crates/paja/src/mestari.rs
+crates/paja/src/mestari/mod.rs
+crates/paja/src/mestari/agent.rs
+crates/paja/src/mestari/land.rs
 crates/paja/src/hook.rs
 crates/paja/src/main.rs
 .paja/
