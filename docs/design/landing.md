@@ -57,6 +57,9 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   different reasons than a copy of the first would.
 - **Each review is a fresh, short session.** Reviewers never share context with the builder or with each other, which
   keeps them independent and keeps each session small.
+- **One change lands at a time, on the latest default branch.** A change the reviewers approved waits for the
+  repository's turn to land, merges in whatever landed meanwhile, and lands only if Vasara's checks pass again on
+  that merge. A conflict, or checks that fail there, is a round for the builder like any other.
 
 ## When a person is asked
 

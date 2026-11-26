@@ -1,5 +1,40 @@
 use super::*;
 
+/// A run that waits for another to finish landing in the same repository:
+/// `{repo, number, round}`.
+pub(super) const EV_MERGING: &str = "pool.merging";
+/// A run that takes its turn to land: `{repo, number, round}`. It holds the turn until the
+/// change lands, or goes back to its builder.
+pub(super) const EV_LANDING: &str = "pool.landing";
+/// How often a run waiting for its turn to land looks again.
+const LAND_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Wait for this repository's turn to land, taken under the home lock and held for as long as
+/// the returned lock lives. Recorded as `pool.merging` while it waits, `pool.landing` once taken.
+/// A `stop now` ends the wait.
+pub(super) fn land_turn(home: &Home, item: &WorkItem, round: u32) -> Result<crate::home::RunLock> {
+    let data = json!({ "repo": item.repo, "number": item.number, "round": round });
+    let mut waiting = false;
+    loop {
+        {
+            let lock = home.lock()?;
+            if let Some(turn) = home.try_land_lock(&item.repo)? {
+                home.events().append(&lock, EV_LANDING, data)?;
+                return Ok(turn);
+            }
+            if !waiting {
+                home.events().append(&lock, EV_MERGING, data.clone())?;
+            }
+        }
+        if !waiting {
+            waiting = true;
+            progress("another change is landing in this repository; waiting for its turn");
+        }
+        stop_point()?;
+        std::thread::sleep(LAND_TICK);
+    }
+}
+
 /// How a landing attempt ended.
 pub(super) enum Landing {
     /// Landed, or parked as a question for the person.
@@ -8,8 +43,9 @@ pub(super) enum Landing {
     Retry(String),
 }
 
-/// Push `judged`, the commit Vasara's checks and the reviewers saw, as the environment's
-/// branch, and land it. Not whatever the branch points at now: code run in the worktree could
+/// Push `judged`, the commit Vasara's checks and the reviewers saw (or that commit with the
+/// latest default branch merged in, which the checks saw again), as the environment's branch,
+/// and land it. The caller holds the repository's turn to land. Not whatever the branch points at now: code run in the worktree could
 /// have moved it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn land(

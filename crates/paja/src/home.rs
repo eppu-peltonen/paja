@@ -105,6 +105,13 @@ impl Home {
         self.try_runs_lock(repo, "pool")
     }
 
+    /// Take the lock a run holds while it lands a change in `repo`, without waiting. None when
+    /// another live run is landing there, so one change lands at a time and each lands on the
+    /// one before it.
+    pub fn try_land_lock(&self, repo: &str) -> Result<Option<RunLock>> {
+        self.try_runs_lock(repo, "land")
+    }
+
     /// A lock file `runs/<owner>@<name>@<tail>.lock`, taken without waiting.
     fn try_runs_lock(&self, repo: &str, tail: &str) -> Result<Option<RunLock>> {
         let dir = self.root.join("runs");

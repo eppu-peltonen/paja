@@ -171,6 +171,17 @@ any other error stops its lanes the same way first. Lanes fetch in the same chec
 (`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes;
 `origin/<branch>` is then moved to that tip, as a plain fetch would.
 
+Changes land one at a time per repository, each on the latest default branch, whether from a pool's lanes or from
+runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
+`runs/<owner>@<name>@land.lock`, under the home lock (`land::land_turn`), recording `pool.merging` (`repo`, `number`,
+`round`) while another run holds it and `pool.landing` once it has it; it holds the turn through the push, the pull
+request, CI and the merge, and lets go when the change lands or goes back to its builder. With the turn it merges the
+latest default branch in again: when that branch moved on while it waited, Vasara's checks run again on the merge
+commit, and only that commit lands. A conflict, or checks that fail on it, sends the item back to its builder for
+another round (`conflict` or `checks_failed`) within the three rounds, and the next review reads the whole change.
+`paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
+from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
+
 Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, local git and the programs `.paja/commands` lists (`cargo` by default).
