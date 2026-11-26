@@ -2,6 +2,11 @@
 
 Settled decisions, newest first within each date. Change one only by adding a new entry that says what it replaces.
 
+## 2026-11-26
+
+- **Paja is licensed under Apache-2.0.** The full text is in `LICENSE` at the repository root, and the crate's
+  `license` field says the same.
+
 ## 2026-11-24
 
 - **Self-hosting first.** Steps 2 and 3 are cut to the smallest loop that can build Paja (issue import, build, review,
