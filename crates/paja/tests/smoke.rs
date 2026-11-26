@@ -1153,6 +1153,35 @@ fn run_never_claims_another_repositorys_item() {
 }
 
 #[test]
+fn work_list_names_the_event_of_a_step_it_cannot_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"run.round","data":{"number":3,"round":1,"verdict":"changes","detail":"","steps":[{"step":"build","input_tokens":10,"output_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"cost_usd":0.5}]}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"run.round","data":{"number":3,"round":2,"verdict":"changes","detail":"","steps":[{"step":7},{"step":8}]}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let (ok, items) = paja(&home, &repo, &["work", "list"]);
+    assert!(ok, "{items}");
+    let usage = &items[0]["usage"];
+    // Both bad steps count as unknown, the good one still adds up, and the event is named once.
+    assert_eq!(
+        (&usage["steps"], &usage["unknown_steps"]),
+        (&3.into(), &2.into()),
+        "{usage}"
+    );
+    assert_eq!(usage["input_tokens"], 10, "{usage}");
+    assert_eq!(
+        usage["unreadable_events"],
+        serde_json::json!([3]),
+        "{usage}"
+    );
+}
+
+#[test]
 fn a_log_written_before_repositories_replays_to_the_same_items() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));

@@ -136,11 +136,15 @@ pub struct Answer {
 /// An item's agent usage, totalled over every recorded step. A step whose result lacked a token
 /// field or the cost counts in `unknown_steps` and still adds the fields it has, so while
 /// `unknown_steps` is above zero each sum is a lower bound. A missing field adds nothing rather
-/// than a zero it didn't see.
+/// than a zero it didn't see. A recorded step Jono can't read at all counts as unknown too, and
+/// the sequence number of its `run.round` event goes in `unreadable_events`, so the bad record
+/// can be found in the log.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub steps: u64,
     pub unknown_steps: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_events: Vec<u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
@@ -392,6 +396,9 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                             Err(_) => {
                                 usage.steps += 1;
                                 usage.unknown_steps += 1;
+                                if usage.unreadable_events.last() != Some(&event.seq) {
+                                    usage.unreadable_events.push(event.seq);
+                                }
                             }
                         }
                     }
@@ -1572,6 +1579,7 @@ mod tests {
         drop(lock);
         let usage = get(&home, 1).unwrap().usage.unwrap();
         assert_eq!((usage.steps, usage.unknown_steps), (5, 3));
+        assert_eq!(usage.unreadable_events.len(), 2, "{usage:?}");
         assert_eq!(usage.input_tokens, 20);
         assert_eq!(list(&home).unwrap().len(), 1);
     }
