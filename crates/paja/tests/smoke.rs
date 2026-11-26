@@ -1413,7 +1413,7 @@ impl Factory {
         let gh = script(
             "gh",
             format!(
-                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && cat \"$a\" >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
                  \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
                  \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
@@ -1577,6 +1577,10 @@ fn run_builds_reviews_and_lands_an_issue() {
         "{log}"
     );
     assert!(!log.contains("Rename the variable"), "{log}");
+    assert!(
+        log.contains("Reviewers found these while reviewing #5"),
+        "{log}"
+    );
     // The prompt reaches `claude` on stdin, not on its command line.
     assert!(f.tmp.path().join("prompt-on-stdin").exists());
     // A token in a finding never reaches the public issue.

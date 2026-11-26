@@ -55,6 +55,9 @@ impl Finding {
     }
 }
 
+/// At most this many findings go in a change's follow-up issue; the rest stay in the log.
+pub(super) const MAX_FILED: usize = 10;
+
 /// The findings worth an issue (bugs and risks) and the nits, which are never filed.
 pub(super) fn worth_filing(findings: &[Finding]) -> (Vec<&Finding>, Vec<&Finding>) {
     findings.iter().partition(|f| f.kind != FindingKind::Nit)
@@ -73,15 +76,8 @@ pub(super) fn file_follow_ups(
     findings: &[Finding],
     labels: &jono::Labels,
 ) {
-    let (filed, nits) = worth_filing(findings);
-    for nit in &nits {
-        record_follow_up(home, item, &nit.shown(), None, "not filed: a nit");
-    }
-    if filed.is_empty() {
-        return;
-    }
     // Review text came from an agent that read untrusted code: keep each finding short, never
-    // let it mention anyone, and keep tokens and local paths out of a public issue.
+    // let it mention anyone, and keep tokens and local paths out of a public issue and the log.
     let user_home = ["HOME", "USERPROFILE"]
         .iter()
         .filter_map(std::env::var_os)
@@ -89,6 +85,29 @@ pub(super) fn file_follow_ups(
         .collect::<Vec<_>>();
     let mut places = vec![(home.root(), "<factory home>"), (repo, "<repository>")];
     places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
+    let (filed, nits) = worth_filing(findings);
+    for nit in &nits {
+        record_follow_up(
+            home,
+            item,
+            &redact(&nit.shown(), &places),
+            None,
+            "not filed: a nit",
+        );
+    }
+    let (filed, left) = filed.split_at(filed.len().min(MAX_FILED));
+    for finding in left {
+        record_follow_up(
+            home,
+            item,
+            &redact(&finding.shown(), &places),
+            None,
+            &format!("not filed: the issue holds the first {MAX_FILED} findings"),
+        );
+    }
+    if filed.is_empty() {
+        return;
+    }
     let shown: Vec<String> = filed
         .iter()
         .map(|finding| {
@@ -125,26 +144,37 @@ pub(super) fn file_follow_ups(
         number = item.number,
         work = labels.work
     );
-    let issue = run_gh(
-        repo,
-        &[
-            "issue",
-            "create",
-            "--label",
-            &labels.follow_up,
-            "--title",
-            &title,
-            "--body",
-            &body,
-        ],
-    );
-    for finding in &filed {
+    // The body goes in a file: up to ten findings would not fit a Windows command line.
+    let body_file = home.root().join(format!(
+        "follow-ups-{}-{}.md",
+        item.number,
+        std::process::id()
+    ));
+    let issue = std::fs::write(&body_file, &body)
+        .with_context(|| format!("writing {}", body_file.display()))
+        .and_then(|()| {
+            run_gh(
+                repo,
+                &[
+                    "issue",
+                    "create",
+                    "--label",
+                    &labels.follow_up,
+                    "--title",
+                    &title,
+                    "--body-file",
+                    &body_file.to_string_lossy(),
+                ],
+            )
+        });
+    let _ = std::fs::remove_file(&body_file);
+    for finding in &shown {
         match &issue {
-            Ok(issue) => record_follow_up(home, item, &finding.shown(), Some(issue.as_str()), ""),
+            Ok(issue) => record_follow_up(home, item, finding, Some(issue.as_str()), ""),
             Err(err) => record_follow_up(
                 home,
                 item,
-                &finding.shown(),
+                finding,
                 None,
                 &format!(
                     "{err:#}; if the label is missing, create it with `gh label create \
