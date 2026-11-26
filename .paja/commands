@@ -1,0 +1,3 @@
+# Programs agents may run besides local git, one per line. `review <program>` lets reviewers run it too.
+cargo
+review cargo

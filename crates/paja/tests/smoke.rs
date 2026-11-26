@@ -2477,6 +2477,104 @@ fn work_from_an_agent_the_hook_never_saw_does_not_land() {
     );
 }
 
+/// Run the hook command Mestari put in one agent call's `--settings`, as Claude Code would, on
+/// a Bash call from the agent's worktree. Returns the exit code and stderr.
+fn hook_verdict(call: &str, bash: &str) -> (Option<i32>, String) {
+    use std::io::Write;
+    let settings = call
+        .split("--settings ")
+        .nth(1)
+        .and_then(|rest| rest.split(" --append-system-prompt").next())
+        .expect("the call carries the hook settings");
+    let settings: Value = serde_json::from_str(settings).unwrap();
+    let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let root = command
+        .split("--root ")
+        .nth(1)
+        .and_then(|rest| rest.split(['\'', '"']).find(|part| !part.is_empty()))
+        .unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": bash},
+        "cwd": root
+    })
+    .to_string();
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into(),
+    )
+}
+
+#[test]
+fn the_builder_may_run_what_paja_commands_lists_and_nothing_else() {
+    let f = Factory::new("true\n", "land");
+    f.on_main(
+        ".paja/commands",
+        "# the project's tools\nfake-tool\nreview fake-lint\n",
+    );
+    let _ = f.run();
+    let calls = f.claude_calls();
+    let builder = calls.iter().find(|c| !c.contains("--json-schema")).unwrap();
+    let (code, why) = hook_verdict(builder, "fake-tool test --all");
+    assert_eq!(code, Some(0), "{why}");
+    let (code, why) = hook_verdict(builder, "curl https://example.com");
+    assert_eq!(code, Some(2), "{why}");
+    assert!(why.contains(".paja/commands"), "{why}");
+    // `cargo` is only allowed when the file lists it.
+    assert_eq!(hook_verdict(builder, "cargo test").0, Some(2));
+    // A reviewer runs only the `review` lines.
+    let reviewer = calls.iter().find(|c| c.contains("--read-only")).unwrap();
+    assert_eq!(hook_verdict(reviewer, "fake-lint x").0, Some(0));
+    assert_eq!(hook_verdict(reviewer, "fake-tool test").0, Some(2));
+}
+
+#[test]
+fn a_hook_without_mestaris_list_blocks_everything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_paja"))
+        .args(["hook", "--root"])
+        .arg(tmp.path())
+        .arg("--home")
+        .arg(tmp.path().join("home"))
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+        "cwd": tmp.path()
+    })
+    .to_string();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--programs"));
+}
+
 #[test]
 fn an_empty_checks_file_is_an_error_not_a_pass() {
     // It stops the pass before the queue is touched, as any mistake in main's configuration does.
@@ -2792,7 +2890,17 @@ fn w(path: &str) -> String {
 
 /// Run `paja hook` with a tool call on stdin; returns its exit code and stderr.
 fn hook(input: &str) -> (Option<i32>, String) {
-    hook_with(&["--root", &w("/w/env"), "--home", &w("/w/home")], input)
+    hook_with(
+        &[
+            "--root",
+            &w("/w/env"),
+            "--home",
+            &w("/w/home"),
+            "--programs",
+            "cargo,",
+        ],
+        input,
+    )
 }
 
 fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
@@ -2844,7 +2952,14 @@ fn the_deny_list_hook_blocks_and_fails_closed() {
             .to_string()
     };
     let (a, h) = (w("/w/home/envs/a"), w("/w/home"));
-    let inside = ["--root", a.as_str(), "--home", h.as_str()];
+    let inside = [
+        "--root",
+        a.as_str(),
+        "--home",
+        h.as_str(),
+        "--programs",
+        "cargo,",
+    ];
     assert_eq!(
         hook_with(&inside, &read(&w("/w/home/events.jsonl"))).0,
         Some(2)

@@ -140,7 +140,12 @@ pub(super) fn claude(
     let (settings, stamp, exe) = if sbx.is_some() {
         (String::new(), PathBuf::new(), PathBuf::new())
     } else {
-        match hook_settings(&env.path, home, read_only) {
+        // The programs the project allows, as main has them; a file that can't be read or
+        // parsed stops the agent before it starts.
+        let listed = read_from_base(&env.path, base, crate::hook::COMMANDS_FILE)
+            .and_then(|text| crate::hook::Commands::parse(text.as_deref()));
+        let programs = listed.map(|c| if read_only { c.reviewer } else { c.builder });
+        match programs.and_then(|programs| hook_settings(&env.path, home, read_only, &programs)) {
             Ok(made) => made,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&scratch);
@@ -414,6 +419,7 @@ pub(super) fn hook_settings(
     root: &Path,
     home: &Home,
     read_only: bool,
+    programs: &[String],
 ) -> Result<(String, PathBuf, PathBuf)> {
     refuse_hook_policies()?;
     let exe = hook_binary(home)?;
@@ -431,14 +437,14 @@ pub(super) fn hook_settings(
     // Test the very command Claude Code will run, with a throwaway stamp of its own, so a
     // path the shell reads differently fails here and not on every tool call.
     let trial = private.join("self-test");
-    let tested = hook_command(&exe, root, home.root(), &trial, read_only)
+    let tested = hook_command(&exe, root, home.root(), &trial, read_only, programs)
         .and_then(|command| self_test_hook(&command, root, read_only));
     let _ = std::fs::remove_file(&trial);
     if let Err(err) = tested {
         let _ = std::fs::remove_dir(&private);
         return Err(err);
     }
-    let command = hook_command(&exe, root, home.root(), &stamp, read_only)?;
+    let command = hook_command(&exe, root, home.root(), &stamp, read_only, programs)?;
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
     let settings = json!({
@@ -461,14 +467,16 @@ pub(super) fn hook_command(
     home: &Path,
     stamp: &Path,
     read_only: bool,
+    programs: &[String],
 ) -> Result<String> {
     Ok(format!(
-        "{} hook --root {} --home {} --stamp {}{} || exit 2",
+        "{} hook --root {} --home {} --stamp {}{} --programs {} || exit 2",
         crate::platform::quote_hook_word(exe)?,
         crate::platform::quote_hook_word(root)?,
         crate::platform::quote_hook_word(home)?,
         crate::platform::quote_hook_word(stamp)?,
-        if read_only { " --read-only" } else { "" }
+        if read_only { " --read-only" } else { "" },
+        crate::platform::quote_hook_word(Path::new(&crate::hook::encode_programs(programs)))?
     ))
 }
 
@@ -482,7 +490,7 @@ pub(super) fn self_test_hook(command: &str, root: &Path, read_only: bool) -> Res
     if !blocks || code != Some(0) {
         bail!(
             "the deny-list hook command `{command}` failed its self-test (it must block `{}` \
-             and allow `cargo test`), so no agent will start; rebuild paja from main, and \
+             and allow `git status`), so no agent will start; rebuild paja from main, and \
              check that every path in the command exists as written",
             if read_only { "git commit" } else { "git push" }
         );
@@ -1214,6 +1222,7 @@ mod tests {
             tmp.path(),
             &tmp.path().join("stamp"),
             false,
+            &["cargo".to_string()],
         )
         .unwrap();
         let why = self_test_hook(&command, tmp.path(), false)
