@@ -58,19 +58,32 @@ pub struct RepoArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListArgs {
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
+    /// List the work items of every repository, each with its repository.
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct NumberArgs {
-    /// The GitHub issue number.
+    /// The GitHub issue number, in the repository of the checkout.
     number: u64,
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct SetArgs {
-    /// The GitHub issue number.
+    /// The GitHub issue number, in the repository of the checkout.
     number: u64,
     /// queued, active, landed or escalated.
     status: String,
     /// Why, for example the question an escalation asks.
     note: Option<String>,
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -98,6 +111,14 @@ pub struct FileArgs {
 pub struct LogArgs {
     /// Only the last N events.
     limit: Option<usize>,
+}
+
+/// The checkout a tool acts on: `repo`, or the server's directory. Absolute, so errors name the
+/// real directory rather than `.`.
+fn checkout(repo: Option<String>) -> Result<PathBuf> {
+    Ok(std::path::absolute(PathBuf::from(
+        repo.unwrap_or_else(|| ".".into()),
+    ))?)
 }
 
 /// Run blocking core work (git, the home lock) off the async runtime, and shape the result
@@ -179,30 +200,57 @@ impl PajaMcp {
         .await
     }
 
-    #[tool(description = "Jono: list work items, oldest first.")]
-    async fn work_list(&self) -> Result<String, String> {
+    #[tool(
+        description = "Jono: list the work items of the checkout's repository, oldest first, or of every repository with all."
+    )]
+    async fn work_list(&self, Parameters(args): Parameters<ListArgs>) -> Result<String, String> {
         let home = self.home.clone();
-        call(move || Ok(serde_json::to_value(jono::list(&home)?)?)).await
-    }
-
-    #[tool(description = "Jono: show one work item by its issue number.")]
-    async fn work_show(&self, Parameters(args): Parameters<NumberArgs>) -> Result<String, String> {
-        let home = self.home.clone();
-        call(move || Ok(serde_json::to_value(jono::get(&home, args.number)?)?)).await
-    }
-
-    #[tool(description = "Jono: the next item to work on (the oldest queued one), or null.")]
-    async fn work_next(&self) -> Result<String, String> {
-        let home = self.home.clone();
-        call(move || Ok(serde_json::to_value(jono::next(&home)?)?)).await
+        call(move || {
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            let items = if args.all {
+                jono::list_all(&home, &name)?
+            } else {
+                jono::list(&home, &name)?
+            };
+            Ok(serde_json::to_value(items)?)
+        })
+        .await
     }
 
     #[tool(
-        description = "Jono: take the next item and mark it active in one step, so two runs never share one. Null when nothing is queued."
+        description = "Jono: show one work item of the checkout's repository by its issue number."
     )]
-    async fn work_claim(&self) -> Result<String, String> {
+    async fn work_show(&self, Parameters(args): Parameters<NumberArgs>) -> Result<String, String> {
         let home = self.home.clone();
-        call(move || Ok(serde_json::to_value(jono::claim(&home)?)?)).await
+        call(move || {
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            Ok(serde_json::to_value(jono::get(&home, &name, args.number)?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Jono: the next item to work on in the checkout's repository (the oldest queued one), or null."
+    )]
+    async fn work_next(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            Ok(serde_json::to_value(jono::next(&home, &name)?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Jono: take the next item of the checkout's repository and mark it active in one step, so two runs never share one. Null when nothing is queued."
+    )]
+    async fn work_claim(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            Ok(serde_json::to_value(jono::claim(&home, &name)?)?)
+        })
+        .await
     }
 
     #[tool(
@@ -212,8 +260,10 @@ impl PajaMcp {
         let home = self.home.clone();
         call(move || {
             let status = jono::parse_status(&args.status)?;
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
             Ok(serde_json::to_value(jono::set_status(
                 &home,
+                &name,
                 args.number,
                 status,
                 args.note.as_deref(),

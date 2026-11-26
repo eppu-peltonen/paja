@@ -29,6 +29,12 @@ pub const EV_STATUS: &str = "work.status";
 pub const EV_ANSWERED: &str = "work.answered";
 /// A sync found which of an item's dependencies are still open: `{"number", "on": [...]}`.
 pub const EV_WAITING: &str = "work.waiting";
+/// A repository's first appearance in a log that holds events from before work items carried
+/// one: `{"repo"}`. It pins those older events to that repository (see [`legacy_repo`]).
+pub const EV_SYNCED: &str = "work.synced";
+
+/// An item's identity: its repository (`owner/name`) and its issue number.
+pub type Key = (String, u64);
 
 /// Where an item is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +63,10 @@ impl Status {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkItem {
-    /// The GitHub issue number.
+    /// The GitHub repository the issue belongs to, as `owner/name`.
+    #[serde(default)]
+    pub repo: String,
+    /// The GitHub issue number, unique within `repo`.
     pub number: u64,
     pub title: String,
     pub body: String,
@@ -81,6 +90,38 @@ pub struct WorkItem {
     /// at the last sync. Jono doesn't start an item until this is empty.
     #[serde(default)]
     pub waiting_on: Vec<u64>,
+}
+
+impl WorkItem {
+    /// The name of the item's Ahjo environment (its branch is `paja/<name>`): the repository's
+    /// name and a short hash of `owner/name`, so two repositories' item #5 never share a
+    /// worktree, a branch or a port block. At most 40 characters (Ahjo's limit).
+    pub fn env_name(&self) -> String {
+        env_name(&self.repo, self.number)
+    }
+}
+
+/// See [`WorkItem::env_name`].
+pub fn env_name(repo: &str, number: u64) -> String {
+    let name = repo.rsplit('/').next().unwrap_or(repo).to_ascii_lowercase();
+    let name: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    // What is left of the 40 after the hash, `-work-<number>` and the dash after the name.
+    let room = 40usize.saturating_sub(6 + 6 + number.to_string().len() + 1);
+    let name: String = name.chars().take(room.min(14)).collect();
+    let name = name.trim_matches('-');
+    // FNV-1a, which is stable across releases and platforms (unlike the std hasher).
+    let hash = repo.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let head = if name.is_empty() {
+        String::new()
+    } else {
+        format!("{name}-")
+    };
+    format!("{head}{:06x}-work-{number}", hash & 0xff_ffff)
 }
 
 /// A person's answer to a question Paja asked about an item.
@@ -144,6 +185,8 @@ pub struct Issue {
 /// What a sync changed.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncReport {
+    /// The repository that was synced, as `owner/name`.
+    pub repo: String,
     pub imported: Vec<u64>,
     pub changed: Vec<u64>,
     pub closed: Vec<u64>,
@@ -188,18 +231,91 @@ struct StatusChange {
     run: bool,
 }
 
-/// The queue, derived by replaying the event log.
-pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
-    let mut items = BTreeMap::new();
+/// Whether `event` is one of the queue's or a run's, which carry a `repo` (the tamper events
+/// use that name for a git directory instead, and belong to the checkout, not an item).
+fn is_item_event(event: &Event) -> bool {
+    (event.kind.starts_with("work.") || event.kind.starts_with("run."))
+        && event.kind != crate::ahjo::EV_TAMPERED
+        && event.kind != crate::ahjo::EV_TAMPER_CHECKED
+}
+
+/// The repository the events written before work items carried one belong to: the first
+/// repository a `work.*` event names (the first `paja work sync` the log records writes one),
+/// or `fallback`, the repository of the checkout the command runs in, when none does yet.
+/// Replay applies this; nothing in `events.jsonl` is rewritten.
+pub fn legacy_repo<'a>(events: &'a [Event], fallback: &'a str) -> &'a str {
+    events
+        .iter()
+        .filter(|e| e.kind.starts_with("work."))
+        .find_map(|e| e.data["repo"].as_str())
+        .unwrap_or(fallback)
+}
+
+/// The repository `event` belongs to: the one it names, else `legacy` (see [`legacy_repo`]).
+pub fn event_repo<'a>(event: &'a Event, legacy: &'a str) -> &'a str {
+    event.data["repo"].as_str().unwrap_or(legacy)
+}
+
+/// The events of item `number` of `repo` (`fallback` as in [`legacy_repo`] is `repo` itself).
+pub fn item_events<'a>(
+    events: &'a [Event],
+    repo: &'a str,
+    number: u64,
+) -> impl Iterator<Item = &'a Event> {
+    let legacy = legacy_repo(events, repo);
+    events
+        .iter()
+        .filter(move |e| e.data["number"] == number && event_repo(e, legacy) == repo)
+}
+
+/// Before the first event of a repository is written to a log that holds older, unkeyed ones,
+/// record which repository those belong to (see [`legacy_repo`]), so a later write from another
+/// checkout can't move them. Every writer calls this under the home lock.
+fn pin_legacy(
+    lock: &crate::home::HomeLock,
+    log: &crate::events::EventLog,
+    repo: &str,
+) -> Result<()> {
+    let events = log.read_all()?;
+    let unkeyed = events
+        .iter()
+        .any(|e| is_item_event(e) && e.data["repo"].as_str().is_none());
+    let pinned = events
+        .iter()
+        .any(|e| e.kind.starts_with("work.") && e.data["repo"].as_str().is_some());
+    if unkeyed && !pinned {
+        log.append(lock, EV_SYNCED, json!({ "repo": repo }))?;
+    }
+    Ok(())
+}
+
+/// The queue of one repository, derived by replaying the event log.
+pub fn replay_repo(events: &[Event], repo: &str) -> Result<BTreeMap<u64, WorkItem>> {
+    Ok(replay(events, repo)?
+        .into_iter()
+        .filter(|((r, _), _)| r == repo)
+        .map(|((_, number), item)| (number, item))
+        .collect())
+}
+
+/// Every repository's queue, derived by replaying the event log. Events written before they
+/// carried a repository belong to [`legacy_repo`] (`fallback` is the checkout's repository).
+pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem>> {
+    let mut items: BTreeMap<Key, WorkItem> = BTreeMap::new();
     let bad = |event: &Event| format!("event {} ({}) has unexpected data", event.seq, event.kind);
+    let legacy = legacy_repo(events, fallback);
     for event in events {
+        let repo = event_repo(event, legacy);
+        // The item an event is about.
+        let key = |number: u64| (repo.to_string(), number);
         match event.kind.as_str() {
             EV_IMPORTED => {
                 let issue: Issue =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
                 items.insert(
-                    issue.number,
+                    key(issue.number),
                     WorkItem {
+                        repo: repo.to_string(),
                         number: issue.number,
                         title: issue.title,
                         body: issue.body,
@@ -216,7 +332,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
             EV_CHANGED => {
                 let issue: Issue =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
-                if let Some(item) = items.get_mut(&issue.number) {
+                if let Some(item) = items.get_mut(&key(issue.number)) {
                     item.title = issue.title;
                     item.body = issue.body;
                     item.url = issue.url;
@@ -225,7 +341,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
             EV_CLOSED | EV_REOPENED => {
                 let n: Number =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
-                if let Some(item) = items.get_mut(&n.number) {
+                if let Some(item) = items.get_mut(&key(n.number)) {
                     item.open = event.kind == EV_REOPENED;
                     // A landed issue opened again (say after a revert) needs work again.
                     if item.open && item.status == Status::Landed {
@@ -237,7 +353,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
             EV_STATUS => {
                 let change: StatusChange =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
-                if let Some(item) = items.get_mut(&change.number) {
+                if let Some(item) = items.get_mut(&key(change.number)) {
                     item.status = change.status;
                     item.note = change.note;
                 }
@@ -245,14 +361,14 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
             EV_WAITING => {
                 let waiting: Waiting =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
-                if let Some(item) = items.get_mut(&waiting.number) {
+                if let Some(item) = items.get_mut(&key(waiting.number)) {
                     item.waiting_on = waiting.on;
                 }
             }
             EV_ANSWERED => {
                 let answered: Answered =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
-                if let Some(item) = items.get_mut(&answered.number) {
+                if let Some(item) = items.get_mut(&key(answered.number)) {
                     item.answers.push(answered.answer);
                 }
             }
@@ -265,7 +381,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                     Value::Array(steps) => steps,
                     other => vec![other],
                 };
-                if let (Some(item), false) = (items.get_mut(&round.number), steps.is_empty()) {
+                if let (Some(item), false) = (items.get_mut(&key(round.number)), steps.is_empty()) {
                     let usage = item.usage.get_or_insert_with(Usage::default);
                     for step in steps {
                         // Usage is informational: a step that can't be read counts as one whose
@@ -285,9 +401,9 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
     }
     // An item no sync has judged yet (imported before Jono read dependencies) waits on every
     // dependency its body names, so a claim before the next sync can't start it too early.
-    let recorded = waiting_recorded(events);
-    for item in items.values_mut() {
-        if !recorded.contains(&item.number) {
+    let recorded = waiting_recorded(events, legacy);
+    for (key, item) in items.iter_mut() {
+        if !recorded.contains(key) {
             item.waiting_on = dependencies(item.number, &item.body);
         }
     }
@@ -295,26 +411,89 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
 }
 
 /// The items a `work.waiting` event was ever recorded for.
-fn waiting_recorded(events: &[Event]) -> BTreeSet<u64> {
+fn waiting_recorded(events: &[Event], legacy: &str) -> BTreeSet<Key> {
     events
         .iter()
         .filter(|e| e.kind == EV_WAITING)
-        .filter_map(|e| e.data["number"].as_u64())
+        .filter_map(|e| {
+            Some((
+                event_repo(e, legacy).to_string(),
+                e.data["number"].as_u64()?,
+            ))
+        })
         .collect()
 }
 
-pub fn list(home: &Home) -> Result<Vec<WorkItem>> {
-    Ok(replay(&home.events().read_all()?)?.into_values().collect())
+/// The repository (`owner/name`) of the checkout at `path`, from `gh repo view`. Work items
+/// belong to it.
+pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
+    if !path.is_dir() {
+        bail!(
+            "{} is not a directory; pass --repo with a path inside the checkout",
+            path.display()
+        );
+    }
+    match crate::ahjo::untampered(home, path) {
+        Ok(ok) => name_of(&ok),
+        // gh runs git, which a tampered configuration could abuse, so Paja asks it nothing
+        // there. The queue stays readable (and an item can still be set) under the repository
+        // the stop recorded.
+        Err(err) if err.is::<crate::ahjo::Tampered>() => {
+            let events = home.events().read_all()?;
+            let key = crate::ahjo::repo_key(path)?;
+            events
+                .iter()
+                .rev()
+                .filter(|e| e.kind == crate::ahjo::EV_TAMPERED && e.data["repo"] == key)
+                .find_map(|e| e.data["work_repo"].as_str().map(str::to_string))
+                .ok_or(err)
+        }
+        Err(err) => Err(err),
+    }
 }
 
-pub fn get(home: &Home, number: u64) -> Result<WorkItem> {
-    replay(&home.events().read_all()?)?
+fn name_of(ok: &Untampered) -> Result<String> {
+    let out = gh(ok, &["repo", "view", "--json", "nameWithOwner"])?;
+    let name = serde_json::from_str::<Value>(&out)
+        .ok()
+        .and_then(|v| v["nameWithOwner"].as_str().map(str::to_string))
+        .filter(|name| !name.is_empty());
+    name.with_context(|| {
+        format!(
+            "`{} repo view` did not name the repository of {}; check `gh auth status` and that \
+             this checkout has a GitHub remote",
+            gh_program(),
+            ok.path().display()
+        )
+    })
+}
+
+/// The work items of `repo`, oldest first.
+pub fn list(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
+    Ok(replay_repo(&home.events().read_all()?, repo)?
+        .into_values()
+        .collect())
+}
+
+/// Every repository's work items, by repository and then oldest first. `repo` is the
+/// checkout's repository, which events from before items carried one may belong to.
+pub fn list_all(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
+    Ok(replay(&home.events().read_all()?, repo)?
+        .into_values()
+        .collect())
+}
+
+pub fn get(home: &Home, repo: &str, number: u64) -> Result<WorkItem> {
+    replay_repo(&home.events().read_all()?, repo)?
         .remove(&number)
-        .with_context(|| {
-            format!(
-                "no work item #{number}; run `paja work sync` to import issues labelled `{LABEL}`"
-            )
-        })
+        .with_context(|| no_item(repo, number))
+}
+
+fn no_item(repo: &str, number: u64) -> String {
+    format!(
+        "no work item #{number} in {repo}; run `paja work sync` in its checkout to import issues \
+         labelled `{LABEL}`"
+    )
 }
 
 fn is_ready(item: &WorkItem) -> bool {
@@ -410,8 +589,8 @@ pub fn dependencies(number: u64, body: &str) -> Vec<u64> {
 
 /// Queued items that wait on open dependencies, as `#179 waits on #178`, for a run that found
 /// nothing ready. None when no queued item is waiting.
-pub fn waiting(home: &Home) -> Result<Option<String>> {
-    let items = list(home)?;
+pub fn waiting(home: &Home, repo: &str) -> Result<Option<String>> {
+    let items = list(home, repo)?;
     let mut waiting: Vec<String> = items
         .iter()
         .filter(|item| is_waiting(item))
@@ -486,23 +665,28 @@ fn cycle_search(items: &[&WorkItem], limit: usize) -> (Option<Vec<u64>>, usize) 
     (None, entered)
 }
 
-/// The next item to work on: the oldest open, queued issue. None when the queue is empty.
-pub fn next(home: &Home) -> Result<Option<WorkItem>> {
-    Ok(list(home)?.into_iter().find(is_ready))
+/// The next item of `repo` to work on: the oldest open, queued issue. None when the queue is
+/// empty.
+pub fn next(home: &Home, repo: &str) -> Result<Option<WorkItem>> {
+    Ok(list(home, repo)?.into_iter().find(is_ready))
 }
 
-/// Take the next item and mark it active in one step under the home lock, so two runs
+/// Take the next item of `repo` and mark it active in one step under the home lock, so two runs
 /// never pick up the same item.
-pub fn claim(home: &Home) -> Result<Option<WorkItem>> {
+pub fn claim(home: &Home, repo: &str) -> Result<Option<WorkItem>> {
     let lock = home.lock()?;
     let log = home.events();
-    let Some(mut item) = replay(&log.read_all()?)?.into_values().find(is_ready) else {
+    pin_legacy(&lock, &log, repo)?;
+    let Some(mut item) = replay_repo(&log.read_all()?, repo)?
+        .into_values()
+        .find(is_ready)
+    else {
         return Ok(None);
     };
     log.append(
         &lock,
         EV_STATUS,
-        json!({ "number": item.number, "status": Status::Active, "note": null }),
+        json!({ "repo": repo, "number": item.number, "status": Status::Active, "note": null }),
     )?;
     item.status = Status::Active;
     item.note = None;
@@ -521,15 +705,21 @@ pub struct RunClaim {
 /// active, and whose run is gone (stopped by Ctrl-C, a closed terminal or a reboot), comes
 /// first, so it is resumed instead of being skipped for good. Otherwise the next queued item is
 /// claimed. Items a person or another worker claimed with `paja work claim` are never taken.
-pub fn claim_for_run(home: &Home) -> Result<Option<RunClaim>> {
+pub fn claim_for_run(home: &Home, repo: &str) -> Result<Option<RunClaim>> {
     let lock = home.lock()?;
     let log = home.events();
+    pin_legacy(&lock, &log, repo)?;
     let events = log.read_all()?;
     // Which items' latest status change was a run's claim.
     let mut by_run = BTreeMap::new();
-    // Replaying first refuses a status change it can't read, so every one parses here.
-    let items = replay(&events)?;
-    for event in events.iter().filter(|e| e.kind == EV_STATUS) {
+    // Replaying first refuses a status change it can't read, so every one parses here. Only
+    // this repository's items are ever taken, whatever the log holds of others.
+    let items = replay_repo(&events, repo)?;
+    let legacy = legacy_repo(&events, repo);
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EV_STATUS && event_repo(e, legacy) == repo)
+    {
         if let Ok(change) = serde_json::from_value::<StatusChange>(event.data.clone()) {
             by_run.insert(change.number, change.run && change.status == Status::Active);
         }
@@ -540,7 +730,7 @@ pub fn claim_for_run(home: &Home) -> Result<Option<RunClaim>> {
         if !left {
             continue;
         }
-        if let Some(run_lock) = home.try_run_lock(item.number)? {
+        if let Some(run_lock) = home.try_run_lock(repo, item.number)? {
             return Ok(Some(RunClaim {
                 item: item.clone(),
                 lock: run_lock,
@@ -550,13 +740,16 @@ pub fn claim_for_run(home: &Home) -> Result<Option<RunClaim>> {
     }
     for item in items.values().filter(|item| is_ready(item)) {
         // A queued item a live run still holds (set back by hand mid-run) waits for that run.
-        let Some(run_lock) = home.try_run_lock(item.number)? else {
+        let Some(run_lock) = home.try_run_lock(repo, item.number)? else {
             continue;
         };
         log.append(
             &lock,
             EV_STATUS,
-            json!({ "number": item.number, "status": Status::Active, "note": null, "run": true }),
+            json!({
+                "repo": repo, "number": item.number, "status": Status::Active, "note": null,
+                "run": true
+            }),
         )?;
         let mut item = item.clone();
         item.status = Status::Active;
@@ -581,15 +774,17 @@ pub fn parse_status(name: &str) -> Result<Status> {
 /// escalated item is queued again only through [`answer`], so its next run gets the answer.
 pub fn set_status(
     home: &Home,
+    repo: &str,
     number: u64,
     status: Status,
     note: Option<&str>,
 ) -> Result<WorkItem> {
     let lock = home.lock()?;
     let log = home.events();
-    let mut item = replay(&log.read_all()?)?.remove(&number).with_context(|| {
-        format!("no work item #{number}; run `paja work sync` to import issues labelled `{LABEL}`")
-    })?;
+    pin_legacy(&lock, &log, repo)?;
+    let mut item = replay_repo(&log.read_all()?, repo)?
+        .remove(&number)
+        .with_context(|| no_item(repo, number))?;
     if item.status == Status::Escalated && status == Status::Queued {
         // Queuing it this way would start a run that never sees the person's answer.
         bail!(
@@ -601,7 +796,7 @@ pub fn set_status(
     log.append(
         &lock,
         EV_STATUS,
-        json!({ "number": number, "status": status, "note": note }),
+        json!({ "repo": repo, "number": number, "status": status, "note": note }),
     )?;
     item.status = status;
     item.note = note.map(str::to_string);
@@ -618,6 +813,7 @@ pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
     }
     // gh runs git in the checkout to find its GitHub repository.
     let ok = crate::ahjo::untampered(home, repo)?;
+    let name = name_of(&ok)?;
     let issues = fetch_issues(&ok)?;
     // A dependency outside the queue (another label, or already closed) is asked about once
     // per sync; one in the queue is open by definition.
@@ -633,36 +829,59 @@ pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
             open_outside.insert(number);
         }
     }
-    apply_with(home, &issues, &open_outside)
+    apply_with(home, &name, &issues, &open_outside)
 }
 
-/// Bring the queue in line with the current open issues. Separate from `sync` so it can be
-/// tested without GitHub.
-pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
-    apply_with(home, open, &BTreeSet::new())
+/// Bring the queue of `repo` in line with its current open issues. Separate from `sync` so it
+/// can be tested without GitHub.
+pub fn apply(home: &Home, repo: &str, open: &[Issue]) -> Result<SyncReport> {
+    apply_with(home, repo, open, &BTreeSet::new())
 }
 
 /// [`apply`], where `open_outside` are the dependencies outside `open` that are still open.
-pub fn apply_with(home: &Home, open: &[Issue], open_outside: &BTreeSet<u64>) -> Result<SyncReport> {
+pub fn apply_with(
+    home: &Home,
+    repo: &str,
+    open: &[Issue],
+    open_outside: &BTreeSet<u64>,
+) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
+    pin_legacy(&lock, &log, repo)?;
     let events = log.read_all()?;
-    let items = replay(&events)?;
-    let recorded = waiting_recorded(&events);
-    let mut report = SyncReport::default();
+    let items = replay_repo(&events, repo)?;
+    let recorded: BTreeSet<u64> = waiting_recorded(&events, legacy_repo(&events, repo))
+        .into_iter()
+        .filter(|(r, _)| r == repo)
+        .map(|(_, number)| number)
+        .collect();
+    let mut report = SyncReport {
+        repo: repo.to_string(),
+        ..SyncReport::default()
+    };
+    // An issue as an event records it, with its repository.
+    let issue_data = |issue: &Issue| -> Result<Value> {
+        let mut data = serde_json::to_value(issue)?;
+        data["repo"] = json!(repo);
+        Ok(data)
+    };
     for issue in open {
         match items.get(&issue.number) {
             None => {
-                log.append(&lock, EV_IMPORTED, serde_json::to_value(issue)?)?;
+                log.append(&lock, EV_IMPORTED, issue_data(issue)?)?;
                 report.imported.push(issue.number);
             }
             Some(item) => {
                 if !item.open {
-                    log.append(&lock, EV_REOPENED, json!({ "number": issue.number }))?;
+                    log.append(
+                        &lock,
+                        EV_REOPENED,
+                        json!({ "repo": repo, "number": issue.number }),
+                    )?;
                     report.reopened.push(issue.number);
                 }
                 if (&item.title, &item.body, &item.url) != (&issue.title, &issue.body, &issue.url) {
-                    log.append(&lock, EV_CHANGED, serde_json::to_value(issue)?)?;
+                    log.append(&lock, EV_CHANGED, issue_data(issue)?)?;
                     report.changed.push(issue.number);
                 }
             }
@@ -692,14 +911,18 @@ pub fn apply_with(home: &Home, open: &[Issue], open_outside: &BTreeSet<u64>) -> 
             log.append(
                 &lock,
                 EV_WAITING,
-                json!({ "number": issue.number, "on": on }),
+                json!({ "repo": repo, "number": issue.number, "on": on }),
             )?;
         }
     }
     for item in items.values() {
         let still_open = open.iter().any(|issue| issue.number == item.number);
         if item.open && !still_open {
-            log.append(&lock, EV_CLOSED, json!({ "number": item.number }))?;
+            log.append(
+                &lock,
+                EV_CLOSED,
+                json!({ "repo": repo, "number": item.number }),
+            )?;
             report.closed.push(item.number);
         }
     }
@@ -715,14 +938,14 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
     }
     // gh runs git in the checkout to find its GitHub repository.
     let ok = crate::ahjo::untampered(home, repo)?;
+    let name = name_of(&ok)?;
     let item = {
         let lock = home.lock()?;
         let log = home.events();
-        let mut item = replay(&log.read_all()?)?.remove(&number).with_context(|| {
-            format!(
-                "no work item #{number}; run `paja work sync` to import issues labelled `{LABEL}`"
-            )
-        })?;
+        pin_legacy(&lock, &log, &name)?;
+        let mut item = replay_repo(&log.read_all()?, &name)?
+            .remove(&number)
+            .with_context(|| no_item(&name, number))?;
         if item.status != Status::Escalated {
             bail!(
                 "work item #{number} is {}, not escalated, so there is no question to answer; \
@@ -737,12 +960,15 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         log.append(
             &lock,
             EV_ANSWERED,
-            json!({ "number": number, "question": answer.question, "answer": answer.answer }),
+            json!({
+                "repo": name, "number": number, "question": answer.question,
+                "answer": answer.answer
+            }),
         )?;
         log.append(
             &lock,
             EV_STATUS,
-            json!({ "number": number, "status": Status::Queued, "note": null }),
+            json!({ "repo": name, "number": number, "status": Status::Queued, "note": null }),
         )?;
         item.answers.push(answer);
         item.status = Status::Queued;
@@ -891,6 +1117,137 @@ mod tests {
             title: title.into(),
             body: String::new(),
             url: format!("https://example.com/{number}"),
+        }
+    }
+
+    // The queue of one repository, which most tests are about.
+    const R: &str = "acme/app";
+
+    fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
+        super::apply(home, R, open)
+    }
+
+    fn apply_with(home: &Home, open: &[Issue], outside: &BTreeSet<u64>) -> Result<SyncReport> {
+        super::apply_with(home, R, open, outside)
+    }
+
+    fn get(home: &Home, number: u64) -> Result<WorkItem> {
+        super::get(home, R, number)
+    }
+
+    fn list(home: &Home) -> Result<Vec<WorkItem>> {
+        super::list(home, R)
+    }
+
+    fn next(home: &Home) -> Result<Option<WorkItem>> {
+        super::next(home, R)
+    }
+
+    fn claim(home: &Home) -> Result<Option<WorkItem>> {
+        super::claim(home, R)
+    }
+
+    fn claim_for_run(home: &Home) -> Result<Option<RunClaim>> {
+        super::claim_for_run(home, R)
+    }
+
+    fn waiting(home: &Home) -> Result<Option<String>> {
+        super::waiting(home, R)
+    }
+
+    fn set_status(
+        home: &Home,
+        number: u64,
+        status: Status,
+        note: Option<&str>,
+    ) -> Result<WorkItem> {
+        super::set_status(home, R, number, status, note)
+    }
+
+    #[test]
+    fn two_repositories_keep_their_own_items_with_the_same_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let (a, b) = ("acme/app", "acme/site");
+        super::apply(&home, a, &[issue(1, "A one")]).unwrap();
+        super::apply(&home, b, &[issue(1, "B one")]).unwrap();
+        super::set_status(&home, a, 1, Status::Escalated, Some("which API?")).unwrap();
+        assert_eq!(super::get(&home, b, 1).unwrap().status, Status::Queued);
+        // A sync of one repository doesn't close or change the other's items.
+        super::apply(&home, b, &[]).unwrap();
+        let item = super::get(&home, a, 1).unwrap();
+        assert_eq!((item.open, item.title.as_str()), (true, "A one"));
+        assert!(!super::get(&home, b, 1).unwrap().open);
+        // A claim and a run's claim take only the repository's own items.
+        assert!(super::claim(&home, a).unwrap().is_none());
+        super::apply(&home, b, &[issue(1, "B one")]).unwrap();
+        assert!(super::claim_for_run(&home, a).unwrap().is_none());
+        let claimed = super::claim_for_run(&home, b).unwrap().unwrap();
+        assert_eq!((claimed.item.repo.as_str(), claimed.item.number), (b, 1));
+        assert_eq!(super::get(&home, a, 1).unwrap().status, Status::Escalated);
+        let all = list_all(&home, a).unwrap();
+        let keys: Vec<(&str, u64)> = all.iter().map(|i| (i.repo.as_str(), i.number)).collect();
+        assert_eq!(keys, [(a, 1), (b, 1)]);
+    }
+
+    #[test]
+    fn events_from_before_repositories_belong_to_the_first_sync_or_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let lock = home.lock().unwrap();
+        let log = home.events();
+        let old = issue(4, "Old");
+        log.append(&lock, EV_IMPORTED, serde_json::to_value(&old).unwrap())
+            .unwrap();
+        log.append(
+            &lock,
+            EV_STATUS,
+            json!({ "number": 4, "status": "escalated", "note": "Q?" }),
+        )
+        .unwrap();
+        log.append(&lock, EV_ANSWERED, json!({ "number": 4, "answer": "A" }))
+            .unwrap();
+        drop(lock);
+        let before = log.read_all().unwrap();
+        // With no repository named yet, they belong to the checkout the command runs in.
+        for repo in ["acme/app", "acme/site"] {
+            let items = replay(&before, repo).unwrap();
+            let item = &items[&(repo.to_string(), 4)];
+            assert_eq!((item.status, item.answers.len()), (Status::Escalated, 1));
+            assert_eq!(items.len(), 1);
+        }
+        // The first write pins them to the repository that wrote it, and a later one from
+        // another checkout leaves them there.
+        super::set_status(&home, "acme/app", 4, Status::Landed, None).unwrap();
+        super::apply(&home, "acme/site", &[issue(4, "Other")]).unwrap();
+        let log = log.read_all().unwrap();
+        assert_eq!(&log[..before.len()], &before[..], "nothing was rewritten");
+        let items = replay(&log, "acme/site").unwrap();
+        assert_eq!(items[&("acme/app".to_string(), 4)].title, "Old");
+        assert_eq!(items[&("acme/app".to_string(), 4)].status, Status::Landed);
+        assert_eq!(items[&("acme/site".to_string(), 4)].title, "Other");
+        assert_eq!(items[&("acme/site".to_string(), 4)].status, Status::Queued);
+    }
+
+    #[test]
+    fn environment_names_tell_repositories_apart_and_fit_ahjo() {
+        let a = env_name("acme/app", 5);
+        let b = env_name("other/app", 5);
+        assert_ne!(a, b);
+        assert!(a.starts_with("app-") && a.ends_with("-work-5"), "{a}");
+        for name in [
+            a,
+            b,
+            env_name("Some-Owner/A_Very.Long-Repository-Name", u64::MAX),
+            env_name("o/___", 1),
+        ] {
+            assert!(name.len() <= 40, "{name}");
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !name.starts_with('-'),
+                "{name}"
+            );
         }
     }
 

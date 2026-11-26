@@ -158,6 +158,7 @@ impl StepUsage {
 /// (a session that was killed before its result) or a figure is unknown.
 pub(super) fn recorded_totals(
     events: &[crate::events::Event],
+    repo: &str,
     number: u64,
     session: &str,
 ) -> Option<StepUsage> {
@@ -165,10 +166,7 @@ pub(super) fn recorded_totals(
         Some(a? + b?)
     }
     let mut total: Option<StepUsage> = None;
-    for event in events
-        .iter()
-        .filter(|e| e.kind == EV_ROUND && e.data["number"] == number)
-    {
+    for event in crate::jono::item_events(events, repo, number).filter(|e| e.kind == EV_ROUND) {
         let Some(steps) = event.data["steps"].as_array() else {
             continue;
         };

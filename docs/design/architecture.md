@@ -50,10 +50,23 @@ current state by replaying it, and every write holds the home lock. See `crates/
 A write cut off by a crash leaves bytes after the last newline. Those were never acknowledged, so the next append
 cuts them off and keeps them in `events.jsonl.torn`; a bad line that ends in a newline is an error, never repaired.
 
+One home serves many repositories. Every `work.*` and `run.*` event about an item carries `"repo"`, the repository as
+`owner/name` (from `gh repo view --json nameWithOwner` in the checkout), so an item is keyed by repository and issue
+number. (`run.tampered` and `run.tamper_checked` are about a checkout and use `repo` for its git directory; the first
+also carries `work_repo`, so the queue stays readable there without running gh.) Logs written before that stay readable
+because replay migrates them and nothing is rewritten: an event without a repository belongs to the repository of the
+first `work.*` event that names one (the first `paja work sync` the log records), or, when none does yet, to the
+repository of the checkout the command runs in. The first write from a repository to a log that still holds such older
+events appends a `work.synced` event naming it, so a later command from another checkout can't move them.
+
 ## Work queue
 
-Jono's items are GitHub issues labelled `paja`. `paja work sync` reads the open ones with `gh` and appends
-`work.imported`, `work.changed`, `work.closed` and `work.reopened` events. Whether an issue is open is kept apart from
+Jono's items are GitHub issues labelled `paja`, each belonging to a repository. `paja work sync` reads the open ones of
+the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
+events; it never touches another repository's items, even when their issue numbers are the same. `paja work
+list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
+in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with its
+`repo`. Whether an issue is open is kept apart from
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
 oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
@@ -90,13 +103,14 @@ prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, 
 A unit test keeps the three high-risk files on the list.
 
 `paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`
-and `.paja/models` from `main` and checks them, claims the next item and creates an Ahjo environment `work-<issue>`
-from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
+and `.paja/models` from `main` and checks them, claims the next item of the checkout's repository and creates an Ahjo environment named
+`<repo>-<hash>-work-<issue>` (the repository's name and a short hash of `owner/name`, so two repositories' item #5
+never share a worktree, branch or port block) from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
 claims anything, with an error naming the file and line, so one fix on `main` is all it takes; a `--every` loop
 reports it and tries again after its wait. While it works on an item the run holds an OS file lock,
-`runs/<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
+`runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
-stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its `work-<issue>` environment, and
+stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and
 says so on stderr. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git and gh run
 in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the terminal's
 Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build, the
@@ -116,7 +130,7 @@ most three rounds:
    later run resumes the item's last recorded builder session the same way, with a short prompt instead of the issue,
    when the run resumes an interrupted item ("Your earlier session was interrupted. Check `git status` and `git log`,
    finish the issue, and commit.") or runs it again after `paja work answer` (the person's question and answer, and
-   "Continue with that."). That needs the work still on its `paja/work-<issue>` branch: an environment made again from
+   "Continue with that."). That needs the work still on its `paja/<environment>` branch: an environment made again from
    `main` starts fresh, and so does a session whose work was thrown away because the hook never ran (recorded as
    `run.step_discarded`). In the sandbox the transcript must still be in the sandbox's home; if it isn't, the run says
    so on stderr and starts fresh. A resumed step's spend is only its own share: the recorded steps of that session

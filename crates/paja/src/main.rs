@@ -97,14 +97,34 @@ enum WorkCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// List work items, oldest first.
-    List,
+    /// List the checkout's repository's work items, oldest first.
+    List {
+        /// List every repository's items, each with its repository.
+        #[arg(long)]
+        all: bool,
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Show one work item by its issue number.
-    Show { number: u64 },
+    Show {
+        number: u64,
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// The next item to work on: the oldest open, queued one, or null.
-    Next,
+    Next {
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Take the next item and mark it active in one step, so two runs never share one.
-    Claim,
+    Claim {
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Answer an escalated item: comment the answer on its issue and queue it again.
     Answer {
         number: u64,
@@ -131,6 +151,9 @@ enum WorkCommand {
         /// Why, for example the question an escalation asks.
         #[arg(long)]
         note: Option<String>,
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
     },
 }
 
@@ -350,11 +373,23 @@ fn run(cli: &Cli) -> Result<()> {
                     )
                 });
             }
-            WorkCommand::List => {
-                let items = jono::list(&home)?;
+            WorkCommand::List { all, repo } => {
+                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let items = if *all {
+                    jono::list_all(&home, &name)?
+                } else {
+                    jono::list(&home, &name)?
+                };
                 emit(cli, serde_json::to_value(&items)?, || {
                     if items.is_empty() {
                         "no work items; run `paja work sync`".to_string()
+                    } else if *all {
+                        // Each repository's items on their own, with its repository first.
+                        items
+                            .iter()
+                            .map(|item| format!("{}\t{}", item.repo, describe_item(item)))
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     } else {
                         items
                             .iter()
@@ -365,14 +400,16 @@ fn run(cli: &Cli) -> Result<()> {
                     }
                 });
             }
-            WorkCommand::Show { number } => {
-                let item = jono::get(&home, *number)?;
+            WorkCommand::Show { number, repo } => {
+                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let item = jono::get(&home, &name, *number)?;
                 emit(cli, serde_json::to_value(&item)?, || {
                     format!("{}\n  {}\n\n{}", describe_item(&item), item.url, item.body)
                 });
             }
-            WorkCommand::Claim => {
-                let item = jono::claim(&home)?;
+            WorkCommand::Claim { repo } => {
+                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let item = jono::claim(&home, &name)?;
                 emit(cli, serde_json::to_value(&item)?, || {
                     item.as_ref()
                         .map_or("nothing queued".to_string(), describe_item)
@@ -382,9 +419,11 @@ fn run(cli: &Cli) -> Result<()> {
                 number,
                 status,
                 note,
+                repo,
             } => {
                 let status = jono::parse_status(status)?;
-                let item = jono::set_status(&home, *number, status, note.as_deref())?;
+                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let item = jono::set_status(&home, &name, *number, status, note.as_deref())?;
                 emit(cli, serde_json::to_value(&item)?, || describe_item(&item));
             }
             WorkCommand::Answer { number, text, repo } => {
@@ -395,8 +434,9 @@ fn run(cli: &Cli) -> Result<()> {
                 let filed = jono::file(&home, &std::path::absolute(repo)?, title, body)?;
                 emit(cli, serde_json::to_value(&filed)?, || filed.url.clone());
             }
-            WorkCommand::Next => {
-                let item = jono::next(&home)?;
+            WorkCommand::Next { repo } => {
+                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let item = jono::next(&home, &name)?;
                 emit(cli, serde_json::to_value(&item)?, || {
                     item.as_ref()
                         .map_or("nothing queued".to_string(), describe_item)

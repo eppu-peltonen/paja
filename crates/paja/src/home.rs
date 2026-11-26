@@ -91,13 +91,24 @@ impl Home {
 }
 
 impl Home {
-    /// Take the lock a `paja run` holds while it works on item `number`, without waiting.
-    /// None when another live run holds it. Like the home lock it is an OS file lock, so it is
-    /// free again once that run's process is gone, however it stopped.
-    pub fn try_run_lock(&self, number: u64) -> Result<Option<RunLock>> {
+    /// Take the lock a `paja run` holds while it works on item `number` of `repo`
+    /// (`owner/name`), without waiting. None when another live run holds it. Like the home lock
+    /// it is an OS file lock, so it is free again once that run's process is gone, however it
+    /// stopped.
+    pub fn try_run_lock(&self, repo: &str, number: u64) -> Result<Option<RunLock>> {
         let dir = self.root.join("runs");
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(format!("{number}.lock"));
+        // `owner/name` as one file name: GitHub names hold only letters, digits and `-_.`, and
+        // `@` can't appear in them, so two repositories never share a file.
+        let repo: String = repo
+            .chars()
+            .map(|c| match c {
+                '/' => '@',
+                c if c.is_ascii_alphanumeric() || "-_.".contains(c) => c,
+                _ => '_',
+            })
+            .collect();
+        let path = dir.join(format!("{repo}@{number}.lock"));
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
