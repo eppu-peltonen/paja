@@ -1684,6 +1684,8 @@ impl Factory {
                  input=$(cat); [ -n \"$input\" ] && : > {d}/prompt-on-stdin; first=$1; shift; set -- \"$first\" \"$input\" \"$@\"\n\
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
+                 *PAJA-PLAN*) p='\"feature.txt\"'; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) p=\"\\\"$t.txt\\\"\" ;; esac; done\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"paths\\\": [$p]}}}}\" ;;\n\
                  *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
                  if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
@@ -5536,6 +5538,123 @@ fn a_lane_that_conflicts_with_the_landing_before_it_goes_back_for_a_round_then_l
         landed.contains("built Alpha") && landed.contains("built Beta"),
         "{landed}"
     );
+}
+
+/// Alpha and Beta name the same file in their `Touches:` lines; Gamma names none, so the
+/// planning agent lists its files. Two lanes run Alpha and Gamma; Beta waits for Alpha.
+#[cfg(unix)]
+#[test]
+fn an_item_whose_files_overlap_a_running_one_waits_and_another_runs_instead() {
+    let f = pool_factory(false);
+    let body = |touches: &str| format!("Please.\n\nTouches: {touches}");
+    let issues = serde_json::json!([
+        {"number": 5, "title": "Alpha feature", "body": body("`src/shared.rs`"), "url": "https://example.com/5"},
+        {"number": 6, "title": "Beta feature", "body": body("src/shared.rs, docs/beta.md"), "url": "https://example.com/6"},
+        {"number": 7, "title": "Gamma feature", "body": "Please.", "url": "https://example.com/7"},
+    ]);
+    std::fs::write(f.tmp.path().join("issues.json"), issues.to_string()).unwrap();
+    let pool = start_pool(&f, "2");
+    wait_until(&f, "Alpha and Gamma building", || {
+        holding(&f, "Alpha") && holding(&f, "Gamma")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(!holding(&f, "Beta"), "Beta started beside Alpha");
+    let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert!(ok, "{status}");
+    let lane_of = |n: u64| {
+        status["lanes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["number"] == n)
+            .unwrap_or_else(|| panic!("{status}"))
+            .clone()
+    };
+    assert_eq!(
+        lane_of(5)["paths"],
+        serde_json::json!(["src/shared.rs"]),
+        "{status}"
+    );
+    assert_eq!(
+        lane_of(7)["paths"],
+        serde_json::json!(["Gamma.txt"]),
+        "{status}"
+    );
+    let beta = &status["waiting"][0];
+    assert_eq!(beta["number"], 6, "{status}");
+    assert_eq!(beta["why"], "overlaps #5: src/shared.rs", "{status}");
+    assert_eq!(
+        beta["paths"],
+        serde_json::json!(["docs/beta.md", "src/shared.rs"]),
+        "{status}"
+    );
+    let planned = events_of(&f, "pool.planned");
+    let source = |n: u64| {
+        planned
+            .iter()
+            .find(|e| e["data"]["number"] == n)
+            .map(|e| e["data"]["source"].clone())
+    };
+    assert_eq!(source(5), Some("spec".into()), "{planned:?}");
+    assert_eq!(source(7), Some("plan".into()), "{planned:?}");
+
+    // Gamma landing frees a lane, but Beta still overlaps Alpha.
+    release(&f, "Gamma");
+    wait_until(&f, "Gamma landing", || landed(&f) == 1);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(!holding(&f, "Beta"), "Beta started beside Alpha");
+    release(&f, "Alpha");
+    wait_until(&f, "Beta starting once Alpha landed", || {
+        holding(&f, "Beta")
+    });
+    release(&f, "Beta");
+    wait_until(&f, "all three landing", || landed(&f) == 3);
+    assert_eq!(stop_pool(&f, pool).len(), 3);
+    let admitted: Vec<u64> = events_of(&f, "pool.admitted")
+        .iter()
+        .map(|e| e["data"]["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(admitted, [5, 7, 6]);
+    // Gamma's builder wrote a file its plan didn't name: recorded, not stopped.
+    let drift = events_of(&f, "pool.drift");
+    let gamma = drift
+        .iter()
+        .find(|e| e["data"]["number"] == 7)
+        .unwrap_or_else(|| panic!("{drift:?}"));
+    assert_eq!(gamma["data"]["outside"], serde_json::json!(["feature.txt"]));
+    assert_eq!(gamma["data"]["admitted"], serde_json::json!(["Gamma.txt"]));
+
+    // The planning agent plans an item again, as a new pool run does, and leaves no branch.
+    for _ in 0..2 {
+        let (ok, plan) = paja_with(
+            &f.home,
+            &f.repo,
+            &["pool", "plan", "7"],
+            &[
+                ("PAJA_GH", f.gh.as_path()),
+                ("PAJA_CLAUDE", f.claude.as_path()),
+            ],
+        );
+        assert!(ok, "{plan}");
+        assert_eq!(plan["source"], "plan", "{plan}");
+        assert_eq!(plan["paths"], serde_json::json!(["Gamma.txt"]));
+    }
+    let branches = Command::new("git")
+        .args(["branch", "--list", "paja/plan-*"])
+        .current_dir(&f.repo)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&branches.stdout).trim(), "");
+    // `paja pool plan` and its MCP tool give the same plan.
+    let (ok, plan) = paja(&f.home, &f.repo, &["pool", "plan", "6"]);
+    assert!(ok, "{plan}");
+    assert_eq!(plan["source"], "spec");
+    assert_eq!(plan["high_risk"], false);
+    let mut mcp = Mcp::start(&f.home, &f.repo, &[("PAJA_GH", f.gh.as_path())]);
+    mcp.initialize();
+    let (ok, by_mcp) = mcp.call("pool_plan", serde_json::json!({"number": 6}));
+    assert!(ok, "{by_mcp}");
+    assert_eq!(by_mcp, plan);
 }
 
 #[test]

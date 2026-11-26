@@ -186,8 +186,18 @@ enum PoolCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// The pool: running or stopped, its lanes (item, stage, step, time in step, spend), the
-    /// items waiting and why, and the latest landings.
+    /// Which files a work item will likely touch, which the pool admits it by: its `Touches:`
+    /// line, else what a short read-only planning agent (the `plan` role) finds on the default
+    /// branch. Recorded as `pool.planned`.
+    Plan {
+        /// The item's issue number.
+        number: u64,
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// The pool: running or stopped, its lanes (item, stage, step, time in step, spend, files),
+    /// the items waiting and why, and the latest landings.
     Status {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
@@ -706,6 +716,18 @@ fn run(cli: &Cli) -> Result<()> {
                         "not running"
                     };
                     format!("pool of {}: {count} ({state})", report.repo)
+                });
+            }
+            PoolCommand::Plan { number, repo } => {
+                let plan = mestari::plan::plan(&home, repo, *number)?;
+                emit(cli, serde_json::to_value(&plan)?, || {
+                    format!(
+                        "#{} touches ({}{}): {}",
+                        plan.number,
+                        plan.source,
+                        if plan.high_risk { ", high risk" } else { "" },
+                        plan.paths.join(", ")
+                    )
                 });
             }
             PoolCommand::Status { repo } => {

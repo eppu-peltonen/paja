@@ -179,6 +179,22 @@ request, CI and the merge, and lets go when the change lands or goes back to its
 latest default branch in again: when that branch moved on while it waited, Vasara's checks run again on the merge
 commit, and only that commit lands. A conflict, or checks that fail on it, sends the item back to its builder for
 another round (`conflict` or `checks_failed`) within the three rounds, and the next review reads the whole change.
+A pool admits an item to a lane only when the files it will touch don't overlap a running item's
+(`crates/paja/src/mestari/plan.rs`). Before a lane starts it, the pool plans the item in a `paja pool plan <number>` of
+its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; recorded as `pool.planning`):
+the item's `Touches:` line names the paths when it has one (`source: spec`), else a short read-only agent on the
+`plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). The plan,
+`pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
+they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
+`.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
+`error`) overlaps everything, so its item runs only in an otherwise idle pool. The pool takes items in queue order and
+admits one only once every item before it has a plan, so a plan that finishes first never puts a later item ahead;
+it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording `pool.admitted` (`repo`,
+`number`, `lane`, `paths`, `source`, `high_risk`). Each round records the paths its change touches as `run.changed`;
+when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`, `admitted`), so the planner's
+accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows each lane's `paths` and each
+waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning which files it touches`).
+
 `paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
 from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
 
@@ -229,7 +245,8 @@ Then, for at most three rounds:
 Each agent runs on the model `.paja/models` names for its role, read from the default branch like the checks, so a change can't
 pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
 build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
-the fix), `review-2` (the second high-risk reviewer) and `triage` (`paja triage`, the cheapest model). Mestari passes `--model` and, when given, `--effort`; a role
+the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, the cheapest model) and `plan` (the pool's
+planner). Mestari passes `--model` and, when given, `--effort`; a role
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. An unknown role, effort or a
 malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the

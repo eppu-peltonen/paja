@@ -275,7 +275,23 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Mestari: the repository's worker pool: running or stopped, its lanes (item, stage, step, since when, spend), the items waiting and why, and the latest landings."
+        description = "Mestari: which files a work item will likely touch, which the worker pool admits it by: its Touches: line, else a short read-only planning agent's list. Recorded as pool.planned."
+    )]
+    async fn pool_plan(&self, Parameters(args): Parameters<NumberArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let repo = checkout(args.repo)?;
+            Ok(serde_json::to_value(crate::mestari::plan::plan(
+                &home,
+                &repo,
+                args.number,
+            )?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Mestari: the repository's worker pool: running or stopped, its lanes (item, stage, step, since when, spend, files), the items waiting and why, and the latest landings."
     )]
     async fn pool_status(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
         let home = self.home.clone();
