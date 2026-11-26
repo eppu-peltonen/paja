@@ -20,6 +20,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::land::{EV_LANDING, EV_MERGING};
+use super::plan::{blocked_by, overlap, Plan, EV_POOL_PLANNED};
+use super::EV_CHANGED;
 use super::{progress, EV_LANDED, EV_ROUND, EV_STEP};
 use crate::events::Event;
 use crate::home::Home;
@@ -34,6 +36,14 @@ pub const EV_POOL_LANES: &str = "pool.lanes";
 pub const EV_POOL_LANE: &str = "pool.lane";
 /// A pool stopped: `{repo}`, with `error` when it stopped on one.
 pub const EV_POOL_STOPPED: &str = "pool.stopped";
+/// The pool started planning an item: `{repo, number}`. Its plan follows as `pool.planned`.
+pub const EV_POOL_PLANNING: &str = "pool.planning";
+/// An item was admitted to a lane for the files its plan names:
+/// `{repo, number, lane, paths, source, high_risk}`.
+pub const EV_POOL_ADMITTED: &str = "pool.admitted";
+/// A lane's change touched files outside the ones it was admitted for:
+/// `{repo, number, lane, outside, admitted}`.
+pub const EV_POOL_DRIFT: &str = "pool.drift";
 
 /// The most lanes one pool runs.
 pub const MAX_LANES: u32 = 32;
@@ -55,6 +65,10 @@ pub struct PoolOptions<'a> {
 /// One busy lane: the `paja run` working on its item.
 struct Lane {
     number: u64,
+    /// The plan the lane was admitted for.
+    plan: Plan,
+    /// The `pool.lane` event that started it.
+    started_seq: u64,
     child: Child,
     stdin: Option<ChildStdin>,
     report: mpsc::Receiver<String>,
@@ -103,11 +117,11 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         EV_POOL_LANES,
         json!({ "repo": name, "lanes": opts.lanes }),
     )?;
-    record(
-        home,
-        EV_POOL_STARTED,
-        json!({ "repo": name, "lanes": opts.lanes, "pid": std::process::id() }),
-    )?;
+    let since = {
+        let lock = home.lock()?;
+        let data = json!({ "repo": name, "lanes": opts.lanes, "pid": std::process::id() });
+        home.events().append(&lock, EV_POOL_STARTED, data)?.seq
+    };
     progress(&format!(
         "pool of {name}: up to {} lanes (`paja pool lanes <N>` changes it; Ctrl+C stops)",
         opts.lanes
@@ -119,6 +133,8 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         key: &key,
         opts: &opts,
         lanes: BTreeMap::new(),
+        planners: BTreeMap::new(),
+        since,
         held_back: BTreeSet::new(),
     };
     let outcome = pool.run();
@@ -143,6 +159,10 @@ struct Pool<'a> {
     key: &'a str,
     opts: &'a PoolOptions<'a>,
     lanes: BTreeMap<u32, Lane>,
+    /// The `pool plan` runs going, by item, with the seq they started after.
+    planners: BTreeMap<u64, (Child, u64)>,
+    /// The seq of this pool's `pool.started`: plans before it are an earlier pool's.
+    since: u64,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
     /// `paja run --every` waits after a failed pass.
     held_back: BTreeSet<u64>,
@@ -195,7 +215,12 @@ impl Pool<'_> {
                 }
                 told_fatal = true;
             }
+            self.reap_planners(&events)?;
             let stopping = level > 0 || fatal.is_some();
+            if stopping {
+                // A plan is only worth having for a lane that may start.
+                self.stop_planners();
+            }
             if stopping && self.lanes.is_empty() {
                 return fatal.map_or(Ok(()), Err);
             }
@@ -222,7 +247,11 @@ impl Pool<'_> {
                         }
                     }
                     let admitted = self.admit(free)?;
-                    if admitted == 0 && self.lanes.is_empty() && !said_idle {
+                    if admitted == 0
+                        && self.lanes.is_empty()
+                        && self.planners.is_empty()
+                        && !said_idle
+                    {
                         said_idle = true;
                         self.idle()?;
                     }
@@ -232,7 +261,8 @@ impl Pool<'_> {
         }
     }
 
-    /// Hand up to `free` lanes the next items a run could take. Returns how many started.
+    /// Hand up to `free` lanes the next items a run could take whose files don't overlap a
+    /// running item's, planning each first. Returns how many started.
     fn admit(&mut self, free: usize) -> Result<usize> {
         let busy: BTreeSet<u64> = self.lanes.values().map(|lane| lane.number).collect();
         let next: Vec<WorkItem> = match jono::runnable(self.home, self.name) {
@@ -242,15 +272,37 @@ impl Pool<'_> {
                 return Ok(0);
             }
         };
-        let next: Vec<WorkItem> = next
-            .into_iter()
-            .filter(|item| !busy.contains(&item.number) && !self.held_back.contains(&item.number))
-            .take(free)
-            .collect();
+        let events = self.home.events().read_all()?;
+        let plans = plans_since(&events, self.name, self.since);
         let mut started = 0;
         for item in next {
+            if started >= free {
+                break;
+            }
+            if busy.contains(&item.number) || self.held_back.contains(&item.number) {
+                continue;
+            }
+            let Some(plan) = plans.get(&item.number) else {
+                // At most as many plans at once as there are free lanes to use them.
+                if !self.planners.contains_key(&item.number) && self.planners.len() < free {
+                    self.start_planner(item.number)?;
+                }
+                continue;
+            };
+            let running: Vec<&Plan> = self.lanes.values().map(|lane| &lane.plan).collect();
+            if blocked_by(plan, &running).is_some() {
+                continue;
+            }
             let lane = (1..).find(|n| !self.lanes.contains_key(n)).unwrap_or(1);
             let start = record_lane(self.home, self.name, lane, item.number, "starting", None)?;
+            record(
+                self.home,
+                EV_POOL_ADMITTED,
+                json!({
+                    "repo": self.name, "number": item.number, "lane": lane, "paths": plan.paths,
+                    "source": plan.source, "high_risk": plan.high_risk,
+                }),
+            )?;
             match spawn(self.repo, lane, item.number) {
                 Ok((child, stdin, report)) => {
                     progress(&format!("lane {lane}: #{} {}", item.number, item.title));
@@ -258,6 +310,8 @@ impl Pool<'_> {
                         lane,
                         Lane {
                             number: item.number,
+                            plan: plan.clone(),
+                            started_seq: start.seq,
                             child,
                             stdin,
                             report,
@@ -278,6 +332,76 @@ impl Pool<'_> {
             }
         }
         Ok(started)
+    }
+
+    /// Plan item `number` in a `paja pool plan` of its own, so the pool's ticks go on meanwhile.
+    fn start_planner(&mut self, number: u64) -> Result<()> {
+        let at = {
+            let lock = self.home.lock()?;
+            let data = json!({ "repo": self.name, "number": number });
+            self.home
+                .events()
+                .append(&lock, EV_POOL_PLANNING, data)?
+                .seq
+        };
+        progress(&format!("planning which files #{number} touches"));
+        match spawn_planner(self.repo, number) {
+            Ok(child) => {
+                self.planners.insert(number, (child, at));
+            }
+            Err(err) => self.plan_failed(number, &format!("{err:#}"))?,
+        }
+        Ok(())
+    }
+
+    /// Free the plans that ended; one that ended without recording a plan failed.
+    fn reap_planners(&mut self, events: &[Event]) -> Result<()> {
+        let done: Vec<u64> = self
+            .planners
+            .iter_mut()
+            .filter_map(|(&n, (child, _))| (!matches!(child.try_wait(), Ok(None))).then_some(n))
+            .collect();
+        for number in done {
+            let Some((_, at)) = self.planners.remove(&number) else {
+                continue;
+            };
+            let planned = events.iter().any(|e| {
+                e.seq > at
+                    && e.kind == EV_POOL_PLANNED
+                    && e.data["repo"] == self.name
+                    && e.data["number"] == number
+            });
+            if !planned {
+                let why = format!("the plan of #{number} ended without one");
+                self.plan_failed(number, &why)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a failed plan, which the pool admits only to an otherwise idle pool.
+    fn plan_failed(&mut self, number: u64, error: &str) -> Result<()> {
+        progress(&format!(
+            "could not plan #{number} ({error}); it runs only when no other lane is busy"
+        ));
+        let failed = Plan {
+            repo: self.name.to_string(),
+            number,
+            paths: Vec::new(),
+            source: "failed".to_string(),
+            high_risk: false,
+            error: Some(error.to_string()),
+        };
+        record(self.home, EV_POOL_PLANNED, serde_json::to_value(&failed)?).map(|_| ())
+    }
+
+    /// End the plans going: they are read-only, and an item left unplanned is planned again.
+    fn stop_planners(&mut self) {
+        for (child, _) in self.planners.values_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.planners.clear();
     }
 
     /// Record each step a busy lane's run started since the last tick.
@@ -314,6 +438,9 @@ impl Pool<'_> {
         };
         if outcome == "error" {
             self.held_back.insert(lane.number);
+        }
+        if let Some(drift) = drift(&events, self.name, n, &lane) {
+            record(self.home, EV_POOL_DRIFT, drift)?;
         }
         let mut done = record_lane_data(self.name, n, lane.number, "done", None);
         done["outcome"] = json!(outcome);
@@ -359,6 +486,7 @@ impl Pool<'_> {
 
     /// Stop every lane's run at once and wait for it to end.
     fn stop_all(&mut self) {
+        self.stop_planners();
         for lane in self.lanes.values_mut() {
             lane.tell("stop now");
         }
@@ -405,6 +533,67 @@ fn follow_lane(home: &Home, repo: &str, n: u32, lane: &mut Lane, events: &[Event
 /// Start lane `lane`'s run of item `number`: `paja --json run --item <number>` in the checkout,
 /// which skips the sync the pool did and reads `stop` lines on stdin. Its progress lines are
 /// passed on to stderr with the lane in front; its report comes back on the channel.
+/// The latest plan of each item of `repo` recorded after `since`.
+fn plans_since(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, Plan> {
+    events
+        .iter()
+        .filter(|e| e.seq > since && e.kind == EV_POOL_PLANNED && e.data["repo"] == repo)
+        .filter_map(|e| serde_json::from_value::<Plan>(e.data.clone()).ok())
+        .map(|plan| (plan.number, plan))
+        .collect()
+}
+
+/// The files lane `n`'s change touched, by its latest `run.changed`, that its plan didn't name:
+/// the `pool.drift` to record, if any. A failed plan named nothing to drift from.
+fn drift(events: &[Event], repo: &str, n: u32, lane: &Lane) -> Option<Value> {
+    if lane.plan.source == "failed" {
+        return None;
+    }
+    let changed = events.iter().rev().find(|e| {
+        e.seq > lane.started_seq
+            && e.kind == EV_CHANGED
+            && e.data["repo"] == repo
+            && e.data["number"] == lane.number
+    })?;
+    let outside: Vec<&str> = changed.data["paths"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|path| !lane.plan.paths.iter().any(|p| overlap(p, path)))
+        .collect();
+    (!outside.is_empty()).then(|| {
+        json!({
+            "repo": repo, "number": lane.number, "lane": n, "outside": outside,
+            "admitted": lane.plan.paths,
+        })
+    })
+}
+
+/// `paja pool plan <number>` as a child of the pool; its progress lines go to the pool's stderr.
+fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
+    let exe = std::env::current_exe().context("finding the paja program to plan with")?;
+    let mut child = Command::new(exe)
+        .args(["--json", "pool", "plan"])
+        .arg(number.to_string())
+        .arg("--repo")
+        .arg(repo)
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting `paja pool plan {number}`"))?;
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                eprintln!("plan #{number}: {line}");
+            }
+        });
+    }
+    Ok(child)
+}
+
 fn spawn(
     repo: &Path,
     lane: u32,
@@ -597,6 +786,8 @@ pub struct LaneStatus {
     /// What the item's finished rounds on this lane spent, in US dollars (Claude Code's
     /// estimate).
     pub spent_usd: f64,
+    /// The files the lane was admitted for, from its `pool.admitted`.
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -604,6 +795,8 @@ pub struct WaitingItem {
     pub number: u64,
     pub title: String,
     pub why: String,
+    /// The files its plan names, once it has one.
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -695,7 +888,7 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             .map(|item| item.title.clone())
             .unwrap_or_default()
     };
-    let (lanes, begun): (Vec<LaneStatus>, Vec<u64>) = lanes
+    let (lanes, begun): (Vec<(LaneStatus, Option<Plan>)>, Vec<u64>) = lanes
         .into_iter()
         .filter(|(_, (event, _))| event.data["stage"] != "done")
         .filter_map(|(lane, (event, begun))| {
@@ -713,6 +906,16 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
                 .sum::<f64>()
                 // An empty sum is -0.0, which JSON shows as such.
                 + 0.0;
+            let plan = events
+                .iter()
+                .rev()
+                .take_while(|e| e.seq >= begun)
+                .find(|e| {
+                    e.kind == EV_POOL_ADMITTED
+                        && e.data["repo"] == repo
+                        && e.data["number"] == number
+                })
+                .and_then(|e| serde_json::from_value::<Plan>(e.data.clone()).ok());
             let lane = LaneStatus {
                 lane,
                 number,
@@ -721,10 +924,27 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
                 step: event.data["step"].as_str().map(str::to_string),
                 since_ms: event.ts_ms,
                 spent_usd,
+                paths: plan.as_ref().map(|p| p.paths.clone()).unwrap_or_default(),
             };
-            Some((lane, begun))
+            Some(((lane, plan), begun))
         })
         .unzip();
+    let (lanes, lane_plans): (Vec<LaneStatus>, Vec<Option<Plan>>) = lanes.into_iter().unzip();
+    let lane_plans: Vec<&Plan> = lane_plans.iter().flatten().collect();
+    let since = started.map_or(u64::MAX, |start| events[start].seq);
+    let plans = plans_since(events, repo, since);
+    let planning = |number: u64| {
+        events
+            .iter()
+            .rev()
+            .take_while(|e| e.seq > since)
+            .find(|e| {
+                matches!(e.kind.as_str(), EV_POOL_PLANNING | EV_POOL_PLANNED)
+                    && e.data["repo"] == repo
+                    && e.data["number"] == number
+            })
+            .is_some_and(|e| e.kind == EV_POOL_PLANNING)
+    };
     let admitted: Vec<u64> = lanes.iter().map(|lane| lane.number).collect();
     let (landing, merging) = land_turns(events, repo, &lanes, &begun);
     let waiting: Vec<WaitingItem> = items
@@ -737,11 +957,22 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             why: if !item.waiting_on.is_empty() {
                 let on: Vec<String> = item.waiting_on.iter().map(|n| format!("#{n}")).collect();
                 format!("waits on {}", on.join(", "))
-            } else if running {
-                "no free lane".to_string()
-            } else {
+            } else if !running {
                 "no pool is running".to_string()
+            } else if let Some((other, why)) = plans
+                .get(&item.number)
+                .and_then(|plan| blocked_by(plan, &lane_plans))
+            {
+                format!("overlaps #{other}: {why}")
+            } else if planning(item.number) {
+                "planning which files it touches".to_string()
+            } else {
+                "no free lane".to_string()
             },
+            paths: plans
+                .get(&item.number)
+                .map(|plan| plan.paths.clone())
+                .unwrap_or_default(),
         })
         .collect();
     let landed = events
@@ -834,6 +1065,13 @@ pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
                 lane.spent_usd
             ));
         }
+    }
+    for lane in status.lanes.iter().filter(|lane| !lane.paths.is_empty()) {
+        out.push(format!(
+            "lane {} touches: {}",
+            lane.lane,
+            lane.paths.join(", ")
+        ));
     }
     if let Some(number) = status.landing {
         out.push(format!("landing: #{number}"));

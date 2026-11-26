@@ -22,6 +22,7 @@ mod builder;
 mod follow_ups;
 mod land;
 pub mod live;
+pub mod plan;
 pub mod pool;
 mod progress;
 mod triage;
@@ -51,7 +52,15 @@ pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
 pub const MODELS_FILE: &str = ".paja/models";
 pub const CI_FILE: &str = ".paja/ci";
 /// The roles `.paja/models` may name, besides `fallback`.
-pub const ROLES: [&str; 6] = ["build", "fix", "review", "re-review", "review-2", "triage"];
+pub const ROLES: [&str; 7] = [
+    "build",
+    "fix",
+    "review",
+    "re-review",
+    "review-2",
+    "triage",
+    "plan",
+];
 /// The effort levels Claude Code takes.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
@@ -70,6 +79,9 @@ pub const EV_CHECKED: &str = "run.checked";
 /// A builder session's work was thrown away (the hook never ran), so it is never resumed.
 pub const EV_STEP_DISCARDED: &str = "run.step_discarded";
 pub const EV_LANDED: &str = "run.landed";
+/// The files a round's change touches against the default branch, once its checks passed:
+/// `{repo, number, round, paths}`.
+pub const EV_CHANGED: &str = "run.changed";
 pub const EV_ESCALATED: &str = "run.escalated";
 /// A non-blocking review finding filed as a follow-up issue (the `follow-up` label) after landing.
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
@@ -1028,10 +1040,17 @@ fn run_item(
                 &format!("{base}...HEAD"),
             ],
         )?;
-        let risky = changed
+        let paths: Vec<&str> = changed
             .split('\0')
             .filter(|path| !path.is_empty())
-            .any(|path| is_high_risk(path, &high_risk));
+            .collect();
+        // What the change touches, which a pool compares with the files it admitted it for.
+        record(
+            home,
+            EV_CHANGED,
+            json!({ "repo": item.repo, "number": item.number, "round": round, "paths": paths }),
+        )?;
+        let risky = paths.iter().any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
         // A fix that merged or rewrote history isn't a plain diff on what was reviewed: read it all.
         if let Some(p) = &prior {

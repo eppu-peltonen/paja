@@ -11,6 +11,8 @@ re-review sonnet medium
 review-2 sonnet medium
 # triage (the follow-up sorting pass of `paja triage`) is the cheapest model.
 triage haiku
+# plan (the pool's planner, listing the files an item will touch) is cheap too.
+plan haiku
 # The most turns one session of a role may take: `max-turns <role> <turns>`. A role with no
 # line gets 80 (build, fix) or 30 (the reviews); no session runs uncapped.
 max-turns build 80
@@ -18,3 +20,4 @@ max-turns fix 80
 max-turns review 30
 max-turns re-review 30
 max-turns review-2 30
+max-turns plan 15
