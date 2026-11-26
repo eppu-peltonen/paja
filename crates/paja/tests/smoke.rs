@@ -1223,6 +1223,46 @@ fn run_never_claims_another_repositorys_item() {
 }
 
 #[test]
+fn work_list_all_needs_no_checkout_once_the_log_names_its_repositories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (elsewhere, home) = (tmp.path().join("elsewhere"), tmp.path().join("home"));
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let no_gh = tmp.path().join("no-gh");
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.imported","data":{"repo":"acme/lib","number":1,"title":"Split it","body":"","url":"https://example.com/1"}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    // Outside any checkout, and with no `gh` to ask.
+    let (ok, items) = paja_with(
+        &home,
+        &elsewhere,
+        &["work", "list", "--all"],
+        &[("PAJA_GH", &no_gh)],
+    );
+    assert!(ok, "{items}");
+    let keys: Vec<(&str, u64)> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["repo"].as_str().unwrap(), i["number"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(keys, [("acme/app", 3), ("acme/lib", 1)], "{items}");
+    // A log from before repositories still needs the checkout to place its events.
+    let old = r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Old","body":"","url":"https://example.com/3"}}"#;
+    std::fs::write(home.join("events.jsonl"), format!("{old}\n")).unwrap();
+    let (ok, report) = paja_with(
+        &home,
+        &elsewhere,
+        &["work", "list", "--all"],
+        &[("PAJA_GH", &no_gh)],
+    );
+    assert!(!ok, "{report}");
+    assert!(report["error"].is_string(), "{report}");
+}
+
+#[test]
 fn work_list_names_the_event_of_a_step_it_cannot_read() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));

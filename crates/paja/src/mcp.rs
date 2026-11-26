@@ -206,11 +206,11 @@ impl PajaMcp {
     async fn work_list(&self, Parameters(args): Parameters<ListArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
-            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            let checkout = checkout(args.repo)?;
             let items = if args.all {
-                jono::list_all(&home, &name)?
+                jono::list_all_from(&home, &checkout)?
             } else {
-                jono::list(&home, &name)?
+                jono::list(&home, &jono::repo_name(&home, &checkout)?)?
             };
             Ok(serde_json::to_value(items)?)
         })
