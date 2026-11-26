@@ -37,5 +37,6 @@ fleet. Claude Code is also the worker that writes the code, so Paja never reimpl
 - **Small batches.** Each chunk has a diff-size budget; an oversized chunk is split, not built.
 - **Plain code for plumbing.** Scheduling, routing and gating are deterministic code; LLMs do the judgment work inside
   steps.
-- **New or existing projects alike.** Factory files live outside the app repo, so a new repo gets them from its first
-  commit and an existing one doesn't have to change.
+- **New or existing projects alike.** A project's Paja files (`.paja/` and `CLAUDE.md`) live in its own repository, on
+  its default branch. Paja reads them from there, never from the branch under review, so a change can't loosen the
+  checks that judge it. A new repo gets them from its first commit and an existing one gets them in one pull request.
