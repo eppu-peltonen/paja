@@ -210,5 +210,26 @@ byId("file-send").addEventListener("click", async () => {
   showFiling("edit");
 });
 
+// The About line: Desk's version and the `paja` it found, with a warning when they differ.
+async function showAbout() {
+  const about = await invoke("about");
+  if (about.error) {
+    throw new Error(about.error);
+  }
+  const pajaText = about.paja
+    ? `paja ${about.paja} (${about.paja_path})`
+    : "no paja found next to Desk or on PATH";
+  byId("about").textContent = `Paja Desk ${about.desk} · ${pajaText}`;
+  const warning = byId("versions");
+  if (!about.paja) {
+    warning.textContent = "Desk found no paja program. Install Paja (or Desk's installer, which includes it) so runs and the plugin work.";
+    warning.hidden = false;
+  } else if (!about.matches) {
+    warning.textContent = `Desk is ${about.desk} but paja is ${about.paja}. Install the same release of both.`;
+    warning.hidden = false;
+  }
+}
+
 listen("paja://events-changed", () => refresh().catch(showError));
+showAbout().catch(showError);
 refresh().catch(showError);

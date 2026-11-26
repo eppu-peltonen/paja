@@ -54,7 +54,8 @@ the real repository, to the smoke tests.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `desk/`: Paja Desk, a Tauri 2 app (`paja-desk`) that calls the core in-process; `desk/ui/` is plain HTML, CSS and
   JavaScript. Not a default workspace member: build and test it with `-p paja-desk` (on Linux it needs WebKitGTK's
-  development packages). Its Tauri permissions (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk.
+  development packages). Its Tauri permissions (`desk/capabilities/`, `desk/tauri.conf.json`) and its installer (`desk/tauri.bundle.json`,
+  `desk/installer.nsh`, which edits PATH) are high risk.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary. Its fake `gh` and `claude` are shell
   scripts; on Windows `crates/paja/examples/fake_tool.rs` runs them, so run the whole `cargo test`, which builds it.
 - `evals/`: harness evals that run headless Claude Code (need a signed-in `claude`; not run in CI).

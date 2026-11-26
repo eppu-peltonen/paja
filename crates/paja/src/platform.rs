@@ -506,6 +506,18 @@ pub fn own_process_group(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Start `cmd` without a console window of its own. A windowed program such as Paja Desk has
+/// no console, so on Windows each console program it starts would open one; elsewhere this
+/// does nothing.
+pub fn no_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(cmd, CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// [`Command::output`] for a long step (an agent or a check), in its own process group, ended
 /// with everything it started when the person presses Ctrl-C a second time.
 pub fn output_until_stopped(cmd: &mut Command) -> std::io::Result<std::process::Output> {

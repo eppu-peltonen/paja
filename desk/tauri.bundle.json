@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "active": true,
+    "externalBin": ["binaries/paja"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "installer.nsh"
+      }
+    }
+  }
+}

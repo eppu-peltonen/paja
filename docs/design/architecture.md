@@ -487,3 +487,11 @@ person's text stays in the window across refreshes and errors. Desk's Tauri perm
 Desk is a workspace member but not a default one, since it needs the webview's development files to build (WebKitGTK
 on Linux): plain `cargo build` and `cargo test` cover the core, and CI's `desk` job runs clippy and the tests for
 `-p paja-desk` on Windows and Linux.
+
+Each `v*` release also builds Desk's installers with Tauri's bundler (the `desk` job in `release.yml`): NSIS on
+Windows, a dmg per Mac architecture, an AppImage and a deb on Linux, unsigned for now. The installer carries the
+`paja` built from the same commit as a Tauri sidecar (`desk/tauri.bundle.json`, which only the release build merges
+in, names `desk/binaries/paja-<target>`), next to `paja-desk`: in the install folder on Windows, which the NSIS hooks in
+`desk/installer.nsh` put on the user's `PATH`, inside the app on macOS and in `/usr/bin` from the deb. Desk's footer
+runs that `paja` (next to its own executable, else on `PATH`) with `--json --version` and warns when its version
+differs from Desk's; a test keeps `desk/tauri.conf.json`, Desk's crate and the core's crate at one version.
