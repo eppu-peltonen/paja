@@ -1009,6 +1009,7 @@ impl Factory {
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
@@ -1232,6 +1233,159 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert!(stderr.contains("resuming #5"), "{stderr}");
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "landed", "{item}");
+}
+
+/// Start `paja run` in a process group of its own, as a terminal runs it, with the fake
+/// builder waiting on `slow` until the test lets it finish.
+#[cfg(unix)]
+fn slow_run(f: &Factory) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("slow"), "").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join("slowing").exists() {
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the builder never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child
+}
+
+/// Ctrl-C as a terminal sends it: to the whole foreground process group.
+#[cfg(unix)]
+fn ctrl_c(run: &std::process::Child) {
+    let group = format!("-{}", run.id());
+    let sent = Command::new("kill")
+        .args(["-INT", "--", &group])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_first_ctrl_c_lets_the_step_finish_and_the_next_run_resumes() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    let mut run = slow_run(&f);
+    ctrl_c(&run);
+    // The builder isn't in paja's process group, so it is still working, and so is paja.
+    assert!(
+        run.try_wait().unwrap().is_none(),
+        "paja died on the first Ctrl-C"
+    );
+    std::fs::remove_file(dir.join("slow")).unwrap();
+    let output = run.wait_with_output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    assert_eq!(report["number"], 5, "{report}");
+    assert!(
+        stderr.contains("stopping after this step; press Ctrl-C again to stop now"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("running Vasara's checks"), "{stderr}");
+    // The finished build is kept: the round is recorded with what it spent, and the item
+    // stays active, not parked.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    assert_eq!(item["usage"]["steps"], 1, "{item}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let rounds: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .collect();
+    assert_eq!(rounds.len(), 1, "{log}");
+    assert_eq!(rounds[0]["data"]["verdict"], "stopped", "{log}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(stderr.contains("resuming #5"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_ctrl_c_stops_at_once_and_ends_the_agent() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    let run = slow_run(&f);
+    ctrl_c(&run);
+    ctrl_c(&run);
+    let started = std::time::Instant::now();
+    let output = run.wait_with_output().unwrap();
+    assert!(started.elapsed().as_secs() < 30, "paja didn't stop at once");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    assert!(stderr.contains("stopping now"), "{stderr}");
+    // The builder was ended with paja, not left running: it never got to commit.
+    std::fs::remove_file(dir.join("slow")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    let (_, env) = paja(&f.home, &f.repo, &["env", "show", "work-5"]);
+    let path = env["path"].as_str().unwrap();
+    assert!(
+        !std::path::Path::new(path).join("feature.txt").exists(),
+        "the builder kept running after paja stopped"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_the_terminal_ends_the_agent_with_paja() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    let run = slow_run(&f);
+    // A closed terminal sends SIGHUP to the whole process group.
+    let group = format!("-{}", run.id());
+    let sent = Command::new("kill")
+        .args(["-HUP", "--", &group])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let output = run.wait_with_output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    // The builder, in its own process group, was ended too: it never gets to commit.
+    std::fs::remove_file(dir.join("slow")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (_, env) = paja(&f.home, &f.repo, &["env", "show", "work-5"]);
+    let path = env["path"].as_str().unwrap();
+    assert!(
+        !std::path::Path::new(path).join("feature.txt").exists(),
+        "the builder outlived paja"
+    );
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
 }
 
 /// The session ids Mestari recorded before starting builder sessions, oldest first.

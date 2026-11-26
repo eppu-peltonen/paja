@@ -643,7 +643,7 @@ pub fn file(home: &Home, repo: &Path, title: &str, body: &str) -> Result<Filed> 
 /// here, and taking the proof means no command can run it without the check.
 fn gh_output(ok: &Untampered, args: &[&str]) -> Result<std::process::Output> {
     let gh = gh_program();
-    Command::new(&gh)
+    crate::platform::own_process_group(Command::new(&gh).env("GH_PROMPT_DISABLED", "1"))
         .current_dir(ok.path())
         .args(args)
         .output()

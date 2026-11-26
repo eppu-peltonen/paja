@@ -60,6 +60,30 @@ pub enum RunReport {
         question: String,
         rounds: u32,
     },
+    /// The person pressed Ctrl-C. The item stays active, and the next `paja run` resumes it in
+    /// the same environment.
+    Stopped { number: u64, rounds: u32 },
+}
+
+/// The run reached a step boundary after the person pressed Ctrl-C.
+#[derive(Debug)]
+pub struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped by Ctrl-C")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// A step boundary: stop here if the person pressed Ctrl-C. The step that was running has
+/// finished and been kept, so nothing is lost.
+fn stop_point() -> Result<()> {
+    if crate::platform::interrupts() > 0 {
+        return Err(Stopped.into());
+    }
+    Ok(())
 }
 
 /// What a reviewer agent decides.
@@ -527,6 +551,24 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let mut run = Unrecorded::default();
     match run_item(home, &repo, &base, &item, config, resumed, &mut run) {
         Ok(report) => Ok(report),
+        // Ctrl-C: whatever failed after it (a step it cut short, or the stop itself) is not the
+        // item's fault. Keep what the round spent, leave the item active and its environment in
+        // place, and let the next run resume it. A tampered repository still stops as below.
+        Err(err) if !is_tampered(&err) && crate::platform::interrupts() > 0 => {
+            let rounds = run.round;
+            if !run.steps.is_empty() {
+                let note = format!("{err:#}");
+                record_round(home, &item, rounds, "stopped", &note, &mut run.steps)?;
+            }
+            progress(&format!(
+                "stopped; #{} stays active and the next `paja run` resumes it",
+                item.number
+            ));
+            Ok(RunReport::Stopped {
+                number: item.number,
+                rounds,
+            })
+        }
         Err(err) => {
             let rounds = run.round;
             let question = format!(
@@ -647,6 +689,7 @@ fn run_item(
     progress(&format!("working in {}", env.path.display()));
     for round in 1..=MAX_ROUNDS {
         run.round = round;
+        stop_point()?;
         let steps = &mut run.steps;
         steps.clear();
         progress(&format!(
@@ -756,6 +799,7 @@ fn run_item(
             put_back(&env, &checked)?;
             flags = git(&env.path, &["ls-files", "-v"])?;
         }
+        stop_point()?;
         let guard = GitGuard::new(&env.path)?;
         progress(&format!(
             "running Vasara's checks ({} command{})",
@@ -834,6 +878,7 @@ fn run_item(
         let mut retried = false;
         let mut i = 0;
         progress("Vasara's checks passed");
+        stop_point()?;
         while i < reviewers {
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
@@ -1753,7 +1798,7 @@ fn claude(
     };
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
-    let output = cmd.stdin(std::process::Stdio::null()).output();
+    let output = crate::platform::output_until_stopped(cmd.stdin(std::process::Stdio::null()));
     let _ = std::fs::remove_dir_all(&scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
@@ -2397,10 +2442,9 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
             };
             // Without the sandbox the checks keep the owner's HOME, as agents do: toolchain
             // managers find cargo through it, and credential files there stay reachable.
-            let output = cmd
-                .stdin(std::process::Stdio::null())
-                .output()
-                .with_context(|| format!("running check `{check}`"))?;
+            let output =
+                crate::platform::output_until_stopped(cmd.stdin(std::process::Stdio::null()))
+                    .with_context(|| format!("running check `{check}`"))?;
             if !output.status.success() {
                 return Ok(Some(format!("`{check}` failed:\n\n{}", tail(&output))));
             }
@@ -2771,13 +2815,14 @@ fn tail(output: &Output) -> String {
 
 fn run_gh(repo: &Path, args: &[&str]) -> Result<String> {
     let gh = jono::gh_program();
-    let output = Command::new(&gh)
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .with_context(|| {
-            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
-        })?;
+    let output =
+        crate::platform::own_process_group(Command::new(&gh).env("GH_PROMPT_DISABLED", "1"))
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .with_context(|| {
+                format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+            })?;
     if !output.status.success() {
         bail!("`{gh} {}` failed: {}", args.join(" "), tail(&output));
     }
