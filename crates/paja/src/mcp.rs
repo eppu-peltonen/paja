@@ -249,7 +249,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: show one work item of the checkout's repository by its issue number."
+        description = "Jono: show one work item of the checkout's repository by its issue number. An active item also carries `run`: its latest run's environment, round, current step and what each finished round spent."
     )]
     async fn work_show(&self, Parameters(args): Parameters<NumberArgs>) -> Result<String, String> {
         let home = self.home.clone();
