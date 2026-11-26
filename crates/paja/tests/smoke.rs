@@ -560,6 +560,7 @@ fn the_mcp_server_serves_the_same_core() {
         "work_set",
         "work_answer",
         "work_file",
+        "doctor",
     ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
@@ -1781,6 +1782,187 @@ fn a_repository_without_ci_lands_on_the_checks_alone() {
         "{log}"
     );
     assert!(log.contains("pr merge"), "{log}");
+}
+
+/// Make `dir` private to this user, as the home folder must be.
+fn make_private(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap();
+        // An elevated account's new folders belong to Administrators; take ownership as the
+        // doctor's fix says. It may be refused, in which case the test tolerates the check.
+        let _ = Command::new("icacls")
+            .arg(dir)
+            .args(["/setowner", &user])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let status = Command::new("icacls")
+            .arg(dir)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:(OI)(CI)F"))
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls failed");
+    }
+}
+
+#[test]
+fn doctor_reports_each_check_and_the_fix_for_a_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home, d) = (
+        tmp.path().join("app"),
+        tmp.path().join("home"),
+        slash(tmp.path()),
+    );
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/app.git",
+        ],
+    );
+    make_private(&home);
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             \"auth status\") if [ -f {d}/gh-signed-out ]; then echo 'You are not logged into any GitHub hosts' >&2; exit 1; fi ;;\n\
+             \"repo view\") echo '{{\"viewerPermission\": \"ADMIN\"}}' ;;\n\
+             \"label list\") echo '[{{\"name\": \"factory\"}}]' ;;\n\
+             \"workflow list\") echo 'CI	active	1' ;;\nesac\n"
+        ),
+    );
+    let claude = program(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\ncase \"$1 $2\" in\n\
+         \"auth status\") echo '{\"loggedIn\": true}' ;;\n\
+         *) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+    );
+    let doctor = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .env("PAJA_CLAUDE", &claude)
+            .env_remove("PAJA_SBX")
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        (output.status.success(), report)
+    };
+    let check = |report: &Value, name: &str| -> Value {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no check {name} in {report}"))
+            .clone()
+    };
+
+    // Everything is in place; only the missing sandbox is a warning, and it doesn't fail.
+    let (success, report) = doctor();
+    // On a Windows account that runs elevated (CI runners do), a folder this user creates is
+    // owned by the Administrators group, so no ACL change makes the home folder pass. Whatever
+    // the machine's temp-folder permissions are, the check must say which, and only it may fail.
+    let home_check = check(&report, "home folder");
+    if home_check["status"] != "ok" {
+        if !cfg!(windows) {
+            panic!("a private home failed the check: {home_check}");
+        }
+        assert_eq!(home_check["status"], "failed", "{home_check}");
+        assert!(
+            home_check["fix"].as_str().unwrap().contains("icacls"),
+            "{home_check}"
+        );
+    }
+    let home_ok = home_check["status"] == "ok";
+    assert_eq!(success, home_ok, "{report}");
+    assert_eq!(report["ok"] == true, home_ok, "{report}");
+    for name in [
+        "git",
+        "gh",
+        "gh sign-in",
+        "gh access",
+        "claude",
+        "claude sign-in",
+        "deny-list hook",
+        "origin",
+        "work label",
+        "checks",
+        "ci",
+    ] {
+        let c = check(&report, name);
+        assert_eq!(c["status"], "ok", "{c}");
+        assert!(c["fix"].is_null(), "{c}");
+    }
+    let sandbox = check(&report, "sandbox");
+    assert_eq!(sandbox["status"], "warning", "{sandbox}");
+    assert!(
+        sandbox["detail"].as_str().unwrap().contains("as this user"),
+        "{sandbox}"
+    );
+
+    // A signed-out gh and a default branch without `.paja/checks`.
+    std::fs::write(tmp.path().join("gh-signed-out"), "").unwrap();
+    git(&repo, &["rm", "-q", ".paja/checks"]);
+    git(&repo, &["commit", "-q", "-m", "no checks"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let (success, report) = doctor();
+    assert!(!success && report["ok"] == false, "{report}");
+    let signed_in = check(&report, "gh sign-in");
+    assert_eq!(signed_in["status"], "failed", "{signed_in}");
+    assert!(
+        signed_in["fix"].as_str().unwrap().contains("auth login"),
+        "{signed_in}"
+    );
+    assert!(
+        signed_in["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not logged in"),
+        "{signed_in}"
+    );
+    let checks = check(&report, "checks");
+    assert_eq!(checks["status"], "failed", "{checks}");
+    assert!(
+        checks["fix"].as_str().unwrap().contains("add it"),
+        "{checks}"
+    );
+    assert!(
+        checks["detail"].as_str().unwrap().contains(".paja/checks"),
+        "{checks}"
+    );
+    // The rest still passed.
+    assert_eq!(check(&report, "git")["status"], "ok");
 }
 
 #[test]

@@ -515,6 +515,16 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     }
 }
 
+/// For `paja doctor`: the deny-list hook a builder would run under passes its self-test in
+/// `root`. Changes nothing but the hook's binary copy in the home, as a run does.
+pub fn check_hook(home: &Home, root: &Path) -> Result<()> {
+    let (_, stamp, _) = hook_settings(root, home, false, &[])?;
+    if let Some(dir) = stamp.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
 /// Where a run is, so an error can still record what the round spent: the round it is in and
 /// the steps that ran in it but are not yet in a `run.round` event.
 #[derive(Default)]
