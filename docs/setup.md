@@ -53,6 +53,27 @@ paja run --once
 
 Then `paja run --every 5` keeps going, as described below.
 
+## Check the setup
+
+`paja doctor` (with `--repo <path>`; the default is the current directory) checks that this machine and the repository
+are ready, so you find out what is missing before `paja run` fails partway. It changes nothing in the repository. Each
+check is `ok`, `warning` or `failed`, and each warning or failure says how to fix it:
+
+- `git` runs; on Windows, Git for Windows' `sh` is found.
+- `gh` runs, is signed in (`gh auth status`), and the account can push and merge in the repository (`viewerPermission`
+  is `WRITE`, `MAINTAIN` or `ADMIN`).
+- `claude` runs and is signed in (`claude auth status`).
+- The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
+- The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
+  branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
+  as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.
+- The sandbox: a warning, not a failure, when `PAJA_SBX` is not set. Agents and checks then run as your user, with
+  your files and sign-ins, behind the deny-list hook only.
+
+With `--json` it prints `{"checks": [{"name", "status", "detail", "fix"}], "ok": bool}`; `fix` is null for a passing
+check, and `ok` is false when any check failed (a warning doesn't count). The exit code is non-zero when any check
+failed. The MCP tool `doctor` returns the same JSON.
+
 ## Using Paja from Claude Code
 
 The Claude Code plugin in `plugin/` starts `paja mcp`, so Paja's core shows up as MCP tools, and adds three skills:

@@ -309,6 +309,20 @@ impl PajaMcp {
         .await
     }
 
+    #[tool(
+        description = "Check that this machine and the repository are ready for paja run: git, gh, claude, the deny-list hook, the repository's labels and .paja files, and the sandbox. Returns {checks: [{name, status (ok, warning or failed), detail, fix}], ok}."
+    )]
+    async fn doctor(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            Ok(serde_json::to_value(crate::doctor::run_checks(
+                &home,
+                &checkout(args.repo)?,
+            )?)?)
+        })
+        .await
+    }
+
     #[tool(description = "Show the event log, oldest first.")]
     async fn log(&self, Parameters(args): Parameters<LogArgs>) -> Result<String, String> {
         let home = self.home.clone();

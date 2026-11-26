@@ -64,6 +64,14 @@ enum Command {
         #[arg(long)]
         tamper_checked: bool,
     },
+    /// Check that this machine and repository are ready for `paja run`: git, `gh`, `claude`,
+    /// the deny-list hook, the repository's labels and `.paja` files, and the sandbox. Each
+    /// check is ok, a warning or failed, with its fix; the exit code is non-zero when any failed.
+    Doctor {
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// The deny-list hook Mestari runs agents under (Claude Code `PreToolUse`). Reads the
     /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow. Prints no
     /// JSON: Claude Code reads only its exit code and stderr.
@@ -260,6 +268,15 @@ fn run(cli: &Cli) -> Result<()> {
             // stderr so it can't be read as a frame.
             if let Err(err) = paja::mcp::serve(home) {
                 eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Doctor { repo } => {
+            let report = paja::doctor::run_checks(&home, repo)?;
+            emit(cli, serde_json::to_value(&report)?, || {
+                describe_doctor(&report)
+            });
+            if !report.ok {
                 std::process::exit(1);
             }
         }
@@ -494,6 +511,27 @@ fn run_json(report: &mestari::RunReport) -> Result<serde_json::Value> {
         );
     }
     Ok(value)
+}
+
+fn describe_doctor(report: &paja::doctor::Report) -> String {
+    let mut out = Vec::new();
+    for check in &report.checks {
+        out.push(format!(
+            "{:<8}{}: {}",
+            check.status.as_str(),
+            check.name,
+            check.detail
+        ));
+        if let Some(fix) = &check.fix {
+            out.push(format!("        fix: {fix}"));
+        }
+    }
+    out.push(if report.ok {
+        "ready: no check failed".to_string()
+    } else {
+        "not ready: fix the failed checks above, then run `paja doctor` again".to_string()
+    });
+    out.join("\n")
 }
 
 fn describe_run(report: &mestari::RunReport) -> String {

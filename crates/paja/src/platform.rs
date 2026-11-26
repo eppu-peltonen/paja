@@ -128,6 +128,33 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
+/// Check, without changing anything, that only this user can enter `dir`: no group or other
+/// permission bits on Unix; on Windows that this user owns it and its ACL is protected and lets
+/// no other account in.
+pub fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        win::check_owner_only(dir)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(std::io::Error::other(format!(
+                "{} has mode {mode:03o}, so other accounts can read or change what's in it",
+                dir.display()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Create `path`, which must not exist yet, as a file only this user can read, write or run
 /// (on Windows: inside a directory `create_private_dir` or `ensure_private_dir` made).
 pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
