@@ -212,8 +212,9 @@ syncs its issues there, as `paja work sync` does, and remembers the folder). For
 - A run started in a terminal shows as running too, and Desk won't start a second one in the same repository; stop it
   where it was started.
 - **Pool** opens the repository's worker pool: whether it runs, how long, what it spent and landed, how many items
-  are ready or held for your answer, a row per lane (item, stage, step, time in step, spend), the waiting items and
-  why, the last landings and the pool's latest events. **Start the pool** starts `paja run --every 5 --workers <N>`
+  are ready or held for your answer, which lane is landing and which wait to land, a row per lane (item, stage,
+  step, time in step, spend, the files it was admitted for), the waiting items and why, the last landings and the
+  pool's latest events. **Start the pool** starts `paja run --every 5 --workers <N>`
   with the lane count in the box. **Set lanes** changes the count of a running pool, which it reads on its next tick,
   as `paja pool lanes <N>` does; lowering it says which busy lanes finish their items first. A pool started in a
   terminal shows here too, and its lanes can be changed the same way.

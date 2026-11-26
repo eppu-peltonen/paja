@@ -475,14 +475,26 @@ function poolNote(status, lanes) {
   const busy = status.lanes.map((lane) => lane.lane);
   if (lanes == null || Number.isNaN(lanes) || busy.length <= lanes) return "";
   const names = busy.length === 1 ? `Lane ${busy[0]} is` : `Lanes ${busy.slice(0, -1).join(", ")} and ${busy[busy.length - 1]} are`;
-  return `${names} busy: each finishes its item, and no new lane starts until fewer than ${lanes + 1} are busy.`;
+  const then = lanes === 0 ? "no new lane starts until the count is raised" : `a new lane starts only once fewer than ${lanes} are busy`;
+  return `${names} busy: each finishes its item, and ${then}.`;
 }
 
 function poolSummary(status) {
   const target = status.target == null ? "no lane count set" : `${status.busy} of ${status.target} lanes busy`;
   if (status.state !== "running") return `Stopped; ${target}. ${status.waiting.length} waiting, ${status.held} held for your answer.`;
   const up = duration(Date.now() - status.started_ms);
-  return `Running for ${up}: ${target}, spent $${status.spent_usd.toFixed(2)}, landed ${status.landed_since_start}, ${status.ready} ready, ${status.held} held for your answer.`;
+  let text = `Running for ${up}: ${target}, spent $${status.spent_usd.toFixed(2)}, landed ${status.landed_since_start}, ${status.ready} ready, ${status.held} held for your answer.`;
+  if (status.landing != null) text += ` Landing #${status.landing}.`;
+  if ((status.merging || []).length) text += ` Waiting to land: ${status.merging.map((n) => `#${n}`).join(", ")}.`;
+  return text;
+}
+
+// The lane count typed in the box, from `min` to 32, or null when it isn't one.
+function typedLanes(min) {
+  const value = byId("pool-lanes").value.trim();
+  const lanes = Number(value);
+  if (value === "" || !Number.isInteger(lanes) || lanes < min || lanes > 32) return null;
+  return lanes;
 }
 
 function renderPool(status, repo, stream) {
@@ -507,6 +519,7 @@ function renderPool(status, repo, stream) {
         el("td", {}, lane.step ?? "-"),
         el("td", {}, duration(now - lane.since_ms)),
         el("td", {}, `$${lane.spent_usd.toFixed(2)}`),
+        el("td", {}, (lane.paths || []).join(", ") || "-"),
       ]),
     ),
   );
@@ -570,8 +583,11 @@ byId("pool-lanes").addEventListener("input", () => {
 });
 
 byId("pool-set").addEventListener("click", async () => {
-  const lanes = Number(byId("pool-lanes").value);
-  if (!Number.isInteger(lanes)) return;
+  const lanes = typedLanes(0);
+  if (lanes == null) {
+    poolResult({ error: "type a lane count from 0 to 32 first (0 lets the busy lanes finish and starts none)" });
+    return;
+  }
   const result = await invoke("pool_lanes", { repo: poolRepo, lanes }).catch((err) => ({ error: String(err) }));
   if (!result.error) poolDraft = null;
   poolResult(result, result.running ? `Set to ${lanes}; the pool reads it on its next tick.` : `Set to ${lanes}; the next pool starts with it unless it is given another.`);
@@ -579,7 +595,11 @@ byId("pool-set").addEventListener("click", async () => {
 });
 
 byId("pool-start").addEventListener("click", async () => {
-  const lanes = Number(byId("pool-lanes").value) || (poolLast && poolLast.target) || 2;
+  const lanes = typedLanes(1);
+  if (lanes == null) {
+    poolResult({ error: "type how many lanes the pool keeps busy, from 1 to 32, first" });
+    return;
+  }
   const result = await invoke("run_start", { repo: poolRepo, every: true, workers: lanes }).catch((err) => ({ error: String(err) }));
   poolResult(result, `Started a pool of ${lanes} lanes.`);
   showPool().catch(showError);
