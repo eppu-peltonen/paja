@@ -24,6 +24,8 @@ pub const EV_CHANGED: &str = "work.changed";
 pub const EV_CLOSED: &str = "work.closed";
 pub const EV_REOPENED: &str = "work.reopened";
 pub const EV_STATUS: &str = "work.status";
+/// A person answered an escalated item's question.
+pub const EV_ANSWERED: &str = "work.answered";
 
 /// Where an item is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,19 @@ pub struct WorkItem {
     /// None until a step is recorded.
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// What a person answered to the item's escalations, oldest first. Every later run gets
+    /// them in its prompts, since agents can't read the issue's comments.
+    #[serde(default)]
+    pub answers: Vec<Answer>,
+}
+
+/// A person's answer to a question Paja asked about an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answer {
+    /// The question, as the escalation asked it, when it was known.
+    #[serde(default)]
+    pub question: Option<String>,
+    pub answer: String,
 }
 
 /// An item's agent usage, totalled over every recorded step. Steps whose result had no usage
@@ -143,6 +158,13 @@ struct Round {
 }
 
 #[derive(Deserialize)]
+struct Answered {
+    number: u64,
+    #[serde(flatten)]
+    answer: Answer,
+}
+
+#[derive(Deserialize)]
 struct StatusChange {
     number: u64,
     status: Status,
@@ -169,6 +191,7 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                         status: Status::Queued,
                         note: None,
                         usage: None,
+                        answers: Vec::new(),
                     },
                 );
             }
@@ -199,6 +222,13 @@ pub fn replay(events: &[Event]) -> Result<BTreeMap<u64, WorkItem>> {
                 if let Some(item) = items.get_mut(&change.number) {
                     item.status = change.status;
                     item.note = change.note;
+                }
+            }
+            EV_ANSWERED => {
+                let answered: Answered =
+                    serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
+                if let Some(item) = items.get_mut(&answered.number) {
+                    item.answers.push(answered.answer);
                 }
             }
             EV_ROUND => {
@@ -335,22 +365,49 @@ pub fn apply(home: &Home, open: &[Issue]) -> Result<SyncReport> {
     Ok(report)
 }
 
-/// Answer an escalated item: post the person's answer as a comment on its issue, then queue it
-/// again so the next run picks it up with the answer on the issue.
+/// Answer an escalated item: record the person's answer in the event log and queue the item
+/// again, in one step under the home lock, then post the answer on the issue so it is visible
+/// there too. The next run passes every recorded answer to its agents.
 pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkItem> {
-    let item = get(home, number)?;
-    if item.status != Status::Escalated {
-        bail!(
-            "work item #{number} is {}, not escalated, so there is no question to answer; \
-             check `paja work show {number}`",
-            item.status.as_str()
-        );
-    }
     if text.trim().is_empty() {
         bail!("the answer for #{number} is empty; say what Paja should do");
     }
     // gh runs git in the checkout to find its GitHub repository.
     crate::ahjo::ensure_untampered(home, repo)?;
+    let item = {
+        let lock = home.lock()?;
+        let log = home.events();
+        let mut item = replay(&log.read_all()?)?.remove(&number).with_context(|| {
+            format!(
+                "no work item #{number}; run `paja work sync` to import issues labelled `{LABEL}`"
+            )
+        })?;
+        if item.status != Status::Escalated {
+            bail!(
+                "work item #{number} is {}, not escalated, so there is no question to answer; \
+                 check `paja work show {number}`",
+                item.status.as_str()
+            );
+        }
+        let answer = Answer {
+            question: item.note.clone(),
+            answer: text.to_string(),
+        };
+        log.append(
+            &lock,
+            EV_ANSWERED,
+            json!({ "number": number, "question": answer.question, "answer": answer.answer }),
+        )?;
+        log.append(
+            &lock,
+            EV_STATUS,
+            json!({ "number": number, "status": Status::Queued, "note": null }),
+        )?;
+        item.answers.push(answer);
+        item.status = Status::Queued;
+        item.note = None;
+        item
+    };
     gh(
         repo,
         &[
@@ -360,8 +417,14 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
             "--body",
             &format!("**Answer to Paja's question.**\n\n{text}"),
         ],
-    )?;
-    set_status(home, number, Status::Queued, None)
+    )
+    .with_context(|| {
+        format!(
+            "the answer is recorded and #{number} is queued, so the next run uses it, but posting \
+             it on the issue failed; post it there by hand if others should see it"
+        )
+    })?;
+    Ok(item)
 }
 
 /// A GitHub issue filed for Jono.
@@ -574,5 +637,43 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 200);
         assert_eq!(usage.num_turns, 8);
         assert_eq!(usage.cost_usd, 1.0);
+    }
+
+    #[test]
+    fn answers_are_kept_with_their_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        apply(&home, &[issue(1, "One")]).unwrap();
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                EV_ANSWERED,
+                json!({ "number": 1, "question": "Which API?", "answer": "v2" }),
+            )
+            .unwrap();
+        // An answer recorded without its question still counts.
+        home.events()
+            .append(
+                &lock,
+                EV_ANSWERED,
+                json!({ "number": 1, "answer": "Keep it small" }),
+            )
+            .unwrap();
+        drop(lock);
+        let answers = get(&home, 1).unwrap().answers;
+        assert_eq!(
+            answers,
+            [
+                Answer {
+                    question: Some("Which API?".into()),
+                    answer: "v2".into()
+                },
+                Answer {
+                    question: None,
+                    answer: "Keep it small".into()
+                },
+            ]
+        );
     }
 }

@@ -895,10 +895,11 @@ fn build(
          with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
          that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
          only for cargo and local git, and Paja's deny-list hook blocks anything else (no `$(`, \
-         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`.\n\nIssue #{number}: {title}\n\n{body}\n",
+         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`.\n\nIssue #{number}: {title}\n\n{body}\n{answers}",
         number = item.number,
         title = item.title,
-        body = item.body
+        body = item.body,
+        answers = answers(item)
     );
     let again = format!(
         "This is another round on the same branch (based on {base}). Address this first:\n\n{feedback}\n"
@@ -1005,11 +1006,31 @@ fn review_prompt(item: &WorkItem, base: &str, checked: &str, prior: Option<&Prio
          `cargo fmt`, `cargo clippy` or the whole `cargo test` again. To probe a behaviour, run \
          one named test (`cargo test <name>`) or the CLI, with long output piped through \
          `tail -n 80` or `grep`. Read-only git is fine; you can't change files.\n\n\
-         Issue #{number}: {title}\n\n{body}\n",
+         Issue #{number}: {title}\n\n{body}\n{answers}",
         number = item.number,
         title = item.title,
-        body = item.body
+        body = item.body,
+        answers = answers(item)
     )
+}
+
+/// What a person answered to Paja's earlier questions on the item, for the agents' prompts.
+/// Agents can't read the issue's comments, so this is how an answer reaches the next run.
+fn answers(item: &WorkItem) -> String {
+    if item.answers.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from(
+        "\nA person answered Paja's earlier questions about this issue. The answers settle what \
+         the issue leaves open; follow them:\n",
+    );
+    for answer in &item.answers {
+        if let Some(question) = &answer.question {
+            text.push_str(&format!("\nQuestion: {question}\n"));
+        }
+        text.push_str(&format!("Answer: {}\n", answer.answer));
+    }
+    text
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2069,9 +2090,11 @@ fn record_follow_up(home: &Home, item: &WorkItem, finding: &str, issue: Option<&
 /// Ask the person on the issue.
 fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
     let body = format!(
-        "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer here, then run \
-         `paja work set {} queued` to try again.",
-        item.number
+        "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer with \
+         `paja work answer {n} \"<your answer>\"` (or `/paja:answer` in Claude Code). That records \
+         the answer for Paja's next run and queues the item again; a reply here alone doesn't \
+         reach the next run.",
+        n = item.number
     );
     run_gh(
         repo,
@@ -2711,6 +2734,7 @@ mod tests {
             status: crate::jono::Status::Active,
             note: None,
             usage: None,
+            answers: Vec::new(),
         };
         let prompt = super::review_prompt(&item, "base1", "abc123", None);
         assert!(prompt.contains("already passed at abc123"), "{prompt}");

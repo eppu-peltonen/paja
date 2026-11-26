@@ -728,6 +728,10 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
     assert!(ok, "{item}");
     assert_eq!(item["status"], "queued");
     assert_eq!(item["note"], Value::Null);
+    assert_eq!(
+        item["answers"],
+        serde_json::json!([{"question": "Which API?", "answer": "Use v2"}])
+    );
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(
         log.contains("issue comment 3 --body **Answer to Paja's question.**"),
@@ -1192,6 +1196,36 @@ fn run_escalates_when_the_reviewer_asks_a_question() {
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "escalated");
     assert_eq!(item["note"], "Which API?");
+}
+
+#[test]
+fn the_next_run_gets_the_persons_answer() {
+    let f = Factory::new("true\n", "escalate");
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    // The question on the issue says how to answer so the next run sees it.
+    assert!(f.gh_log().contains("paja work answer 5"), "{}", f.gh_log());
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Use the v2 API"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    std::fs::write(f.tmp.path().join("verdict.txt"), "land").unwrap();
+    std::fs::remove_file(f.tmp.path().join("claude-args.log")).unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let calls = f.claude_calls();
+    let builder = calls.iter().find(|c| !c.contains("--json-schema")).unwrap();
+    let reviewer = calls.iter().find(|c| c.contains("--json-schema")).unwrap();
+    for call in [builder, reviewer] {
+        assert!(
+            call.contains("Question: Which API?") && call.contains("Answer: Use the v2 API"),
+            "{call}"
+        );
+    }
 }
 
 #[test]
