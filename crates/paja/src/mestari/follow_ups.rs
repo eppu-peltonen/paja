@@ -193,7 +193,7 @@ const TOKEN_PREFIXES: &[&str] = &[
 ];
 
 /// Words that introduce a credential: the next long value after one of them, past spaces,
-/// quotes, `:`, `=` or `,`, is redacted whatever it looks like.
+/// quotes, backticks, `:`, `=` or `,`, is redacted whatever it looks like.
 const TOKEN_LEADS: &[&str] = &["bearer", "token", "password", "secret", "apikey", "api_key"];
 
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
@@ -203,16 +203,19 @@ fn redact_tokens(text: &str) -> String {
     let value_char = |c: char| token_char(c) || matches!(c, '.' | '+' | '/' | '=');
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    // Whether the previous word leads a credential and only spaces, quotes, `:`, `=` or `,`
-    // came since.
+    // Whether the previous word leads a credential and only spaces, quotes, backticks, `:`, `=`
+    // or `,` came since.
     let mut led = false;
     while !rest.is_empty() {
-        let start = rest.find(token_char).unwrap_or(rest.len());
+        // After a lead, a value may also start with base64's `+` or `/`.
+        let start = rest
+            .find(|c: char| token_char(c) || (led && matches!(c, '+' | '/')))
+            .unwrap_or(rest.len());
         let gap = &rest[..start];
         out.push_str(gap);
         if !gap
             .chars()
-            .all(|c| c.is_whitespace() || matches!(c, ':' | '=' | ',' | '"' | '\''))
+            .all(|c| c.is_whitespace() || matches!(c, ':' | '=' | ',' | '"' | '\'' | '`'))
         {
             led = false;
         }
@@ -220,7 +223,11 @@ fn redact_tokens(text: &str) -> String {
         if rest.is_empty() {
             break;
         }
-        let end = rest.find(|c: char| !token_char(c)).unwrap_or(rest.len());
+        // A short value that starts with `+` or `/` is left as it is, one character at a time.
+        let end = match rest.find(|c: char| !token_char(c)).unwrap_or(rest.len()) {
+            0 => rest.chars().next().map_or(0, char::len_utf8),
+            end => end,
+        };
         let word = &rest[..end];
         let prefixed =
             word.len() >= 16 && TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix));
@@ -323,14 +330,17 @@ mod tests {
         let part = "d4".repeat(10);
         let jwt = format!("eyJ{part}.{part}.{part}");
         let base64 = format!("{part}+{part}/{part}==");
+        let slashed = format!("/{part}+{part}");
         let text = format!(
             "\"token\": \"{part}\", password=\"{part}\", token, {part}, Bearer {jwt}. \
-             secret {base64} and {jwt} alone; a token. Then the end."
+             secret {base64} and {jwt} alone; a token. Then the end. password: \"{slashed}\", \
+             token `{part}`, token +ab and token /x."
         );
         assert_eq!(
             redact_tokens(&text),
             "\"token\": \"<redacted>\", password=\"<redacted>\", token, <redacted>, Bearer \
-             <redacted>. secret <redacted> and <redacted> alone; a token. Then the end."
+             <redacted>. secret <redacted> and <redacted> alone; a token. Then the end. \
+             password: \"<redacted>\", token `<redacted>`, token +ab and token /x."
         );
     }
 

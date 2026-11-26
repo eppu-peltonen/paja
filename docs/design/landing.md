@@ -29,10 +29,10 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them, and
   Mestari checks for itself too: before filing, it replaces values that start like a known credential (GitHub,
   GitLab, Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI, JSON Web Tokens) or follow `Bearer`, `token`,
-  `password`, `secret` or `api_key` (past quotes, `:`, `=` or `,`) with `<redacted>`, the whole value including any
-  `.`, `+`, `/` or `=`, and the factory home, the repository and the user's home directory (also as `~/...`) with
-  `<factory home>`, `<repository>` and `<home>`, where no letter or digit follows the path. Windows paths match in any
-  letter case.
+  `password`, `secret` or `api_key` (past quotes, backticks, `:`, `=` or `,`) with `<redacted>`, the whole value
+  including any `.`, `+`, `/` or `=`, and the factory home, the repository and the user's home directory (also as
+  `~/...`) with `<factory home>`, `<repository>` and `<home>`, where no letter or digit follows the path. Windows paths
+  match in any letter case.
 - **A re-review judges the fix.** After a round of changes, the next reviewer gets the earlier blockers and reads only
   the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
   builder without a review. High-risk changes are the exception: both
