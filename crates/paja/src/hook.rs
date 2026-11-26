@@ -847,6 +847,11 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
                 match token {
                     Token::Word { text, assigns } => {
                         if words.len() == assignments && is_assignment(text) {
+                            // The name first: telling an agent to move its quotes is no help
+                            // when the variable is refused anyway.
+                            if let Some(refused) = refused_variable(text) {
+                                return Some(refused);
+                            }
                             if !assigns {
                                 return Some(format!(
                                     "`{text}` has a quote before its `=`, so bash runs it as a \
@@ -875,6 +880,23 @@ fn check_command(command: &str, cwd: &Path, b: &Bounds) -> Option<String> {
     None
 }
 
+/// Why the assignment `NAME=value` is refused, if it is: a variable agents don't set, or a
+/// `~` in the value, which bash expands after the `=` or a `:` of an assignment.
+fn refused_variable(assignment: &str) -> Option<String> {
+    let (name, value) = assignment.split_once('=').unwrap_or(("", ""));
+    if !ALLOWED_VARIABLES.contains(&name) {
+        return Some(format!(
+            "agents don't set {name} (PAJA_HOME is already a throwaway home); {SHAPE}"
+        ));
+    }
+    if value.contains('~') {
+        return Some(format!(
+            "`{assignment}` has a `~`, which bash may expand to a home directory; {SHAPE}"
+        ));
+    }
+    None
+}
+
 /// `words[..start]` are the assignments in front of the program.
 fn check_simple(
     words: &[&str],
@@ -884,11 +906,8 @@ fn check_simple(
     b: &Bounds,
 ) -> Option<String> {
     for assignment in &words[..start] {
-        let name = assignment.split_once('=').map_or("", |(n, _)| n);
-        if !ALLOWED_VARIABLES.contains(&name) {
-            return Some(format!(
-                "agents don't set {name} (PAJA_HOME is already a throwaway home); {SHAPE}"
-            ));
+        if let Some(refused) = refused_variable(assignment) {
+            return Some(refused);
         }
     }
     let Some((program, args)) = words[start..].split_first() else {
@@ -915,8 +934,9 @@ fn check_simple(
         "cd" if first => match args {
             [target]
                 if !target
+                    .as_bytes()
                     .get(..2)
-                    .is_some_and(|two| two.chars().all(|c| c == '/' || c == '\\'))
+                    .is_some_and(|two| two.iter().all(|b| matches!(b, b'/' | b'\\')))
                     && !target
                         .split(['/', '\\'])
                         .any(|part| part == "." || part == "..")
@@ -1409,7 +1429,17 @@ mod tests {
             let reason = bash(bad).unwrap_or_else(|| panic!("{bad} was allowed"));
             assert!(reason.contains("quote only the value"), "{bad}: {reason}");
         }
-        // A quoted variable that isn't allowed is still refused for its name.
+        // A variable that isn't allowed is refused for its name, quoted anywhere.
+        assert!(bash("'PAJA_HOME=x' cargo test")
+            .is_some_and(|r| r.contains("agents don't set PAJA_HOME")));
+        // Bash expands `~` after the `=` or a `:` of an assignment.
+        for bad in [
+            "RUST_LOG=~ cargo test",
+            "RUST_LOG='a':~/x cargo test",
+            "RUST_LOG='~' cargo test",
+        ] {
+            assert!(bash(bad).is_some_and(|r| r.contains("has a `~`")), "{bad}");
+        }
         assert!(bash("PAJA_HOME='x' cargo test")
             .is_some_and(|r| r.contains("agents don't set PAJA_HOME")));
     }
@@ -2011,7 +2041,8 @@ mod windows_tests {
         assert_eq!(e.bash("RUST_LOG=debug cargo test"), None);
         assert_eq!(e.bash("RUST_LOG='debug' cargo test"), None);
         for bad in ["'RUST_LOG=x' cargo test", "\"RUST_LOG=x\" cargo test"] {
-            assert!(e.bash(bad).is_some(), "{bad}");
+            let reason = e.bash(bad).unwrap_or_else(|| panic!("{bad} was allowed"));
+            assert!(reason.contains("quote only the value"), "{bad}: {reason}");
         }
     }
 
@@ -2120,6 +2151,14 @@ mod windows_tests {
         let e = env();
         let windows = e.root.display().to_string();
         assert_eq!(e.bash(&format!("cd '{windows}' && cargo test")), None);
+        // Network spellings are refused, whichever separators they use.
+        for bad in [
+            "cd '\\\\server\\share'",
+            "cd //server/share",
+            "cd '/\\server'",
+        ] {
+            assert!(e.bash(bad).is_some(), "{bad}");
+        }
         let drive = windows.chars().next().unwrap().to_ascii_lowercase();
         let msys = format!("/{drive}{}", windows[2..].replace('\\', "/"));
         assert_eq!(e.bash(&format!("cd {msys} && cargo test")), None);
