@@ -246,7 +246,7 @@ impl PajaMcp {
         let home = self.home.clone();
         call(move || {
             let name = jono::repo_name(&home, &checkout(args.repo)?)?;
-            Ok(serde_json::to_value(jono::get(&home, &name, args.number)?)?)
+            jono::show(&home, &name, args.number)
         })
         .await
     }

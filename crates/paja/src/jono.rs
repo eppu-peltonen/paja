@@ -706,6 +706,17 @@ pub fn get(home: &Home, repo: &str, number: u64) -> Result<WorkItem> {
         .with_context(|| no_item(repo, number))
 }
 
+/// One item as `paja work show` and its MCP tool print it: the item, plus `run` (its latest
+/// run's round, step and finished rounds, see [`crate::mestari::live`]) while it is active.
+pub fn show(home: &Home, repo: &str, number: u64) -> Result<Value> {
+    let item = get(home, repo, number)?;
+    let mut shown = serde_json::to_value(&item)?;
+    if item.status == Status::Active {
+        shown["run"] = serde_json::to_value(crate::mestari::live::live(home, repo, number)?)?;
+    }
+    Ok(shown)
+}
+
 fn no_item(repo: &str, number: u64) -> String {
     format!(
         "no work item #{number} in {repo}; run `paja work sync` in its checkout to import issues \

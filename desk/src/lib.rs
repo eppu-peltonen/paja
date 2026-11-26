@@ -30,6 +30,22 @@ pub fn work_list_in(home: &Home, checkout: &Path) -> Value {
     }
 }
 
+/// Where an item's latest run is, for the run view: [`paja::mestari::live::live`], or null when
+/// no run has started it.
+#[tauri::command]
+async fn work_run(repo: String, number: u64) -> Value {
+    off_main(move |home| work_run_in(home, &repo, number)).await
+}
+
+pub fn work_run_in(home: &Home, repo: &str, number: u64) -> Value {
+    match paja::mestari::live::live(home, repo, number)
+        .and_then(|live| Ok(serde_json::to_value(live)?))
+    {
+        Ok(live) => live,
+        Err(err) => error(err),
+    }
+}
+
 /// Answer escalated item `number` of `repo`, as `paja --json work answer` does: it records the
 /// answer, queues the item again and posts the answer on the issue. Returns the item's JSON.
 #[tauri::command]
@@ -184,6 +200,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             work_list,
+            work_run,
             work_answer,
             work_file,
             about
@@ -215,6 +232,70 @@ mod tests {
                 }),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_recorded_run_becomes_the_run_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        import(&home, "acme/app", 3, "Add a login page");
+        assert_eq!(work_run_in(&home, "acme/app", 3), Value::Null);
+        let at = |extra: Value| {
+            let mut data = json!({ "repo": "acme/app", "number": 3 });
+            data.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            data
+        };
+        let recorded = [
+            (
+                jono::EV_STATUS,
+                at(json!({ "status": "active", "note": null })),
+            ),
+            ("run.started", at(json!({ "env": "app-3", "base": "abc" }))),
+            (
+                "run.step",
+                at(json!({ "round": 1, "role": "build", "model": "opus" })),
+            ),
+            ("run.step", at(json!({ "round": 1, "role": "checks" }))),
+            (
+                "run.round",
+                at(
+                    json!({ "round": 1, "verdict": "checks_failed", "detail": "a test failed",
+                           "steps": [{ "step": "build", "input_tokens": 1200, "output_tokens": 300,
+                                       "cache_read_input_tokens": null,
+                                       "cache_creation_input_tokens": null, "cost_usd": 0.25,
+                                       "num_turns": 9, "duration_ms": 90000,
+                                       "session_id": "s1" }] }),
+                ),
+            ),
+            (
+                "run.step",
+                at(json!({ "round": 2, "role": "fix", "model": "opus" })),
+            ),
+        ];
+        {
+            let lock = home.lock().unwrap();
+            for (kind, data) in recorded {
+                home.events().append(&lock, kind, data).unwrap();
+            }
+        }
+        let view = work_run_in(&home, "acme/app", 3);
+        // No `paja run` holds the item in this test, so the run shows as interrupted.
+        assert_eq!(view["state"], "interrupted", "{view}");
+        assert_eq!(
+            (&view["round"], &view["max_rounds"]),
+            (&json!(2), &json!(3))
+        );
+        assert_eq!(view["step"]["role"], "fix", "{view}");
+        assert!(view["step"]["started_ms"].as_u64().unwrap() > 0, "{view}");
+        assert_eq!(view["steps"].as_array().unwrap().len(), 3, "{view}");
+        let round = &view["rounds"][0];
+        assert_eq!(round["verdict"], "checks_failed", "{view}");
+        assert_eq!(round["steps"][0]["input_tokens"], 1200, "{view}");
+        assert_eq!(round["steps"][0]["cost_usd"], 0.25, "{view}");
+        assert_eq!(view["env"], Value::Null, "{view}");
+        assert_eq!(view["pr"], Value::Null, "{view}");
     }
 
     #[test]

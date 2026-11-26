@@ -43,12 +43,125 @@ function itemRow(item) {
     el("span", { className: "status" }, item.open ? item.status : `${item.status} (issue closed)`),
   ]);
   const children = [row];
+  if (item.status === "active") {
+    const key = `${item.repo}#${item.number}`;
+    const open = following.has(key);
+    const toggle = el("button", { type: "button", className: "quiet" }, open ? "Hide run" : "Follow run");
+    toggle.addEventListener("click", () => {
+      if (open) {
+        following.delete(key);
+        lastRun.delete(key);
+      } else {
+        following.add(key);
+      }
+      refresh().catch(showError);
+    });
+    row.append(toggle);
+    if (open) children.push(runView(item));
+  }
   if (item.status === "escalated") {
     if (item.note) children.push(el("div", { className: "note" }, item.note));
     children.push(answerForm(item));
   }
   return el("li", {}, children);
 }
+
+// The active items whose run view is open, by `repo#number`.
+const following = new Set();
+
+function duration(ms) {
+  const secs = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
+}
+
+function stepName(step) {
+  const who = step.reviewer ? `${step.role} (reviewer ${step.reviewer})` : step.role;
+  return step.model ? `${who} on ${step.model}` : who;
+}
+
+function spent(step) {
+  const parts = [];
+  if (step.input_tokens != null) {
+    const read = (step.input_tokens ?? 0) + (step.cache_read_input_tokens ?? 0) + (step.cache_creation_input_tokens ?? 0);
+    parts.push(`${read.toLocaleString()} tokens in, ${(step.output_tokens ?? 0).toLocaleString()} out`);
+  }
+  if (step.cost_usd != null) parts.push(`$${step.cost_usd.toFixed(2)}`);
+  if (step.num_turns != null) parts.push(`${step.num_turns} turns`);
+  if (step.duration_ms != null) parts.push(duration(step.duration_ms));
+  return parts.length ? parts.join(", ") : "spend unknown";
+}
+
+// What each open run view last read, by `repo#number`, so a refresh shows it until the new
+// read arrives instead of flashing.
+const lastRun = new Map();
+
+// The run view of an active item: filled by `work_run`, read again on every refresh (each
+// refresh rebuilds the rows), and its step clock ticks every second.
+function runView(item) {
+  const key = `${item.repo}#${item.number}`;
+  const box = el("div", { className: "run" });
+  const show = (run) => box.replaceChildren(...runParts(run));
+  if (lastRun.has(key)) show(lastRun.get(key));
+  else box.append(el("p", { className: "muted" }, "Reading the run..."));
+  invoke("work_run", { repo: item.repo, number: item.number })
+    .then((run) => {
+      if (run && run.error) throw new Error(run.error);
+      lastRun.set(key, run);
+      show(run);
+    })
+    .catch((err) => box.replaceChildren(el("p", { className: "error" }, `error: ${err?.message ?? err}`)));
+  return box;
+}
+
+// A run that is killed writes no event, so while a run view is open Desk also reads the queue
+// again every few seconds: its run lock comes free, and the view turns to interrupted.
+const FOLLOW_EVERY_MS = 5000;
+setInterval(() => {
+  if (following.size > 0) refresh().catch(showError);
+}, FOLLOW_EVERY_MS);
+
+function runParts(run) {
+  if (!run) return [el("p", { className: "muted" }, "No run has started this item yet.")];
+  const parts = [];
+  if (run.state === "interrupted") {
+    parts.push(el("p", { className: "warning-inline" },
+      "Interrupted: no paja run is working on it now. Start paja run in its checkout to go on from here."));
+  }
+  // An interrupted run's step isn't running, so it gets no clock.
+  const now = !run.step ? []
+    : run.state !== "running" ? [`, stopped in ${stepName(run.step)}`]
+    : [`, ${stepName(run.step)} for `,
+       el("span", { className: "clock", "data-since": String(run.step.started_ms) }, duration(Date.now() - run.step.started_ms))];
+  parts.push(el("p", {}, [el("strong", {}, `Round ${run.round} of ${run.max_rounds}`), ...now]));
+  if (run.env) {
+    parts.push(el("p", { className: "muted" }, `Environment ${run.env.name}: ${run.env.path} (${run.env.branch})`));
+  }
+  if (run.pr) {
+    const link = el("a", { href: run.pr }, run.pr);
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      window.__TAURI__.opener.openUrl(run.pr).catch(showError);
+    });
+    parts.push(el("p", {}, ["Pull request ", link]));
+  }
+  for (const round of run.rounds) {
+    const steps = round.steps.map((s) => el("li", {}, `${stepName({ ...s, role: s.role ?? s.step })}: ${spent(s)}`));
+    parts.push(el("div", { className: "round" }, [
+      el("div", {}, [el("strong", {}, `Round ${round.round}: ${round.verdict}`), round.detail ? ` - ${round.detail}` : ""]),
+      el("ul", {}, steps),
+    ]));
+  }
+  return parts;
+}
+
+setInterval(() => {
+  for (const clock of document.querySelectorAll(".clock")) {
+    clock.textContent = duration(Date.now() - Number(clock.dataset.since));
+  }
+}, 1000);
 
 // A message that stays until the person dismisses it, whatever the queue does meanwhile.
 function notice(text) {
