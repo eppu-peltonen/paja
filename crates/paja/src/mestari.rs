@@ -466,13 +466,14 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     let base = git(&repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     progress("checking the queue (issues labelled paja)");
     jono::sync(home, &repo)?;
+    let config = read_config(&repo, &base)?;
     let Some(item) = jono::claim(home)? else {
         return Ok(RunReport::Idle);
     };
     progress(&format!("picked #{}: {}", item.number, item.title));
     // Anything that goes wrong from here is reported on the issue, not lost.
     let mut rounds = 0;
-    match run_item(home, &repo, &base, &item, &mut rounds) {
+    match run_item(home, &repo, &base, &item, config, &mut rounds) {
         Ok(report) => Ok(report),
         Err(err) => {
             let question = format!(
@@ -513,13 +514,16 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     }
 }
 
-fn run_item(
-    home: &Home,
-    repo: &Path,
-    base: &str,
-    item: &WorkItem,
-    rounds: &mut u32,
-) -> Result<RunReport> {
+/// Vasara's check commands, the high-risk paths and the model per role, as `main` has them.
+struct Config {
+    checks: Vec<String>,
+    high_risk: Vec<String>,
+    models: Models,
+}
+
+/// Read and check `main`'s configuration once, before an item is claimed: a mistake there is
+/// one fix on `main`, so it stops the pass instead of parking every item in turn.
+fn read_config(repo: &Path, base: &str) -> Result<Config> {
     let checks = read_from_base(repo, base, CHECKS_FILE)?.with_context(|| {
         format!("{CHECKS_FILE} is missing on main; add the check commands there")
     })?;
@@ -530,6 +534,26 @@ fn run_item(
     }
     let high_risk = lines(&read_from_base(repo, base, HIGH_RISK_FILE)?.unwrap_or_default());
     let models = Models::parse(&read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default())?;
+    Ok(Config {
+        checks,
+        high_risk,
+        models,
+    })
+}
+
+fn run_item(
+    home: &Home,
+    repo: &Path,
+    base: &str,
+    item: &WorkItem,
+    config: Config,
+    rounds: &mut u32,
+) -> Result<RunReport> {
+    let Config {
+        checks,
+        high_risk,
+        models,
+    } = config;
     let env = environment(home, repo, base, item)?;
     record(
         home,
