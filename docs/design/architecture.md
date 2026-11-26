@@ -108,8 +108,8 @@ repository without CI; with `required` a repository with no GitHub Actions workf
 landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and creates an Ahjo environment named
 `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of `owner/name`, so two repositories' item #5
 never share a worktree, branch or port block) from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
-claims anything, with an error naming the file and line, so one fix on `main` is all it takes; a `--every` loop
-reports it and tries again after its wait. While it works on an item the run holds an OS file lock,
+claims anything, with an error naming the file and line, so one fix on `main` is all it takes. That holds even when the
+queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait. While it works on an item the run holds an OS file lock,
 `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
 stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and

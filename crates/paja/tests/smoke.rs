@@ -1967,6 +1967,20 @@ fn first_wait_of_every(f: &Factory) -> (String, bool, Value) {
 }
 
 #[test]
+fn a_bad_config_on_main_fails_a_pass_with_nothing_to_do() {
+    // `.paja` on main is checked before the queue, so a mistake there is reported even when
+    // there is nothing to claim, instead of hiding behind `idle`.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(".paja/models", "nobody sonnet\n");
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(error.contains("unknown role"), "{report}");
+    assert!(error.contains(".paja/models"), "{report}");
+}
+
+#[test]
 fn run_every_says_when_it_waits() {
     // With nothing to do, `--every` says it waits, and keeps running until stopped.
     let f = Factory::new("true\n", "land");
