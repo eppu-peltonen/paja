@@ -1489,6 +1489,7 @@ impl Factory {
                  case \"$*\" in *\"another round\"*) if [ -f {d}/hang-fix ]; then : > {d}/hanging; while [ -f {d}/hang-fix ]; do sleep 0.1; done; exit 1; fi ;; esac\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
                  if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/leave-merge ]; then rm {d}/leave-merge; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
@@ -4226,6 +4227,25 @@ fn a_conflict_with_the_default_branch_goes_back_to_the_builder() {
         .status()
         .unwrap();
     assert!(merged.success(), "the landed branch holds main");
+}
+
+#[test]
+fn a_merge_the_builder_leaves_unfinished_stays_in_progress_for_the_next_round() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.main_moves("feature.txt", "landed elsewhere");
+    std::fs::write(f.tmp.path().join("leave-merge"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("the builder left the merge unfinished; asking again"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("isn't finished: these files still have conflicts: feature.txt"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("finish the merge"), "{fix}");
 }
 
 #[test]
