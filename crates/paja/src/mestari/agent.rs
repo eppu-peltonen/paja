@@ -120,6 +120,53 @@ pub(super) fn not_retried(out: &Value) -> Option<&'static str> {
     }
 }
 
+/// The arguments of one headless Claude Code session. Every agent runs in auto mode, with or
+/// without a sandbox; `settings` (the deny-list hook) is given only outside one.
+fn claude_args(
+    prompt: &str,
+    settings: Option<String>,
+    harness: String,
+    read_only: bool,
+    model_args: &[String],
+    tools: &[&str],
+    schema: Option<&Value>,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["-p", prompt, "--output-format", "json", "--permission-mode"]
+        .into_iter()
+        .map(String::from)
+        // Auto mode, Anthropic's own safety checks, as an extra layer beside the hook. Never
+        // bypassPermissions (the sandbox image's default) and never a weaker mode.
+        .chain(["auto".to_string()])
+        // No settings files at all, only the deny-list hook: neither the owner's settings nor
+        // a settings file on the branch can loosen or switch it off.
+        .chain(["--setting-sources".to_string(), String::new()])
+        .collect();
+    if let Some(settings) = settings {
+        args.extend(["--settings".to_string(), settings]);
+    }
+    // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
+    // main: the branch under review can't rewrite the rules its agents follow.
+    args.extend(["--append-system-prompt".to_string(), harness]);
+    // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
+    args.push("--strict-mcp-config".to_string());
+    // Only the built-in tools the role uses are defined at all, so no other tool (subagents,
+    // web tools) reaches the agent or spends prompt tokens on its definition.
+    args.extend(["--tools".to_string(), agent_tools(read_only).to_string()]);
+    // Per-machine details (the worktree's path, its git status) go in the first message
+    // instead of the system prompt, so sessions in different environments share a cached
+    // prompt prefix.
+    args.push("--exclude-dynamic-system-prompt-sections".to_string());
+    // The model and effort come from `.paja/models` on main, so a change can't pick the models
+    // that judge it.
+    args.extend(model_args.iter().cloned());
+    args.push("--allowedTools".to_string());
+    args.extend(tools.iter().map(|t| t.to_string()));
+    if let Some(schema) = schema {
+        args.extend(["--json-schema".to_string(), schema.to_string()]);
+    }
+    args
+}
+
 /// Run headless Claude Code in the environment and return its JSON result.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude(
@@ -159,38 +206,15 @@ pub(super) fn claude(
             }
         }
     };
-    let mut args: Vec<String> = ["-p", prompt, "--output-format", "json", "--permission-mode"]
-        .into_iter()
-        .map(String::from)
-        // The sandbox image defaults to bypassPermissions, which is never acceptable.
-        .chain([if sbx.is_some() { "auto" } else { "acceptEdits" }.to_string()])
-        // No settings files at all, only the deny-list hook: neither the owner's settings nor
-        // a settings file on the branch can loosen or switch it off.
-        .chain(["--setting-sources".to_string(), String::new()])
-        .collect();
-    if sbx.is_none() {
-        args.extend(["--settings".to_string(), settings]);
-    }
-    // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
-    // main: the branch under review can't rewrite the rules its agents follow.
-    args.extend(["--append-system-prompt".to_string(), harness]);
-    // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
-    args.push("--strict-mcp-config".to_string());
-    // Only the built-in tools the role uses are defined at all, so no other tool (subagents,
-    // web tools) reaches the agent or spends prompt tokens on its definition.
-    args.extend(["--tools".to_string(), agent_tools(read_only).to_string()]);
-    // Per-machine details (the worktree's path, its git status) go in the first message
-    // instead of the system prompt, so sessions in different environments share a cached
-    // prompt prefix.
-    args.push("--exclude-dynamic-system-prompt-sections".to_string());
-    // The model and effort come from `.paja/models` on main, so a change can't pick the models
-    // that judge it.
-    args.extend(model_args.iter().cloned());
-    args.push("--allowedTools".to_string());
-    args.extend(tools.iter().map(|t| t.to_string()));
-    if let Some(schema) = schema {
-        args.extend(["--json-schema".to_string(), schema.to_string()]);
-    }
+    let args = claude_args(
+        prompt,
+        (sbx.is_none()).then_some(settings),
+        harness,
+        read_only,
+        model_args,
+        tools,
+        schema,
+    );
     let mut cmd = match &sbx {
         Some(sbx) => {
             let mut argv = vec![program.clone()];
@@ -277,6 +301,16 @@ pub(super) fn claude(
         }
     }
     if !output.status.success() {
+        // A Claude Code without headless auto mode rejects the flag: stop, never fall back to
+        // another permission mode.
+        let text = tail(&output);
+        if text.contains("--permission-mode") {
+            bail!(
+                "`{program} -p` does not accept `--permission-mode auto`; Paja always runs agents \
+                 in auto mode and never falls back to another mode, so update Claude Code to a \
+                 version that supports auto mode headless. Claude Code said: {text}"
+            );
+        }
         return Err(ClaudeFailed(
             format!(
                 "`{program} -p` failed in {}: {}",
@@ -1217,6 +1251,32 @@ impl GitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_always_run_in_auto_mode_and_never_bypass_permissions() {
+        for settings in [None, Some("{}".to_string())] {
+            for read_only in [false, true] {
+                let args = claude_args(
+                    "go",
+                    settings.clone(),
+                    String::new(),
+                    read_only,
+                    &[],
+                    &["Read"],
+                    None,
+                );
+                let at = args.iter().position(|a| a == "--permission-mode").unwrap();
+                assert_eq!(args[at + 1], "auto", "{args:?}");
+                assert_eq!(args.iter().filter(|a| *a == "--permission-mode").count(), 1);
+                assert!(args.iter().any(|a| a == "--tools"), "{args:?}");
+                for arg in &args {
+                    assert!(!arg.contains("bypassPermissions"), "{args:?}");
+                    assert!(!arg.contains("dangerously-skip-permissions"), "{args:?}");
+                    assert!(!arg.contains("acceptEdits"), "{args:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_broken_hook_command_fails_the_self_test_and_is_named() {
