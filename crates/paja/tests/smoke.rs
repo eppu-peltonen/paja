@@ -946,6 +946,7 @@ impl Factory {
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
+                 if [ -f {d}/ask ]; then printf '%s\\n' '{{\"is_error\": false, \"result\": \"I need a decision.\\nPAJA-QUESTION: Which API, A or B? I recommend A.\"}}'; git checkout -q -- . ; exit 0; fi\n\
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
@@ -1280,6 +1281,32 @@ fn run_says_when_it_needs_a_decision() {
     ] {
         assert!(stderr.contains(step), "missing {step:?} in:\n{stderr}");
     }
+}
+
+#[test]
+fn the_builder_can_ask_for_a_decision() {
+    // Checks that always fail: if they ran, the item would go another round first.
+    let f = Factory::new("false\n", "land");
+    std::fs::write(f.tmp.path().join("ask"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert_eq!(report["rounds"], 1, "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("Which API, A or B? I recommend A."),
+        "{question}"
+    );
+    assert!(!question.contains("I need a decision."), "{question}");
+    let gh = std::fs::read_to_string(f.tmp.path().join("gh.log")).unwrap();
+    assert!(gh.contains("issue comment 5"), "{gh}");
+    assert!(gh.contains("Which API, A or B?"), "{gh}");
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert!(!args.contains("--json-schema"), "no review ran:\n{args}");
+    assert!(
+        args.contains("PAJA-QUESTION:"),
+        "the builder is told how to ask"
+    );
 }
 
 #[test]

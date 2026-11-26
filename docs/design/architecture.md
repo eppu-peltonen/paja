@@ -81,7 +81,10 @@ environment `work-<issue>` from `main` (resuming the branch an earlier run kept)
    there is no session from this run (a new `paja run`, so a recreated environment too) or resuming fails, it starts a
    fresh session with the whole issue and says so in a progress line. Reviewers never resume: each review is a fresh
    session reading cold. A resumed step records `resumed: true` and only its own share of the session's running
-   `total_cost_usd` and `modelUsage`.
+   `total_cost_usd` and `modelUsage`. When the issue leaves a decision only the person can make, the builder commits
+   nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
+   and its recommendation. Mestari then escalates at once with that question: no checks run and no more rounds are
+   spent, and the round is recorded with verdict `question`.
 2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
    fresh index, so the only assume-unchanged or skip-worktree flags left are the ones sparse checkout gives; a check
