@@ -40,6 +40,12 @@ fn paja(home: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
     paja_with(home, cwd, args, &[("PAJA_GH", gh.as_path())])
 }
 
+/// A GitHub-token-shaped string for redaction tests, built at run time so the source holds no
+/// literal token for secret scanners to flag.
+fn fake_token() -> String {
+    ["ghp", "ABCDEFGHIJKLMNOPQRSTuvwx"].join("_")
+}
+
 /// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
 fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
@@ -554,6 +560,7 @@ fn the_mcp_server_serves_the_same_core() {
         "work_set",
         "work_answer",
         "work_file",
+        "doctor",
     ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
@@ -1039,6 +1046,30 @@ fn a_repository_names_its_own_work_and_follow_up_labels() {
 }
 
 #[test]
+fn work_sync_reads_the_labels_from_a_default_branch_not_called_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, home) = (tmp.path().join("src"), tmp.path().join("home"));
+    init_repo(&src);
+    git(&src, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(src.join(".paja")).unwrap();
+    std::fs::write(src.join(".paja/labels"), "work game\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-q", "-m", "labels"]);
+    git(tmp.path(), &["clone", "-q", "--bare", "src", "origin.git"]);
+    git(tmp.path(), &["clone", "-q", "origin.git", "app"]);
+    let gh = fake_gh(tmp.path(), "[]");
+    let (ok, report) = paja_with(
+        &home,
+        &tmp.path().join("app"),
+        &["work", "sync"],
+        &[("PAJA_GH", gh.as_path())],
+    );
+    assert!(ok, "{report}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("issue list --label game"), "{log}");
+}
+
+#[test]
 fn a_bad_labels_file_says_which_line_to_fix() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -1056,7 +1087,10 @@ fn a_bad_labels_file_says_which_line_to_fix() {
     );
     assert!(!ok);
     let err = err["error"].as_str().unwrap();
-    assert!(err.contains(".paja/labels on main, line 2"), "{err}");
+    assert!(
+        err.contains(".paja/labels on the default branch, line 2"),
+        "{err}"
+    );
 }
 
 /// A fake `gh` for a repository called `name` (`owner/name`) whose open issues are `issues`
@@ -1385,12 +1419,18 @@ struct Factory {
 
 impl Factory {
     fn new(checks: &str, verdict: &str) -> Self {
+        Self::on_branch(checks, verdict, "main", r#"{"nameWithOwner": "acme/app"}"#)
+    }
+
+    /// A repository whose default branch is `branch` and whose `gh repo view` says `view`.
+    fn on_branch(checks: &str, verdict: &str, branch: &str, view: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
         let origin = tmp.path().join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&origin, &["init", "-q", "--bare", "-b", branch]);
         init_repo(&repo);
+        git(&repo, &["branch", "-m", branch]);
         std::fs::create_dir_all(repo.join(".paja")).unwrap();
         std::fs::write(repo.join(".paja/checks"), checks).unwrap();
         git(&repo, &["add", "."]);
@@ -1399,7 +1439,7 @@ impl Factory {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
-        git(&repo, &["push", "-q", "origin", "main"]);
+        git(&repo, &["push", "-q", "origin", branch]);
 
         let dir = tmp.path();
         std::fs::write(
@@ -1410,14 +1450,19 @@ impl Factory {
         std::fs::write(dir.join("verdict.txt"), verdict).unwrap();
         let script = |name: &str, body: String| program(dir, name, &body);
         let d = slash(dir);
+        let token = fake_token();
         let gh = script(
             "gh",
             format!(
-                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && cat \"$a\" >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
-                 \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+                 \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
+                 \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi ;;\n\
+                 \"pr checks\") if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
+                 if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
+                 \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") if [ -f {d}/gh-down ]; then exit 1; fi ;;\n\
@@ -1431,16 +1476,19 @@ impl Factory {
                  input=$(cat); [ -n \"$input\" ] && : > {d}/prompt-on-stdin; first=$1; shift; set -- \"$first\" \"$input\" \"$@\"\n\
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
-                 *--json-schema*) if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
+                 *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper, which logs ghp_ABCDEFGHIJKLMNOPQRSTuvwx\\\"]}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [{{\\\"kind\\\": \\\"risk\\\", \\\"finding\\\": \\\"Tidy the helper, which logs {token}\\\"}}, {{\\\"kind\\\": \\\"nit\\\", \\\"finding\\\": \\\"Rename the variable\\\"}}]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/hang-fix ]; then : > {d}/hanging; while [ -f {d}/hang-fix ]; do sleep 0.1; done; exit 1; fi ;; esac\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
+                 if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
@@ -1477,12 +1525,41 @@ impl Factory {
         )
     }
 
+    /// `run`, with the progress lines it wrote on stderr.
+    fn run_with_stderr(&self) -> (Value, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&self.repo)
+            .env("PAJA_HOME", &self.home)
+            .env("PAJA_GH", &self.gh)
+            .env("PAJA_CLAUDE", &self.claude)
+            .args(["--json", "run"])
+            .output()
+            .unwrap();
+        let report = serde_json::from_slice(&output.stdout).unwrap();
+        (report, String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
     /// Commit `text` as `path` on main and push it, as a person changing the factory would.
     fn on_main(&self, path: &str, text: &str) {
         std::fs::write(self.repo.join(path), text).unwrap();
         git(&self.repo, &["add", "."]);
         git(&self.repo, &["commit", "-q", "-m", path]);
         git(&self.repo, &["push", "-q", "origin", "main"]);
+    }
+
+    /// Have the fake builder's next call push `text` as `path` to origin's main from another
+    /// clone first, as a change landing elsewhere while this one is built.
+    fn main_moves(&self, path: &str, text: &str) {
+        let d = slash(self.tmp.path());
+        std::fs::write(
+            self.tmp.path().join("main-moves.sh"),
+            format!(
+                "git clone -q {d}/origin.git {d}/other && cd {d}/other && printf '{text}\\n' > {path} \
+                 && git add {path} && git -c user.name=t -c user.email=t@example.com commit -qm moved \
+                 && git push -q origin HEAD:main >/dev/null 2>&1\n"
+            ),
+        )
+        .unwrap();
     }
 
     /// Each `claude` call the fake logged, in order.
@@ -1529,6 +1606,44 @@ fn a_run_uses_the_labels_main_names() {
 }
 
 #[test]
+fn run_lands_on_the_default_branch_with_an_allowed_merge_method() {
+    let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "trunk"}, "squashMergeAllowed": false, "mergeCommitAllowed": true, "rebaseMergeAllowed": false}"#;
+    let f = Factory::on_branch("test -f feature.txt\n", "land", "trunk", view);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("merges into: trunk (default branch), by a merge commit"),
+        "{stderr}"
+    );
+    let log = f.gh_log();
+    assert!(
+        log.contains(&format!("pr create --base trunk --head paja/{WORK_5}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("pr merge https://example.com/pull/1 --merge --delete-branch"),
+        "{log}"
+    );
+}
+
+#[test]
+fn run_escalates_when_the_repository_allows_no_merge_method() {
+    let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "main"}, "squashMergeAllowed": false, "mergeCommitAllowed": false, "rebaseMergeAllowed": false}"#;
+    let f = Factory::on_branch("test -f feature.txt\n", "land", "main", view);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("acme/app allows no merge method"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr merge"), "{}", f.gh_log());
+}
+
+#[test]
 fn run_builds_reviews_and_lands_an_issue() {
     // Vasara's checks run the branch's code, so they get no GitHub access either: Mestari's
     // `PAJA_GH` is gone, and so is its PAJA_HOME.
@@ -1569,11 +1684,23 @@ fn run_builds_reviews_and_lands_an_issue() {
         log.contains("issue create --label factory-follow-up --title Tidy the helper"),
         "{log}"
     );
+    // The reviewer's risk and nit make one issue that holds only the risk: nits are not filed.
+    assert_eq!(
+        log.matches("issue create --label factory-follow-up")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("Rename the variable"), "{log}");
+    assert!(
+        log.contains("Reviewers found these while reviewing #5"),
+        "{log}"
+    );
     // The prompt reaches `claude` on stdin, not on its command line.
     assert!(f.tmp.path().join("prompt-on-stdin").exists());
     // A token in a finding never reaches the public issue.
     assert!(
-        !log.contains("ghp_ABCDEFGHIJKLMNOPQRSTuvwx") && log.contains("logs <redacted>"),
+        !log.contains(&fake_token()) && log.contains("logs <redacted>"),
         "{log}"
     );
     // Every agent runs under the deny-list hook, bounded to its environment, and with no
@@ -1655,6 +1782,187 @@ fn a_repository_without_ci_lands_on_the_checks_alone() {
         "{log}"
     );
     assert!(log.contains("pr merge"), "{log}");
+}
+
+/// Make `dir` private to this user, as the home folder must be.
+fn make_private(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap();
+        // An elevated account's new folders belong to Administrators; take ownership as the
+        // doctor's fix says. It may be refused, in which case the test tolerates the check.
+        let _ = Command::new("icacls")
+            .arg(dir)
+            .args(["/setowner", &user])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let status = Command::new("icacls")
+            .arg(dir)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:(OI)(CI)F"))
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls failed");
+    }
+}
+
+#[test]
+fn doctor_reports_each_check_and_the_fix_for_a_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home, d) = (
+        tmp.path().join("app"),
+        tmp.path().join("home"),
+        slash(tmp.path()),
+    );
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/app.git",
+        ],
+    );
+    make_private(&home);
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             \"auth status\") if [ -f {d}/gh-signed-out ]; then echo 'You are not logged into any GitHub hosts' >&2; exit 1; fi ;;\n\
+             \"repo view\") echo '{{\"viewerPermission\": \"ADMIN\"}}' ;;\n\
+             \"label list\") echo '[{{\"name\": \"factory\"}}]' ;;\n\
+             \"workflow list\") echo 'CI	active	1' ;;\nesac\n"
+        ),
+    );
+    let claude = program(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\ncase \"$1 $2\" in\n\
+         \"auth status\") echo '{\"loggedIn\": true}' ;;\n\
+         *) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+    );
+    let doctor = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .env("PAJA_CLAUDE", &claude)
+            .env_remove("PAJA_SBX")
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        (output.status.success(), report)
+    };
+    let check = |report: &Value, name: &str| -> Value {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no check {name} in {report}"))
+            .clone()
+    };
+
+    // Everything is in place; only the missing sandbox is a warning, and it doesn't fail.
+    let (success, report) = doctor();
+    // On a Windows account that runs elevated (CI runners do), a folder this user creates is
+    // owned by the Administrators group, so no ACL change makes the home folder pass. Whatever
+    // the machine's temp-folder permissions are, the check must say which, and only it may fail.
+    let home_check = check(&report, "home folder");
+    if home_check["status"] != "ok" {
+        if !cfg!(windows) {
+            panic!("a private home failed the check: {home_check}");
+        }
+        assert_eq!(home_check["status"], "failed", "{home_check}");
+        assert!(
+            home_check["fix"].as_str().unwrap().contains("icacls"),
+            "{home_check}"
+        );
+    }
+    let home_ok = home_check["status"] == "ok";
+    assert_eq!(success, home_ok, "{report}");
+    assert_eq!(report["ok"] == true, home_ok, "{report}");
+    for name in [
+        "git",
+        "gh",
+        "gh sign-in",
+        "gh access",
+        "claude",
+        "claude sign-in",
+        "deny-list hook",
+        "origin",
+        "work label",
+        "checks",
+        "ci",
+    ] {
+        let c = check(&report, name);
+        assert_eq!(c["status"], "ok", "{c}");
+        assert!(c["fix"].is_null(), "{c}");
+    }
+    let sandbox = check(&report, "sandbox");
+    assert_eq!(sandbox["status"], "warning", "{sandbox}");
+    assert!(
+        sandbox["detail"].as_str().unwrap().contains("as this user"),
+        "{sandbox}"
+    );
+
+    // A signed-out gh and a default branch without `.paja/checks`.
+    std::fs::write(tmp.path().join("gh-signed-out"), "").unwrap();
+    git(&repo, &["rm", "-q", ".paja/checks"]);
+    git(&repo, &["commit", "-q", "-m", "no checks"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let (success, report) = doctor();
+    assert!(!success && report["ok"] == false, "{report}");
+    let signed_in = check(&report, "gh sign-in");
+    assert_eq!(signed_in["status"], "failed", "{signed_in}");
+    assert!(
+        signed_in["fix"].as_str().unwrap().contains("auth login"),
+        "{signed_in}"
+    );
+    assert!(
+        signed_in["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not logged in"),
+        "{signed_in}"
+    );
+    let checks = check(&report, "checks");
+    assert_eq!(checks["status"], "failed", "{checks}");
+    assert!(
+        checks["fix"].as_str().unwrap().contains("add it"),
+        "{checks}"
+    );
+    assert!(
+        checks["detail"].as_str().unwrap().contains(".paja/checks"),
+        "{checks}"
+    );
+    // The rest still passed.
+    assert_eq!(check(&report, "git")["status"], "ok");
 }
 
 #[test]
@@ -1740,6 +2048,86 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert!(stderr.contains("resuming #5"), "{stderr}");
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "landed", "{item}");
+}
+
+/// Start `paja run` with its output discarded, wait until the fake agent writes `marker` (it is
+/// then stuck in a step), and kill the run, as a closed terminal or a reboot would.
+fn interrupt_run(f: &Factory, marker: &str) {
+    let dir = f.tmp.path();
+    let _ = std::fs::remove_file(dir.join(marker));
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join(marker).exists() {
+        assert!(started.elapsed().as_secs() < 60, "no step reached {marker}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run.kill().unwrap();
+    run.wait().unwrap();
+}
+
+fn builds(f: &Factory) -> usize {
+    f.claude_calls()
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .count()
+}
+
+#[test]
+fn a_run_stopped_in_its_review_resumes_without_building_again() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("review-hang"), "").unwrap();
+    interrupt_run(&f, "review-hanging");
+    std::fs::remove_file(dir.join("review-hang")).unwrap();
+    assert_eq!(builds(&f), 1);
+
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("resuming #5 in round 1: the review of "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("skipping"), "{stderr}");
+    assert_eq!(builds(&f), 1, "the resumed run built again");
+    assert!(!stderr.contains("Claude is building"), "{stderr}");
+}
+
+#[test]
+fn a_run_stopped_twice_in_a_fix_keeps_its_round_and_its_blockers() {
+    let f = Factory::new("true\n", "changes");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("hang-fix"), "").unwrap();
+    // Stopped in round 2's fix, after round 1's `changes` verdict; then again in the same
+    // fix, before the resumed run recorded anything.
+    interrupt_run(&f, "hanging");
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(dir.join("hang-fix")).unwrap();
+    std::fs::write(dir.join("verdict.txt"), "land").unwrap();
+
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(stderr.contains("resuming #5 in round 2"), "{stderr}");
+    assert!(!stderr.contains("round 1 of 3"), "{stderr}");
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .rfind(|c| !c.contains("--json-schema") && c.contains("another round"))
+        .unwrap();
+    assert!(fix.contains("add more"), "{fix}");
+    // The re-review judges only the fix, against the earlier blockers.
+    let review = calls.iter().rfind(|c| c.contains("--json-schema")).unwrap();
+    assert!(review.contains("Judge only the fix"), "{review}");
+    assert!(review.contains("add more"), "{review}");
 }
 
 /// Start `paja run` in a process group of its own, as a terminal runs it, with the fake
@@ -2212,6 +2600,35 @@ fn run_records_what_each_agent_step_spent() {
     assert_eq!(usage["cost_usd"], 0.25);
     let (_, listed) = paja(&f.home, &f.repo, &["work", "list"]);
     assert_eq!(listed[0]["usage"], *usage);
+}
+
+#[test]
+fn a_fix_round_hands_the_builder_the_nits() {
+    // Round one asks for changes, so the nit goes to the fix round instead of an issue.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(!builds[0].contains("Rename the variable"), "{}", builds[0]);
+    assert!(
+        builds[1].contains("also noted these nits") && builds[1].contains("Rename the variable"),
+        "{}",
+        builds[1]
+    );
+    let log = f.gh_log();
+    assert_eq!(
+        log.matches("issue create --label factory-follow-up")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("Rename the variable"), "{log}");
 }
 
 #[test]
@@ -3763,6 +4180,79 @@ fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
 }
 
 #[test]
+fn a_run_merges_a_default_branch_that_moved_while_it_built() {
+    let f = Factory::new("test -f feature.txt && test -f other.txt\n", "land");
+    f.main_moves("other.txt", "elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("main moved on; merged it into the branch"),
+        "{stderr}"
+    );
+    let origin = f.tmp.path().join("origin.git");
+    git(
+        &origin,
+        &["cat-file", "-e", &format!("paja/{WORK_5}:other.txt")],
+    );
+}
+
+#[test]
+fn a_conflict_with_the_default_branch_goes_back_to_the_builder() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.main_moves("feature.txt", "landed elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("the branch conflicts with main"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("merging it conflicts in: feature.txt"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("another round"), "{fix}");
+    // The round after the conflict builds on main as it is now.
+    let origin = f.tmp.path().join("origin.git");
+    let merged = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            "main",
+            &format!("paja/{WORK_5}"),
+        ])
+        .status()
+        .unwrap();
+    assert!(merged.success(), "the landed branch holds main");
+}
+
+#[test]
+fn red_ci_goes_back_to_the_builder_with_the_failed_log() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-red-once"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    assert!(
+        stderr.contains("CI failed; sending the failure back to the builder"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("CI failed on https://example.com/pull/1"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("Author identity unknown"), "{fix}");
+    assert!(
+        f.gh_log().contains("run view --job 8 --log-failed"),
+        "{}",
+        f.gh_log()
+    );
+}
+
+#[test]
 fn init_keeps_the_repositorys_own_claude_md_and_adds_one_section() {
     let own = "# My app\n\nBuild with care.\n";
     let (_tmp, repo, home, gh) = init_fixture(&[("CLAUDE.md", own), ("go.mod", "module x\n")]);
@@ -3783,4 +4273,38 @@ fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
     assert!(ok, "{out}");
     assert!(out["note"].as_str().unwrap().contains("fill in"), "{out}");
     assert!(show(&repo, "paja/init", ".paja/checks").contains("# make test"));
+}
+
+#[test]
+fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-silent"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("CI did not report"),
+        "{report}"
+    );
+    assert!(
+        !stderr.contains("sending the failure back to the builder"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_merge_github_refuses_escalates_naming_the_setting() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("GitHub refused to merge https://example.com/pull/1"),
+        "{question}"
+    );
+    assert!(question.contains("allow squash merging"), "{question}");
 }

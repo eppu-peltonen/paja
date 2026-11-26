@@ -72,7 +72,9 @@ the real repository, to the smoke tests.
 - **Checks stay out of reach of the change they judge.** A change that fixes a failing test must not edit that test;
   Vasara's rules and scenarios are read from `main`, never from the branch under review.
 - **Small changes.** One concern per pull request.
-- **This repository is public.** Never commit secrets, private links, personal details or internal hostnames.
+- **This repository is public.** Never commit secrets, private links, personal details or internal hostnames. A
+  test that needs a token-shaped string (`ghp_…`, `Bearer …`, a JWT) builds it at run time from parts, never writes it
+  as one literal, so secret scanners have nothing to flag.
 - **Docs describe Paja, nothing else.** `docs/` and other Markdown cover only how the system works and what agents
   need to work in it. Leave out references to other projects, research, and notes on inspiration or lineage.
 
@@ -91,8 +93,9 @@ code.
   question goes to Posti (until Posti exists: a comment on the issue or pull request) as an intent decision, with
   options and a recommendation. Details: `docs/design/landing.md`.
 - **Review converges.** At most three review rounds per change. Only blockers (a bug in what the issue asks for, a
-  security hole the change opens, a broken rule, missing tests) need another round; every other finding becomes a
-  `paja-follow-up` issue for the person to queue. A re-review reads only the fix (high risk: the whole change). Each
+  security hole the change opens, a broken rule, missing tests) need another round; every other bug or risk goes into
+  the change's one `paja-follow-up` issue for the person to queue, and nits are fixed in a round that runs anyway or
+  dropped. A re-review reads only the fix (high risk: the whole change). Each
   review runs in its own fresh session. Details: `docs/design/landing.md`.
 - **Until Paja's own reviewer runs (build step 3)**, Claude does the review and landing for these hand-built seed
   pull requests under the same rules.

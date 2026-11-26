@@ -36,7 +36,7 @@ flowchart TB
 | **Jono** (queue and scheduler) | Work items with dependencies (`Depends on #N`); lease each chunk to one worker; pick the next one with plain rules; enforce a diff-size budget per chunk; pace work to the account's usage limits | GitHub issues with the work label (`.paja/labels`, `paja` in this repository), event log |
 | **Kaava** (specs and harness) | Versioned specs with acceptance criteria and a risk tier; held-out scenarios the builder never sees; an eval suite of real chunks that tests the harness itself; the domain harness and canon rules, the `CLAUDE.md` and skills each environment reads from the project's default branch rather than from outside the repository | Markdown in the repo |
 | **Mestari** (orchestrator) | Run workflow graphs: spec, plan, build, verify, review, land, post-land verify. Fix loops are capped at three rounds, after which the builder rethinks the approach instead of patching. Planner, builder, reviewer and evaluator are separate roles. A learn step after landing drafts harness rules from failures | YAML graphs; `claude -p` subprocesses |
-| **Vasara** (verifier) | Load rules and scenarios from `main`, never from the branch; boot the environment and run deterministic and end-to-end checks; an independent, skeptical evaluator agent grades the running app against the acceptance criteria and held-out scenarios; after landing, re-run on `main` and revert on failure | The app's own test commands, Playwright |
+| **Vasara** (verifier) | Load rules and scenarios from the default branch, never from the branch under review; boot the environment and run deterministic and end-to-end checks; an independent, skeptical evaluator agent grades the running app against the acceptance criteria and held-out scenarios; after landing, re-run on `main` and revert on failure | The app's own test commands, Playwright |
 | **Posti** (inbox) | Collect every agent question and escalation; send one digest, each item with options and a recommendation; mirror status to the issue | Issue comments, event log |
 | Interface | One set of core functions exposed three ways, all reading from the event log | CLI (`paja ... --json`), MCP server (official Rust MCP SDK), HTTP API |
 | Claude Code plugin | `plugin/`: the MCP server config (`paja mcp`) and the skills `/paja:status` (the queue, latest events, open questions), `/paja:answer` (answer an escalation and requeue it) and `/paja:spec` (turn a conversation into a `paja` issue after the person approves it). The skills change Paja's state only through its MCP tools. Agents Mestari starts load no plugins; their deny-list hook is set by Mestari itself | Claude Code plugin, installed from this repository's marketplace |
@@ -106,18 +106,28 @@ prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, 
 (`progress.rs`), follow-ups (`follow_ups.rs`) and the builder's question and answers (`builder.rs`) are normal risk.
 A unit test keeps the three high-risk files on the list.
 
-`paja run` is Mestari's first graph. It fetches `origin/main`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`,
-`.paja/models` and `.paja/ci` from `main` and checks them (`.paja/ci` is `required`, the default, or `none` for a
+`paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
+`gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
+and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, or `none` for a
 repository without CI; with `required` a repository with no GitHub Actions workflow stops the pass, and with `none`
-landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and creates an Ahjo environment named
-`<repo>-<hash>-work-<issue>` (the repository's name and a short hash of `owner/name`, so two repositories' item #5
-never share a worktree, branch or port block) from `main` (resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it
-claims anything, with an error naming the file and line, so one fix on `main` is all it takes. That holds even when the
-queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait. While it works on an item the run holds an OS file lock,
+landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
+creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
+`owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch
+(resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it claims anything,
+with an error naming the file and line, so one fix on the default branch is all it takes. That holds even when the
+queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
+While it works on an item the run holds an OS file lock,
 `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
 stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and
-says so on stderr. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git and gh run
+says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
+abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. It rebuilds where it stood
+from every run event of the item since it was last queued, claimed or answered, not only the last run's, so an item
+interrupted again before it records a round keeps its round count and blockers: the round, the feedback for the
+builder, and the reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on
+the branch's HEAD (`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no
+index flags, it skips the build; if the default branch is also unchanged it skips the checks too and goes straight to
+the review. Any other state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git and gh run
 in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the terminal's
 Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build, the
 checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
@@ -137,7 +147,7 @@ most three rounds:
    when the run resumes an interrupted item ("Your earlier session was interrupted. Check `git status` and `git log`,
    finish the issue, and commit.") or runs it again after `paja work answer` (the person's question and answer, and
    "Continue with that."). That needs the work still on its `paja/<environment>` branch: an environment made again from
-   `main` starts fresh, and so does a session whose work was thrown away because the hook never ran (recorded as
+   the default branch starts fresh, and so does a session whose work was thrown away because the hook never ran (recorded as
    `run.step_discarded`). In the sandbox the transcript must still be in the sandbox's home; if it isn't, the run says
    so on stderr and starts fresh. A resumed step's spend is only its own share: the recorded steps of that session
    come off Claude Code's running totals, or none do when none were recorded. When
@@ -151,22 +161,24 @@ most three rounds:
    nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
    and its recommendation. Mestari then escalates at once with that question: no checks run and no more rounds are
    spent, and the round is recorded with verdict `question`.
-2. Vasara runs each command in `.paja/checks`, read from `main`. A failure goes back to the builder, and so does a
+2. Vasara runs each command in `.paja/checks`, read from the default
+   branch. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
    fresh index, so the only assume-unchanged or skip-worktree flags left are the ones sparse checkout gives; a check
    run that changes those flags changed the index.
-3. A fresh reviewer agent reads `git diff main...HEAD` cold against the issue and `CLAUDE.md` as it is on `main`, and
+3. A fresh reviewer agent reads `git diff <default branch>...HEAD` cold against the issue and `CLAUDE.md` as it is
+   on the default branch, and
    answers `land`, `changes` (blockers only) or `escalate`, plus non-blocking follow-ups that Mestari files as
    follow-up issues (the `follow-up` label of `.paja/labels`) once the change lands. A later round's reviewer judges only the fix for the earlier
    blockers, except on high-risk changes. It may read, run cargo and use read-only git, and changes nothing. Its
    prompt names the commit Vasara's checks passed at, which the run loop passes in and the review refuses to judge
    if `HEAD` has moved from it, and tells it not to re-run formatting, lints or the full test suite; to probe a
    behaviour it runs one named test or the CLI, with long output piped through `tail` or `grep`. A change touching a
-   path in `.paja/high-risk` (read from `main`) gets two reviewers, who must agree; a split is escalated.
+   path in `.paja/high-risk` (read from the default branch) gets two reviewers, who must agree; a split is escalated.
    An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
    or the name with an extension, at any depth, in any letter case.
 
-Each agent runs on the model `.paja/models` names for its role, read from `main` like the checks, so a change can't
+Each agent runs on the model `.paja/models` names for its role, read from the default branch like the checks, so a change can't
 pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
 build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
 the fix) and `review-2` (the second high-risk reviewer). Mestari passes `--model` and, when given, `--effort`; a role
@@ -185,12 +197,28 @@ finished verdict is kept. If it hits the limit again, its worktree is put back a
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
+Before Vasara's checks in every round, Mestari fetches the default branch and merges it into the environment's branch
+when the branch doesn't hold its tip yet, so the checks, the reviewers and CI judge the change as it would land, and a
+branch built on an old default branch never reaches the pull request. The diffs reviewers read then start from that
+tip. A merge that conflicts is left in progress and the round goes back to the builder, naming the conflicted files;
+the builder resolves them and commits, which finishes the merge, and a merge it leaves with conflicts is undone and asked
+for again.
+
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
-for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. On `escalate`, three failed rounds, a
-red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
+for CI with `gh pr checks --watch`, merges it and marks the item landed. A red CI goes back to the builder as another
+round, like a failed check, with the failing checks and the end of the first failed job's log (`gh run view --job <id>
+--log-failed`); the pull request stays open and the next round pushes to it. So do checks that never start because the
+default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
+CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
+otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
+setting to change. On `escalate`, three failed rounds or
+an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
-`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. Each `run.round` event also lists the
+`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `run.checked` (`round`, `commit`, `base`)
+records that Vasara's checks passed on a commit. A `run.round` of a round after which the loop goes on carries
+`next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
+like `detail`) or null; older events without it stay readable. Each `run.round` event also lists the
 round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
 Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
 `duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
@@ -212,7 +240,7 @@ or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the 
 first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool call
 to `paja hook --root <environment> --home <factory home> --programs <list>` as a Claude Code `PreToolUse` hook. No settings file and no
 MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it off.
-Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the branch
+Because that also skips `CLAUDE.md`, Mestari passes the default branch's `CLAUDE.md` with `--append-system-prompt`, so the branch
 under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read from
 the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
@@ -237,9 +265,12 @@ the tool call, because the reported `cwd` moves when the agent runs `cd`.
   roles) only. A missing file lists `cargo` for every role, so a repository without one behaves as before. Mestari reads
   the file and passes the role's list as `--programs` (comma-terminated, `,` for none); a file it can't read or parse
   stops the agent, and a hook started without the list blocks every call. A listed program runs under the shape rules
-  above and the generic checks: it must start in the worktree, and any word that names a path (also after `--flag=`)
-  must stay inside it and obey the write rules. A program not on the list is refused with a message naming
-  `.paja/commands` on the default branch as the fix. Only `cargo` and `git` have per-subcommand flag lists.
+  above and the generic checks: it must start in the worktree, and any word that names a path (also after `--flag=`
+  or glued to a short flag, as in `-o./out`) must stay inside it and obey the write rules; a short-flag cluster with a
+  path inside it (`-xvf/tmp/a`, `-xC..`) or a `~` glued to the flag is refused, with the fix of putting a space before
+  the value, and each dot name inside a cluster (`.git` in `-xf.git`) is checked like a path. A program not
+  on the list is refused with a message naming `.paja/commands` on the default branch as the fix. Only `cargo` and
+  `git` have per-subcommand flag lists.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
@@ -373,6 +404,12 @@ while it starts.
 - **Assumptions about `sbx`.** Everything Paja assumes about it is in `crates/paja/src/sandbox.rs`: `sbx exec`
   with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, and that a mounted path has the same absolute
   path inside the sandbox.
+- **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
+  which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
+  needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
+  of the real one on `PATH` sets `GIT_DIR` and `GIT_WORK_TREE` for git commands aimed at the worktree (current
+  directory or `-C`, compared by identity, not spelling). Other git commands run unchanged. The `.git` file on the
+  host is never rewritten.
 - **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
   Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The
   other worktrees under `envs/` are mounted too, so code in one worktree can reach another.
