@@ -435,7 +435,9 @@ const RG_IGNORE_FILES: &[&str] = &[".ignore", ".rgignore"];
 /// - a ripgrep ignore file (`.ignore`, `.rgignore`) in the worktree's top directory or above it,
 ///   or a `.gitignore` above it with a `!` line;
 /// - no `.git` in the worktree, without which ripgrep ignores `.gitignore`;
-/// - a `.gitignore` that isn't all UTF-8, which ripgrep stops reading at the first bad line;
+/// - a `.gitignore` that isn't all UTF-8, which ripgrep stops reading at the first bad line, or
+///   that holds anything but comments, names and `*`/`?` (no braces, classes, escapes or spaces)
+///   or is over 4 KiB, since ripgrep drops a file it can't compile;
 /// - a search that starts inside `target`.
 fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
     let target = b.root.join("target");
@@ -464,6 +466,19 @@ fn grep_skips(b: &Bounds, base: &Path, rg_config: bool) -> Vec<PathBuf> {
         .split(|byte| *byte == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .collect();
+    // ripgrep drops a whole ignore file whose patterns it can't compile, for example a huge
+    // brace alternation, so only a small file of names and `*`/`?` wildcards (and comments) is
+    // trusted. ripgrep compiles tens of thousands of wildcards; 4 KiB holds far fewer.
+    let plain = |line: &&[u8]| {
+        line.is_empty()
+            || line.starts_with(b"#")
+            || line
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-/*?".contains(c))
+    };
+    if text.len() > 4096 || !lines.iter().all(plain) {
+        return Vec::new();
+    }
     let names = lines
         .iter()
         .any(|line| [&b"target"[..], b"target/", b"/target", b"/target/"].contains(line));
@@ -1660,6 +1675,19 @@ mod tests {
                 std::fs::remove_file(dir.join(name)).unwrap();
             }
         }
+        // ripgrep drops a file it can't compile, and the hook doesn't compile it, so only
+        // names and simple wildcards count.
+        let braces: Vec<String> = (0..2000).map(|n| format!("x{n}")).collect();
+        for text in [
+            format!("target/\n{{{}}}\n", braces.join(",")),
+            "target/\n[ab].log\n".to_string(),
+            format!("target/\n#{}\n", "x".repeat(5000)),
+        ] {
+            gitignore(&text);
+            assert!(grep().is_some(), "{}", &text[..20]);
+        }
+        gitignore("# build output\n/target\n__pycache__/\n*.pyc\n**/out?.log\n");
+        assert_eq!(grep(), None, "comments, names and simple wildcards");
         std::fs::write(root.join(".gitignore"), b"\xff\ntarget/\n").unwrap();
         assert!(
             grep().is_some(),
