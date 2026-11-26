@@ -410,6 +410,7 @@ struct Config {
     checks: Vec<String>,
     high_risk: Vec<String>,
     models: Models,
+    commands: crate::hook::Commands,
 }
 
 /// Read and check `main`'s configuration once, before an item is claimed: a mistake there is
@@ -425,10 +426,14 @@ fn read_config(repo: &Path, base: &str) -> Result<Config> {
     }
     let high_risk = lines(&read_from_base(repo, base, HIGH_RISK_FILE)?.unwrap_or_default());
     let models = Models::parse(&read_from_base(repo, base, MODELS_FILE)?.unwrap_or_default())?;
+    let commands = crate::hook::Commands::parse(
+        read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
+    )?;
     Ok(Config {
         checks,
         high_risk,
         models,
+        commands,
     })
 }
 
@@ -445,6 +450,7 @@ fn run_item(
         checks,
         high_risk,
         models,
+        commands,
     } = config;
     let (env, kept) = environment(home, repo, base, item)?;
     // An earlier run's builder session is resumed only for work still on its branch: an
@@ -493,6 +499,7 @@ fn run_item(
             builder.as_ref(),
             earlier.as_ref(),
             steps,
+            &commands.builder,
         );
         let (step, raw, asked) = match built {
             Ok(built) => built,
@@ -687,6 +694,8 @@ fn run_item(
                 &models,
                 role,
                 retried,
+                &checks,
+                &commands.reviewer,
             );
             match reviewed {
                 Ok((review, used)) => {
@@ -1035,6 +1044,44 @@ fn review_role(risky: bool, reviewer: usize, fix_only: bool) -> &'static str {
     }
 }
 
+/// The programs as prose: "local git", "local git and `npm`", "local git, `npm` and `node`".
+fn programs_prose(programs: &[String]) -> String {
+    let names: Vec<String> = programs.iter().map(|p| format!("`{p}`")).collect();
+    match names.split_last() {
+        None => "local git".to_string(),
+        Some((last, [])) => format!("local git and {last}"),
+        Some((last, rest)) => format!("local git, {} and {last}", rest.join(", ")),
+    }
+}
+
+/// The `--allowedTools` entries for the project's programs.
+fn program_tools(programs: &[String]) -> Vec<String> {
+    programs.iter().map(|p| format!("Bash({p} *)")).collect()
+}
+
+/// What the builder is asked. `programs` are the ones `.paja/commands` lets it run.
+fn builder_prompt(item: &WorkItem, programs: &[String]) -> String {
+    format!(
+        "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
+         CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
+         and commit your work on the current branch (never push, never switch branches). Commit \
+         with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
+         that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
+         only for {programs}, and Paja's deny-list hook blocks anything else (no `$(`, \
+         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`. If the \
+         issue leaves a decision only the person can make (what to build or what is out of scope, \
+         not how to build it), don't put the question in code, tests or commits: commit nothing, \
+         and end your final message with a line that starts with `{ASK}` followed by the \
+         question, the options and your recommendation. Paja then asks the person on the \
+         issue.\n\nIssue #{number}: {title}\n\n{body}\n{answers}",
+        number = item.number,
+        programs = programs_prose(programs),
+        title = item.title,
+        body = item.body,
+        answers = answers(item)
+    )
+}
+
 /// What one build step gave: its usage this round, its running totals (for a later resume),
 /// and the question it asked instead of building, if any.
 type Built = (StepUsage, StepUsage, Option<String>);
@@ -1052,38 +1099,19 @@ fn build(
     resume: Option<&StepUsage>,
     carried: Option<&Carried>,
     spent: &mut Vec<StepUsage>,
+    programs: &[String],
 ) -> Result<Built> {
-    let mut prompt = format!(
-        "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
-         CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
-         and commit your work on the current branch (never push, never switch branches). Commit \
-         with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
-         that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
-         only for cargo and local git, and Paja's deny-list hook blocks anything else (no `$(`, \
-         heredocs or redirects). When output is long, pipe it through `tail -n 80` or `grep`. If the \
-         issue leaves a decision only the person can make (what to build or what is out of scope, \
-         not how to build it), don't put the question in code, tests or commits: commit nothing, \
-         and end your final message with a line that starts with `{ASK}` followed by the \
-         question, the options and your recommendation. Paja then asks the person on the \
-         issue.\n\nIssue #{number}: {title}\n\n{body}\n{answers}",
-        number = item.number,
-        title = item.title,
-        body = item.body,
-        answers = answers(item)
-    );
+    let mut prompt = builder_prompt(item, programs);
     let again = format!(
         "This is another round on the same branch (based on {base}). Address this first:\n\n{feedback}\n"
     );
     if !feedback.is_empty() {
         prompt.push_str(&format!("\n{again}"));
     }
-    let tools = [
-        "Read",
-        "Edit",
-        "Write",
-        "Glob",
-        "Grep",
-        "Bash(cargo *)",
+    let program_tools = program_tools(programs);
+    let mut tools: Vec<&str> = vec!["Read", "Edit", "Write", "Glob", "Grep"];
+    tools.extend(program_tools.iter().map(String::as_str));
+    tools.extend([
         "Bash(git add *)",
         "Bash(git commit *)",
         "Bash(git rm *)",
@@ -1096,7 +1124,7 @@ fn build(
         "Bash(grep *)",
         "Bash(wc *)",
         "Bash(pwd)",
-    ];
+    ]);
     // A fix round resumes the builder's own session, which keeps what it learned and, on a
     // subscription, reads its earlier turns from the prompt cache. It gets only the feedback.
     // Every other flag, the hook included, is the same as for a fresh session.
@@ -1182,6 +1210,8 @@ fn review_prompt(
     checked: &str,
     prior: Option<&Prior>,
     diff: &str,
+    checks: &[String],
+    programs: &[String],
 ) -> String {
     // A first review reads the whole change; a later one judges only the fix for the blockers
     // an earlier review named, so review rounds converge instead of starting over.
@@ -1209,7 +1239,7 @@ fn review_prompt(
     // role-specific text last, so a second reviewer on the same model reuses the cached prefix.
     format!(
         "Issue #{number}: {title}\n\n{body}\n{answers}\n{diff}\n\n\
-         You are an independent reviewer for Paja. You did not write this change; decide \
+         You are an independent reviewer for this project. You did not write this change; decide \
          whether it lands.\n\n{scope} You already have the diff, so read only the surrounding \
          code you need. Judge it by the rules in CLAUDE.md as they are on main: the CLAUDE.md in \
          your system prompt is main's copy, not the branch's, so don't read it again.\n\n\
@@ -1223,11 +1253,17 @@ fn review_prompt(
          finding each, starting with a short title line, at most five; Paja files them as public \
          issues after landing, so never copy secrets, environment details or run output into \
          them. They never hold the change up.\n\n\
-         Vasara's checks (every command in `.paja/checks` on main: formatting, lints and the full \
-         test suite) already passed at {checked}, the commit you are judging, so don't run \
-         `cargo fmt`, `cargo clippy` or the whole `cargo test` again. To probe a behaviour, run \
-         one named test (`cargo test <name>`) or the CLI, with long output piped through \
-         `tail -n 80` or `grep`. Read-only git is fine; you can't change files.\n",
+         Vasara's checks (every command in `.paja/checks` on main: {checks}) already passed at \
+         {checked}, the commit you are judging, so don't run them again. To probe a behaviour, \
+         run one named test or the project itself, with Bash limited to {programs} and long \
+         output piped through `tail -n 80` or `grep`. Read-only git is fine; you can't change \
+         files.\n",
+        checks = checks
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        programs = programs_prose(programs),
         number = item.number,
         title = item.title,
         body = item.body,
@@ -1305,6 +1341,8 @@ fn review(
     models: &Models,
     role: &str,
     focused: bool,
+    checks: &[String],
+    programs: &[String],
 ) -> Result<(Review, StepUsage)> {
     // The reviewer judges the commit the checks passed at, and nothing else.
     let head = git(&env.path, &["rev-parse", "HEAD"])?;
@@ -1321,7 +1359,7 @@ fn review(
         Some(prior) => format!("{}..HEAD", prior.reviewed),
     };
     let diff = review_diff(&env.path, &range, REVIEW_DIFF_CAP)?;
-    let mut prompt = review_prompt(item, base, &before, prior, &diff);
+    let mut prompt = review_prompt(item, base, &before, prior, &diff, checks, programs);
     if focused {
         prompt.push_str(&format!(
             "\nAn earlier review of this commit stopped at its turn limit of {} before giving a \
@@ -1341,11 +1379,10 @@ fn review(
         },
         "required": ["verdict", "summary"]
     });
-    let tools = [
-        "Read",
-        "Glob",
-        "Grep",
-        "Bash(cargo *)",
+    let program_tools = program_tools(programs);
+    let mut tools: Vec<&str> = vec!["Read", "Glob", "Grep"];
+    tools.extend(program_tools.iter().map(String::as_str));
+    tools.extend([
         "Bash(git status*)",
         "Bash(git diff*)",
         "Bash(git log*)",
@@ -1355,7 +1392,7 @@ fn review(
         "Bash(wc *)",
         "Bash(pwd)",
         "Bash(git show*)",
-    ];
+    ]);
     let out = claude(
         home,
         env,
@@ -1783,21 +1820,60 @@ mod tests {
             answers: Vec::new(),
             waiting_on: Vec::new(),
         };
-        let prompt = super::review_prompt(&item, "base1", "abc123", None, "DIFF-TEXT");
+        let checks: Vec<String> = ["cargo fmt --all --check", "cargo test"]
+            .map(String::from)
+            .to_vec();
+        let cargo = vec!["cargo".to_string()];
+        let review_prompt = |item: &_, prior: Option<&super::Prior>| {
+            super::review_prompt(item, "base1", "abc123", prior, "DIFF-TEXT", &checks, &cargo)
+        };
+        let prompt = review_prompt(&item, None);
+        assert!(
+            prompt.contains("`cargo fmt --all --check`, `cargo test`"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Bash limited to local git and `cargo`"),
+            "{prompt}"
+        );
+        assert!(super::builder_prompt(&item, &cargo).contains("only for local git and `cargo`"));
+
+        // Another project: neither prompt mentions cargo or Paja as the project.
+        let npm = vec!["npm".to_string(), "node".to_string()];
+        let js = super::review_prompt(
+            &item,
+            "base1",
+            "abc123",
+            None,
+            "DIFF-TEXT",
+            &["npm test".to_string()],
+            &npm,
+        );
+        let build = super::builder_prompt(&item, &npm);
+        for text in [&js, &build] {
+            assert!(!text.contains("cargo"), "{text}");
+            assert!(!text.contains("reviewer for Paja"), "{text}");
+        }
+        assert!(js.contains("`npm test`"), "{js}");
+        assert!(js.contains("local git, `npm` and `node`"), "{js}");
+        assert!(
+            build.contains("only for local git, `npm` and `node`"),
+            "{build}"
+        );
+        assert_eq!(super::program_tools(&npm), ["Bash(npm *)", "Bash(node *)"]);
+
         assert!(prompt.contains("DIFF-TEXT"), "{prompt}");
         assert!(!prompt.contains("git show base1:CLAUDE.md"), "{prompt}");
         assert!(prompt.contains("CLAUDE.md in your system prompt is main's copy"));
         assert!(prompt.find("Issue #9").unwrap() < prompt.find("independent reviewer").unwrap());
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
-        assert!(prompt.contains("don't run `cargo fmt`, `cargo clippy` or the whole `cargo test`"));
-        assert!(prompt.contains("`cargo test <name>`"));
         // A re-review judges only the fix, at the checked commit, against the earlier blockers.
         let prior = super::Prior {
             reviewed: "old456".into(),
             blockers: "Fix the parser.".into(),
             follow_ups: vec!["Tidy the helper".into()],
         };
-        let prompt = super::review_prompt(&item, "base1", "abc123", Some(&prior), "DIFF-TEXT");
+        let prompt = review_prompt(&item, Some(&prior));
         assert!(prompt.contains("already passed at abc123"), "{prompt}");
         assert!(prompt.contains("`git diff old456..HEAD`"), "{prompt}");
         assert!(prompt.contains("Fix the parser."), "{prompt}");
