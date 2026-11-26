@@ -55,15 +55,15 @@ cuts them off and keeps them in `events.jsonl.torn`; a bad line that ends in a n
 Jono's items are GitHub issues labelled `paja`. `paja work sync` reads the open ones with `gh` and appends
 `work.imported`, `work.changed`, `work.closed` and `work.reopened` events. Whether an issue is open is kept apart from
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
-survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the oldest
-open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
+survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
+oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
 
-An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed
-by issue numbers (`Depends on #12, #14`). Each sync records a `work.waiting` event when the set of those still open
+An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed by
+issue numbers (`Depends on #12, #14`). Each sync records a `work.waiting` event when the set of those still open
 changes: a dependency in the queue is open until it closes or Paja lands it, and one outside the queue is asked about
-with `gh issue view` (one that can't be read counts as open). An item with open dependencies is never claimed;
-`paja work list` shows them as `waiting_on`, and `paja run` says which items wait on what when nothing else is ready. A sync that reads its full limit
-of issues refuses to close anything rather than drop work it could not see.
+with `gh issue view` (one that can't be read counts as open). An item with open dependencies is never claimed; `paja
+work list` shows them as `waiting_on`, and `paja run` says which items wait on what when nothing else is ready. A sync
+that reads its full limit of issues refuses to close anything rather than drop work it could not see.
 
 `paja work answer <issue> <text>` records a person's answer to an escalated item (`work.answered`, with the question it
 answers) and queues the item again under the home lock, then posts the answer as a comment on the issue. Each item
@@ -158,44 +158,44 @@ for CI with `gh pr checks --watch`, squash-merges it and marks the item landed. 
 red CI or an error it can't fix, it comments on the issue with the question and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
-`run.escalated`, plus a `run.follow_up` for each non-blocking
-review finding. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or
-`review` with its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and
-cache-creation tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p`
-result. A round that stops on an error still records the steps that already ran, as a `run.round` with verdict
-`error` and the error as its detail, before the item is parked. A field the result lacks is `null`, never zero, and
-rounds recorded before steps were kept have none. Replaying
-those events gives each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching
-MCP tools; steps with missing fields count in its `unknown_steps` and add nothing, and so does a recorded step Jono can't read,
-so a bad usage record never stops the queue. While it works, `paja run` prints one progress line per step on stderr (the issue it picked, each build
-round, the checks, each review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so
-stdout keeps its JSON. `paja run --every 5` keeps going, checking an empty queue every five minutes.
+`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. Each `run.round` event also lists the
+round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
+Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
+`duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
+already ran, as a `run.round` with verdict `error` and the error as its detail, before the item is parked. A field the
+result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying those events gives
+each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching MCP tools; steps
+with missing fields count in its `unknown_steps` and add nothing, and so does a recorded step Jono can't read, so a bad
+usage record never stops the queue. While it works, `paja run` prints one progress line per step on stderr (the issue it
+picked, each build round, the checks, each review and its verdict, waiting for CI, landed or asked, and with `--every`
+each wait), so stdout keeps its JSON. `paja run --every 5` keeps going, checking an empty queue every five minutes.
 
 ## The deny-list hook
 
-Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config`, `--tools` naming only the
-built-in tools its role uses (`Read,Edit,Write,Glob,Grep,Bash` for builders, `Read,Glob,Grep,Bash` for reviewers, so
-no subagent or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the worktree's path and git
-status go in the first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool
-call to `paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file
-and no MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it
-off. Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the
-branch under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read
-from the tool call, because the reported `cwd` moves when the agent runs `cd`.
+Every agent Mestari starts runs with `--setting-sources ""`, `--strict-mcp-config`, `--tools` naming only the built-in
+tools its role uses (`Read,Edit,Write,Glob,Grep,Bash` for builders, `Read,Glob,Grep,Bash` for reviewers, so no subagent
+or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the worktree's path and git status go in the
+first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool call
+to `paja hook --root <environment> --home <factory home>` as a Claude Code `PreToolUse` hook. No settings file and no
+MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it off.
+Because that also skips `CLAUDE.md`, Mestari passes main's `CLAUDE.md` with `--append-system-prompt`, so the branch
+under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read from
+the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
   tools included, is blocked. Subagents run in the same worktree in the foreground, under the same hook; one with
   `isolation` or `run_in_background` is blocked, since Claude Code would make its worktree without a call to judge.
-- **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional
-  `cd` to the worktree's root as a step of its own (an absolute path with no `.` or `..` parts, since bash's `cd`
-  drops `..` as text before following links, and no leading `//`, which can name a network path; a symlink or
-  junction that is itself the root is accepted, since cargo and git act on where they physically run, which trusts
-  the link not to change between the hook's check and the shell following it), then `cargo`, local `git` and `pwd`
-  commands joined by `&&`, each optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading `~`
-  or `=`, redirections other than `2>&1`, or other separators outside single quotes. Only `RUST_BACKTRACE` and
-  `RUST_LOG` may be set in front of a command, and only the value may be quoted (`RUST_LOG='debug'`): bash runs a
-  word with a quote before its `=` as a program, so the hook refuses it and says to quote only the value. A value
-  with a `~` is refused, since bash expands it after the `=` or a `:`.
+- **Shell commands** must have one plain shape, because a shell has too many ways to hide a command: an optional `cd` to
+  the worktree's root as a step of its own (an absolute path with no `.` or `..` parts, since bash's `cd` drops `..` as
+  text before following links, and no leading `//`, which can name a network path; a symlink or junction that is itself
+  the root is accepted, since cargo and git act on where they physically run, which trusts the link not to change
+  between the hook's check and the shell following it), then `cargo`, local `git` and `pwd` commands joined by `&&`,
+  each optionally piped into `head`, `tail`, `grep` or `wc` with no file arguments. No `$`, backticks, globs, a leading
+  `~` or `=`, a `~` after an unquoted `=` or `:` in any word (bash expands it there too, even in a commit message),
+  redirections other than `2>&1`, or other separators outside single quotes. Only `RUST_BACKTRACE` and `RUST_LOG` may be
+  set in front of a command, and only the value may be quoted (`RUST_LOG='debug'`): bash runs a word with a quote before
+  its `=` as a program, so the hook refuses it and says to quote only the value. A value with a `~` is refused, since
+  bash expands it after the `=` or a `:`.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first

@@ -725,6 +725,8 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
     let mut in_word = false;
     // Per word: `None` until its first unquoted `=` or quote, then whether that came first.
     let mut assigns: Option<bool> = None;
+    // The last character added to the word, if it was outside quotes.
+    let mut bare: Option<char> = None;
     let mut chars = command.chars().peekable();
     let flush = |word: &mut String,
                  in_word: &mut bool,
@@ -739,6 +741,7 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
         }
     };
     while let Some(c) = chars.next() {
+        let before = bare.take();
         match c {
             '\'' => {
                 in_word = true;
@@ -778,6 +781,14 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             '2' if !in_word && next_is(&mut chars, ">&1") => {
                 tokens.push(Token::StderrToStdout);
             }
+            // Bash expands `~` after an unquoted `=` or `:` in any word, not only in an
+            // assignment: `git commit -m a=~` would put a home path in the message.
+            '~' if matches!(before, Some('=' | ':')) => {
+                return Err(
+                    "a `~` after `=` or `:`, which bash expands to a home directory (quote it)"
+                        .into(),
+                );
+            }
             // `~` only inside a word (`HEAD~1`); at its start the shell would expand it.
             c if c.is_ascii_alphanumeric()
                 || "-_./=:,+@%^".contains(c)
@@ -788,6 +799,7 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
                 }
                 in_word = true;
                 word.push(c);
+                bare = Some(c);
             }
             '\n' => return Err("a newline".into()),
             c => return Err(format!("`{c}` outside quotes")),
@@ -897,7 +909,8 @@ fn refused_variable(assignment: &str) -> Option<String> {
     None
 }
 
-/// `words[..start]` are the assignments in front of the program.
+/// `words[..start]` are the assignments in front of the program, which `check_command` has
+/// already checked.
 fn check_simple(
     words: &[&str],
     start: usize,
@@ -905,11 +918,6 @@ fn check_simple(
     here: &mut PathBuf,
     b: &Bounds,
 ) -> Option<String> {
-    for assignment in &words[..start] {
-        if let Some(refused) = refused_variable(assignment) {
-            return Some(refused);
-        }
-    }
     let Some((program, args)) = words[start..].split_first() else {
         return Some(format!("an empty command; {SHAPE}"));
     };
@@ -1439,6 +1447,22 @@ mod tests {
             "RUST_LOG='~' cargo test",
         ] {
             assert!(bash(bad).is_some_and(|r| r.contains("has a `~`")), "{bad}");
+        }
+        // And after an unquoted `=` or `:` in any word, a commit message included.
+        for bad in [
+            "git commit -m a=~",
+            "git commit -m 'a'=~/x",
+            "cargo test -- a:~",
+            "git log --format=~",
+        ] {
+            assert!(
+                bash(bad).is_some_and(|r| r.contains("has a `~` after")),
+                "{bad}"
+            );
+        }
+        // Quoted, or inside a word, it is plain text.
+        for good in ["git commit -m 'a=~'", "git log HEAD~1", "git show HEAD~2:x"] {
+            assert_eq!(bash(good), None, "{good}");
         }
         assert!(bash("PAJA_HOME='x' cargo test")
             .is_some_and(|r| r.contains("agents don't set PAJA_HOME")));
@@ -2157,7 +2181,11 @@ mod windows_tests {
             "cd //server/share",
             "cd '/\\server'",
         ] {
-            assert!(e.bash(bad).is_some(), "{bad}");
+            let reason = e.bash(bad).unwrap_or_else(|| panic!("{bad} was allowed"));
+            assert!(
+                reason.contains("only goes to the worktree's root"),
+                "{bad}: {reason}"
+            );
         }
         let drive = windows.chars().next().unwrap().to_ascii_lowercase();
         let msys = format!("/{drive}{}", windows[2..].replace('\\', "/"));
