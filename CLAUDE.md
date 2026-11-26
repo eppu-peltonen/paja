@@ -33,17 +33,21 @@ the real repository, to the smoke tests.
 - `crates/paja/src/events.rs`: the append-only event log, the core's only source of truth.
 - `crates/paja/src/home.rs`: the state directory (`$PAJA_HOME`, default `~/.paja`) and its lock.
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
-- `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues labelled `paja` (`gh`, or `$PAJA_GH`).
+- `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues with the work label (`paja` here; `gh`,
+  or `$PAJA_GH`).
 - `crates/paja/src/mestari/`: `paja run`, the build, check, review and land loop for one work item. Only the
   high-risk parts are listed in `.paja/high-risk`: `mod.rs` (the round loop, main's configuration, the risk tier,
   the review prompt and verdicts), `agent.rs` (`claude()`, the hook settings and self-test, the sandbox glue,
   `GitGuard`) and `land.rs` (landing, waiting for CI, escalation). `usage.rs` (what a step spent), `progress.rs`
   (stderr text), `follow_ups.rs` and `builder.rs` (the builder's question and answers) are normal risk.
-- `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`: Vasara's check commands, the high-risk path
-  prefixes, the model per agent role and the programs agents may run besides local git (`review <program>` for
-  reviewers too; `cargo` when missing). `paja run` reads them from `main`, never from the branch under review.
+- `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`, `.paja/labels`: Vasara's check commands, the
+  high-risk path prefixes, the model per agent role, the programs agents may run besides local git (`review <program>`
+  for reviewers too; `cargo` when missing) and the repository's `work` and `follow-up` issue labels (`factory` and
+  `factory-follow-up` when missing). `paja run` reads them from `main`, never from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It allows local
   git and the programs Mestari passes from `.paja/commands`, and it fails closed.
+- `crates/paja/src/posti.rs`: Posti, the notices that tell the person a run needs them (desktop, `PAJA_NOTIFIER`,
+  a push URL), each recorded as `notify.sent` or `notify.failed`.
 - `crates/paja/src/mcp.rs`: `paja mcp`, the same core functions as MCP tools over stdio.
 - `crates/paja/src/platform.rs`: what differs between Windows and Unix. Paja runs natively on both; keep
   `std::os::unix`, `/`-only paths and `sh` assumptions out of the other modules' non-test code.
@@ -71,7 +75,9 @@ the real repository, to the smoke tests.
 - **Checks stay out of reach of the change they judge.** A change that fixes a failing test must not edit that test;
   Vasara's rules and scenarios are read from `main`, never from the branch under review.
 - **Small changes.** One concern per pull request.
-- **This repository is public.** Never commit secrets, private links, personal details or internal hostnames.
+- **This repository is public.** Never commit secrets, private links, personal details or internal hostnames. A
+  test that needs a token-shaped string (`ghp_…`, `Bearer …`, a JWT) builds it at run time from parts, never writes it
+  as one literal, so secret scanners have nothing to flag.
 - **Docs describe Paja, nothing else.** `docs/` and other Markdown cover only how the system works and what agents
   need to work in it. Leave out references to other projects, research, and notes on inspiration or lineage.
 
@@ -90,8 +96,9 @@ code.
   question goes to Posti (until Posti exists: a comment on the issue or pull request) as an intent decision, with
   options and a recommendation. Details: `docs/design/landing.md`.
 - **Review converges.** At most three review rounds per change. Only blockers (a bug in what the issue asks for, a
-  security hole the change opens, a broken rule, missing tests) need another round; every other finding becomes a
-  `paja-follow-up` issue for the person to queue. A re-review reads only the fix (high risk: the whole change). Each
+  security hole the change opens, a broken rule, missing tests) need another round; every other bug or risk goes into
+  the change's one `paja-follow-up` issue for the person to queue, and nits are fixed in a round that runs anyway or
+  dropped. A re-review reads only the fix (high risk: the whole change). Each
   review runs in its own fresh session. Details: `docs/design/landing.md`.
 - **Until Paja's own reviewer runs (build step 3)**, Claude does the review and landing for these hand-built seed
   pull requests under the same rules.

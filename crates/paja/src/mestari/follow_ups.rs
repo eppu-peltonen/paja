@@ -1,24 +1,83 @@
 use super::*;
 
-/// The label follow-up issues get. Jono imports only `paja`, so a follow-up waits until a
-/// person relabels it: reviewers suggest work, people set intent.
-pub const FOLLOW_UP_LABEL: &str = "paja-follow-up";
+/// What kind of finding a reviewer reports beside its verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// A wrong result outside what the issue asks.
+    Bug,
+    /// A security or data-loss risk, or a missing test for behaviour that could break.
+    Risk,
+    /// Style, naming, comment wording or a small refactor: fixed in a round that runs anyway,
+    /// never filed.
+    Nit,
+}
 
-/// At most this many follow-up issues per change; the rest are folded into the last one.
-pub(super) const MAX_FOLLOW_UPS: usize = 5;
+/// One non-blocking review finding. A plain string, as reviewers wrote them before findings
+/// were marked, reads as a `risk`, so it is still filed rather than lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Finding {
+    pub kind: FindingKind,
+    #[serde(rename = "finding")]
+    pub text: String,
+}
 
-/// File each non-blocking review finding as a `paja-follow-up` issue, once the change has
-/// landed. A failure here is recorded, never turned into an escalation: the change is already
-/// merged.
+impl<'de> Deserialize<'de> for Finding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Plain(String),
+            Marked { kind: FindingKind, finding: String },
+        }
+        Ok(match Shape::deserialize(deserializer)? {
+            Shape::Plain(text) => Finding {
+                kind: FindingKind::Risk,
+                text,
+            },
+            Shape::Marked { kind, finding } => Finding {
+                kind,
+                text: finding,
+            },
+        })
+    }
+}
+
+impl Finding {
+    /// The finding with its kind, as a reviewer or the log sees it.
+    pub fn shown(&self) -> String {
+        let kind = match self.kind {
+            FindingKind::Bug => "bug",
+            FindingKind::Risk => "risk",
+            FindingKind::Nit => "nit",
+        };
+        format!("[{kind}] {}", self.text)
+    }
+}
+
+/// At most this many findings go in a change's follow-up issue; the rest stay in the log.
+pub(super) const MAX_FILED: usize = 10;
+
+/// The findings worth an issue (bugs and risks) and the nits, which are never filed.
+pub(super) fn worth_filing(findings: &[Finding]) -> (Vec<&Finding>, Vec<&Finding>) {
+    findings.iter().partition(|f| f.kind != FindingKind::Nit)
+}
+
+/// File the landed change's bugs and risks together as one issue with the repository's
+/// follow-up label, so one change asks for at most one more round of work. Nits are recorded in
+/// the log and dropped; with nothing else, no issue is filed. Jono imports only the work label,
+/// so the follow-up waits until a person relabels it: reviewers suggest work, people set intent.
+/// A failure here is recorded, never turned into an escalation: the change is already merged.
 pub(super) fn file_follow_ups(
     home: &Home,
     repo: &Path,
     item: &WorkItem,
     pr: &str,
-    findings: &[String],
+    findings: &[Finding],
+    labels: &jono::Labels,
 ) {
     // Review text came from an agent that read untrusted code: keep each finding short, never
-    // let it mention anyone, and keep tokens and local paths out of a public issue.
+    // let it mention anyone, and keep tokens and local paths out of a public issue and the log.
     let user_home = ["HOME", "USERPROFILE"]
         .iter()
         .filter_map(std::env::var_os)
@@ -26,57 +85,91 @@ pub(super) fn file_follow_ups(
         .collect::<Vec<_>>();
     let mut places = vec![(home.root(), "<factory home>"), (repo, "<repository>")];
     places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
-    let mut findings: Vec<String> = findings
+    let (filed, nits) = worth_filing(findings);
+    for nit in &nits {
+        record_follow_up(
+            home,
+            item,
+            &redact(&nit.shown(), &places),
+            None,
+            "not filed: a nit",
+        );
+    }
+    let (filed, left) = filed.split_at(filed.len().min(MAX_FILED));
+    for finding in left {
+        record_follow_up(
+            home,
+            item,
+            &redact(&finding.shown(), &places),
+            None,
+            &format!("not filed: the issue holds the first {MAX_FILED} findings"),
+        );
+    }
+    if filed.is_empty() {
+        return;
+    }
+    let shown: Vec<String> = filed
         .iter()
         .map(|finding| {
-            let finding = redact(finding, &places);
-            let mut text: String = finding.chars().take(4000).collect();
-            if text.len() < finding.len() {
-                text.push_str("\n\n(cut short)");
+            let text = redact(&finding.shown(), &places);
+            let mut cut: String = text.chars().take(4000).collect();
+            if cut.len() < text.len() {
+                cut.push_str("\n\n(cut short)");
             }
-            text.replace('@', "@\u{200b}")
+            cut.replace('@', "@\u{200b}")
         })
         .collect();
-    if findings.len() > MAX_FOLLOW_UPS {
-        let rest = findings.split_off(MAX_FOLLOW_UPS - 1);
-        findings.push(format!(
-            "More review follow-ups for #{}\n\n{}",
-            item.number,
-            rest.join("\n\n---\n\n")
-        ));
-    }
-    for finding in &findings {
-        let title: String = finding
-            .lines()
-            .map(|line| {
-                line.trim()
-                    .trim_matches(['#', '-', '*', '_', '`', ' '])
-                    .trim()
-            })
-            .find(|line| !line.is_empty())
-            .unwrap_or("Review follow-up")
-            .chars()
-            .take(100)
-            .collect();
-        let body = format!(
-            "{finding}\n\nA reviewer found this while reviewing #{number} ({pr}). It did not \
-             block landing. Relabel it `paja` to queue it.",
-            number = item.number
-        );
-        let filed = run_gh(
-            repo,
-            &[
-                "issue",
-                "create",
-                "--label",
-                FOLLOW_UP_LABEL,
-                "--title",
-                &title,
-                "--body",
-                &body,
-            ],
-        );
-        match &filed {
+    let first: String = shown[0]
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches("[bug]")
+                .trim_start_matches("[risk]")
+                .trim_matches(['#', '-', '*', '_', '`', ' '])
+                .trim()
+        })
+        .find(|line| !line.is_empty())
+        .unwrap_or("Review follow-up")
+        .chars()
+        .take(90)
+        .collect();
+    let title = match shown.len() {
+        1 => first,
+        n => format!("{first} (+{} more)", n - 1),
+    };
+    let body = format!(
+        "{}\n\nReviewers found these while reviewing #{number} ({pr}). They did not block \
+         landing. Relabel this issue `{work}` to queue them as one piece of work.",
+        shown.join("\n\n---\n\n"),
+        number = item.number,
+        work = labels.work
+    );
+    // The body goes in a file: up to ten findings would not fit a Windows command line.
+    let body_file = home.root().join(format!(
+        "follow-ups-{}-{}.md",
+        item.number,
+        std::process::id()
+    ));
+    let issue = std::fs::write(&body_file, &body)
+        .with_context(|| format!("writing {}", body_file.display()))
+        .and_then(|()| {
+            run_gh(
+                repo,
+                &[
+                    "issue",
+                    "create",
+                    "--label",
+                    &labels.follow_up,
+                    "--title",
+                    &title,
+                    "--body-file",
+                    &body_file.to_string_lossy(),
+                ],
+            )
+        });
+    let _ = std::fs::remove_file(&body_file);
+    for finding in &shown {
+        match &issue {
             Ok(issue) => record_follow_up(home, item, finding, Some(issue.as_str()), ""),
             Err(err) => record_follow_up(
                 home,
@@ -85,11 +178,25 @@ pub(super) fn file_follow_ups(
                 None,
                 &format!(
                     "{err:#}; if the label is missing, create it with `gh label create \
-                     {FOLLOW_UP_LABEL}` and file this finding by hand"
+                     {}` and file this finding by hand",
+                    labels.follow_up
                 ),
             ),
         }
     }
+}
+
+/// `text` made fit for a public issue comment: tokens redacted, and the repository's and the
+/// user's home paths (the factory home is under the latter by default) named, not shown.
+pub(super) fn redact_for_issue(text: &str, repo: &Path) -> String {
+    let user_home = ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let mut places = vec![(repo, "<repository>")];
+    places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
+    redact(text, &places)
 }
 
 /// Tokens that look like credentials become `<redacted>`, and each path in `places` (and
@@ -140,21 +247,36 @@ fn spelling(path: &Path) -> String {
         .to_string()
 }
 
+/// Whether `path` is spelled the Windows way (a drive letter or a `\`), where case doesn't
+/// matter.
+fn is_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.contains('\\') || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
 /// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
-/// `label`.
+/// `label`. A Windows path matches in any letter case, as Windows itself does.
 fn replace_path(text: &str, path: &str, label: &str) -> String {
+    // ASCII lowercasing keeps every byte offset, so a match in `haystack` is one in `text`.
+    let fold = is_windows_path(path);
+    let (haystack, needle) = if fold {
+        (text.to_ascii_lowercase(), path.to_ascii_lowercase())
+    } else {
+        (text.to_string(), path.to_string())
+    };
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(path) {
-        let after = &rest[at + path.len()..];
+    let mut from = 0;
+    while let Some(found) = haystack[from..].find(&needle) {
+        let at = from + found;
+        let end = at + needle.len();
         // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
         // around the path, so a path before one is still redacted.
-        let ends = !after.starts_with(char::is_alphanumeric);
-        out.push_str(&rest[..at]);
-        out.push_str(if ends { label } else { path });
-        rest = after;
+        let ends = !text[end..].starts_with(char::is_alphanumeric);
+        out.push_str(&text[from..at]);
+        out.push_str(if ends { label } else { &text[at..end] });
+        from = end;
     }
-    out.push_str(rest);
+    out.push_str(&text[from..]);
     out
 }
 
@@ -173,26 +295,34 @@ const TOKEN_PREFIXES: &[&str] = &[
     "xoxp-",
     "npm_",
     "pypi-",
+    // A JSON Web Token's header.
+    "eyJ",
 ];
 
-/// Words that introduce a credential: the next long word after one of them, past spaces, `:`
-/// or `=`, is redacted whatever it looks like.
+/// Words that introduce a credential: the next long value after one of them, past spaces,
+/// quotes, backticks, `:`, `=` or `,`, is redacted whatever it looks like.
 const TOKEN_LEADS: &[&str] = &["bearer", "token", "password", "secret", "apikey", "api_key"];
 
-/// The scan visits each word once, so its cost is linear in the text.
+/// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
+/// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole.
 fn redact_tokens(text: &str) -> String {
     let token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let value_char = |c: char| token_char(c) || matches!(c, '.' | '+' | '/' | '=');
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    // Whether the previous word leads a credential and only spaces, `:` or `=` came since.
+    // Whether the previous word leads a credential and only spaces, quotes, backticks, `:`, `=`
+    // or `,` came since.
     let mut led = false;
     while !rest.is_empty() {
-        let start = rest.find(token_char).unwrap_or(rest.len());
+        // After a lead, a value may also start with base64's `+` or `/`.
+        let start = rest
+            .find(|c: char| token_char(c) || (led && matches!(c, '+' | '/')))
+            .unwrap_or(rest.len());
         let gap = &rest[..start];
         out.push_str(gap);
         if !gap
             .chars()
-            .all(|c| c.is_whitespace() || c == ':' || c == '=')
+            .all(|c| c.is_whitespace() || matches!(c, ':' | '=' | ',' | '"' | '\'' | '`'))
         {
             led = false;
         }
@@ -200,11 +330,29 @@ fn redact_tokens(text: &str) -> String {
         if rest.is_empty() {
             break;
         }
-        let end = rest.find(|c: char| !token_char(c)).unwrap_or(rest.len());
+        // A short value that starts with `+` or `/` is left as it is, one character at a time.
+        let end = match rest.find(|c: char| !token_char(c)).unwrap_or(rest.len()) {
+            0 => rest.chars().next().map_or(0, char::len_utf8),
+            end => end,
+        };
         let word = &rest[..end];
-        let secret = word.len() >= 16
-            && (led || TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix)));
-        out.push_str(if secret { "<redacted>" } else { word });
+        let prefixed =
+            word.len() >= 16 && TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix));
+        if prefixed || led {
+            // The whole value, up to the first character no token holds; a sentence's full
+            // stop stays outside it. Only a lead or a prefix starts this scan, and a redacted
+            // value is skipped, so each character is still read a bounded number of times.
+            let value_end = rest[..rest.find(|c: char| !value_char(c)).unwrap_or(rest.len())]
+                .trim_end_matches('.')
+                .len();
+            if prefixed || value_end >= 16 {
+                out.push_str("<redacted>");
+                rest = &rest[value_end..];
+                led = false;
+                continue;
+            }
+        }
+        out.push_str(word);
         led = TOKEN_LEADS
             .iter()
             .any(|lead| word.eq_ignore_ascii_case(lead));
@@ -237,6 +385,43 @@ pub(super) fn record_follow_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finding(kind: FindingKind, text: &str) -> Finding {
+        Finding {
+            kind,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn only_bugs_and_risks_are_worth_an_issue() {
+        let nits = [
+            finding(FindingKind::Nit, "Rename x"),
+            finding(FindingKind::Nit, "Reword y"),
+        ];
+        assert!(worth_filing(&nits).0.is_empty());
+        let mixed = [
+            finding(FindingKind::Nit, "Rename x"),
+            finding(FindingKind::Bug, "Off by one in z"),
+            finding(FindingKind::Nit, "Reword y"),
+        ];
+        let (filed, dropped) = worth_filing(&mixed);
+        assert_eq!(filed, [&mixed[1]]);
+        assert_eq!(dropped.len(), 2);
+    }
+
+    #[test]
+    fn a_finding_reads_marked_or_plain() {
+        let marked: Finding =
+            serde_json::from_value(json!({"kind": "nit", "finding": "Rename x"})).unwrap();
+        assert_eq!(marked, finding(FindingKind::Nit, "Rename x"));
+        // A reviewer that still writes plain strings has them filed, not lost.
+        let plain: Finding = serde_json::from_value(json!("Off by one")).unwrap();
+        assert_eq!(plain, finding(FindingKind::Risk, "Off by one"));
+        assert!(
+            serde_json::from_value::<Finding>(json!({"kind": "idea", "finding": "x"})).is_err()
+        );
+    }
 
     #[test]
     fn findings_lose_tokens_and_local_paths() {
@@ -284,10 +469,60 @@ mod tests {
     }
 
     #[test]
+    fn quoted_dotted_and_base64_values_go_whole() {
+        // Built at run time, so secret scanners don't take the test's fake tokens for real ones.
+        let part = "d4".repeat(10);
+        let jwt = format!("eyJ{part}.{part}.{part}");
+        let base64 = format!("{part}+{part}/{part}==");
+        let slashed = format!("/{part}+{part}");
+        let text = format!(
+            "\"token\": \"{part}\", password=\"{part}\", token, {part}, Bearer {jwt}. \
+             secret {base64} and {jwt} alone; a token. Then the end. password: \"{slashed}\", \
+             token `{part}`, token +ab and token /x."
+        );
+        assert_eq!(
+            redact_tokens(&text),
+            "\"token\": \"<redacted>\", password=\"<redacted>\", token, <redacted>, Bearer \
+             <redacted>. secret <redacted> and <redacted> alone; a token. Then the end. \
+             password: \"<redacted>\", token `<redacted>`, token +ab and token /x."
+        );
+    }
+
+    #[test]
+    fn windows_paths_match_in_any_case() {
+        let home = Path::new(r"C:\Users\Me");
+        let places = [(home, "<home>"), (Path::new("/home/Me"), "<home>")];
+        let shown = redact(
+            r"c:\users\me\.paja, C:/USERS/ME/x, C:\Users\Meg and /home/me/y",
+            &places,
+        );
+        // Unix paths keep their case: `/home/me` is another directory than `/home/Me`.
+        assert_eq!(
+            shown,
+            r"<home>\.paja, <home>/x, C:\Users\Meg and /home/me/y"
+        );
+    }
+
+    #[test]
+    fn an_issue_comment_names_the_repository_and_hides_tokens() {
+        let repo = Path::new("/work/acme-app");
+        let token = format!("ghp_{}", "A1".repeat(12));
+        let text = format!("test failed in /work/acme-app/src/lib.rs with {token}");
+        let shown = redact_for_issue(&text, repo);
+        assert_eq!(
+            shown,
+            "test failed in <repository>/src/lib.rs with <redacted>"
+        );
+    }
+
+    #[test]
     fn redacting_a_long_finding_stays_fast() {
         let text = "word ".repeat(200_000);
         let started = std::time::Instant::now();
         assert_eq!(redact_tokens(&text), text);
+        // Dotted runs after a lead word stay linear too.
+        let dotted = format!("token {}", "a.".repeat(200_000));
+        assert_eq!(redact_tokens(&dotted), "token <redacted>.");
         // A scan that re-read the text for every word would take minutes here.
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }

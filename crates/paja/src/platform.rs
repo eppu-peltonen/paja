@@ -128,6 +128,33 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
+/// Check, without changing anything, that only this user can enter `dir`: no group or other
+/// permission bits on Unix; on Windows that this user owns it and its ACL is protected and lets
+/// no other account in.
+pub fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        win::check_owner_only(dir)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(std::io::Error::other(format!(
+                "{} has mode {mode:03o}, so other accounts can read or change what's in it",
+                dir.display()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Create `path`, which must not exist yet, as a file only this user can read, write or run
 /// (on Windows: inside a directory `create_private_dir` or `ensure_private_dir` made).
 pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -482,12 +509,33 @@ pub fn own_process_group(cmd: &mut Command) -> &mut Command {
 /// [`Command::output`] for a long step (an agent or a check), in its own process group, ended
 /// with everything it started when the person presses Ctrl-C a second time.
 pub fn output_until_stopped(cmd: &mut Command) -> std::io::Result<std::process::Output> {
-    use std::io::Read;
+    output_until_stopped_with_input(cmd, None)
+}
+
+/// [`output_until_stopped`], writing `input` to the child's stdin and then closing it. Long
+/// text goes this way rather than on the command line, which Windows limits to 32,767
+/// characters.
+pub fn output_until_stopped_with_input(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Write};
     use std::process::Stdio;
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     let mut child = own_process_group(cmd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Written on its own thread, so a child that doesn't read all of it can't stall Paja; a
+    // child that exits early just closes the pipe.
+    let writer = match (input, child.stdin.take()) {
+        (Some(bytes), Some(mut stdin)) => Some(std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        })),
+        _ => None,
+    };
     // Drain both pipes while waiting, so a chatty child can't fill one and stall.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -524,6 +572,9 @@ pub fn output_until_stopped(cmd: &mut Command) -> std::io::Result<std::process::
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
     Ok(std::process::Output {
         status,
         stdout: stdout.join().unwrap_or_default(),
@@ -556,6 +607,74 @@ fn kill_tree(child: &mut std::process::Child) {
             .status();
     }
     let _ = child.kill();
+}
+
+/// The command that shows `title` and `text` as a desktop notification: a Windows toast through
+/// Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere. The texts travel as
+/// environment variables or arguments, never inside a script, so nothing in them is run.
+pub fn desktop_notification(title: &str, text: &str) -> Command {
+    if cfg!(windows) {
+        const TOAST: &str = "$ErrorActionPreference = 'Stop'; \
+            [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
+            $t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+            $x = $t.GetElementsByTagName('text'); \
+            $x.Item(0).AppendChild($t.CreateTextNode($env:PAJA_TOAST_TITLE)) | Out-Null; \
+            $x.Item(1).AppendChild($t.CreateTextNode($env:PAJA_TOAST_TEXT)) | Out-Null; \
+            $app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'; \
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($t))";
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", TOAST])
+            .env("PAJA_TOAST_TITLE", title)
+            .env("PAJA_TOAST_TEXT", text);
+        cmd
+    } else if cfg!(target_os = "macos") {
+        let mut cmd = Command::new("osascript");
+        cmd.args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display notification (item 2 of argv) with title (item 1 of argv)",
+            "-e",
+            "end run",
+            title,
+            text,
+        ]);
+        cmd
+    } else {
+        let mut cmd = Command::new("notify-send");
+        cmd.args(["--app-name=Paja", "--", title, text]);
+        cmd
+    }
+}
+
+/// Run `cmd` with no input or output, and wait at most `limit` for it: a notifier that hangs
+/// must not hold up the run. An error names what went wrong.
+pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<()> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("it exited with {status}")))
+            };
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(format!(
+                "it was still running after {} seconds, so Paja stopped it",
+                limit.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]

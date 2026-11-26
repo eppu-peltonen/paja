@@ -25,8 +25,78 @@ const NAME: &str = "paja";
 /// path on the host.
 pub const SCRATCH: &str = "/tmp/paja-home";
 
-/// Puts rustup's directory on `PATH`, then runs the command it is given.
-const WRAP: &str = r#"PATH="$HOME/.cargo/bin:$PATH"; export PATH; exec "$@""#;
+/// The variables that tell the git shim where the worktree is, as the sandbox spells its paths.
+const WORKTREE_ROOT_VAR: &str = "PAJA_WT_ROOT";
+const WORKTREE_GITDIR_VAR: &str = "PAJA_WT_GITDIR";
+
+/// A `git` that runs in the sandbox ahead of the real one when the worktree's `.git` file holds a
+/// host path (`C:/.../.git/worktrees/x`) the sandbox can't resolve. A git command aimed at the
+/// worktree (the current directory or the `-C` directories are inside it) gets `GIT_DIR` and
+/// `GIT_WORK_TREE` set to the sandbox's spelling; every other git command runs unchanged. Paths
+/// are compared by identity (`-ef`: each directory from the target up to `/` against the root),
+/// not by spelling, so separators, case, short names (`RUNNER~1`) and mount spellings don't
+/// matter.
+const GIT_SHIM: &str = r#"#!/bin/sh
+dir=.
+want=0
+for a in "$@"; do
+  if [ "$want" = 1 ]; then
+    dir=$(cd "$dir" 2>/dev/null && cd "$a" 2>/dev/null && pwd -P) || dir=/nonexistent-paja
+    want=0
+    continue
+  fi
+  case "$a" in
+    -C) want=1 ;;
+    *) break ;;
+  esac
+done
+p=$(cd "$dir" 2>/dev/null && pwd -P)
+while [ -z "${GIT_DIR:-}" ] && [ -n "$p" ]; do
+  if [ "$p" -ef "$PAJA_WT_ROOT" ]; then
+    GIT_DIR="$PAJA_WT_GITDIR"
+    GIT_WORK_TREE="$PAJA_WT_ROOT"
+    export GIT_DIR GIT_WORK_TREE
+    break
+  fi
+  [ "$p" = / ] && break
+  p=$(dirname "$p")
+done
+exec "$PAJA_REAL_GIT" "$@""#;
+
+/// Puts rustup's directory on `PATH`, installs the git shim when the worktree needs one, then
+/// runs the command it is given.
+fn wrap() -> String {
+    format!(
+        r#"PATH="$HOME/.cargo/bin:$PATH"; export PATH
+if [ -n "${{{WORKTREE_ROOT_VAR}:-}}" ] && PAJA_REAL_GIT=$(command -v git) && shim="$HOME/.paja-shim" && mkdir -p "$shim"; then
+  cat > "$shim/git.$$" <<'PAJA_SHIM_END'
+{GIT_SHIM}
+PAJA_SHIM_END
+  chmod +x "$shim/git.$$" && mv -f "$shim/git.$$" "$shim/git" && export PAJA_REAL_GIT && PATH="$shim:$PATH" && export PATH
+fi
+exec "$@""#
+    )
+}
+
+/// The worktree root and its git directory, both as the sandbox spells them, when `dot_git` (the
+/// content of the worktree's `.git` file) points at a host path. `None` for a plain repository,
+/// a relative gitdir (it resolves the same in the sandbox) or a host whose paths need no
+/// translation.
+fn redirect_from(root: &str, dot_git: &str) -> Result<Option<(String, String)>> {
+    let Some(gitdir) = dot_git
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("gitdir:"))
+        .map(str::trim)
+    else {
+        return Ok(None);
+    };
+    let translated = translate(gitdir)?;
+    if translated == gitdir {
+        return Ok(None);
+    }
+    Ok(Some((root.to_string(), translated)))
+}
 
 /// A shell function that runs a command (an `apt-get`), retrying while apt's lists or dpkg lock
 /// is held. A fresh sandbox runs its own `apt-get` just after it starts. It tries
@@ -252,6 +322,27 @@ fn windows_spelling(path: &str) -> Result<String> {
     Ok(path.replace('\\', "/"))
 }
 
+/// Make an `sbx exec` command from [`Sbx::command`] pass Paja's stdin to the program in the
+/// sandbox (`exec -i`), for a prompt written there. Any other command is left as it is.
+pub fn keep_stdin(cmd: &mut Command) {
+    let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
+    if args.first().map(|a| a == "exec") != Some(true) {
+        return;
+    }
+    let mut kept = Command::new(cmd.get_program());
+    kept.arg("exec").arg("-i").args(&args[1..]);
+    for (key, value) in cmd.get_envs() {
+        match value {
+            Some(value) => kept.env(key, value),
+            None => kept.env_remove(key),
+        };
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        kept.current_dir(dir);
+    }
+    *cmd = kept;
+}
+
 impl Sbx {
     fn unavailable(&self) -> String {
         format!(
@@ -279,12 +370,21 @@ impl Sbx {
         argv: &[String],
     ) -> Result<Command> {
         let mut cmd = Command::new(&self.program);
-        cmd.arg("exec").arg("-w").arg(in_sandbox_path(dir)?);
+        let root = in_sandbox_path(dir)?;
+        cmd.arg("exec").arg("-w").arg(&root);
         for (key, value) in env {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
+        // A worktree's `.git` file holds a host path the sandbox can't resolve; the shim
+        // gives git the sandbox's spelling of it.
+        if let Ok(dot_git) = std::fs::read_to_string(dir.join(".git")) {
+            if let Some((root, gitdir)) = redirect_from(&root, &dot_git)? {
+                cmd.arg("-e").arg(format!("{WORKTREE_ROOT_VAR}={root}"));
+                cmd.arg("-e").arg(format!("{WORKTREE_GITDIR_VAR}={gitdir}"));
+            }
+        }
         cmd.arg(&self.name)
-            .args(["--", "sh", "-c", WRAP, "sh"])
+            .args(["--", "sh", "-c", &wrap(), "sh"])
             .args(argv);
         Ok(cmd)
     }
@@ -394,7 +494,7 @@ impl Sbx {
             cmd.args(["-u", user]);
         }
         cmd.arg(&self.name)
-            .args(["--", "sh", "-c", WRAP, "sh", "sh", "-c", script]);
+            .args(["--", "sh", "-c", &wrap(), "sh", "sh", "-c", script]);
         let out = cmd
             .stdin(Stdio::null())
             .output()
@@ -447,6 +547,25 @@ mod tests {
             program: "sbx".into(),
             name: "paja".into(),
         }
+    }
+
+    #[test]
+    fn keep_stdin_asks_sbx_exec_for_stdin() {
+        let mut cmd = sbx()
+            .command(Path::new("/work"), &[], &["claude".into(), "-p".into()])
+            .unwrap();
+        keep_stdin(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..2], ["exec", "-i"]);
+        assert_eq!(&args[args.len() - 2..], ["claude", "-p"]);
+        // Anything else is untouched.
+        let mut other = Command::new("sbx");
+        other.args(["ls"]);
+        keep_stdin(&mut other);
+        assert_eq!(other.get_args().collect::<Vec<_>>(), ["ls"]);
     }
 
     #[test]
@@ -504,6 +623,109 @@ mod tests {
             assert!(err.contains("UNC"), "{err}");
         }
         assert!(windows_spelling(r"C:dir").is_err());
+    }
+
+    #[test]
+    fn a_host_gitdir_gets_the_sandbox_spelling() {
+        let dot_git = "gitdir: C:/repo/.git/worktrees/w\n";
+        if cfg!(windows) {
+            assert_eq!(
+                redirect_from("/c/envs/w", dot_git).unwrap(),
+                Some((
+                    "/c/envs/w".to_string(),
+                    "/c/repo/.git/worktrees/w".to_string()
+                ))
+            );
+        }
+        // A relative gitdir resolves the same in the sandbox; a plain checkout has no file.
+        assert_eq!(
+            redirect_from("/w", "gitdir: ../repo/.git/worktrees/w\n").unwrap(),
+            None
+        );
+        assert_eq!(redirect_from("/w", "not a gitdir file").unwrap(), None);
+    }
+
+    /// Run the git shim with a fake real git that prints the `GIT_DIR` and `GIT_WORK_TREE` it
+    /// gets, from `cwd`, for worktree root `root_s` (as the sandbox would spell it).
+    fn shim_sees(root_s: &str, cwd: &Path, args: &[&str]) -> String {
+        let tools = tempfile::tempdir().unwrap();
+        let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+        let shim = tools.path().join("shim");
+        let real = tools.path().join("real");
+        std::fs::write(&shim, GIT_SHIM).unwrap();
+        std::fs::write(
+            &real,
+            "#!/bin/sh\necho \"dir=${GIT_DIR:-} tree=${GIT_WORK_TREE:-}\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = Command::new("sh")
+            .arg(slash(&shim))
+            .args(args)
+            .current_dir(cwd)
+            .env("PAJA_REAL_GIT", slash(&real))
+            .env(WORKTREE_ROOT_VAR, root_s)
+            .env(WORKTREE_GITDIR_VAR, "/gitdirs/w")
+            .env_remove("GIT_DIR")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `root` as the shell spells it, so the test doesn't depend on the host's path style.
+    fn shell_path(root: &Path) -> String {
+        if cfg!(windows) {
+            windows_spelling(&root.to_string_lossy()).unwrap()
+        } else {
+            root.to_string_lossy().into_owned()
+        }
+    }
+
+    #[test]
+    fn the_git_shim_redirects_only_git_commands_aimed_at_the_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root_s = shell_path(root.path());
+        let hit = |out: String| out == format!("dir=/gitdirs/w tree={root_s}");
+        let miss = |out: String| out == "dir= tree=";
+
+        assert!(hit(shim_sees(&root_s, root.path(), &["status"])));
+        assert!(hit(shim_sees(&root_s, &sub, &["status"])));
+        assert!(miss(shim_sees(&root_s, other.path(), &["status"])));
+        // `-C` moves the command into or out of the worktree.
+        let sub_s = shell_path(&sub);
+        let other_s = shell_path(other.path());
+        assert!(hit(shim_sees(
+            &root_s,
+            other.path(),
+            &["-C", &sub_s, "status"]
+        )));
+        assert!(miss(shim_sees(
+            &root_s,
+            root.path(),
+            &["-C", &other_s, "status"]
+        )));
+    }
+
+    #[test]
+    fn the_wrapper_installs_the_shim_only_for_a_worktree_that_needs_one() {
+        let script = wrap();
+        assert!(script.contains(WORKTREE_ROOT_VAR) && script.contains("PAJA_SHIM_END"));
+        assert!(script.trim_end().ends_with(r#"exec "$@""#));
+        let cmd = sbx()
+            .command(Path::new("/work"), &[], &["true".into()])
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a.starts_with(WORKTREE_ROOT_VAR)));
     }
 
     #[test]

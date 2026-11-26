@@ -1,0 +1,111 @@
+name: Release
+
+# A tag `v*` builds `paja` for each platform and publishes a GitHub release with the archives
+# and their SHA256SUMS. Run by hand (workflow_dispatch), it builds and checks the same archives
+# without publishing anything: the dry run.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    env:
+      PAJA_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p paja
+      - name: Package
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/paja/Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} doesn't match the crate version ${version} in crates/paja/Cargo.toml" >&2
+            exit 1
+          fi
+          name="paja-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp LICENSE README.md CHANGELOG.md "dist/${name}/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp "target/${{ matrix.target }}/release/paja.exe" "dist/${name}/"
+            (cd dist && 7z a -tzip "${name}.zip" "${name}" >/dev/null)
+          else
+            cp "target/${{ matrix.target }}/release/paja" "dist/${name}/"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          fi
+          rm -r "dist/${name}"
+      - name: Smoke-test the binary
+        # The cross-built x86_64 macOS binary runs on Apple silicon through Rosetta.
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/paja"
+          [ "${{ runner.os }}" = Windows ] && bin="${bin}.exe"
+          if [ "${{ matrix.target }}" = x86_64-apple-darwin ] && ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "no Rosetta on this runner, so the x86_64 binary is only checked by file type"
+            file "$bin" | grep -q x86_64
+            exit 0
+          fi
+          "$bin" --version
+          "$bin" --json --version | grep -q "\"commit\":\"${GITHUB_SHA:0:12}\""
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paja-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: paja-*
+          merge-multiple: true
+      - name: Checksums and release notes
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/paja/Cargo.toml | head -n 1)
+          # The notes are CHANGELOG.md's section for this version; a dry run without one uses
+          # Unreleased, so it checks the rest before the version's section is written.
+          section="$version"
+          if [ "${GITHUB_REF_TYPE}" != tag ] && ! grep -Eq "^## \[?${version}\]?( |$)" CHANGELOG.md; then
+            section=Unreleased
+          fi
+          awk -v v="$section" '
+            /^## / { on = ($0 ~ "^## \\[?" v "\\]?([ ]|$)"); next }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md has no section for ${section}; add '## ${version}' before tagging" >&2
+            exit 1
+          fi
+          cat notes.md
+      - name: Publish
+        # Only a tag publishes; a run by hand stops after the checks above.
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --title "Paja ${GITHUB_REF_NAME}" --notes-file notes.md

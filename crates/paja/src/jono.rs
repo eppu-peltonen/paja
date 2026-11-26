@@ -1,4 +1,5 @@
-//! Jono: the work queue. Work comes from GitHub issues labelled `paja`; `sync` imports them
+//! Jono: the work queue. Work comes from GitHub issues with the repository's work label
+//! (`.paja/labels`); `sync` imports them
 //! into the event log, and the queue's state is derived by replaying it like everything else.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,8 +18,95 @@ use crate::mestari::{StepUsage, EV_ROUND};
 /// Most issues one sync reads. A sync that hits it refuses to close anything.
 pub const FETCH_LIMIT: usize = 1000;
 
-/// The label that puts an issue in Jono.
-pub const LABEL: &str = "paja";
+/// The repository's queue labels, read from the default branch.
+pub const LABELS_FILE: &str = ".paja/labels";
+
+/// The labels a repository names for its queue (`.paja/labels` on the default branch): `work`
+/// puts an issue in Jono, `follow-up` marks the non-blocking findings Mestari files, and
+/// `needs-answer` marks an escalated item until `paja work answer` requeues it. Without the
+/// file they are `factory`, `factory-follow-up` and `factory-needs-answer`, which don't name
+/// any project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Labels {
+    pub work: String,
+    pub follow_up: String,
+    pub needs_answer: String,
+}
+
+impl Default for Labels {
+    fn default() -> Self {
+        Labels {
+            work: "factory".into(),
+            follow_up: "factory-follow-up".into(),
+            needs_answer: "factory-needs-answer".into(),
+        }
+    }
+}
+
+impl Labels {
+    /// Read the file's text: `work <label>`, `follow-up <label>` and `needs-answer <label>`
+    /// lines (any may be left out), `#` starts a comment line. Anything else is an error naming the line and the fix.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut labels = Labels::default();
+        let (mut work, mut follow_up, mut needs_answer) = (false, false, false);
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let at = format!(
+                "{LABELS_FILE} on the default branch, line {}: {line:?}",
+                i + 1
+            );
+            let (key, value) = line
+                .split_once(char::is_whitespace)
+                .map(|(key, value)| (key, value.trim()))
+                .unwrap_or((line, ""));
+            if value.is_empty() || value.starts_with('-') || value.contains([',', '\\']) {
+                bail!(
+                    "{at}: write it as `{key} <label>`, a label that doesn't start with `-` and \
+                     has no comma"
+                );
+            }
+            let (slot, seen) = match key {
+                "work" => (&mut labels.work, &mut work),
+                "follow-up" => (&mut labels.follow_up, &mut follow_up),
+                "needs-answer" => (&mut labels.needs_answer, &mut needs_answer),
+                _ => bail!("{at}: unknown key {key:?}; use `work`, `follow-up` or `needs-answer`"),
+            };
+            if std::mem::replace(seen, true) {
+                bail!("{at}: `{key}` is named twice; keep one line");
+            }
+            *slot = value.to_string();
+        }
+        if labels.work == labels.follow_up {
+            bail!(
+                "{LABELS_FILE} on the default branch gives `work` and `follow-up` the same label {:?}; they \
+                 must differ, or follow-ups would queue themselves",
+                labels.work
+            );
+        }
+        if labels.needs_answer == labels.work || labels.needs_answer == labels.follow_up {
+            bail!(
+                "{LABELS_FILE} on the default branch gives `needs-answer` the label {:?}, which \
+                 `work` or `follow-up` already uses; give it its own, since answering removes it",
+                labels.needs_answer
+            );
+        }
+        Ok(labels)
+    }
+
+    /// The labels on the default branch of the checkout `ok` proved safe (see
+    /// [`crate::ahjo::show_on_default_branch`]). A repository without the file, or without a
+    /// default branch, gets the defaults. Never read from the branch checked out, which is the
+    /// change under review.
+    fn of_default_branch(ok: &Untampered) -> Result<Self> {
+        match crate::ahjo::show_on_default_branch(ok, LABELS_FILE)? {
+            Some(text) => Self::parse(&text),
+            None => Ok(Self::default()),
+        }
+    }
+}
 
 pub const EV_IMPORTED: &str = "work.imported";
 pub const EV_CHANGED: &str = "work.changed";
@@ -71,7 +159,7 @@ pub struct WorkItem {
     pub title: String,
     pub body: String,
     pub url: String,
-    /// Whether the issue is open and labelled `paja`. A closed issue keeps its status, so an
+    /// Whether the issue is open and has the work label. A closed issue keeps its status, so an
     /// escalation's question or a landing survives the issue closing and reopening.
     pub open: bool,
     pub status: Status,
@@ -136,11 +224,15 @@ pub struct Answer {
 /// An item's agent usage, totalled over every recorded step. A step whose result lacked a token
 /// field or the cost counts in `unknown_steps` and still adds the fields it has, so while
 /// `unknown_steps` is above zero each sum is a lower bound. A missing field adds nothing rather
-/// than a zero it didn't see.
+/// than a zero it didn't see. A recorded step Jono can't read at all counts as unknown too, and
+/// the sequence number of its `run.round` event goes in `unreadable_events`, so the bad record
+/// can be found in the log.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub steps: u64,
     pub unknown_steps: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_events: Vec<u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
@@ -392,6 +484,9 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                             Err(_) => {
                                 usage.steps += 1;
                                 usage.unknown_steps += 1;
+                                if usage.unreadable_events.last() != Some(&event.seq) {
+                                    usage.unreadable_events.push(event.seq);
+                                }
                             }
                         }
                     }
@@ -484,6 +579,27 @@ pub fn list_all(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
         .collect())
 }
 
+/// Every repository's work items, as [`list_all`], for a command run in `checkout`. Only a log
+/// with events from before items carried a repository, and no `work.*` event yet that names
+/// one, needs the checkout's repository; any other log is listed without asking `gh`, so this
+/// works outside a GitHub checkout too.
+pub fn list_all_from(home: &Home, checkout: &Path) -> Result<Vec<WorkItem>> {
+    let events = home.events().read_all()?;
+    let pinned = events
+        .iter()
+        .filter(|e| e.kind.starts_with("work."))
+        .any(|e| e.data["repo"].is_string());
+    let unplaced = events
+        .iter()
+        .any(|e| is_item_event(e) && !e.data["repo"].is_string());
+    let fallback = if unplaced && !pinned {
+        repo_name(home, checkout)?
+    } else {
+        String::new()
+    };
+    Ok(replay(&events, &fallback)?.into_values().collect())
+}
+
 pub fn get(home: &Home, repo: &str, number: u64) -> Result<WorkItem> {
     replay_repo(&home.events().read_all()?, repo)?
         .remove(&number)
@@ -493,7 +609,7 @@ pub fn get(home: &Home, repo: &str, number: u64) -> Result<WorkItem> {
 fn no_item(repo: &str, number: u64) -> String {
     format!(
         "no work item #{number} in {repo}; run `paja work sync` in its checkout to import issues \
-         labelled `{LABEL}`"
+         with its work label (`{LABELS_FILE}` on the default branch)"
     )
 }
 
@@ -810,8 +926,14 @@ pub fn set_status(
     Ok(item)
 }
 
-/// Import the open issues labelled `paja` from the GitHub repository of the checkout at `repo`.
+/// Import the open issues with the work label from the GitHub repository of the checkout at
+/// `repo`. The label is the one `.paja/labels` names on the default branch.
 pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
+    sync_with(home, repo, None)
+}
+
+/// [`sync`] with the labels already read (`paja run` reads them from the commit it works on).
+pub fn sync_with(home: &Home, repo: &Path, labels: Option<&Labels>) -> Result<SyncReport> {
     if !repo.is_dir() {
         bail!(
             "{} is not a directory; pass --repo with a path inside the checkout",
@@ -820,8 +942,12 @@ pub fn sync(home: &Home, repo: &Path) -> Result<SyncReport> {
     }
     // gh runs git in the checkout to find its GitHub repository.
     let ok = crate::ahjo::untampered(home, repo)?;
+    let labels = match labels {
+        Some(labels) => labels.clone(),
+        None => Labels::of_default_branch(&ok)?,
+    };
     let name = name_of(&ok)?;
-    let issues = fetch_issues(&ok)?;
+    let issues = fetch_issues(&ok, &labels.work)?;
     // A dependency outside the queue (another label, or already closed) is asked about once
     // per sync; one in the queue is open by definition.
     let queued: BTreeSet<u64> = issues.iter().map(|issue| issue.number).collect();
@@ -982,6 +1108,23 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         item.note = None;
         item
     };
+    // The item no longer waits on the person. An issue escalated before Paja labelled
+    // escalations has no label to remove, so a failure here only says so.
+    let needs_answer = Labels::of_default_branch(&ok)
+        .map(|labels| labels.needs_answer)
+        .unwrap_or_else(|_| Labels::default().needs_answer);
+    if let Err(err) = gh(
+        &ok,
+        &[
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--remove-label",
+            &needs_answer,
+        ],
+    ) {
+        eprintln!("paja: couldn't remove the `{needs_answer}` label from #{number}: {err:#}");
+    }
     gh(
         &ok,
         &[
@@ -1001,23 +1144,53 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
     Ok(item)
 }
 
+/// Put the repository's `needs-answer` label on escalated item `number`'s issue, creating the
+/// label first when the repository doesn't have it yet. Returns the label.
+pub fn mark_needs_answer(home: &Home, repo: &Path, number: u64) -> Result<String> {
+    let ok = crate::ahjo::untampered(home, repo)?;
+    let label = Labels::of_default_branch(&ok)?.needs_answer;
+    let add = |ok: &Untampered| {
+        gh(
+            ok,
+            &["issue", "edit", &number.to_string(), "--add-label", &label],
+        )
+    };
+    if add(&ok).is_err() {
+        gh(
+            &ok,
+            &[
+                "label",
+                "create",
+                &label,
+                "--color",
+                "d93f0b",
+                "--description",
+                "Paja is waiting for an answer: paja work answer <number> \"<answer>\"",
+            ],
+        )?;
+        add(&ok)?;
+    }
+    Ok(label)
+}
+
 /// A GitHub issue filed for Jono.
 #[derive(Debug, Clone, Serialize)]
 pub struct Filed {
     pub url: String,
 }
 
-/// File a new GitHub issue labelled `paja`, for example a spec a person approved. The next sync
-/// imports it as queued work.
+/// File a new GitHub issue with the repository's work label, for example a spec a person
+/// approved. The next sync imports it as queued work.
 pub fn file(home: &Home, repo: &Path, title: &str, body: &str) -> Result<Filed> {
     if title.trim().is_empty() {
         bail!("the issue needs a title; pass --title");
     }
     let ok = crate::ahjo::untampered(home, repo)?;
+    let label = Labels::of_default_branch(&ok)?.work;
     let url = gh(
         &ok,
         &[
-            "issue", "create", "--label", LABEL, "--title", title, "--body", body,
+            "issue", "create", "--label", &label, "--title", title, "--body", body,
         ],
     )?;
     Ok(Filed {
@@ -1036,7 +1209,7 @@ fn gh_output(ok: &Untampered, args: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)"))
 }
 
-fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
+pub(crate) fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
     let repo = ok.path();
     if !repo.is_dir() {
         bail!(
@@ -1064,7 +1237,7 @@ pub fn gh_program() -> String {
     std::env::var("PAJA_GH").unwrap_or_else(|_| "gh".to_string())
 }
 
-fn fetch_issues(ok: &Untampered) -> Result<Vec<Issue>> {
+fn fetch_issues(ok: &Untampered, label: &str) -> Result<Vec<Issue>> {
     let repo = ok.path();
     let gh = gh_program();
     let output = gh_output(
@@ -1073,7 +1246,7 @@ fn fetch_issues(ok: &Untampered) -> Result<Vec<Issue>> {
             "issue",
             "list",
             "--label",
-            LABEL,
+            label,
             "--state",
             "open",
             "--limit",
@@ -1095,7 +1268,7 @@ fn fetch_issues(ok: &Untampered) -> Result<Vec<Issue>> {
     if issues.len() >= FETCH_LIMIT {
         // A full page may be cut short, and closing what is missing would drop real work.
         bail!(
-            "{FETCH_LIMIT} or more open issues are labelled `{LABEL}`, more than one sync reads; \
+            "{FETCH_LIMIT} or more open issues are labelled `{label}`, more than one sync reads; \
              close or unlabel some, then rerun"
         );
     }
@@ -1125,6 +1298,39 @@ mod tests {
             body: String::new(),
             url: format!("https://example.com/{number}"),
         }
+    }
+
+    #[test]
+    fn labels_default_to_neutral_names_and_read_both_keys() {
+        assert_eq!(Labels::parse("").unwrap(), Labels::default());
+        assert_eq!(Labels::default().work, "factory");
+        assert_eq!(Labels::default().follow_up, "factory-follow-up");
+        let both = Labels::parse("# mine\nwork game\nfollow-up game ideas\n").unwrap();
+        assert_eq!(
+            (both.work.as_str(), both.follow_up.as_str()),
+            ("game", "game ideas")
+        );
+        let one = Labels::parse("follow-up later\n").unwrap();
+        assert_eq!(
+            (one.work.as_str(), one.follow_up.as_str()),
+            ("factory", "later")
+        );
+        for bad in [
+            "work",
+            "work -x",
+            "work a,b",
+            "nope x",
+            "work a\nwork b",
+            "work x\nfollow-up x",
+            "needs-answer factory",
+            "follow-up y\nneeds-answer y",
+            "needs-answer a\nneeds-answer b",
+        ] {
+            assert!(Labels::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(Labels::default().needs_answer, "factory-needs-answer");
+        let waiting = Labels::parse("needs-answer waiting on you\n").unwrap();
+        assert_eq!(waiting.needs_answer, "waiting on you");
     }
 
     // The queue of one repository, which most tests are about.
@@ -1572,6 +1778,7 @@ mod tests {
         drop(lock);
         let usage = get(&home, 1).unwrap().usage.unwrap();
         assert_eq!((usage.steps, usage.unknown_steps), (5, 3));
+        assert_eq!(usage.unreadable_events.len(), 2, "{usage:?}");
         assert_eq!(usage.input_tokens, 20);
         assert_eq!(list(&home).unwrap().len(), 1);
     }

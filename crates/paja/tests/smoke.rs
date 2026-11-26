@@ -40,6 +40,12 @@ fn paja(home: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
     paja_with(home, cwd, args, &[("PAJA_GH", gh.as_path())])
 }
 
+/// A GitHub-token-shaped string for redaction tests, built at run time so the source holds no
+/// literal token for secret scanners to flag.
+fn fake_token() -> String {
+    ["ghp", "ABCDEFGHIJKLMNOPQRSTuvwx"].join("_")
+}
+
 /// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
 fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
@@ -272,10 +278,35 @@ fn help_and_version_are_json_under_json() {
     let tmp = tempfile::tempdir().unwrap();
     let (ok, version) = paja(tmp.path(), tmp.path(), &["--version"]);
     assert!(ok);
-    assert!(version["version"].as_str().unwrap().contains("paja"));
+    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"), "{version}");
+    let commit = version["commit"].as_str().unwrap();
+    assert!(!commit.is_empty(), "{version}");
+    // The text names both too.
+    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert_eq!(
+        text.trim(),
+        format!("paja {} ({commit})", env!("CARGO_PKG_VERSION"))
+    );
     let (ok, help) = paja(tmp.path(), tmp.path(), &["--help"]);
     assert!(ok);
     assert!(help["help"].as_str().unwrap().contains("env"));
+}
+
+#[test]
+fn the_plugin_version_is_the_crates() {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/.claude-plugin/plugin.json");
+    let plugin: Value = serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        plugin["version"],
+        env!("CARGO_PKG_VERSION"),
+        "set \"version\" in {} to the crate's version in crates/paja/Cargo.toml",
+        manifest.display()
+    );
 }
 
 #[test]
@@ -518,6 +549,49 @@ impl Mcp {
     }
 }
 
+/// Every tool a plugin skill tells the agent to call (`Call `name``) is one `paja mcp` provides,
+/// and every skill has a description that says when to use it.
+#[test]
+fn plugin_skills_name_only_tools_the_mcp_server_provides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let mut mcp = Mcp::start(&home, &repo, &[]);
+    mcp.initialize();
+    let tools = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+
+    let skills = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/skills");
+    let mut seen = Vec::new();
+    for entry in std::fs::read_dir(&skills).unwrap() {
+        let file = entry.unwrap().path().join("SKILL.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        seen.push(file.parent().unwrap().file_name().unwrap().to_owned());
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("description: ") && l.contains("Use when")),
+            "{} needs a description that says when to use it",
+            file.display()
+        );
+        for part in text.split("all `").skip(1) {
+            let name = part.split('`').next().unwrap();
+            assert!(
+                names.iter().any(|n| n == name),
+                "{} calls `{name}`, which paja mcp doesn't provide: {names:?}",
+                file.display()
+            );
+        }
+    }
+    for want in ["init", "doctor"] {
+        assert!(seen.iter().any(|s| s == want), "skill {want} missing");
+    }
+}
+
 /// Drive `paja mcp` over stdio: initialize, list tools, then create, list and remove an env.
 #[test]
 fn the_mcp_server_serves_the_same_core() {
@@ -554,6 +628,7 @@ fn the_mcp_server_serves_the_same_core() {
         "work_set",
         "work_answer",
         "work_file",
+        "doctor",
     ] {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
@@ -671,7 +746,9 @@ fn the_mcp_server_answers_and_files_issues() {
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(log.contains("issue comment 3 --body"), "{log}");
     assert!(
-        log.contains("issue create --label paja --title Add a status page --body What to build."),
+        log.contains(
+            "issue create --label factory --title Add a status page --body What to build."
+        ),
         "{log}"
     );
     mcp.finish();
@@ -741,7 +818,7 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     assert_eq!(report["imported"], serde_json::json!([7, 3]));
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(
-        log.contains("--label paja") && log.contains("--state open"),
+        log.contains("--label factory") && log.contains("--state open"),
         "{log}"
     );
 
@@ -984,8 +1061,103 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
     assert_eq!(filed["url"], "https://example.com/9");
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(
-        log.contains("issue create --label paja --title Add a status page --body What to build."),
+        log.contains(
+            "issue create --label factory --title Add a status page --body What to build."
+        ),
         "{log}"
+    );
+}
+
+#[test]
+fn a_repository_names_its_own_work_and_follow_up_labels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("game"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(
+        repo.join(".paja/labels"),
+        "# queue labels\nwork game\nfollow-up game-ideas\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    // A `gh` that lists issues only for the label `game`, as GitHub would.
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/game\"}}' ;;\n\
+             \"issue list\") case \"$*\" in *\"--label game \"*) echo '[{{\"number\": 4, \"title\": \"Add a boss\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; *) echo '[]' ;; esac ;;\n\
+             \"issue create\") echo https://example.com/9 ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["imported"], serde_json::json!([4]));
+    let (ok, filed) = paja_with(
+        &home,
+        &repo,
+        &["work", "file", "--title", "Add a level", "--body", "Soon."],
+        &with_gh,
+    );
+    assert!(ok, "{filed}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("issue create --label game --title Add a level"),
+        "{log}"
+    );
+    assert!(!log.contains("factory"), "{log}");
+}
+
+#[test]
+fn work_sync_reads_the_labels_from_a_default_branch_not_called_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, home) = (tmp.path().join("src"), tmp.path().join("home"));
+    init_repo(&src);
+    git(&src, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(src.join(".paja")).unwrap();
+    std::fs::write(src.join(".paja/labels"), "work game\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-q", "-m", "labels"]);
+    git(tmp.path(), &["clone", "-q", "--bare", "src", "origin.git"]);
+    git(tmp.path(), &["clone", "-q", "origin.git", "app"]);
+    let gh = fake_gh(tmp.path(), "[]");
+    let (ok, report) = paja_with(
+        &home,
+        &tmp.path().join("app"),
+        &["work", "sync"],
+        &[("PAJA_GH", gh.as_path())],
+    );
+    assert!(ok, "{report}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("issue list --label game"), "{log}");
+}
+
+#[test]
+fn a_bad_labels_file_says_which_line_to_fix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\nwork other\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    let gh = fake_gh(tmp.path(), "[]");
+    let (ok, err) = paja_with(
+        &home,
+        &repo,
+        &["work", "sync"],
+        &[("PAJA_GH", gh.as_path())],
+    );
+    assert!(!ok);
+    let err = err["error"].as_str().unwrap();
+    assert!(
+        err.contains(".paja/labels on the default branch, line 2"),
+        "{err}"
     );
 }
 
@@ -1153,6 +1325,75 @@ fn run_never_claims_another_repositorys_item() {
 }
 
 #[test]
+fn work_list_all_needs_no_checkout_once_the_log_names_its_repositories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (elsewhere, home) = (tmp.path().join("elsewhere"), tmp.path().join("home"));
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let no_gh = tmp.path().join("no-gh");
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.imported","data":{"repo":"acme/lib","number":1,"title":"Split it","body":"","url":"https://example.com/1"}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    // Outside any checkout, and with no `gh` to ask.
+    let (ok, items) = paja_with(
+        &home,
+        &elsewhere,
+        &["work", "list", "--all"],
+        &[("PAJA_GH", &no_gh)],
+    );
+    assert!(ok, "{items}");
+    let keys: Vec<(&str, u64)> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["repo"].as_str().unwrap(), i["number"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(keys, [("acme/app", 3), ("acme/lib", 1)], "{items}");
+    // A log from before repositories still needs the checkout to place its events.
+    let old = r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Old","body":"","url":"https://example.com/3"}}"#;
+    std::fs::write(home.join("events.jsonl"), format!("{old}\n")).unwrap();
+    let (ok, report) = paja_with(
+        &home,
+        &elsewhere,
+        &["work", "list", "--all"],
+        &[("PAJA_GH", &no_gh)],
+    );
+    assert!(!ok, "{report}");
+    assert!(report["error"].is_string(), "{report}");
+}
+
+#[test]
+fn work_list_names_the_event_of_a_step_it_cannot_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"run.round","data":{"number":3,"round":1,"verdict":"changes","detail":"","steps":[{"step":"build","input_tokens":10,"output_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"cost_usd":0.5}]}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"run.round","data":{"number":3,"round":2,"verdict":"changes","detail":"","steps":[{"step":7},{"step":8}]}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let (ok, items) = paja(&home, &repo, &["work", "list"]);
+    assert!(ok, "{items}");
+    let usage = &items[0]["usage"];
+    // Both bad steps count as unknown, the good one still adds up, and the event is named once.
+    assert_eq!(
+        (&usage["steps"], &usage["unknown_steps"]),
+        (&3.into(), &2.into()),
+        "{usage}"
+    );
+    assert_eq!(usage["input_tokens"], 10, "{usage}");
+    assert_eq!(
+        usage["unreadable_events"],
+        serde_json::json!([3]),
+        "{usage}"
+    );
+}
+
+#[test]
 fn a_log_written_before_repositories_replays_to_the_same_items() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -1246,12 +1487,18 @@ struct Factory {
 
 impl Factory {
     fn new(checks: &str, verdict: &str) -> Self {
+        Self::on_branch(checks, verdict, "main", r#"{"nameWithOwner": "acme/app"}"#)
+    }
+
+    /// A repository whose default branch is `branch` and whose `gh repo view` says `view`.
+    fn on_branch(checks: &str, verdict: &str, branch: &str, view: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
         let origin = tmp.path().join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&origin, &["init", "-q", "--bare", "-b", branch]);
         init_repo(&repo);
+        git(&repo, &["branch", "-m", branch]);
         std::fs::create_dir_all(repo.join(".paja")).unwrap();
         std::fs::write(repo.join(".paja/checks"), checks).unwrap();
         git(&repo, &["add", "."]);
@@ -1260,7 +1507,7 @@ impl Factory {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
-        git(&repo, &["push", "-q", "origin", "main"]);
+        git(&repo, &["push", "-q", "origin", branch]);
 
         let dir = tmp.path();
         std::fs::write(
@@ -1271,17 +1518,23 @@ impl Factory {
         std::fs::write(dir.join("verdict.txt"), verdict).unwrap();
         let script = |name: &str, body: String| program(dir, name, &body);
         let d = slash(dir);
+        let token = fake_token();
         let gh = script(
             "gh",
             format!(
-                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && cat \"$a\" >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
-                 \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+                 \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
+                 \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi ;;\n\
+                 \"pr checks\") if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
+                 if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
+                 \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") if [ -f {d}/gh-down ]; then exit 1; fi ;;\n\
+                 \"issue edit\") if [ -f {d}/no-label ]; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -1289,18 +1542,23 @@ impl Factory {
             "claude",
             format!(
                 "#!/bin/sh\necho \"$PAJA_HOME\" >> {d}/claude-homes.log\n\
+                 input=$(cat); [ -n \"$input\" ] && : > {d}/prompt-on-stdin; first=$1; shift; set -- \"$first\" \"$input\" \"$@\"\n\
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
-                 *--json-schema*) if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
+                 *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [\\\"Tidy the helper, which logs ghp_ABCDEFGHIJKLMNOPQRSTuvwx\\\"]}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [{{\\\"kind\\\": \\\"risk\\\", \\\"finding\\\": \\\"Tidy the helper, which logs {token}\\\"}}, {{\\\"kind\\\": \\\"nit\\\", \\\"finding\\\": \\\"Rename the variable\\\"}}]}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/hang-fix ]; then : > {d}/hanging; while [ -f {d}/hang-fix ]; do sleep 0.1; done; exit 1; fi ;; esac\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
+                 if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
+                 case \"$*\" in *\"another round\"*) if [ -f {d}/leave-merge ]; then rm {d}/leave-merge; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  echo built >> feature.txt\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
@@ -1337,12 +1595,41 @@ impl Factory {
         )
     }
 
+    /// `run`, with the progress lines it wrote on stderr.
+    fn run_with_stderr(&self) -> (Value, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&self.repo)
+            .env("PAJA_HOME", &self.home)
+            .env("PAJA_GH", &self.gh)
+            .env("PAJA_CLAUDE", &self.claude)
+            .args(["--json", "run"])
+            .output()
+            .unwrap();
+        let report = serde_json::from_slice(&output.stdout).unwrap();
+        (report, String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
     /// Commit `text` as `path` on main and push it, as a person changing the factory would.
     fn on_main(&self, path: &str, text: &str) {
         std::fs::write(self.repo.join(path), text).unwrap();
         git(&self.repo, &["add", "."]);
         git(&self.repo, &["commit", "-q", "-m", path]);
         git(&self.repo, &["push", "-q", "origin", "main"]);
+    }
+
+    /// Have the fake builder's next call push `text` as `path` to origin's main from another
+    /// clone first, as a change landing elsewhere while this one is built.
+    fn main_moves(&self, path: &str, text: &str) {
+        let d = slash(self.tmp.path());
+        std::fs::write(
+            self.tmp.path().join("main-moves.sh"),
+            format!(
+                "git clone -q {d}/origin.git {d}/other && cd {d}/other && printf '{text}\\n' > {path} \
+                 && git add {path} && git -c user.name=t -c user.email=t@example.com commit -qm moved \
+                 && git push -q origin HEAD:main >/dev/null 2>&1\n"
+            ),
+        )
+        .unwrap();
     }
 
     /// Each `claude` call the fake logged, in order.
@@ -1354,6 +1641,76 @@ impl Factory {
     fn gh_log(&self) -> String {
         std::fs::read_to_string(self.tmp.path().join("gh.log")).unwrap_or_default()
     }
+}
+
+#[test]
+fn run_lands_an_issue_whose_prompt_is_longer_than_a_windows_command_line() {
+    // Windows refuses a command line over 32,767 characters (os error 206). The prompt goes on
+    // stdin, so an issue body longer than that still builds, reviews and lands.
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let body = "Please add the feature. ".repeat(2_000);
+    let issues = serde_json::json!([{"number": 5, "title": "Add a feature file", "body": body, "url": "https://example.com/5"}]);
+    std::fs::write(f.tmp.path().join("issues.json"), issues.to_string()).unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+}
+
+#[test]
+fn a_run_uses_the_labels_main_names() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.on_main(".paja/labels", "work game\nfollow-up game-ideas\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(
+        log.contains("issue list --label game --state open"),
+        "{log}"
+    );
+    assert!(
+        log.contains("issue create --label game-ideas --title Tidy the helper"),
+        "{log}"
+    );
+    assert!(!log.contains("factory"), "{log}");
+}
+
+#[test]
+fn run_lands_on_the_default_branch_with_an_allowed_merge_method() {
+    let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "trunk"}, "squashMergeAllowed": false, "mergeCommitAllowed": true, "rebaseMergeAllowed": false}"#;
+    let f = Factory::on_branch("test -f feature.txt\n", "land", "trunk", view);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("merges into: trunk (default branch), by a merge commit"),
+        "{stderr}"
+    );
+    let log = f.gh_log();
+    assert!(
+        log.contains(&format!("pr create --base trunk --head paja/{WORK_5}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("pr merge https://example.com/pull/1 --merge --delete-branch"),
+        "{log}"
+    );
+}
+
+#[test]
+fn run_escalates_when_the_repository_allows_no_merge_method() {
+    let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "main"}, "squashMergeAllowed": false, "mergeCommitAllowed": false, "rebaseMergeAllowed": false}"#;
+    let f = Factory::on_branch("test -f feature.txt\n", "land", "main", view);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("acme/app allows no merge method"),
+        "{report}"
+    );
+    assert!(!f.gh_log().contains("pr merge"), "{}", f.gh_log());
 }
 
 #[test]
@@ -1394,12 +1751,26 @@ fn run_builds_reviews_and_lands_an_issue() {
     // A finding that didn't block landing becomes an issue for a person to queue, not queued
     // work.
     assert!(
-        log.contains("issue create --label paja-follow-up --title Tidy the helper"),
+        log.contains("issue create --label factory-follow-up --title Tidy the helper"),
         "{log}"
     );
+    // The reviewer's risk and nit make one issue that holds only the risk: nits are not filed.
+    assert_eq!(
+        log.matches("issue create --label factory-follow-up")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("Rename the variable"), "{log}");
+    assert!(
+        log.contains("Reviewers found these while reviewing #5"),
+        "{log}"
+    );
+    // The prompt reaches `claude` on stdin, not on its command line.
+    assert!(f.tmp.path().join("prompt-on-stdin").exists());
     // A token in a finding never reaches the public issue.
     assert!(
-        !log.contains("ghp_ABCDEFGHIJKLMNOPQRSTuvwx") && log.contains("logs <redacted>"),
+        !log.contains(&fake_token()) && log.contains("logs <redacted>"),
         "{log}"
     );
     // Every agent runs under the deny-list hook, bounded to its environment, and with no
@@ -1481,6 +1852,187 @@ fn a_repository_without_ci_lands_on_the_checks_alone() {
         "{log}"
     );
     assert!(log.contains("pr merge"), "{log}");
+}
+
+/// Make `dir` private to this user, as the home folder must be.
+fn make_private(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap();
+        // An elevated account's new folders belong to Administrators; take ownership as the
+        // doctor's fix says. It may be refused, in which case the test tolerates the check.
+        let _ = Command::new("icacls")
+            .arg(dir)
+            .args(["/setowner", &user])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let status = Command::new("icacls")
+            .arg(dir)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:(OI)(CI)F"))
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls failed");
+    }
+}
+
+#[test]
+fn doctor_reports_each_check_and_the_fix_for_a_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home, d) = (
+        tmp.path().join("app"),
+        tmp.path().join("home"),
+        slash(tmp.path()),
+    );
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    init_repo(&repo);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/app.git",
+        ],
+    );
+    make_private(&home);
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             \"auth status\") if [ -f {d}/gh-signed-out ]; then echo 'You are not logged into any GitHub hosts' >&2; exit 1; fi ;;\n\
+             \"repo view\") echo '{{\"viewerPermission\": \"ADMIN\"}}' ;;\n\
+             \"label list\") echo '[{{\"name\": \"factory\"}}]' ;;\n\
+             \"workflow list\") echo 'CI	active	1' ;;\nesac\n"
+        ),
+    );
+    let claude = program(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\ncase \"$1 $2\" in\n\
+         \"auth status\") echo '{\"loggedIn\": true}' ;;\n\
+         *) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+    );
+    let doctor = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .env("PAJA_CLAUDE", &claude)
+            .env_remove("PAJA_SBX")
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        (output.status.success(), report)
+    };
+    let check = |report: &Value, name: &str| -> Value {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no check {name} in {report}"))
+            .clone()
+    };
+
+    // Everything is in place; only the missing sandbox is a warning, and it doesn't fail.
+    let (success, report) = doctor();
+    // On a Windows account that runs elevated (CI runners do), a folder this user creates is
+    // owned by the Administrators group, so no ACL change makes the home folder pass. Whatever
+    // the machine's temp-folder permissions are, the check must say which, and only it may fail.
+    let home_check = check(&report, "home folder");
+    if home_check["status"] != "ok" {
+        if !cfg!(windows) {
+            panic!("a private home failed the check: {home_check}");
+        }
+        assert_eq!(home_check["status"], "failed", "{home_check}");
+        assert!(
+            home_check["fix"].as_str().unwrap().contains("icacls"),
+            "{home_check}"
+        );
+    }
+    let home_ok = home_check["status"] == "ok";
+    assert_eq!(success, home_ok, "{report}");
+    assert_eq!(report["ok"] == true, home_ok, "{report}");
+    for name in [
+        "git",
+        "gh",
+        "gh sign-in",
+        "gh access",
+        "claude",
+        "claude sign-in",
+        "deny-list hook",
+        "origin",
+        "work label",
+        "checks",
+        "ci",
+    ] {
+        let c = check(&report, name);
+        assert_eq!(c["status"], "ok", "{c}");
+        assert!(c["fix"].is_null(), "{c}");
+    }
+    let sandbox = check(&report, "sandbox");
+    assert_eq!(sandbox["status"], "warning", "{sandbox}");
+    assert!(
+        sandbox["detail"].as_str().unwrap().contains("as this user"),
+        "{sandbox}"
+    );
+
+    // A signed-out gh and a default branch without `.paja/checks`.
+    std::fs::write(tmp.path().join("gh-signed-out"), "").unwrap();
+    git(&repo, &["rm", "-q", ".paja/checks"]);
+    git(&repo, &["commit", "-q", "-m", "no checks"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let (success, report) = doctor();
+    assert!(!success && report["ok"] == false, "{report}");
+    let signed_in = check(&report, "gh sign-in");
+    assert_eq!(signed_in["status"], "failed", "{signed_in}");
+    assert!(
+        signed_in["fix"].as_str().unwrap().contains("auth login"),
+        "{signed_in}"
+    );
+    assert!(
+        signed_in["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not logged in"),
+        "{signed_in}"
+    );
+    let checks = check(&report, "checks");
+    assert_eq!(checks["status"], "failed", "{checks}");
+    assert!(
+        checks["fix"].as_str().unwrap().contains("add it"),
+        "{checks}"
+    );
+    assert!(
+        checks["detail"].as_str().unwrap().contains(".paja/checks"),
+        "{checks}"
+    );
+    // The rest still passed.
+    assert_eq!(check(&report, "git")["status"], "ok");
 }
 
 #[test]
@@ -1566,6 +2118,86 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert!(stderr.contains("resuming #5"), "{stderr}");
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "landed", "{item}");
+}
+
+/// Start `paja run` with its output discarded, wait until the fake agent writes `marker` (it is
+/// then stuck in a step), and kill the run, as a closed terminal or a reboot would.
+fn interrupt_run(f: &Factory, marker: &str) {
+    let dir = f.tmp.path();
+    let _ = std::fs::remove_file(dir.join(marker));
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join(marker).exists() {
+        assert!(started.elapsed().as_secs() < 60, "no step reached {marker}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run.kill().unwrap();
+    run.wait().unwrap();
+}
+
+fn builds(f: &Factory) -> usize {
+    f.claude_calls()
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .count()
+}
+
+#[test]
+fn a_run_stopped_in_its_review_resumes_without_building_again() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("review-hang"), "").unwrap();
+    interrupt_run(&f, "review-hanging");
+    std::fs::remove_file(dir.join("review-hang")).unwrap();
+    assert_eq!(builds(&f), 1);
+
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("resuming #5 in round 1: the review of "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("skipping"), "{stderr}");
+    assert_eq!(builds(&f), 1, "the resumed run built again");
+    assert!(!stderr.contains("Claude is building"), "{stderr}");
+}
+
+#[test]
+fn a_run_stopped_twice_in_a_fix_keeps_its_round_and_its_blockers() {
+    let f = Factory::new("true\n", "changes");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("hang-fix"), "").unwrap();
+    // Stopped in round 2's fix, after round 1's `changes` verdict; then again in the same
+    // fix, before the resumed run recorded anything.
+    interrupt_run(&f, "hanging");
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(dir.join("hang-fix")).unwrap();
+    std::fs::write(dir.join("verdict.txt"), "land").unwrap();
+
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(stderr.contains("resuming #5 in round 2"), "{stderr}");
+    assert!(!stderr.contains("round 1 of 3"), "{stderr}");
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .rfind(|c| !c.contains("--json-schema") && c.contains("another round"))
+        .unwrap();
+    assert!(fix.contains("add more"), "{fix}");
+    // The re-review judges only the fix, against the earlier blockers.
+    let review = calls.iter().rfind(|c| c.contains("--json-schema")).unwrap();
+    assert!(review.contains("Judge only the fix"), "{review}");
+    assert!(review.contains("add more"), "{review}");
 }
 
 /// Start `paja run` in a process group of its own, as a terminal runs it, with the fake
@@ -1895,8 +2527,7 @@ fn a_step_records_when_its_fallback_model_served_it() {
 }
 
 #[test]
-fn run_every_says_when_it_waits_and_reports_progress_once() {
-    use std::io::{BufRead, BufReader};
+fn a_landing_pass_says_once_that_the_checks_passed() {
     // A pass that lands an item says once that the checks passed, before its reviewers.
     let f = Factory::new("true\n", "land");
     f.on_main(".paja/high-risk", "feature.txt\n");
@@ -1908,44 +2539,102 @@ fn run_every_says_when_it_waits_and_reports_progress_once() {
         .args(["--json", "run"])
         .output()
         .unwrap();
+    let report: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(report["outcome"], "landed", "{report}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches("checks passed").count(), 1, "{stderr}");
     assert!(
         stderr.contains("reviewer 2 of 2 is reading the change"),
         "{stderr}"
     );
+}
 
-    // With nothing left to do, `--every` says it waits, and keeps running until stopped.
-    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+/// Starts `paja --json run --every 1`, reads stderr up to its first wait line, then stops it.
+/// Returns that line, whether the loop was still running, and the first JSON line on stdout.
+/// A run whose stderr closes first fails the test instead of hanging it.
+fn first_wait_of_every(f: &Factory) -> (String, bool, Value) {
+    first_wait_of_every_with(f, &[])
+}
+
+/// [`first_wait_of_every`] with more environment variables.
+fn first_wait_of_every_with(f: &Factory, vars: &[(&str, &Path)]) -> (String, bool, Value) {
+    use std::io::{BufRead, BufReader};
     let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
+        .envs(vars.iter().copied())
         .args(["--json", "run", "--every", "1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut lines = BufReader::new(every.stderr.take().unwrap()).lines();
-    let waiting = lines
-        .by_ref()
+    // Every wait line, whatever its reason, ends the search, so a pass that fails instead of
+    // idling can't keep the test reading forever.
+    let waiting = BufReader::new(every.stderr.take().unwrap())
+        .lines()
         .map(|line| line.unwrap())
-        .find(|line| line.contains("nothing to do right now"));
+        .find(|line| line.contains("checking again in"));
     let still_running = every.try_wait().unwrap().is_none();
     every.kill().unwrap();
     every.wait().unwrap();
     let waiting = waiting.expect("no wait line before stderr closed");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut every.stdout.take().unwrap(), &mut stdout).unwrap();
+    let first: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    (waiting, still_running, first)
+}
+
+#[test]
+fn a_bad_config_on_main_fails_a_pass_with_nothing_to_do() {
+    // `.paja` on main is checked before the queue, so a mistake there is reported even when
+    // there is nothing to claim, instead of hiding behind `idle`.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(".paja/models", "nobody sonnet\n");
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(error.contains("unknown role"), "{report}");
+    assert!(error.contains(".paja/models"), "{report}");
+}
+
+#[test]
+fn run_every_says_when_it_waits() {
+    // With nothing to do, `--every` says it waits, and keeps running until stopped.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    let (waiting, still_running, first) = first_wait_of_every(&f);
     assert!(
-        waiting.contains("checking again in 1 minute (Ctrl+C stops)"),
+        waiting.contains("nothing to do right now; checking again in 1 minute (Ctrl+C stops)"),
         "{waiting}"
     );
     assert!(still_running, "the loop stopped by itself");
-    let mut stdout = String::new();
-    std::io::Read::read_to_string(&mut every.stdout.take().unwrap(), &mut stdout).unwrap();
-    let idle: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
-    assert_eq!(idle["outcome"], "idle", "{stdout}");
+    assert_eq!(first["outcome"], "idle", "{first}");
+}
+
+#[test]
+fn run_every_keeps_going_after_a_pass_fails() {
+    // A `.paja/models` on main that names no real role fails every pass, idle or not; the loop
+    // reports the error and waits for the next pass instead of stopping.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/models", "nobody sonnet\n");
+    let (waiting, still_running, first) = first_wait_of_every(&f);
+    assert!(
+        waiting.contains("that pass failed; Paja keeps going; checking again in 1 minute"),
+        "{waiting}"
+    );
+    assert!(still_running, "the loop stopped by itself");
+    assert!(
+        first["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown role"),
+        "{first}"
+    );
 }
 
 #[test]
@@ -1987,6 +2676,35 @@ fn run_records_what_each_agent_step_spent() {
     assert_eq!(usage["cost_usd"], 0.25);
     let (_, listed) = paja(&f.home, &f.repo, &["work", "list"]);
     assert_eq!(listed[0]["usage"], *usage);
+}
+
+#[test]
+fn a_fix_round_hands_the_builder_the_nits() {
+    // Round one asks for changes, so the nit goes to the fix round instead of an issue.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(!builds[0].contains("Rename the variable"), "{}", builds[0]);
+    assert!(
+        builds[1].contains("also noted these nits") && builds[1].contains("Rename the variable"),
+        "{}",
+        builds[1]
+    );
+    let log = f.gh_log();
+    assert_eq!(
+        log.matches("issue create --label factory-follow-up")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("Rename the variable"), "{log}");
 }
 
 #[test]
@@ -2201,6 +2919,198 @@ fn run_says_when_it_needs_a_decision() {
     ] {
         assert!(stderr.contains(step), "missing {step:?} in:\n{stderr}");
     }
+}
+
+/// A fake `PAJA_NOTIFIER` that logs each notice as `title|text`, and the path of its log.
+fn fake_notifier(f: &Factory) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = f.tmp.path().join("notices.log");
+    let script = program(
+        f.tmp.path(),
+        "notifier",
+        &format!(
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> {}\n",
+            slash(&log)
+        ),
+    );
+    (script, log)
+}
+
+fn events_of(f: &Factory, kind: &str) -> Vec<Value> {
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    log.as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == kind)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn an_escalation_reaches_the_notifier() {
+    let f = Factory::new("true\n", "escalate");
+    let (notifier, log) = fake_notifier(&f);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_NOTIFIER", notifier.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    assert!(
+        notices.starts_with("Paja: acme/app#5 needs a decision|"),
+        "{notices}"
+    );
+    assert!(notices.contains("paja work answer 5"), "{notices}");
+    let sent = events_of(&f, "notify.sent");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["data"]["kind"], "escalated");
+    assert_eq!(sent[0]["data"]["number"], 5);
+    assert_eq!(sent[0]["data"]["channel"], "PAJA_NOTIFIER");
+}
+
+#[test]
+fn an_escalated_issue_is_labelled_until_it_is_answered() {
+    let f = Factory::new("true\n", "escalate");
+    // The repository doesn't have the label yet, so Paja creates it.
+    std::fs::write(f.tmp.path().join("no-label"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let log = f.gh_log();
+    let add = "issue edit 5 --add-label factory-needs-answer";
+    assert_eq!(log.matches(add).count(), 2, "{log}");
+    assert!(log.contains("label create factory-needs-answer"), "{log}");
+    // The text list puts what waits on the person first, with the command that answers it,
+    // ahead of an older issue imported since.
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 5, "title": "Add a feature file", "body": "Please.", "url": "https://example.com/5"},
+            {"number": 2, "title": "Older", "body": "", "url": "https://example.com/2"}]"#,
+    )
+    .unwrap();
+    let (ok, synced) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "sync"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{synced}");
+    let listed = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .args(["work", "list"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.starts_with("#5\tescalated"), "{text}");
+    assert!(text.contains("answer: paja work answer 5"), "{text}");
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Use v2"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(
+        f.gh_log()
+            .contains("issue edit 5 --remove-label factory-needs-answer"),
+        "{}",
+        f.gh_log()
+    );
+}
+
+#[test]
+fn the_needs_answer_label_follows_the_labels_file() {
+    let f = Factory::new("true\n", "escalate");
+    f.on_main(
+        ".paja/labels",
+        "work factory\nneeds-answer waiting-on-you\n",
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert!(
+        f.gh_log()
+            .contains("issue edit 5 --add-label waiting-on-you"),
+        "{}",
+        f.gh_log()
+    );
+}
+
+#[test]
+fn a_failed_pass_of_run_every_reaches_the_notifier() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(".paja/models", "nobody sonnet\n");
+    let (notifier, log) = fake_notifier(&f);
+    let (waiting, _, first) =
+        first_wait_of_every_with(&f, &[("PAJA_NOTIFIER", notifier.as_path())]);
+    assert!(waiting.contains("that pass failed"), "{waiting}");
+    assert!(first["error"].is_string(), "{first}");
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    assert!(
+        notices.starts_with("Paja: a pass failed in acme/app|"),
+        "{notices}"
+    );
+}
+
+#[test]
+fn a_push_url_that_is_not_a_url_is_recorded_and_the_run_carries_on() {
+    let f = Factory::new("true\n", "escalate");
+    f.on_main(".paja/notify", "# where notices go\nntfy.example/paja\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PAJA_NOTIFIER", "none")
+        .env_remove("PAJA_NOTIFY")
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("must start with https://").count(),
+        1,
+        "{stderr}"
+    );
+    let failed = events_of(&f, "notify.failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["data"]["channel"], "push");
+    assert!(events_of(&f, "notify.sent").is_empty());
+}
+
+#[test]
+fn run_text_says_how_to_answer_an_escalation() {
+    let f = Factory::new("true\n", "escalate");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .arg("run")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("#5 escalated:"), "{stdout}");
+    assert!(
+        stdout.contains("answer: paja work answer 5 \"<your answer>\""),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("paja work answer 5"), "{stderr}");
+    assert!(!stderr.contains("answer there"), "{stderr}");
 }
 
 #[test]
@@ -3422,4 +4332,395 @@ fn the_deny_list_hook_blocks_and_fails_closed() {
         hook_with(&inside, &read(&w("/w/home/envs/a/src/lib.rs"))).0,
         Some(0)
     );
+}
+
+/// A repository with a bare `origin`, the `files` committed on main, and a fake `gh` that logs
+/// its arguments and prints a pull request URL. Returns (tmp, repo, home, gh).
+fn init_fixture(
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    init_repo(&repo);
+    // `paja init` commits with the repository's own identity, which CI runners don't have.
+    git(&repo, &["config", "user.name", "test"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    for (name, text) in files {
+        std::fs::write(repo.join(name), text).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "files"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             \"pr create\") echo https://example.com/pull/7 ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    (tmp, repo, home, gh)
+}
+
+/// The text of `path` on branch `rev` of `repo`.
+fn show(repo: &Path, rev: &str, path: &str) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &format!("{rev}:{path}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{rev}:{path} is missing");
+    String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
+}
+
+#[test]
+fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
+    let (tmp, repo, home, gh) = init_fixture(&[(
+        "package.json",
+        r#"{"scripts": {"test": "jest", "lint": "eslint ."}}"#,
+    )]);
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci"], &vars);
+    assert!(ok, "{out}");
+    assert_eq!(out["branch"], "paja/init");
+    assert_eq!(out["default_branch"], "main");
+    assert_eq!(out["detected"]["checks"][0], "npm test");
+    assert_eq!(out["detected"]["commands"][0], "npm");
+    assert_eq!(out["pull_request"], "https://example.com/pull/7");
+    assert_eq!(out["ci"], "workflow");
+
+    let checks = show(&repo, "paja/init", ".paja/checks");
+    assert!(checks.contains("npm test\n") && checks.contains("npm run lint\n"));
+    assert!(show(&repo, "paja/init", ".paja/commands").contains("\nnpm\nreview npm\n"));
+    assert!(show(&repo, "paja/init", ".paja/high-risk").contains("\n.github/\n"));
+    assert!(show(&repo, "paja/init", ".paja/models").contains("build sonnet"));
+    assert!(show(&repo, "paja/init", "CLAUDE.md").contains("## Working with Paja"));
+    assert!(show(&repo, "paja/init", ".github/workflows/paja.yml").contains("run: npm test"));
+
+    // Nothing reached main, locally or on origin, and the checkout is untouched.
+    let on_main = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["cat-file", "-e", "origin/main:.paja/checks"])
+        .status()
+        .unwrap();
+    assert!(!on_main.success());
+    assert!(!repo.join(".paja").exists());
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("label create factory"), "{log}");
+    assert!(
+        log.contains("pr create --base main --head paja/init"),
+        "{log}"
+    );
+
+    // Once the files are on main, a second init is refused; --force writes them on the branch.
+    git(&repo, &["merge", "-q", "--ff-only", "paja/init"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let (ok, out) = paja_with(&home, &repo, &["init"], &vars);
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains(".paja/checks is already on main") && error.contains("--force"),
+        "{error}"
+    );
+}
+
+#[test]
+fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo create\") echo \"https://github.com/acme/$3\" ;;\n\
+             \"repo clone\") git clone -q {d}/origin-$(basename \"$3\").git \"$4\" ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let identity = [
+        ("GIT_AUTHOR_NAME", Path::new("test")),
+        ("GIT_AUTHOR_EMAIL", Path::new("test@example.com")),
+        ("GIT_COMMITTER_NAME", Path::new("test")),
+        ("GIT_COMMITTER_EMAIL", Path::new("test@example.com")),
+        ("PAJA_GH", gh.as_path()),
+    ];
+    for (name, stack, extra) in [
+        ("rusty", "rust", "--private"),
+        ("nody", "node", "--public"),
+        ("pyish", "python", "--private"),
+    ] {
+        let origin = tmp.path().join(format!("origin-{name}.git"));
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        let (ok, out) = paja_with(
+            &home,
+            &work,
+            &["init", "--new", name, "--stack", stack, extra],
+            &identity,
+        );
+        assert!(ok, "{out}");
+        let dir = work.join(name);
+        assert_eq!(out["repo"], format!("acme/{name}"));
+        assert_eq!(out["directory"], dir.display().to_string());
+        assert_eq!(out["default_branch"], "main");
+        assert_eq!(out["private"], extra == "--private");
+        let files: Vec<&str> = out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        for file in [
+            ".paja/checks",
+            ".paja/commands",
+            ".paja/models",
+            ".paja/high-risk",
+            ".paja/labels",
+            "CLAUDE.md",
+            ".github/workflows/paja.yml",
+            ".gitignore",
+        ] {
+            assert!(files.contains(&file), "{file} missing from {files:?}");
+            assert!(dir.join(file).is_file(), "{file} not written");
+        }
+        // The first commit reached the default branch of origin.
+        let pushed = show(&origin, "main", ".paja/checks");
+        assert_eq!(
+            pushed,
+            std::fs::read_to_string(dir.join(".paja/checks"))
+                .unwrap()
+                .replace("\r\n", "\n")
+        );
+        assert!(show(&origin, "main", "CLAUDE.md").contains("## Working with Paja"));
+        assert!(out["next_steps"].to_string().contains("paja run --once"));
+    }
+
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("repo create rusty --private"), "{log}");
+    assert!(log.contains("repo create nody --public"), "{log}");
+    assert!(log.contains("label create paja "), "{log}");
+
+    // The Rust skeleton passes the checks Paja will run.
+    let dir = work.join("rusty");
+    let checks = std::fs::read_to_string(dir.join(".paja/checks")).unwrap();
+    let checks: Vec<&str> = checks
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            "cargo fmt --all --check",
+            "cargo clippy --all-targets -- -D warnings",
+            "cargo test"
+        ]
+    );
+    for check in checks {
+        let mut words = check.split_whitespace();
+        let output = Command::new(words.next().unwrap())
+            .args(words)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "`{check}` failed in the Rust skeleton: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // A name Paja can't use is refused before anything is created.
+    let (ok, out) = paja_with(
+        &home,
+        &work,
+        &["init", "--new", "bad name", "--stack", "rust"],
+        &identity,
+    );
+    assert!(!ok, "{out}");
+    assert!(out["error"]
+        .as_str()
+        .unwrap()
+        .contains("not a usable project name"));
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(!log.contains("bad name"), "{log}");
+}
+
+#[test]
+fn a_run_merges_a_default_branch_that_moved_while_it_built() {
+    let f = Factory::new("test -f feature.txt && test -f other.txt\n", "land");
+    f.main_moves("other.txt", "elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("main moved on; merged it into the branch"),
+        "{stderr}"
+    );
+    let origin = f.tmp.path().join("origin.git");
+    git(
+        &origin,
+        &["cat-file", "-e", &format!("paja/{WORK_5}:other.txt")],
+    );
+}
+
+#[test]
+fn a_conflict_with_the_default_branch_goes_back_to_the_builder() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.main_moves("feature.txt", "landed elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("the branch conflicts with main"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("merging it conflicts in: feature.txt"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("another round"), "{fix}");
+    // The round after the conflict builds on main as it is now.
+    let origin = f.tmp.path().join("origin.git");
+    let merged = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            "main",
+            &format!("paja/{WORK_5}"),
+        ])
+        .status()
+        .unwrap();
+    assert!(merged.success(), "the landed branch holds main");
+}
+
+#[test]
+fn a_merge_the_builder_leaves_unfinished_stays_in_progress_for_the_next_round() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.main_moves("feature.txt", "landed elsewhere");
+    std::fs::write(f.tmp.path().join("leave-merge"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("the builder left the merge unfinished; asking again"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("isn't finished: these files still have conflicts: feature.txt"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("finish the merge"), "{fix}");
+}
+
+#[test]
+fn red_ci_goes_back_to_the_builder_with_the_failed_log() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-red-once"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    assert!(
+        stderr.contains("CI failed; sending the failure back to the builder"),
+        "{stderr}"
+    );
+    let calls = f.claude_calls();
+    let fix = calls
+        .iter()
+        .find(|c| c.contains("CI failed on https://example.com/pull/1"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(fix.contains("Author identity unknown"), "{fix}");
+    assert!(
+        f.gh_log().contains("run view --job 8 --log-failed"),
+        "{}",
+        f.gh_log()
+    );
+}
+
+#[test]
+fn init_keeps_the_repositorys_own_claude_md_and_adds_one_section() {
+    let own = "# My app\n\nBuild with care.\n";
+    let (_tmp, repo, home, gh) = init_fixture(&[("CLAUDE.md", own), ("go.mod", "module x\n")]);
+    let (ok, out) = paja_with(&home, &repo, &["init"], &[("PAJA_GH", gh.as_path())]);
+    assert!(ok, "{out}");
+    assert_eq!(out["ci"], "none");
+    assert_eq!(show(&repo, "paja/init", ".paja/ci"), "none\n");
+    let claude = show(&repo, "paja/init", "CLAUDE.md");
+    assert!(claude.starts_with(own), "{claude}");
+    assert_eq!(claude.matches("## Working with Paja").count(), 1);
+    assert!(claude.contains("go test ./..."));
+}
+
+#[test]
+fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
+    let (_tmp, repo, home, gh) = init_fixture(&[("README.md", "# app\n")]);
+    let (ok, out) = paja_with(&home, &repo, &["init"], &[("PAJA_GH", gh.as_path())]);
+    assert!(ok, "{out}");
+    assert!(out["note"].as_str().unwrap().contains("fill in"), "{out}");
+    assert!(show(&repo, "paja/init", ".paja/checks").contains("# make test"));
+}
+
+#[test]
+fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-silent"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert!(
+        report["question"]
+            .as_str()
+            .unwrap()
+            .contains("CI did not report"),
+        "{report}"
+    );
+    assert!(
+        !stderr.contains("sending the failure back to the builder"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_merge_github_refuses_escalates_naming_the_setting() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("GitHub refused to merge https://example.com/pull/1"),
+        "{question}"
+    );
+    assert!(question.contains("allow squash merging"), "{question}");
 }

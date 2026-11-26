@@ -21,16 +21,24 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   reviewer's after its one focused retry) counts against the three without a verdict. Builder and reviewer limit hits
   are counted separately: a second round failed by the same kind of step escalates.
 - **Only blockers hold a change up.** A blocker is a bug in what the issue asks for, a security hole the change opens, a
-  broken `CLAUDE.md` rule, or missing tests for the new behaviour. Every other finding (hardening ideas, edge cases
-  outside the issue, nits) is a follow-up: once the change lands, Mestari files the landing round's follow-ups (at most
-  five) as `paja-follow-up` issues. Jono doesn't import that label, so a person queues one by relabelling it `paja`:
-  reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and repeats the ones
-  that still apply. If the change doesn't land after all (CI fails), the follow-ups stay in the event log unfiled.
+  broken `CLAUDE.md` rule, or missing tests for the new behaviour. Every other finding is a follow-up, which the
+  reviewer marks `bug` (a wrong result outside what the issue asks), `risk` (a security or data-loss risk, or a missing
+  test for behaviour that could break) or `nit` (style, naming, comment wording, a small refactor); anything that is
+  none of these is left out. Once the change lands, Mestari files the landing round's bugs and risks together as one
+  follow-up issue (the follow-up label of `.paja/labels`, `paja-follow-up` in this repository), so a change asks for
+  at most one more piece of work, and files nothing when there are none. Nits are never filed: when a round asks for
+  changes anyway, the builder gets them to fix if a line or two does it, and otherwise they are dropped, kept only in
+  the event log. Jono doesn't import the follow-up label, so a person queues the issue by relabelling it with the work
+  label (`paja` here): reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and
+  repeats the ones that still apply. If the change doesn't land in that round (CI fails and the builder gets another round), the follow-ups stay
+  in the event log unfiled, and the next round's reviewers file their own.
   Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them, and
-  Mestari checks for itself too: before filing, it replaces words that start like a known credential (GitHub,
-  GitLab, Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI) or follow `Bearer`, `token`, `password`, `secret` or
-  `api_key` with `<redacted>`, and the factory home, the repository and the user's home directory (also as `~/...`)
-  with `<factory home>`, `<repository>` and `<home>`, where no letter or digit follows the path.
+  Mestari checks for itself too: before filing, it replaces values that start like a known credential (GitHub,
+  GitLab, Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI, JSON Web Tokens) or follow `Bearer`, `token`,
+  `password`, `secret` or `api_key` (past quotes, backticks, `:`, `=` or `,`) with `<redacted>`, the whole value
+  including any `.`, `+`, `/` or `=`, and the factory home, the repository and the user's home directory (also as
+  `~/...`) with `<factory home>`, `<repository>` and `<home>`, where no letter or digit follows the path. Windows paths
+  match in any letter case.
 - **A re-review judges the fix.** After a round of changes, the next reviewer gets the earlier blockers and reads only
   the diff since the commit that was reviewed, not the whole change again. A round that commits no fix goes back to the
   builder without a review. High-risk changes are the exception: both

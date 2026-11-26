@@ -10,9 +10,12 @@ use paja::home::Home;
 use paja::jono;
 use paja::mestari;
 
+/// The version and the commit this binary was built from.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PAJA_COMMIT"), ")");
+
 /// Paja: a software factory. Every command takes --json for machine-readable output.
 #[derive(Parser)]
-#[command(name = "paja", version)]
+#[command(name = "paja", version = VERSION)]
 struct Cli {
     /// Print one JSON value on stdout instead of text; errors become {"error": "..."}.
     #[arg(long, global = true)]
@@ -29,7 +32,7 @@ enum Command {
         #[command(subcommand)]
         command: EnvCommand,
     },
-    /// Jono: the work queue, imported from GitHub issues labelled `paja`.
+    /// Jono: the work queue, imported from GitHub issues with the work label (`.paja/labels`).
     Work {
         #[command(subcommand)]
         command: WorkCommand,
@@ -63,6 +66,50 @@ enum Command {
         /// again.
         #[arg(long)]
         tamper_checked: bool,
+    },
+    /// Set an existing repository up for Paja in one pull request.
+    ///
+    /// Detects the stack, writes `.paja/checks`, `.paja/commands`, `.paja/models` and
+    /// `.paja/high-risk`, adds a `CLAUDE.md` (or a "Working with Paja" section to the existing
+    /// one), creates the work label, and opens a pull request from `paja/init`. Never pushes to
+    /// the default branch; Paja starts working once the pull request is merged.
+    Init {
+        /// Any path inside the repository's checkout (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// When the repository has no GitHub Actions workflow, write one that runs the checks on
+        /// pull requests. Without it, `.paja/ci` says `none`.
+        #[arg(long, conflicts_with = "new")]
+        ci: bool,
+        /// Write the files again on the branch although `.paja/checks` is on the default branch.
+        #[arg(long, conflicts_with = "new")]
+        force: bool,
+        /// Start a new project instead: create this GitHub repository under the signed-in
+        /// account, clone it, and push a walking skeleton (a minimal app with a passing test, a
+        /// formatter, a linter, a CI workflow, and the `.paja/` files and `CLAUDE.md`) as the
+        /// first commit on the default branch. Needs --stack.
+        #[arg(long, value_name = "NAME", requires = "stack")]
+        new: Option<String>,
+        /// The skeleton's stack, with --new.
+        #[arg(long, value_parser = paja::init::STACKS, requires = "new")]
+        stack: Option<String>,
+        /// With --new: make the repository public (the default is private).
+        #[arg(long, requires = "new", conflicts_with = "private")]
+        public: bool,
+        /// With --new: make the repository private (the default).
+        #[arg(long, requires = "new")]
+        private: bool,
+        /// With --new: clone into this directory instead of `<name>` here.
+        #[arg(long, requires = "new")]
+        dir: Option<PathBuf>,
+    },
+    /// Check that this machine and repository are ready for `paja run`: git, `gh`, `claude`,
+    /// the deny-list hook, the repository's labels and `.paja` files, and the sandbox. Each
+    /// check is ok, a warning or failed, with its fix; the exit code is non-zero when any failed.
+    Doctor {
+        /// Any path inside the repository (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
     },
     /// The deny-list hook Mestari runs agents under (Claude Code `PreToolUse`). Reads the
     /// tool call on stdin; exits 2 to block, also on any error, and 0 to allow. Prints no
@@ -101,7 +148,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WorkCommand {
-    /// Import open issues labelled `paja` from the checkout's GitHub repository (uses `gh`).
+    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`).
     Sync {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
@@ -144,7 +191,7 @@ enum WorkCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// File a new GitHub issue labelled `paja` (uses `gh`); the next sync queues it.
+    /// File a new GitHub issue with the work label (uses `gh`); the next sync queues it.
     File {
         #[arg(long)]
         title: String,
@@ -215,7 +262,13 @@ fn main() -> ExitCode {
                     json!({ "error": "a subcommand is required", "help": text }),
                     ExitCode::from(2),
                 ),
-                ErrorKind::DisplayVersion => (json!({ "version": text }), ExitCode::SUCCESS),
+                ErrorKind::DisplayVersion => (
+                    json!({
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "commit": env!("PAJA_COMMIT"),
+                    }),
+                    ExitCode::SUCCESS,
+                ),
                 _ => (json!({ "error": text }), ExitCode::from(2)),
             };
             println!("{value}");
@@ -260,6 +313,51 @@ fn run(cli: &Cli) -> Result<()> {
             // stderr so it can't be read as a frame.
             if let Err(err) = paja::mcp::serve(home) {
                 eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Init {
+            new: Some(name),
+            stack,
+            public,
+            dir,
+            ..
+        } => {
+            let report = paja::init::run_new(
+                &home,
+                &std::env::current_dir()?,
+                paja::init::NewOptions {
+                    name: name.clone(),
+                    stack: stack.clone().unwrap_or_default(),
+                    private: !*public,
+                    dir: dir.clone(),
+                },
+            )?;
+            emit(cli, serde_json::to_value(&report)?, || {
+                describe_new(&report)
+            });
+        }
+        Command::Init {
+            repo, ci, force, ..
+        } => {
+            let report = paja::init::run(
+                &home,
+                &std::path::absolute(repo)?,
+                paja::init::Options {
+                    ci: *ci,
+                    force: *force,
+                },
+            )?;
+            emit(cli, serde_json::to_value(&report)?, || {
+                describe_init(&report)
+            });
+        }
+        Command::Doctor { repo } => {
+            let report = paja::doctor::run_checks(&home, repo)?;
+            emit(cli, serde_json::to_value(&report)?, || {
+                describe_doctor(&report)
+            });
+            if !report.ok {
                 std::process::exit(1);
             }
         }
@@ -326,6 +424,7 @@ fn run(cli: &Cli) -> Result<()> {
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
+            let mut failures = paja::posti::Failures::default();
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
             loop {
@@ -339,24 +438,41 @@ fn run(cli: &Cli) -> Result<()> {
                     },
                 );
                 let Some(minutes) = every else {
-                    let report = outcome?;
+                    let report = match outcome {
+                        Ok(report) => report,
+                        Err(err) => {
+                            if mestari::is_fatal(&err) {
+                                paja::posti::stopped(&home, repo);
+                            } else {
+                                paja::posti::pass_failed(&home, repo, false);
+                            }
+                            return Err(err);
+                        }
+                    };
                     emit(cli, run_json(&report)?, || describe_run(&report));
                     break;
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
                 let wait = match outcome {
                     Ok(report) => {
+                        failures.passed();
                         emit(cli, run_json(&report)?, || describe_run(&report));
                         matches!(report, mestari::RunReport::Idle)
                             .then_some("nothing to do right now")
                     }
                     // Except when git's configuration was tampered with (running git again is the
                     // danger) or no later pass could start either: the loop stops for a person.
-                    Err(err) if mestari::is_fatal(&err) => return Err(err),
+                    Err(err) if mestari::is_fatal(&err) => {
+                        paja::posti::stopped(&home, repo);
+                        return Err(err);
+                    }
                     Err(err) => {
                         emit(cli, json!({ "error": format!("{err:#}") }), || {
                             format!("error: {err:#}")
                         });
+                        if failures.failed() {
+                            paja::posti::pass_failed(&home, repo, true);
+                        }
                         Some("that pass failed; Paja keeps going")
                     }
                 };
@@ -390,13 +506,16 @@ fn run(cli: &Cli) -> Result<()> {
                 });
             }
             WorkCommand::List { all, repo } => {
-                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let checkout = std::path::absolute(repo)?;
                 let items = if *all {
-                    jono::list_all(&home, &name)?
+                    jono::list_all_from(&home, &checkout)?
                 } else {
-                    jono::list(&home, &name)?
+                    jono::list(&home, &jono::repo_name(&home, &checkout)?)?
                 };
                 emit(cli, serde_json::to_value(&items)?, || {
+                    // The text puts what waits on the person first; the JSON keeps Jono's order.
+                    let mut items = items.clone();
+                    items.sort_by_key(|item| item.status != jono::Status::Escalated);
                     if items.is_empty() {
                         "no work items; run `paja work sync`".to_string()
                     } else if *all {
@@ -496,6 +615,27 @@ fn run_json(report: &mestari::RunReport) -> Result<serde_json::Value> {
     Ok(value)
 }
 
+fn describe_doctor(report: &paja::doctor::Report) -> String {
+    let mut out = Vec::new();
+    for check in &report.checks {
+        out.push(format!(
+            "{:<8}{}: {}",
+            check.status.as_str(),
+            check.name,
+            check.detail
+        ));
+        if let Some(fix) = &check.fix {
+            out.push(format!("        fix: {fix}"));
+        }
+    }
+    out.push(if report.ok {
+        "ready: no check failed".to_string()
+    } else {
+        "not ready: fix the failed checks above, then run `paja doctor` again".to_string()
+    });
+    out.join("\n")
+}
+
 fn describe_run(report: &mestari::RunReport) -> String {
     match report {
         mestari::RunReport::Idle => "nothing queued".to_string(),
@@ -504,11 +644,62 @@ fn describe_run(report: &mestari::RunReport) -> String {
         }
         mestari::RunReport::Escalated {
             number, question, ..
-        } => format!("#{number} escalated:\n{question}"),
+        } => format!(
+            "#{number} escalated:\n{question}\n  answer: paja work answer {number} \"<your answer>\""
+        ),
         mestari::RunReport::Stopped { number, .. } => {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
         }
     }
+}
+
+fn describe_new(report: &paja::init::NewReport) -> String {
+    let mut text = format!(
+        "created {} ({}): {}\ncloned to {}\nstack: {}\nchecks: {}\nwrote: {}\npushed the first commit to {}\n\nNext:\n",
+        report.repo,
+        if report.private { "private" } else { "public" },
+        report.url,
+        report.directory,
+        report.stack,
+        report.checks.join("; "),
+        report.files.join(", "),
+        report.default_branch
+    );
+    for step in &report.next_steps {
+        text.push_str(&format!("  {step}\n"));
+    }
+    text.trim_end().to_string()
+}
+
+fn describe_init(report: &paja::init::Report) -> String {
+    let found = if report.detected.stacks.is_empty() {
+        "no stack Paja knows".to_string()
+    } else {
+        report.detected.stacks.join(", ")
+    };
+    let mut text = format!(
+        "detected: {found}\nchecks: {}\nwrote: {}\nci: {}\n",
+        if report.detected.checks.is_empty() {
+            "none".to_string()
+        } else {
+            report.detected.checks.join("; ")
+        },
+        report.files.join(", "),
+        report.ci
+    );
+    if report.ci == "none" {
+        text.push_str(
+            "  the repository has no CI; `.paja/ci` says `none` (use --ci to add a workflow)\n",
+        );
+    }
+    if let Some(note) = &report.note {
+        text.push_str(&format!("note: {note}\n"));
+    }
+    text.push_str(&format!(
+        "pull request: {}\nPaja starts working once it is merged into {}.",
+        report.pull_request, report.default_branch
+    ));
+    text
 }
 
 fn describe_item(item: &jono::WorkItem) -> String {

@@ -12,7 +12,7 @@ The design lives in [`docs/`](docs/index.md): start with the [overview](docs/des
 | Name | Meaning | What it is |
 | --- | --- | --- |
 | Paja | workshop, forge | The whole factory and its headless core |
-| Jono | queue | Work queue and scheduler, fed by GitHub issues labelled `paja` |
+| Jono | queue | Work queue and scheduler, fed by GitHub issues with the repository's work label (`paja` here) |
 | Kaava | pattern, formula | Specs, scenarios, harness evals and the harness agents work from |
 | Posti | mail | Inbox for agent questions and escalations |
 | Mestari | master craftsman | Orchestrator that runs workflow graphs |
@@ -28,11 +28,11 @@ start Paja on its own queue (`paja run --every 5`). Every command also takes `--
 ```sh
 paja env create fix-login        # isolated worktree on branch paja/fix-login with its own ports
 paja --json env show fix-login
-paja work list                   # the queue, imported from issues labelled paja
+paja work list                   # the queue, imported from issues with the work label
 paja log                         # the append-only event log
 ```
 
-To work with Paja from Claude Code (`/paja:status`, `/paja:answer`, `/paja:spec` and the MCP tools), install the plugin:
+To work with Paja from Claude Code (`/paja:init`, `/paja:doctor`, `/paja:status`, `/paja:answer`, `/paja:spec` and the MCP tools), install the plugin:
 
 ```sh
 claude plugin install paja --marketplace eppu-peltonen/paja

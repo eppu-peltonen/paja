@@ -120,10 +120,10 @@ pub(super) fn not_retried(out: &Value) -> Option<&'static str> {
     }
 }
 
-/// The arguments of one headless Claude Code session. Every agent runs in auto mode, with or
-/// without a sandbox; `settings` (the deny-list hook) is given only outside one.
+/// The arguments of one headless Claude Code session (the prompt goes on stdin). Every agent
+/// runs in auto mode, with or without a sandbox; `settings` (the deny-list hook) is given only
+/// outside one.
 fn claude_args(
-    prompt: &str,
     settings: Option<String>,
     harness: String,
     read_only: bool,
@@ -131,7 +131,7 @@ fn claude_args(
     tools: &[&str],
     schema: Option<&Value>,
 ) -> Vec<String> {
-    let mut args: Vec<String> = ["-p", prompt, "--output-format", "json", "--permission-mode"]
+    let mut args: Vec<String> = ["-p", "--output-format", "json", "--permission-mode"]
         .into_iter()
         .map(String::from)
         // Auto mode, Anthropic's own safety checks, as an extra layer beside the hook. Never
@@ -167,6 +167,10 @@ fn claude_args(
     args
 }
 
+/// The most characters a `claude` command line may hold: well under Windows' 32,767, since
+/// the harness (`CLAUDE.md`), the hook settings and the schema all travel on it.
+pub(super) const COMMAND_LINE_BUDGET: usize = 30_000;
+
 /// Run headless Claude Code in the environment and return its JSON result.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude(
@@ -181,7 +185,7 @@ pub(super) fn claude(
 ) -> Result<Value> {
     let program = claude_program();
     let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
-        Some(text) => format!("The project's CLAUDE.md, as it is on main:\n\n{text}"),
+        Some(text) => format!("The project's CLAUDE.md, as it is on the default branch:\n\n{text}"),
         None => String::new(),
     };
     let git_identity = git_identity(&env.path);
@@ -206,8 +210,9 @@ pub(super) fn claude(
             }
         }
     };
+    // The prompt goes on stdin, not the command line: a review prompt holds the diff, and
+    // Windows refuses a command line over 32,767 characters (os error 206).
     let args = claude_args(
-        prompt,
         (sbx.is_none()).then_some(settings),
         harness,
         read_only,
@@ -215,11 +220,28 @@ pub(super) fn claude(
         tools,
         schema,
     );
+    let line: usize = args.iter().map(|arg| arg.len() + 3).sum();
+    if line > COMMAND_LINE_BUDGET {
+        let longest = args
+            .iter()
+            .max_by_key(|arg| arg.len())
+            .cloned()
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&scratch);
+        bail!(
+            "the `claude` command line would be {line} characters, over Paja's budget of \
+             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
+            longest.chars().take(60).collect::<String>()
+        );
+    }
     let mut cmd = match &sbx {
         Some(sbx) => {
             let mut argv = vec![program.clone()];
             argv.extend(args);
-            in_sandbox(sbx, &env.path, git_identity, Err(&argv))?
+            let mut cmd = in_sandbox(sbx, &env.path, git_identity, Err(&argv))?;
+            // `sbx exec` passes stdin through only when asked to.
+            crate::sandbox::keep_stdin(&mut cmd);
+            cmd
         }
         None => {
             let mut cmd = Command::new(&program);
@@ -231,7 +253,10 @@ pub(super) fn claude(
     };
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
-    let output = crate::platform::output_until_stopped(cmd.stdin(std::process::Stdio::null()));
+    let output = crate::platform::output_until_stopped_with_input(
+        &mut cmd,
+        Some(prompt.as_bytes().to_vec()),
+    );
     let _ = std::fs::remove_dir_all(&scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
@@ -1257,7 +1282,6 @@ mod tests {
         for settings in [None, Some("{}".to_string())] {
             for read_only in [false, true] {
                 let args = claude_args(
-                    "go",
                     settings.clone(),
                     String::new(),
                     read_only,

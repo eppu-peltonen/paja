@@ -1,8 +1,17 @@
 use super::*;
 
+/// How a landing attempt ended.
+pub(super) enum Landing {
+    /// Landed, or parked as a question for the person.
+    Done(RunReport),
+    /// CI failed on the pull request: what the builder needs to fix it in another round.
+    Retry(String),
+}
+
 /// Push `judged`, the commit Vasara's checks and the reviewers saw, as the environment's
 /// branch, and land it. Not whatever the branch points at now: code run in the worktree could
 /// have moved it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn land(
     home: &Home,
     repo: &Path,
@@ -11,9 +20,14 @@ pub(super) fn land(
     rounds: u32,
     judged: &str,
     ci: CiMode,
-) -> Result<RunReport> {
+    target: &RepoSettings,
+) -> Result<Landing> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
+    let Some(merge_flag) = target.merge_flag() else {
+        return escalated(home, repo, env, item, &no_merge_method(&item.repo), rounds)
+            .map(Landing::Done);
+    };
     git(
         &env.path,
         &[
@@ -55,7 +69,15 @@ pub(super) fn land(
         _ => run_gh(
             repo,
             &[
-                "pr", "create", "--base", "main", "--head", branch, "--title", &title, "--body",
+                "pr",
+                "create",
+                "--base",
+                &target.branch,
+                "--head",
+                branch,
+                "--title",
+                &title,
+                "--body",
                 &body,
             ],
         )?,
@@ -65,16 +87,44 @@ pub(super) fn land(
         progress(&format!("opened {pr}; the repository has no CI, landing"));
     } else {
         progress(&format!("opened {pr}; waiting for CI"));
+        // A red CI is the builder's to fix, like a failed check: the pull request stays open
+        // and the next round pushes to it.
         if let Err(err) = wait_for_ci(repo, &pr) {
-            let question = format!("CI did not pass on {pr}, so Paja did not land it:\n\n{err:#}");
-            return escalated(home, repo, env, item, &question, rounds);
+            let err = format!("{err:#}");
+            // Only a failed check, or checks that never start because the default branch moved
+            // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
+            // `gh` or network error, or a repository whose workflows never run, is not.
+            let failed_check = err.contains("\tfail\t");
+            if !failed_check && !default_branch_moved(repo, &target.branch, judged) {
+                let question =
+                    format!("CI did not report on {pr}, so Paja did not land it:\n\n{err}");
+                return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+            }
+            let mut why = format!(
+                "CI failed on {pr}, so Paja did not land it. CI runs on GitHub's machines, which \
+                 differ from this one (no git identity, a fresh checkout, other temp folders), so \
+                 fix the cause so the change passes there too:\n\n{err}"
+            );
+            if let Some(log) = failed_log(repo, &err) {
+                why.push_str(&format!("\n\nThe end of the failed job's log:\n\n{log}"));
+            }
+            return Ok(Landing::Retry(why));
         }
     }
     // Free the worktree first: gh deletes the local branch too, which git refuses while a
     // worktree has it checked out.
     ahjo::remove(home, &env.name, true)?;
-    run_gh(repo, &["pr", "merge", &pr, "--squash", "--delete-branch"])
-        .with_context(|| format!("{gh} pr merge {pr}"))?;
+    if let Err(err) = run_gh(repo, &["pr", "merge", &pr, merge_flag, "--delete-branch"]) {
+        let text = format!("{err:#}").to_lowercase();
+        if text.contains("not allowed") || text.contains("permission") {
+            let question = format!(
+                "GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{}",
+                no_merge_method(&item.repo)
+            );
+            return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+        }
+        return Err(err).with_context(|| format!("{gh} pr merge {pr}"));
+    }
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, &item.repo, item.number, Status::Landed, Some(&pr));
     let _ = record(
@@ -83,11 +133,48 @@ pub(super) fn land(
         json!({ "repo": item.repo, "number": item.number, "pr": pr, "rounds": rounds }),
     );
     progress(&format!("landed #{} ({pr})", item.number));
-    Ok(RunReport::Landed {
+    Ok(Landing::Done(RunReport::Landed {
         number: item.number,
         pr,
         rounds,
-    })
+    }))
+}
+
+/// Whether `branch` on origin has moved past what `judged` holds. A fetch that fails counts
+/// as not moved, so the caller escalates rather than spending a round.
+fn default_branch_moved(repo: &Path, branch: &str, judged: &str) -> bool {
+    if git(repo, &["fetch", "-q", "origin", branch]).is_err() {
+        return false;
+    }
+    let Ok(tip) = git(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"]) else {
+        return false;
+    };
+    git(repo, &["merge-base", "--is-ancestor", &tip, judged]).is_err()
+}
+
+/// The last lines of the first failed job's log that `gh pr checks` linked to, if `gh` can
+/// read it.
+fn failed_log(repo: &Path, checks: &str) -> Option<String> {
+    const LINES: usize = 60;
+    let job = checks.split("/job/").nth(1)?;
+    let job: String = job.chars().take_while(char::is_ascii_digit).collect();
+    if job.is_empty() {
+        return None;
+    }
+    let log = run_gh(repo, &["run", "view", "--job", &job, "--log-failed"]).ok()?;
+    let lines: Vec<&str> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
+    (!tail.trim().is_empty()).then_some(tail)
+}
+
+/// The question for a repository whose settings leave Paja no way to merge.
+fn no_merge_method(repo: &str) -> String {
+    format!(
+        "Paja can't land this change: {repo} allows no merge method Paja can use. Under \
+         Settings > General > Pull Requests, allow squash merging (preferred), rebase merging \
+         or merge commits, and make sure the signed-in `gh` account may merge there, then \
+         answer that it is changed."
+    )
 }
 
 pub(super) fn escalated(
@@ -150,11 +237,28 @@ pub(super) fn escalate(
     )?;
     // The item is parked either way; a failed comment must not escalate it a second time.
     // The caller reports it, cleaned for the terminal.
-    Ok(comment(repo, item, question).err())
+    let asked = comment(repo, item, question).err();
+    tell(home, repo, item);
+    Ok(asked)
 }
 
-/// Ask the person on the issue.
+/// Tell the person the item needs them (Posti), next to the comment on the issue, which
+/// GitHub doesn't notify them about when it is posted with their own token.
+pub(super) fn tell(home: &Home, repo: &Path, item: &WorkItem) {
+    if let Err(err) = jono::mark_needs_answer(home, repo, item.number) {
+        progress(&format!(
+            "couldn't label #{} as waiting for an answer: {err:#}",
+            item.number
+        ));
+    }
+    let notice = crate::posti::Notice::escalated(&item.repo, item.number, &item.title);
+    crate::posti::send(home, repo, &notice);
+}
+
+/// Ask the person on the issue. The question can quote CI logs or review text, so it is
+/// redacted first: the issue is public.
 pub(super) fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
+    let question = follow_ups::redact_for_issue(question, repo);
     let body = format!(
         "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer with \
          `paja work answer {n} \"<your answer>\"` (or `/paja:answer` in Claude Code). That records \
