@@ -221,9 +221,16 @@ pub fn in_sandbox_path(path: &Path) -> Result<String> {
 }
 
 fn translate(path: &str) -> Result<String> {
-    if !cfg!(windows) {
-        return Ok(path.to_string());
+    if cfg!(windows) {
+        windows_spelling(path)
+    } else {
+        Ok(path.to_string())
     }
+}
+
+/// The sandbox spelling of a Windows host path. Separate from `translate` so its rules are
+/// tested on every platform, not only on Windows.
+fn windows_spelling(path: &str) -> Result<String> {
     // `\\?\C:\a` is the verbatim form of a drive path; `\\?\UNC\..` and `\\server\..` are UNC.
     let plain = path.strip_prefix(r"\\?\").unwrap_or(path);
     let b = plain.as_bytes();
@@ -461,8 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn unix_paths_are_unchanged() {
+    fn translate_uses_the_host_platform_rules() {
         if cfg!(windows) {
+            assert_eq!(translate(r"C:\a").unwrap(), "/c/a");
+            assert!(translate(r"\\server\share").is_err());
             return;
         }
         assert_eq!(translate("/home/a b/c").unwrap(), "/home/a b/c");
@@ -471,36 +480,30 @@ mod tests {
 
     #[test]
     fn windows_paths_get_the_sandbox_spelling() {
-        if !cfg!(windows) {
-            return;
-        }
-        assert_eq!(translate(r"C:\a\b").unwrap(), "/c/a/b");
-        assert_eq!(translate(r"d:/a/b").unwrap(), "/d/a/b");
-        assert_eq!(translate(r"C:\").unwrap(), "/c/");
-        assert_eq!(translate("C:").unwrap(), "/c");
+        assert_eq!(windows_spelling(r"C:\a\b").unwrap(), "/c/a/b");
+        assert_eq!(windows_spelling(r"d:/a/b").unwrap(), "/d/a/b");
+        assert_eq!(windows_spelling(r"C:\").unwrap(), "/c/");
+        assert_eq!(windows_spelling("C:").unwrap(), "/c");
         assert_eq!(
-            translate(r"C:\Users\A B\my repo").unwrap(),
+            windows_spelling(r"C:\Users\A B\my repo").unwrap(),
             "/c/Users/A B/my repo"
         );
-        assert_eq!(translate(r"\\?\C:\a").unwrap(), "/c/a");
-        assert_eq!(translate("/").unwrap(), "/");
-        assert_eq!(translate("/work").unwrap(), "/work");
+        assert_eq!(windows_spelling(r"\\?\C:\a").unwrap(), "/c/a");
+        assert_eq!(windows_spelling("/").unwrap(), "/");
+        assert_eq!(windows_spelling("/work").unwrap(), "/work");
     }
 
     #[test]
-    fn unc_paths_are_refused_on_windows() {
-        if !cfg!(windows) {
-            return;
-        }
+    fn windows_unc_paths_are_refused() {
         for unc in [
             r"\\server\share\a",
             r"\\?\UNC\server\share",
             "//server/share",
         ] {
-            let err = translate(unc).unwrap_err().to_string();
+            let err = windows_spelling(unc).unwrap_err().to_string();
             assert!(err.contains("UNC"), "{err}");
         }
-        assert!(translate(r"C:dir").is_err());
+        assert!(windows_spelling(r"C:dir").is_err());
     }
 
     #[test]
