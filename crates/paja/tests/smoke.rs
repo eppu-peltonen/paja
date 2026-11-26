@@ -3671,6 +3671,9 @@ fn init_fixture(
     std::fs::create_dir_all(&origin).unwrap();
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
     init_repo(&repo);
+    // `paja init` commits with the repository's own identity, which CI runners don't have.
+    git(&repo, &["config", "user.name", "test"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
     for (name, text) in files {
         std::fs::write(repo.join(name), text).unwrap();
     }
