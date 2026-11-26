@@ -775,7 +775,11 @@ fn run_item(
         }
         let mut reviews: Vec<Review> = Vec::new();
         let mut limited = None;
-        for i in 0..reviewers {
+        // A reviewer at its turn limit gets one more, focused try in the round, and the other
+        // reviewer's finished verdict is kept: only the capped review runs again.
+        let mut retried = false;
+        let mut i = 0;
+        while i < reviewers {
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
             progress(&format!(
@@ -798,11 +802,13 @@ fn run_item(
                 reviewer,
                 &models,
                 role,
+                retried,
             );
             match reviewed {
                 Ok((review, used)) => {
                     steps.push(used);
                     reviews.push(review);
+                    i += 1;
                 }
                 // The review already put the worktree back. Its spend still counts.
                 Err(err) => match turn_limit(&err) {
@@ -815,10 +821,16 @@ fn run_item(
                             &limit.0,
                         );
                         steps.push(used);
-                        limited = Some(format!(
+                        let note = format!(
                             "reviewer {reviewer} hit the turn limit of {}",
                             models.max_turns(role)
-                        ));
+                        );
+                        if !retried {
+                            retried = true;
+                            progress(&format!("{note}; asking it again to stay focused"));
+                            continue;
+                        }
+                        limited = Some(note);
                         break;
                     }
                     None => return Err(err),
@@ -1192,9 +1204,18 @@ fn review(
     reviewer: u32,
     models: &Models,
     role: &str,
+    focused: bool,
 ) -> Result<(Review, StepUsage)> {
     let before = git(&env.path, &["rev-parse", "HEAD"])?;
-    let prompt = review_prompt(item, base, &before, prior);
+    let mut prompt = review_prompt(item, base, &before, prior);
+    if focused {
+        prompt.push_str(&format!(
+            "\nAn earlier review of this commit stopped at its turn limit of {} before giving a \
+             verdict. Stay focused: read the diff and only the code it touches, probe at most a \
+             few behaviours, and give your verdict well before the limit.\n",
+            models.max_turns(role)
+        ));
+    }
     let schema = json!({
         "type": "object",
         "properties": {
