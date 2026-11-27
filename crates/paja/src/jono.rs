@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::ahjo::Untampered;
 use crate::events::Event;
 use crate::home::{Home, RunLock};
-use crate::mestari::{StepUsage, EV_ROUND};
+use crate::mestari::{StepUsage, EV_ARBITRATED, EV_ROUND};
 
 /// Most issues one sync reads. A sync that hits it refuses to close anything.
 pub const FETCH_LIMIT: usize = 1000;
@@ -474,6 +474,20 @@ pub struct Answer {
     #[serde(default)]
     pub question: Option<String>,
     pub answer: String,
+    /// Who answered when it wasn't a person: `arbiter` for Mestari's arbiter agent. Absent for
+    /// a person's answer, and in older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+}
+
+/// The `by` of an answer Mestari's arbiter agent gave.
+pub const BY_ARBITER: &str = "arbiter";
+
+impl Answer {
+    /// Whether the arbiter agent gave this answer, not a person.
+    pub fn by_arbiter(&self) -> bool {
+        self.by.as_deref() == Some(BY_ARBITER)
+    }
 }
 
 /// An item's agent usage, totalled over every recorded step. A step whose result lacked a token
@@ -746,7 +760,7 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                     item.answers.push(answered.answer);
                 }
             }
-            EV_ROUND => {
+            EV_ROUND | EV_ARBITRATED => {
                 let round: Round =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
                 // Steps that aren't a list count as one step whose usage is unknown.
@@ -1931,6 +1945,35 @@ fn apply_claims(
     Ok(())
 }
 
+/// Record the arbiter agent's answer to an escalation Mestari didn't take to the person, and
+/// queue the item again, in one step under the home lock. Like [`answer`] it only touches the
+/// event log; the caller comments on the issue.
+pub fn answer_by_arbiter(
+    home: &Home,
+    repo: &str,
+    number: u64,
+    question: &str,
+    text: &str,
+) -> Result<()> {
+    let lock = home.lock()?;
+    let log = home.events();
+    pin_legacy(&lock, &log, repo)?;
+    log.append(
+        &lock,
+        EV_ANSWERED,
+        json!({
+            "repo": repo, "number": number, "question": question, "answer": text,
+            "by": BY_ARBITER
+        }),
+    )?;
+    log.append(
+        &lock,
+        EV_STATUS,
+        json!({ "repo": repo, "number": number, "status": Status::Queued, "note": null }),
+    )?;
+    Ok(())
+}
+
 /// Answer an escalated item: record the person's answer in the event log and queue the item
 /// again, in one step under the home lock, then post the answer on the issue so it is visible
 /// there too. The next run passes every recorded answer to its agents.
@@ -1948,7 +1991,11 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         let mut item = replay_repo(&log.read_all()?, &name)?
             .remove(&number)
             .with_context(|| no_item(&name, number))?;
-        if item.status != Status::Escalated {
+        // A queued item whose last answer is the arbiter's hasn't run since: a person may
+        // override that answer, which then comes last in the prompts.
+        let overriding =
+            item.status == Status::Queued && item.answers.last().is_some_and(Answer::by_arbiter);
+        if item.status != Status::Escalated && !overriding {
             bail!(
                 "work item #{number} is {}, not escalated, so there is no question to answer; \
                  check `paja work show {number}`",
@@ -1956,8 +2003,13 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
             );
         }
         let answer = Answer {
-            question: item.note.clone(),
+            question: if overriding {
+                item.answers.last().and_then(|a| a.question.clone())
+            } else {
+                item.note.clone()
+            },
             answer: text.to_string(),
+            by: None,
         };
         log.append(
             &lock,
@@ -2913,11 +2965,13 @@ mod tests {
             [
                 Answer {
                     question: Some("Which API?".into()),
-                    answer: "v2".into()
+                    answer: "v2".into(),
+                    by: None
                 },
                 Answer {
                     question: None,
-                    answer: "Keep it small".into()
+                    answer: "Keep it small".into(),
+                    by: None
                 },
             ]
         );

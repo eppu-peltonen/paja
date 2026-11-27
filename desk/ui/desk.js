@@ -59,6 +59,10 @@ function itemRow(item) {
     row.append(toggle);
     if (open) children.push(runView(item));
   }
+  const last = (item.answers || []).at(-1);
+  if (last && last.by === "arbiter") {
+    children.push(el("div", { className: "note" }, `answered by arbiter: ${last.answer}`));
+  }
   if (item.status === "escalated") {
     if (item.note) children.push(el("div", { className: "note" }, item.note));
     children.push(answerForm(item));

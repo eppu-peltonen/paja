@@ -18,6 +18,7 @@ use crate::home::Home;
 use crate::jono::{self, Status, WorkItem};
 
 mod agent;
+mod arbiter;
 mod builder;
 mod detect;
 mod follow_ups;
@@ -35,6 +36,7 @@ pub use triage::{
 };
 
 use agent::*;
+use arbiter::*;
 use builder::*;
 use follow_ups::*;
 use land::*;
@@ -62,7 +64,7 @@ const SQUASH: &str = "--squash";
 const REBASE: &str = "--rebase";
 const MERGE: &str = "--merge";
 /// The roles `.paja/models` may name, besides `fallback`.
-pub const ROLES: [&str; 8] = [
+pub const ROLES: [&str; 9] = [
     "build",
     "fix",
     "review",
@@ -71,6 +73,7 @@ pub const ROLES: [&str; 8] = [
     "triage",
     "plan",
     "init",
+    "arbiter",
 ];
 /// The effort levels Claude Code takes.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -94,6 +97,11 @@ pub const EV_LANDED: &str = "run.landed";
 /// `{repo, number, round, paths}`.
 pub const EV_CHANGED: &str = "run.changed";
 pub const EV_ESCALATED: &str = "run.escalated";
+/// The arbiter agent looked at an escalation before it reached the person: `{repo, number,
+/// round, verdict, model}` with the `answer` (verdict `answer`: the item is queued again with it
+/// recorded) or the `question` (verdict `escalate`: the person is asked it), and `overruled`
+/// when Mestari turned an `answer` into `escalate`.
+pub const EV_ARBITRATED: &str = "run.arbitrated";
 /// A non-blocking review finding filed as a follow-up issue (the `follow-up` label) after landing.
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// The tamper lock lives in Ahjo, next to the git every command runs.
@@ -113,6 +121,13 @@ pub enum RunReport {
     Escalated {
         number: u64,
         question: String,
+        rounds: u32,
+    },
+    /// The arbiter agent settled an escalation: its answer is recorded and the item is queued
+    /// again, so the next run goes on with it. Nobody was asked.
+    Arbitrated {
+        number: u64,
+        answer: String,
         rounds: u32,
     },
     /// The person pressed Ctrl-C. The item stays active, and the next `paja run` resumes it in
@@ -339,11 +354,21 @@ impl Models {
             })
     }
 
+    /// The model line a role runs on: its own, or for `arbiter` with no line of its own, the
+    /// `review` line.
+    pub fn chosen(&self, role: &str) -> Option<&RoleModel> {
+        self.roles.get(role).or_else(|| {
+            (role == "arbiter")
+                .then(|| self.roles.get("review"))
+                .flatten()
+        })
+    }
+
     /// The flags `claude -p` gets for a role. The model flags are left out when the file
     /// doesn't name the role.
     fn args(&self, role: &str) -> Vec<String> {
         let mut args = vec!["--max-turns".to_string(), self.max_turns(role).to_string()];
-        let Some(chosen) = self.roles.get(role) else {
+        let Some(chosen) = self.chosen(role) else {
             return args;
         };
         args.extend(["--model".to_string(), chosen.model.clone()]);
@@ -360,7 +385,7 @@ impl Models {
     /// account's default), and none for a role already on the fallback model, which Claude Code
     /// refuses.
     pub fn fallback_for(&self, role: &str) -> Option<&str> {
-        let chosen = self.roles.get(role)?;
+        let chosen = self.chosen(role)?;
         self.fallback.as_deref().filter(|f| *f != chosen.model)
     }
 }
@@ -1034,7 +1059,15 @@ fn run_item(
                 steps.push(step);
                 if builder_limits > 1 {
                     record_round(home, item, round, "turn_limit", &note, steps)?;
-                    return turn_limit_twice(home, repo, &env, item, &note, round);
+                    let scene = Scene {
+                        home,
+                        repo,
+                        env: &env,
+                        base: &base,
+                        item,
+                        models: &models,
+                    };
+                    return turn_limit_twice(&scene, &note, round);
                 }
                 progress(&format!("{note}; asking it to finish smaller"));
                 feedback = format!(
@@ -1065,7 +1098,15 @@ fn run_item(
                 record_round(home, item, round, "question", &asked, steps)?;
                 let question =
                     format!("Paja's builder needs a decision before it can go on:\n\n{asked}");
-                return escalated(home, repo, &env, item, &question, round);
+                let scene = Scene {
+                    home,
+                    repo,
+                    env: &env,
+                    base: &base,
+                    item,
+                    models: &models,
+                };
+                return settle(&scene, &question, "", round);
             }
         }
         // A merge Paja handed over must be finished, not committed with its conflicts. It stays
@@ -1323,7 +1364,15 @@ fn run_item(
             review_limits += 1;
             if review_limits > 1 {
                 record_round(home, item, round, "turn_limit", &note, steps)?;
-                return turn_limit_twice(home, repo, &env, item, &note, round);
+                let scene = Scene {
+                    home,
+                    repo,
+                    env: &env,
+                    base: &base,
+                    item,
+                    models: &models,
+                };
+                return turn_limit_twice(&scene, &note, round);
             }
             progress(&format!(
                 "{note}; asking the builder to make the change easier to review"
@@ -1373,7 +1422,15 @@ fn run_item(
         }
 
         if let Some(esc) = reviews.iter().find(|r| r.verdict == "escalate") {
-            return escalated(home, repo, &env, item, &esc.question, round);
+            let scene = Scene {
+                home,
+                repo,
+                env: &env,
+                base: &base,
+                item,
+                models: &models,
+            };
+            return settle(&scene, &esc.question, &summaries(&reviews), round);
         }
         if verdicts.iter().all(|v| *v == "land") {
             // One change lands at a time per repository, each on the latest default branch: a
@@ -1479,7 +1536,15 @@ fn run_item(
                 "The two reviewers disagree on this high-risk change.\n\n{}",
                 summaries(&reviews)
             );
-            return escalated(home, repo, &env, item, &question, round);
+            let scene = Scene {
+                home,
+                repo,
+                env: &env,
+                base: &base,
+                item,
+                models: &models,
+            };
+            return settle(&scene, &question, "", round);
         }
         // A `changes` verdict without comments still names something: its summary.
         let blockers = reviews
@@ -1534,7 +1599,15 @@ fn run_item(
         "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
          Answer with what should change, or what is out of scope."
     );
-    escalated(home, repo, &env, item, &question, MAX_ROUNDS)
+    let scene = Scene {
+        home,
+        repo,
+        env: &env,
+        base: &base,
+        item,
+        models: &models,
+    };
+    settle(&scene, &question, "", MAX_ROUNDS)
 }
 
 /// The latest reset time any usage-limit stop recorded, in milliseconds since the epoch, when it
@@ -1666,20 +1739,13 @@ pub fn format_utc(ms: u64) -> String {
 
 /// The same kind of step hit its turn limit a second time in this run: ask a person rather
 /// than spend another round.
-fn turn_limit_twice(
-    home: &Home,
-    repo: &Path,
-    env: &Env,
-    item: &WorkItem,
-    note: &str,
-    round: u32,
-) -> Result<RunReport> {
+fn turn_limit_twice(scene: &Scene, note: &str, round: u32) -> Result<RunReport> {
     let question = format!(
         "In this run {note}, the second time that step stopped at its turn limit. The issue may \
          be too big for one change: split it into smaller issues, or raise the limit with a \
          `max-turns` line in `{MODELS_FILE}` on the default branch, then answer with what you changed."
     );
-    escalated(home, repo, env, item, &question, round)
+    settle(scene, &question, "", round)
 }
 
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
@@ -1832,9 +1898,7 @@ fn record_step(
     models: Option<&Models>,
     reviewer: Option<u32>,
 ) -> Result<()> {
-    let model = models
-        .and_then(|m| m.roles.get(role))
-        .map(|c| c.model.clone());
+    let model = models.and_then(|m| m.chosen(role)).map(|c| c.model.clone());
     record(
         home,
         EV_STEP,

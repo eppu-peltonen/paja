@@ -201,7 +201,7 @@ impl StepUsage {
             step: step.to_string(),
             reviewer,
             role: Some(role.to_string()),
-            model: chosen.roles.get(role).map(|m| m.model.clone()),
+            model: chosen.chosen(role).map(|m| m.model.clone()),
             input_tokens: usage["input_tokens"].as_u64(),
             output_tokens: usage["output_tokens"].as_u64(),
             cache_read_input_tokens: usage["cache_read_input_tokens"].as_u64(),

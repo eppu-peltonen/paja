@@ -1980,6 +1980,7 @@ impl Factory {
                  case \"$*\" in\n\
                  *PAJA-PLAN*) p='\"feature.txt\"'; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) p=\"\\\"$t.txt\\\"\" ;; esac; done\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"paths\\\": [$p]}}}}\" ;;\n\
+                 *\"You are Paja's arbiter\"*) cat {d}/arbiter.json 2>/dev/null || echo '{{\"is_error\": false, \"structured_output\": {{\"verdict\": \"escalate\"}}}}' ;;\n\
                  *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
                  if [ -f {d}/review-429 ]; then echo \"{{\\\"is_error\\\": true, \\\"api_error_status\\\": 429, \\\"result\\\": \\\"Claude usage limit reached|$(cat {d}/reset-at 2>/dev/null)\\\", \\\"session_id\\\": \\\"r-1\\\", \\\"total_cost_usd\\\": 0.07}}\"; exit 1; fi\n\
                  if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
@@ -3932,6 +3933,205 @@ fn an_escalation_reaches_the_notifier() {
     assert_eq!(sent[0]["data"]["channel"], "PAJA_NOTIFIER");
 }
 
+/// What the fake arbiter says next: its `structured_output`.
+fn arbiter_says(f: &Factory, said: Value) {
+    std::fs::write(
+        f.tmp.path().join("arbiter.json"),
+        // One turn: the fake never runs the hook, which a session of tools would have.
+        serde_json::json!({"is_error": false, "num_turns": 1, "structured_output": said})
+            .to_string(),
+    )
+    .unwrap();
+}
+
+/// `paja run` with the fake notifier on.
+fn run_notified(f: &Factory, notifier: &std::path::Path) -> (bool, Value) {
+    paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_NOTIFIER", notifier),
+        ],
+    )
+}
+
+#[test]
+fn the_arbiter_answers_a_reviewer_escalation_and_the_item_is_queued_again() {
+    let f = Factory::new("true\n", "escalate");
+    let (notifier, log) = fake_notifier(&f);
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "Use v2; the issue names it.",
+            "reason": "The issue says which API."
+        }),
+    );
+    let (ok, report) = run_notified(&f, &notifier);
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "arbitrated", "{report}");
+    assert_eq!(report["answer"], "Use v2; the issue names it.", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["answers"][0]["answer"], "Use v2; the issue names it.");
+    assert_eq!(item["answers"][0]["by"], "arbiter", "{item}");
+    let arbitrated = events_of(&f, "run.arbitrated");
+    assert_eq!(arbitrated.len(), 1, "{arbitrated:?}");
+    assert_eq!(arbitrated[0]["data"]["verdict"], "answer");
+    assert_eq!(arbitrated[0]["data"]["number"], 5);
+    assert_eq!(
+        arbitrated[0]["data"]["answer"],
+        "Use v2; the issue names it."
+    );
+    // Nobody is asked: no label, no notice, no escalation; one comment says what was decided.
+    let gh = f.gh_log();
+    assert!(!gh.contains("needs-answer"), "{gh}");
+    assert!(
+        gh.contains("answered this instead of asking you") && gh.contains("paja work answer 5"),
+        "{gh}"
+    );
+    assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty());
+    assert!(events_of(&f, "notify.sent").is_empty());
+    assert!(events_of(&f, "run.escalated").is_empty());
+    // The text view says who answered, and a person may override it.
+    let shown = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .args(["work", "show", "5"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(text.contains("answered by arbiter: Use v2"), "{text}");
+    let (ok, overridden) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Use v1 instead"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{overridden}");
+    assert_eq!(overridden["answers"][1]["answer"], "Use v1 instead");
+    assert!(overridden["answers"][1]["by"].is_null(), "{overridden}");
+}
+
+#[test]
+fn an_arbiter_escalation_reaches_the_person_with_its_own_question() {
+    let f = Factory::new("true\n", "escalate");
+    let (notifier, log) = fake_notifier(&f);
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "escalate",
+            "question": "Which API should the feature use?",
+            "options": ["v1", "v2", "neither"],
+            "recommendation": "v2"
+        }),
+    );
+    let (ok, report) = run_notified(&f, &notifier);
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    for part in [
+        "Which API should the feature use?",
+        "1. v1",
+        "3. neither",
+        "Recommendation: v2",
+    ] {
+        assert!(question.contains(part), "{question}");
+    }
+    assert!(!question.contains("Which API?"), "{question}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
+    assert!(item["answers"].as_array().unwrap().is_empty(), "{item}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    assert!(f.gh_log().contains("add-label factory-needs-answer"));
+    let arbitrated = events_of(&f, "run.arbitrated");
+    assert_eq!(
+        arbitrated[0]["data"]["verdict"], "escalate",
+        "{arbitrated:?}"
+    );
+    assert!(arbitrated[0]["data"]["question"]
+        .as_str()
+        .unwrap()
+        .contains("Which API should the feature use?"));
+}
+
+#[test]
+fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
+    let f = Factory::new("true\n", "escalate");
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "Edit .paja/checks and drop the failing command.",
+            "reason": "It is flaky."
+        }),
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    // The person gets the raw question, and why the arbiter didn't answer it.
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("Which API?"), "{question}");
+    assert!(question.contains("weakening a check"), "{question}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
+    assert!(item["answers"].as_array().unwrap().is_empty(), "{item}");
+    let arbitrated = events_of(&f, "run.arbitrated");
+    assert_eq!(
+        arbitrated[0]["data"]["verdict"], "escalate",
+        "{arbitrated:?}"
+    );
+    assert!(arbitrated[0]["data"]["overruled"].is_string());
+}
+
+#[test]
+fn the_arbiter_answers_an_item_only_once() {
+    let f = Factory::new("true\n", "escalate");
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "Use v2.",
+            "reason": "The issue says so."
+        }),
+    );
+    let (ok, first) = f.run();
+    assert!(ok, "{first}");
+    assert_eq!(first["outcome"], "arbitrated", "{first}");
+    // The same escalation again: the arbiter tries to answer, and is overruled.
+    let (ok, second) = f.run();
+    assert!(ok, "{second}");
+    assert_eq!(second["outcome"], "escalated", "{second}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
+    assert_eq!(item["answers"].as_array().unwrap().len(), 1, "{item}");
+    let arbitrated = events_of(&f, "run.arbitrated");
+    assert_eq!(arbitrated.len(), 2, "{arbitrated:?}");
+    assert_eq!(arbitrated[1]["data"]["verdict"], "escalate");
+    assert!(arbitrated[1]["data"]["overruled"]
+        .as_str()
+        .unwrap()
+        .contains("at most once"));
+}
+
+#[test]
+fn an_arbiter_that_cant_run_leaves_the_escalation_with_the_person() {
+    let f = Factory::new("true\n", "escalate");
+    // No usable verdict: the raw question reaches the person as before.
+    arbiter_says(&f, serde_json::json!({"nonsense": true}));
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        report["question"].as_str().unwrap().contains("Which API?"),
+        "{report}"
+    );
+}
+
 #[test]
 fn an_escalated_issue_is_labelled_until_it_is_answered() {
     let f = Factory::new("true\n", "escalate");
@@ -4089,7 +4289,11 @@ fn the_builder_can_ask_for_a_decision() {
     assert!(gh.contains("issue comment 5"), "{gh}");
     assert!(gh.contains("Which API, A or B?"), "{gh}");
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
-    assert!(!args.contains("--json-schema"), "no review ran:\n{args}");
+    // The arbiter reads the question; no reviewer runs.
+    assert!(
+        !args.contains("independent reviewer"),
+        "no review ran:\n{args}"
+    );
     assert!(
         args.contains("PAJA-QUESTION:"),
         "the builder is told how to ask"

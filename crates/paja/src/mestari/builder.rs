@@ -22,8 +22,9 @@ pub(super) fn answers(item: &WorkItem) -> String {
         return String::new();
     }
     let mut text = String::from(
-        "\nA person answered Paja's earlier questions about this issue. The answers settle what \
-         the issue leaves open; follow them:\n",
+        "\nA person (or, where marked, Paja's arbiter agent) answered Paja's earlier questions \
+         about this issue. The answers settle what the issue leaves open; follow them, and a \
+         later answer over an earlier one:\n",
     );
     for answer in &item.answers {
         text.push('\n');
@@ -38,7 +39,12 @@ pub(super) fn show_answer(answer: &jono::Answer) -> String {
     if let Some(question) = &answer.question {
         text.push_str(&format!("Question: {question}\n"));
     }
-    text.push_str(&format!("Answer: {}\n", answer.answer));
+    let by = if answer.by_arbiter() {
+        " (by the arbiter)"
+    } else {
+        ""
+    };
+    text.push_str(&format!("Answer{by}: {}\n", answer.answer));
     text
 }
 

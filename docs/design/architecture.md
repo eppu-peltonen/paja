@@ -275,7 +275,8 @@ Each agent runs on the model `.paja/models` names for its role, read from the de
 pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
 build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
 the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, the cheapest model), `plan` (the pool's
-planner) and `init` (`paja init`'s detection agent: it reads the default branch under the read-only deny-list hook and
+planner), `arbiter` (the read-only agent that settles an escalation before it reaches the person, on the `review` model
+when it has no line; see `landing.md`) and `init` (`paja init`'s detection agent: it reads the default branch under the read-only deny-list hook and
 proposes the stacks, checks, commands and environment, and `paja init` keeps only what files on the default branch back
 up; it also runs from a checkout that is not yet set up, so it reads `.paja/models` from there when the file exists and
 otherwise runs on the account's default). Mestari passes `--model` and, when given, `--effort`; a role
@@ -337,7 +338,10 @@ setting to change. On `escalate`, three failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
-`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `run.step` (`round`, `role`, `model`,
+`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. Before an escalation Mestari's arbiter
+agent looks at it: `run.arbitrated` (`number`, `verdict` `answer` or `escalate`, the `answer` or the `question`,
+`model`, `overruled`, `steps`) follows, and for an answer a `work.answered` with `by: arbiter` and a status event that
+queues the item again, with no `run.escalated`. `run.step` (`round`, `role`, `model`,
 `reviewer`, `pr`) records that a step starts, so the run can be followed from outside its terminal: an agent step under
 its `.paja/models` role, `checks` for Vasara's checks, and `ci` (or `land` with no CI) once the pull request `pr` is
 open; logs from before it replay with no steps. `run.checked` (`round`, `commit`, `base`)
