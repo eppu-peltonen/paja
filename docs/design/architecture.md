@@ -178,7 +178,9 @@ While it works on an item the run holds an OS file lock,
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
 stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and
 says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
-abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. It rebuilds where it stood
+abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. When the environment or its
+branch is gone, the item starts again on a new branch with a build, but in the round it had reached ("resuming #5 in
+round 2 on a new branch"), so the rounds already spent still count toward the cap. It rebuilds where it stood
 from every run event of the item since it was last queued, claimed or answered, not only the last run's, so an item
 interrupted again before it records a round keeps its round count and blockers: the round, the feedback for the
 builder, and the reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on

@@ -945,6 +945,22 @@ fn run_item(
             "resuming #{} in round {start}: {was}",
             item.number
         ));
+    } else if resumed {
+        // The branch is made again, so nothing an earlier round had carries over, but the
+        // rounds it spent still count: the cap holds across runs that lose their environment.
+        let point = resume_point(&home.events().read_all()?, &item.repo, item.number);
+        start = point.round;
+        // Past the cap, no round runs: the escalation quotes the last round's feedback.
+        if start > MAX_ROUNDS {
+            feedback = point.feedback;
+        }
+        if start > 1 {
+            progress(&format!(
+                "resuming #{} in round {start} on a new branch: the earlier rounds' work wasn't \
+                 kept, but they count toward the cap of {MAX_ROUNDS} rounds",
+                item.number
+            ));
+        }
     }
     // The builder's last result in this run: its session is resumed for a fix round, and its
     // running totals come off the next step's. Not kept across runs: an earlier run's session
@@ -984,7 +1000,12 @@ fn run_item(
                 "round {round} of {MAX_ROUNDS}: Claude is building the change (often 5 to 30 minutes)"
             ));
         }
-        let role = if round == 1 { "build" } else { "fix" };
+        // A new branch starts with a build, whatever the round.
+        let role = if round == 1 || (round == start && !kept) {
+            "build"
+        } else {
+            "fix"
+        };
         // A build the window can't finish buys nothing: keep the work and wait for the reset.
         // Reviews still start, so a built change isn't left unreviewed for a whole window.
         if !skip_build {

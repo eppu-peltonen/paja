@@ -3218,6 +3218,50 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert_eq!(item["status"], "landed", "{item}");
 }
 
+#[test]
+fn rounds_spent_count_toward_the_cap_when_the_environment_is_lost() {
+    let f = Factory::new("true\n", "fix");
+    let dir = f.tmp.path();
+    // Round 1 builds and is told to fix; round 2's fix is cut off.
+    std::fs::write(dir.join("hang-fix"), "").unwrap();
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(dir.join("hang-fix")).unwrap();
+    // The environment and its branch are lost before the next run.
+    let (_, list) = paja(&f.home, &f.repo, &["env", "list"]);
+    let env = list[0]["name"].as_str().unwrap().to_string();
+    let (ok, _) = paja(&f.home, &f.repo, &["env", "remove", &env, "--force"]);
+    assert!(ok);
+    git(&f.repo, &["branch", "-D", &format!("paja/{env}")]);
+    std::fs::write(dir.join("verdict.txt"), "land").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    // The new branch starts in round 2, with a build, not back at round 1.
+    assert!(
+        stderr.contains("resuming #5 in round 2 on a new branch"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("round 1 of"), "{stderr}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let last = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["kind"] == "run.round")
+        .unwrap()
+        .clone();
+    assert_eq!(last["data"]["round"], 2, "{last}");
+    assert_eq!(last["data"]["steps"][0]["role"], "build", "{last}");
+}
+
 /// Start `paja run` with its output discarded, wait until the fake agent writes `marker` (it is
 /// then stuck in a step), and kill the run, as a closed terminal or a reboot would.
 fn interrupt_run(f: &Factory, marker: &str) {
