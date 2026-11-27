@@ -179,7 +179,9 @@ fn render(template: &str, name: &str) -> String {
     if krate.starts_with(|c: char| c.is_ascii_digit()) {
         krate.insert_str(0, "app_");
     }
+    // A Windows checkout may embed the templates with CRLF; Prettier and ESLint want LF.
     template
+        .replace("\r\n", "\n")
         .replace("{{name}}", &slug)
         .replace("{{crate}}", &krate)
 }
