@@ -80,12 +80,15 @@ pub const EV_ROUND: &str = "run.round";
 /// A step of a round starts: `{repo, number, round, role, model, reviewer, pr}`. The role is a
 /// `.paja/models` role for an agent step, `checks` for Vasara's checks, or `ci` (waiting for
 /// CI) or `land` (no CI) once the pull request `pr` is open. What a finished step spent is
-/// still in `run.round`.
+/// still in `run.round`. A review step also has `reviewers`, how many reviewers the round has.
 pub const EV_STEP: &str = "run.step";
+/// A reviewer's verdict (`land`, `changes` or `escalate`) is in: `{repo, number, round,
+/// reviewer, verdict}`.
+pub const EV_REVIEWED: &str = "run.reviewed";
 /// A builder session is about to start: its session id, recorded before it runs, so a run
 /// that is killed mid-session can resume it.
 pub const EV_STEP_STARTED: &str = "run.step_started";
-/// Vasara's checks passed on a commit: `{repo, number, round, commit, base}`.
+/// Vasara's checks passed on a commit: `{repo, number, round, commit, base, checks_passed}`.
 pub const EV_CHECKED: &str = "run.checked";
 /// A builder session's work was thrown away (the hook never ran), so it is never resumed.
 pub const EV_STEP_DISCARDED: &str = "run.step_discarded";
@@ -982,7 +985,7 @@ fn run_item(
         // An earlier run's session is offered to the first build only.
         let earlier = if skip_build { None } else { carried.take() };
         if !skip_build {
-            record_step(home, item, round, role, Some(&models), None)?;
+            record_step(home, item, round, role, Some(&models), None, None)?;
         }
         let built = (!skip_build).then(|| {
             build(
@@ -1193,7 +1196,7 @@ fn run_item(
                 )?;
                 continue;
             }
-            record_checked(home, item, round, &checked, &base)?;
+            record_checked(home, item, round, &checked, &base, checks.len())?;
         }
         // --no-renames lists both sides of a rename, so moving a high-risk file keeps it high risk.
         let changed = git(
@@ -1257,7 +1260,15 @@ fn run_item(
             ));
             let role = review_role(risky, i, prior.is_some());
             let reviewer = i as u32 + 1;
-            record_step(home, item, round, role, Some(&models), Some(reviewer))?;
+            record_step(
+                home,
+                item,
+                round,
+                role,
+                Some(&models),
+                Some(reviewer),
+                Some(reviewers as u32),
+            )?;
             let reviewed = review(
                 home,
                 &env,
@@ -1275,6 +1286,7 @@ fn run_item(
             match reviewed {
                 Ok((review, used)) => {
                     steps.push(used);
+                    record_reviewed(home, item, round, reviewer, &review.verdict)?;
                     reviews.push(review);
                     i += 1;
                 }
@@ -1414,7 +1426,7 @@ fn run_item(
                         )?;
                         continue;
                     }
-                    record_checked(home, item, round, &judged, &base)?;
+                    record_checked(home, item, round, &judged, &base, checks.len())?;
                 }
                 CatchUp::Conflict(files) => {
                     drop(landing);
@@ -1831,6 +1843,7 @@ fn record_step(
     role: &str,
     models: Option<&Models>,
     reviewer: Option<u32>,
+    reviewers: Option<u32>,
 ) -> Result<()> {
     let model = models
         .and_then(|m| m.roles.get(role))
@@ -1840,7 +1853,26 @@ fn record_step(
         EV_STEP,
         json!({
             "repo": item.repo, "number": item.number, "round": round, "role": role,
-            "model": model, "reviewer": reviewer,
+            "model": model, "reviewer": reviewer, "reviewers": reviewers,
+        }),
+    )
+}
+
+/// Record a reviewer's verdict as soon as it is in, so someone following the run sees which
+/// reviews of the round are still out.
+fn record_reviewed(
+    home: &Home,
+    item: &WorkItem,
+    round: u32,
+    reviewer: u32,
+    verdict: &str,
+) -> Result<()> {
+    record(
+        home,
+        EV_REVIEWED,
+        json!({
+            "repo": item.repo, "number": item.number, "round": round,
+            "reviewer": reviewer, "verdict": verdict,
         }),
     )
 }
@@ -2423,7 +2455,7 @@ fn vasara(
         checks.len(),
         if checks.len() == 1 { "" } else { "s" }
     ));
-    record_step(home, item, round, "checks", None, None)?;
+    record_step(home, item, round, "checks", None, None, None)?;
     let result = run_checks(&env.path, checks);
     guard.check("Vasara's checks")?;
     let mut failed = result;
@@ -2549,13 +2581,14 @@ fn record_checked(
     round: u32,
     commit: &str,
     base: &str,
+    checks_passed: usize,
 ) -> Result<()> {
     record(
         home,
         EV_CHECKED,
         json!({
             "repo": item.repo, "number": item.number, "round": round,
-            "commit": commit, "base": base,
+            "commit": commit, "base": base, "checks_passed": checks_passed,
         }),
     )
 }

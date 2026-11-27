@@ -226,6 +226,18 @@ waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning whic
 `paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
 from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
 
+`pool::status` carries everything a live dashboard shows, all replayed from the log and the same through the CLI, the
+MCP tool and Paja Desk, which only draws it. Each lane has `round` (1 to 3: the review round, from `run.step` and the
+`next` of a `run.round` that goes on), `admitted_ms` (its `pool.admitted`), `tokens` (input, output and cache of the
+item's finished rounds, counted as `paja usage` does) next to `spent_usd`, `area` (the longest directory its `paths`
+share, else the first path's top folder, empty without paths) and, in `review`, `reviews`: one `pending`, `pass` or
+`block` per reviewer of the round, from the `reviewers` of the review's `run.step` and each `run.reviewed` (`round`,
+`reviewer`, `verdict`). A waiting item has an `area` too. The pool has `tokens` next to `spent_usd`, `out` (the latest
+five items that left a lane, newest first: `number`, `title`, `outcome` and `ts_ms`; the outcome is `landed`, `held`
+for an escalation, `failed` for a run that errored, or `retired` for an item closed without landing, from the lane's
+`done`), `retired_since_start` and `target`, 1 for a repository that never recorded a lane count. `run.checked` records
+`checks_passed` and `run.landed` the `checks_passed` and `merge_commit` of the change, on new events only.
+
 Then, for at most three rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, local git and the programs `.paja/commands` lists (`cargo` by default).
