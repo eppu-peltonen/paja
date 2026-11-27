@@ -2,12 +2,16 @@
 //!
 //! The window: `claude -p --output-format stream-json --verbose` prints the account's rate-limit
 //! state as `rate_limit_event` messages, whose `rate_limit_info` holds `status` (`allowed`,
-//! `allowed_warning` or `rejected`), `utilization` (the share used, 0 to 1) and `resetsAt` (epoch
-//! seconds). `agent::fold_stream` reduces the stream to the final `result` message and adds the
-//! latest event's `rate_limit_info` to it unless the result has one. Paja records `status`, the used percent and the reset time on the step
-//! (`window_status`, `window_used_percent`, `window_resets_at`). A Claude Code whose result has no
-//! `rate_limit_info` leaves all three `None`, and then nothing is held back: the window is only
-//! ever judged on what was reported.
+//! `allowed_warning` or `rejected`) and `resetsAt` (epoch seconds) for the limit that binds now
+//! (`rateLimitType`, such as `five_hour`), and `unifiedWindows`: each window by name, with its
+//! `utilization` (the share used, 0 to 1), `resetsAt` and `status`. A top-level `utilization`
+//! is read too, when there is one. `agent::fold_stream` reduces the stream to the final `result`
+//! message and adds the latest event's `rate_limit_info` to it unless the result has one. Paja
+//! records `status`, the used percent and the reset time on the step (`window_status`,
+//! `window_used_percent`, `window_resets_at`; see [`window_of`] for which window's). A Claude Code
+//! whose result has no `rate_limit_info` leaves all three `None`, and then nothing is held back:
+//! the window is only ever judged on what was reported, and `paja doctor` warns while none of the
+//! latest steps has a window.
 //!
 //! Before a `build` or `fix` session, and before a new item is claimed, Mestari reads the latest
 //! recorded state ([`window_nearly_used`]); `window <percent>` in `.paja/models` on the default
@@ -64,6 +68,65 @@ pub struct StepUsage {
     pub window_resets_at: Option<u64>,
 }
 
+/// The status, used percent and reset time (milliseconds since the epoch) a `rate_limit_info`
+/// reports. The status is the top-level one, the limit that binds now. The used share is the
+/// top-level `utilization` when there is one. Otherwise it comes from `unifiedWindows`: while the
+/// status is a warning (or rejected), the binding window's (`rateLimitType`), with the top-level
+/// reset time (or, without one, the binding window's own), so the hold lasts until that limit
+/// resets; else the fullest window's, with its own
+/// reset time, so a window that is nearly used holds builds back until it resets. Every window
+/// counts, whichever model it is for, and `isUsingOverage` (extra usage that keeps work going
+/// past a full window) is not read: both err on holding back.
+pub fn window_of(info: &Value) -> (Option<String>, Option<f64>, Option<u64>) {
+    let as_ms = |n: u64| if n < 100_000_000_000 { n * 1000 } else { n };
+    let status = info["status"].as_str().map(str::to_string);
+    let top_reset = info["resetsAt"].as_u64().map(as_ms);
+    if let Some(used) = info["utilization"].as_f64() {
+        return (status, Some(used * 100.0), top_reset);
+    }
+    let windows = info["unifiedWindows"].as_object();
+    let warned = status
+        .as_deref()
+        .is_some_and(|s| s.contains("warning") || s == "rejected");
+    let binding = info["rateLimitType"]
+        .as_str()
+        .and_then(|kind| windows?.get(kind));
+    if warned || windows.is_none() {
+        let used = binding.and_then(|w| w["utilization"].as_f64());
+        let resets = top_reset.or_else(|| binding.and_then(|w| w["resetsAt"].as_u64()).map(as_ms));
+        return (status, used.map(|u| u * 100.0), resets);
+    }
+    // Only a window with its own reset time: another window's would end the hold too early.
+    let fullest = windows
+        .into_iter()
+        .flat_map(|w| w.values())
+        .filter_map(|w| Some((w["utilization"].as_f64()?, w["resetsAt"].as_u64()?)))
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    match fullest {
+        Some((used, resets)) => (status, Some(used * 100.0), Some(as_ms(resets))),
+        None => (status, None, top_reset),
+    }
+}
+
+impl StepUsage {
+    /// Whether the step's result reported the usage window at all.
+    pub fn reports_window(&self) -> bool {
+        self.window_status.is_some()
+            || self.window_used_percent.is_some()
+            || self.window_resets_at.is_some()
+    }
+
+    /// The agent steps the log's `run.round` events recorded, oldest first.
+    pub fn recorded(events: &[crate::events::Event]) -> impl Iterator<Item = StepUsage> + '_ {
+        events
+            .iter()
+            .filter(|e| e.kind == EV_ROUND)
+            .filter_map(|e| e.data["steps"].as_array())
+            .flatten()
+            .filter_map(|s| serde_json::from_value::<StepUsage>(s.clone()).ok())
+    }
+}
+
 /// The window state the latest step that reported one recorded, when it says the window is nearly
 /// used up (a warning or rejected status, or at least `threshold_percent` used) and its reset
 /// time, still ahead of `now_ms`, is known: that reset time, in milliseconds since the epoch.
@@ -73,17 +136,9 @@ pub fn window_nearly_used(
     now_ms: u64,
     threshold_percent: u32,
 ) -> Option<u64> {
-    let latest = events
-        .iter()
-        .filter(|e| e.kind == EV_ROUND)
-        .filter_map(|e| e.data["steps"].as_array())
-        .flatten()
-        .filter_map(|s| serde_json::from_value::<StepUsage>(s.clone()).ok())
-        .rfind(|s| {
-            s.window_status.is_some()
-                || s.window_used_percent.is_some()
-                || s.window_resets_at.is_some()
-        })?;
+    let latest = StepUsage::recorded(events)
+        .filter(StepUsage::reports_window)
+        .last()?;
     let warned = latest
         .window_status
         .as_deref()
@@ -192,12 +247,12 @@ impl StepUsage {
             .unwrap_or_default();
         let fallback = chosen.fallback_for(role).map(str::to_string);
         // The window, if the result reports it: see the module doc comment.
-        let window = &result["rate_limit_info"];
-        let as_ms = |n: u64| if n < 100_000_000_000 { n * 1000 } else { n };
+        let (window_status, window_used_percent, window_resets_at) =
+            window_of(&result["rate_limit_info"]);
         StepUsage {
-            window_status: window["status"].as_str().map(str::to_string),
-            window_used_percent: window["utilization"].as_f64().map(|u| u * 100.0),
-            window_resets_at: window["resetsAt"].as_u64().map(as_ms),
+            window_status,
+            window_used_percent,
+            window_resets_at,
             step: step.to_string(),
             reviewer,
             role: Some(role.to_string()),
@@ -284,6 +339,60 @@ mod tests {
         assert_eq!(models.roles["fix"].model, "haiku");
         assert_eq!(models.max_turns["build"], 50);
         assert_eq!(models.window_percent(), 80);
+    }
+
+    #[test]
+    fn the_window_is_read_from_the_unified_windows_claude_code_reports() {
+        use super::window_of;
+        use serde_json::json;
+        // The shape a current Claude Code prints: no top-level utilization.
+        let info = |status: &str, five: f64, seven: f64| {
+            json!({"status": status, "resetsAt": 1_000, "rateLimitType": "five_hour",
+                "isUsingOverage": false, "unifiedWindows": {
+                    "five_hour": {"utilization": five, "resetsAt": 1_000, "status": status},
+                    "seven_day": {"utilization": seven, "resetsAt": 9_000, "status": "allowed"}}})
+        };
+        let percent = |u: f64| Some(u * 100.0);
+        // Allowed: the fullest window, with its own reset time.
+        assert_eq!(
+            window_of(&info("allowed", 0.66, 0.43)),
+            (Some("allowed".into()), percent(0.66), Some(1_000_000))
+        );
+        assert_eq!(
+            window_of(&info("allowed", 0.2, 0.95)),
+            (Some("allowed".into()), percent(0.95), Some(9_000_000))
+        );
+        // A warning: the binding window, until the binding limit resets.
+        assert_eq!(
+            window_of(&info("allowed_warning", 0.91, 0.95)),
+            (
+                Some("allowed_warning".into()),
+                percent(0.91),
+                Some(1_000_000)
+            )
+        );
+        // A top-level utilization is read as it is; a bare status keeps its reset time.
+        assert_eq!(
+            window_of(&json!({"status": "allowed", "utilization": 0.5, "resetsAt": 2})),
+            (Some("allowed".into()), Some(50.0), Some(2_000))
+        );
+        assert_eq!(
+            window_of(&json!({"status": "rejected", "resetsAt": 3})),
+            (Some("rejected".into()), None, Some(3_000))
+        );
+        assert_eq!(window_of(&serde_json::Value::Null), (None, None, None));
+        // A warning with no top-level reset waits for the binding window's own.
+        let warned = json!({"status": "allowed_warning", "rateLimitType": "five_hour",
+            "unifiedWindows": {"five_hour": {"utilization": 0.9, "resetsAt": 4}}});
+        assert_eq!(window_of(&warned).2, Some(4_000));
+        // A window with no reset time of its own is passed over for the fullest that has one.
+        let unknown = json!({"status": "allowed", "resetsAt": 1, "unifiedWindows": {
+            "five_hour": {"utilization": 0.3, "resetsAt": 1},
+            "other": {"utilization": 0.99}}});
+        assert_eq!(
+            window_of(&unknown),
+            (Some("allowed".into()), percent(0.3), Some(1_000))
+        );
     }
 
     #[test]
