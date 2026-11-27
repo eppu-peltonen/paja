@@ -2242,7 +2242,15 @@ const REVIEW_DIFF_CAP: usize = 60_000;
 /// characters, whole files are included in order until the next would pass it, and the rest
 /// are named for the reviewer to read itself.
 fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
-    let flags = ["diff", "--no-ext-diff", "--no-textconv"];
+    // Renames pinned on, so the names and the sections below agree whatever the machine's git
+    // configuration says.
+    let flags = [
+        "-c",
+        "diff.renames=true",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+    ];
     let run = |extra: &[&str]| {
         let mut args = flags.to_vec();
         args.extend_from_slice(extra);
@@ -2273,9 +2281,10 @@ fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
         last.push_str(line);
         last.push('\n');
     }
+    let labels = section_names(&names, &files);
     let mut full_so_far = false;
     for (index, file) in files.iter().enumerate() {
-        let name = names.get(index).copied().unwrap_or("(unknown file)");
+        let name = labels[index];
         let size = file.chars().count();
         if !full_so_far && used + size <= cap {
             shown.push_str(file);
@@ -2306,6 +2315,25 @@ fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
         skipped.join(", ")
     ));
     Ok(text)
+}
+
+/// The name of each of the diff's `files` (one section per file): `names`, from `git diff
+/// --name-only -z`, matched by position. Should git ever list a different number of them, each
+/// section is named by its own `diff --git` line instead, which may be quoted or ambiguous for
+/// odd paths but never names another file.
+fn section_names<'a>(names: &[&'a str], files: &'a [String]) -> Vec<&'a str> {
+    if names.len() == files.len() {
+        return names.to_vec();
+    }
+    files
+        .iter()
+        .map(|file| {
+            file.lines()
+                .next()
+                .and_then(|l| l.strip_prefix("diff --git "))
+                .unwrap_or("(unknown file)")
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3335,9 +3363,17 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "y".repeat(900)).unwrap();
         std::fs::write(dir.join("c.bin"), [0u8, 1, 2, 0, 255, 0]).unwrap();
         std::fs::write(dir.join("z.txt"), "one\ntwo\n").unwrap();
-        run(&["add", "-A"]);
-        run(&["update-index", "--chmod=+x", "m.sh"]);
         run(&["mv", "old.txt", "new.txt"]);
+        // A rename with one line changed, so its section differs in length from the binary
+        // file's; and renames off in the repository's configuration, which Paja's own diff
+        // pins back on.
+        let mut text = "rename me\n".repeat(19);
+        text.push_str("changed\n");
+        std::fs::write(dir.join("new.txt"), text).unwrap();
+        run(&["add", "-A"]);
+        // Last, as `git add` would read the file's mode back from the disk.
+        run(&["update-index", "--chmod=+x", "m.sh"]);
+        run(&["config", "diff.renames", "false"]);
         run(&["commit", "-q", "-m", "change"]);
         let capped = super::review_diff(dir, "base...HEAD", 300).unwrap();
         assert!(
@@ -3345,16 +3381,33 @@ mod tests {
             "{capped}"
         );
         // Header, mode and index lines plus `Binary files ... differ`; old and new mode; the
-        // similarity and rename lines; a new file's five header lines and its two added lines.
+        // similarity, rename and index lines with the hunk of one changed line; a new file's
+        // five header lines and its two added lines.
         for skipped in [
             "c.bin (4 lines)",
             "m.sh (3 lines)",
-            "new.txt (4 lines)",
+            "new.txt (13 lines)",
             "z.txt (8 lines)",
         ] {
             assert!(capped.contains(skipped), "{skipped}: {capped}");
         }
         assert!(!capped.contains("(unknown file)"), "{capped}");
+    }
+
+    #[test]
+    fn diff_sections_are_named_by_their_header_when_git_lists_other_names() {
+        let files = vec![
+            "diff --git a/a.txt b/a.txt\n+x\n".to_string(),
+            "diff --git a/b.txt b/b.txt\n+y\n".to_string(),
+        ];
+        assert_eq!(
+            super::section_names(&["a.txt", "b.txt"], &files),
+            ["a.txt", "b.txt"]
+        );
+        assert_eq!(
+            super::section_names(&["b.txt"], &files),
+            ["a/a.txt b/a.txt", "a/b.txt b/b.txt"]
+        );
     }
 
     #[test]
@@ -3420,14 +3473,15 @@ mod tests {
             "doctor.rs",
             "home.rs",
             "init.rs",
+            // Checks the init agent proposes for another repository, kept only when files back
+            // them; this repository's own `.paja/` is high risk.
             "init/detect.rs",
-            "init/generate.rs",
             "init/recommend.rs",
+            // Pushes the first commit of a brand-new repository, not a landing.
             "init/scaffold.rs",
             "jono.rs",
             "mcp.rs",
             "mestari/builder.rs",
-            "mestari/detect.rs",
             "mestari/follow_ups.rs",
             "mestari/live.rs",
             "mestari/plan.rs",

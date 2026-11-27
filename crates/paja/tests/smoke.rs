@@ -4578,7 +4578,7 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
     let d = slash(&dir);
     let issue = |n: u64, title: &str| {
         format!(
-            r#"{{"number": {n}, "title": "{title}", "body": "details of {n}", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            r#"{{"number": {n}, "title": "{title}", "body": "details of {n}", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
         )
     };
     std::fs::write(
@@ -4587,7 +4587,7 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
             "[{}, {}, {}]",
             issue(11, "Tidy the helper"),
             issue(12, "Tidy the helper, again"),
-            issue(13, "Add a check file")
+            issue(13, "Add a .paja/checks file")
         ),
     )
     .unwrap();
@@ -4729,6 +4729,79 @@ fn triage_leaves_a_persons_triage_environment_alone_and_waits_for_a_running_pass
         std::fs::read_to_string(theirs.join("my-work.txt")).unwrap(),
         "unsaved"
     );
+}
+
+#[test]
+fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
+    let (f, dir) = triage_factory("{}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&f.repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // #11 was opened after every commit, so no commit can show it fixed; #12 and #13 earlier.
+    // `.paja/checks` exists, but only #13 names it.
+    let issue = |n: u64, title: &str, opened: &str| {
+        format!(
+            r#"{{"number": {n}, "title": "{title}", "body": "details", "createdAt": "{opened}", "labels": [{{"name": "factory-follow-up"}}]}}"#
+        )
+    };
+    std::fs::write(
+        dir.join("followups.json"),
+        format!(
+            "[{}, {}, {}, {}, {}]",
+            issue(11, "Fix the helper", "2099-01-01T00:00:00Z"),
+            issue(12, "Fix the helper too", "2020-01-01T00:00:00Z"),
+            issue(13, "Say more in .paja/checks.", "2020-01-01T00:00:00Z"),
+            issue(14, "Tidy, then tidy: again", "2020-01-01T00:00:00Z"),
+            issue(15, "Sort out .paja", "2020-01-01T00:00:00Z")
+        ),
+    )
+    .unwrap();
+    let answer = format!(
+        r#"{{"issues": [
+            {{"number": 11, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}},
+            {{"number": 12, "verdict": "already_fixed", "file": ".paja/checks", "reason": "Fixed."}},
+            {{"number": 13, "verdict": "already_fixed", "file": ".paja/checks", "reason": "Fixed."}},
+            {{"number": 14, "verdict": "already_fixed", "file": "./", "reason": "Fixed."}},
+            {{"number": 15, "verdict": "already_fixed", "file": ".paja", "reason": "Fixed."}}
+        ]}}"#
+    );
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(r#"{{"is_error": false, "num_turns": 1, "structured_output": {answer}}}"#),
+    )
+    .unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([13]), "{report}");
+    // Neither the top of the tree nor a directory the issue names is a file that shows a fix.
+    for kept in [0, 1, 3, 4] {
+        assert_eq!(report["items"][kept]["verdict"], "keep", "{report}");
+        let reason = report["items"][kept]["reason"].as_str().unwrap();
+        assert!(reason.contains("after the issue was opened"), "{reason}");
+    }
+    // The same commit counts for an issue opened before it.
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issue(11, "Fix the helper", "2020-01-01T00:00:00Z")),
+    )
+    .unwrap();
+    let answer = format!(
+        r#"{{"issues": [{{"number": 11, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}}]}}"#
+    );
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(r#"{{"is_error": false, "num_turns": 1, "structured_output": {answer}}}"#),
+    )
+    .unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([11]), "{report}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("createdAt"), "{log}");
 }
 
 #[test]

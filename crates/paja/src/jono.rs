@@ -289,7 +289,7 @@ fn format_utc(secs: u64) -> String {
 }
 
 /// The seconds since the Unix epoch of a time written as `2026-01-31T09:05:00Z`.
-fn parse_utc(text: &str) -> Option<u64> {
+pub(crate) fn parse_utc(text: &str) -> Option<u64> {
     let text = text.trim().strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
     let mut d = date.split('-');
