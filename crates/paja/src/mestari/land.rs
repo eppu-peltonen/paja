@@ -306,14 +306,21 @@ pub(super) fn escalate(
 /// Tell the person the item needs them (Posti), next to the comment on the issue, which
 /// GitHub doesn't notify them about when it is posted with their own token.
 pub(super) fn tell(home: &Home, repo: &Path, item: &WorkItem) {
+    let notice = crate::posti::Notice::escalated(&item.repo, item.number, &item.title);
+    tell_with(home, repo, item, &notice);
+}
+
+/// [`tell`], with `notice` as what Posti sends.
+pub(super) fn tell_with(home: &Home, repo: &Path, item: &WorkItem, notice: &crate::posti::Notice) {
+    // The notice first: labelling makes up to three `gh` calls, which a slow GitHub could hold
+    // up.
+    crate::posti::send(home, repo, notice);
     if let Err(err) = jono::mark_needs_answer(home, repo, item.number) {
         progress(&format!(
             "couldn't label #{} as waiting for an answer: {err:#}",
             item.number
         ));
     }
-    let notice = crate::posti::Notice::escalated(&item.repo, item.number, &item.title);
-    crate::posti::send(home, repo, &notice);
 }
 
 /// Ask the person on the issue. The question can quote CI logs or review text, so it is

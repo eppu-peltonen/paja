@@ -41,6 +41,18 @@ pub struct Notice {
 }
 
 impl Notice {
+    /// An item set escalated by hand (`paja work set`, the `work_set` tool): its note stays in
+    /// the log, since a push leaves the machine, and no question is on the issue.
+    pub fn escalated_by_hand(repo: &str, number: u64, title: &str) -> Self {
+        Self {
+            text: format!(
+                "{title}. It was set escalated by hand; paja work show {number} has the note. \
+                 Answer with paja work answer {number} \"<your answer>\"."
+            ),
+            ..Self::escalated(repo, number, title)
+        }
+    }
+
     /// An item that needs the person's decision.
     pub fn escalated(repo: &str, number: u64, title: &str) -> Self {
         Self {
