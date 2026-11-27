@@ -179,3 +179,35 @@ pub struct RunLock {
 pub struct HomeLock {
     _file: File,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_held_sees_only_a_live_run_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let repo = "owner/name";
+
+        // No lock file yet: free, and the probe creates neither the file nor `runs/`.
+        assert!(!home.run_held(repo, 7).unwrap());
+        assert!(!home.root().join("runs").exists());
+
+        // A live run holds it: held. Another item of the same repository stays free.
+        let lock = home
+            .try_run_lock(repo, 7)
+            .unwrap()
+            .expect("the lock is free");
+        assert!(home.run_held(repo, 7).unwrap());
+        assert!(!home.run_held(repo, 8).unwrap());
+        // The probe took nothing, so the lock is still the run's.
+        assert!(home.try_run_lock(repo, 7).unwrap().is_none());
+
+        // The run is gone but its file is left behind: free again.
+        drop(lock);
+        assert!(home.runs_lock_path(repo, "7").exists());
+        assert!(!home.run_held(repo, 7).unwrap());
+        assert!(home.try_run_lock(repo, 7).unwrap().is_some());
+    }
+}
