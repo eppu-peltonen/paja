@@ -230,6 +230,9 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   lookup takes a few seconds at most; when it fails (offline), the check says so and stays ok. `PAJA_CLAUDE_LATEST`
   names another source: an `http(s)` URL or a file holding the version.
 - The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
+- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it
+  is answered; if its issue is closed instead, this is a warning that names the environment and the
+  `paja env remove <name>` that frees it (the branch is kept).
 - The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
   branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.
