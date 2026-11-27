@@ -1317,7 +1317,8 @@ fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
              *\"--label factory-follow-up \"*) echo '[{{\"number\": 2, \"title\": \"Tidy\", \"body\": \"\", \"url\": \"https://example.com/2\"}}]' ;; \
              *\"--label factory \"*) echo '[{{\"number\": 4, \"title\": \"Build\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; \
              *) echo '[]' ;; esac ;;\n\
-             \"api \"*) case \"$2\" in *events) if [ -f {d}/reopened-on-github ]; then cat {d}/reopened-on-github; fi ;; \
+             \"api \"*) case \"$2\" in *events) if [ -f {d}/events-down ]; then echo 'HTTP 503' >&2; exit 1; fi; \
+             if [ -f {d}/reopened-on-github ]; then cat {d}/reopened-on-github; fi ;; \
              *) if [ -f {d}/closed-on-github ]; then echo closed; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
@@ -1475,6 +1476,52 @@ fn a_landed_follow_up_github_reopened_while_hidden_by_follow_ups_off_is_queued_w
 }
 
 #[test]
+fn a_failed_reopen_check_fails_the_sync_and_the_next_sync_asks_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let queue = |text: &str| {
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/queue"), text).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "queue"]);
+    };
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (_, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert_eq!(set["status"], "landed", "{set}");
+    queue("follow-ups = off\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
+    std::fs::write(
+        tmp.path().join("reopened-on-github"),
+        "2099-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    // GitHub can't list #2's events: the sync fails and says so, and records nothing.
+    std::fs::write(tmp.path().join("events-down"), "").unwrap();
+    queue("follow-ups = on\n");
+    let (ok, err) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("follow-up #2") && msg.contains("issues/2/events") && msg.contains("HTTP 503"),
+        "{msg}"
+    );
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["open"], false, "{item}");
+    // Once GitHub answers, the next sync asks again and queues it.
+    std::fs::remove_file(tmp.path().join("events-down")).unwrap();
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["status"], "queued", "{item}");
+}
+
+#[test]
 fn a_follow_up_hidden_by_follow_ups_off_and_reopened_only_before_stays_landed() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -1487,10 +1534,13 @@ fn a_follow_up_hidden_by_follow_ups_off_and_reopened_only_before_stays_landed() 
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "queue"]);
     };
-    paja_with(&home, &repo, &["work", "sync"], &with_gh);
-    paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (_, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert_eq!(set["status"], "landed", "{set}");
     queue("follow-ups = off\n");
-    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
     // GitHub's only reopen of #2 is older than the hiding.
     std::fs::write(
         tmp.path().join("reopened-on-github"),
