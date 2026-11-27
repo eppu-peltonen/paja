@@ -70,7 +70,9 @@ Without the file they are `factory`, `factory-follow-up` and `factory-needs-answ
 `paja work answer` still records and posts the answer, removes the default `factory-needs-answer` and says on stderr
 that it did.
 Changing the work label closes the queue as it was: the next sync no longer sees issues with the old label and closes
-every item it imported with it, so relabel the open issues to the new label in the same change.
+every item it imported with it. `.paja/labels` takes effect only once its change lands on the default branch, so add the
+new label to the open issues before it lands, keeping the old one, and remove the old label after: every sync in
+between sees them under one label or the other.
 `paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
 events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than the last one recorded (every
 `paja run` syncs first, so runs record it too); it never touches another repository's items, even when their issue
