@@ -10209,7 +10209,7 @@ fn a_merge_github_refuses_escalates_naming_the_setting() {
     // Asked after the refusal, GitHub says squash merging is off.
     std::fs::write(
         f.tmp.path().join("settings-after.json"),
-        r#"{"viewerPermission": "ADMIN", "squashMergeAllowed": false}"#,
+        r#"{"viewerPermission": "ADMIN", "squashMergeAllowed": false, "rebaseMergeAllowed": false, "mergeCommitAllowed": false}"#,
     )
     .unwrap();
     let (ok, report) = f.run();
@@ -10301,6 +10301,12 @@ fn an_answered_merge_refusal_lands_through_the_open_pull_request() {
     assert_eq!(count("pr create"), 1, "{log}");
     assert!(count("pr edit") >= 1, "{log}");
     assert_eq!(count("pr merge"), 2, "{log}");
+    // The second merge is of the pull request opened in the first run.
+    let merges: Vec<&str> = log.lines().filter(|l| l.starts_with("pr merge")).collect();
+    assert!(
+        merges[1].starts_with("pr merge https://example.com/pull/1 --squash"),
+        "{log}"
+    );
 }
 
 /// A pool's test factory: items #5 Alpha, #6 Beta, #7 Gamma (and #8 Delta with `four`), each

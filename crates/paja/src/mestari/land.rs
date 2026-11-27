@@ -247,7 +247,6 @@ fn failed_log(repo: &Path, checks: &str) -> Option<String> {
     (!tail.trim().is_empty()).then_some(tail)
 }
 
-/// The question for a repository whose settings leave Paja no way to merge.
 /// Why GitHub won't let the signed-in `gh` account merge with `flag` in `repo`, asked after a
 /// merge failed: its permission there is below write, or the method is now off. None when
 /// GitHub shows neither, or `gh` can't say, so the failure is an error instead.
@@ -269,7 +268,7 @@ fn merge_refused(checkout: &Path, repo: &str, flag: &str) -> Option<String> {
 /// [`merge_refused`]'s reading of `gh repo view`'s answer `v`. A field it leaves out says
 /// nothing.
 fn merge_refusal(v: &Value, repo: &str, flag: &str) -> Option<String> {
-    if let Some(permission) = v["viewerPermission"].as_str() {
+    if let Some(permission) = v["viewerPermission"].as_str().filter(|p| !p.is_empty()) {
         if !matches!(permission, "ADMIN" | "MAINTAIN" | "WRITE") {
             return Some(format!(
                 "The signed-in `gh` account has {permission} permission on {repo}, and merging \
@@ -278,14 +277,26 @@ fn merge_refusal(v: &Value, repo: &str, flag: &str) -> Option<String> {
             ));
         }
     }
-    let key = match flag {
-        SQUASH => "squashMergeAllowed",
-        REBASE => "rebaseMergeAllowed",
-        _ => "mergeCommitAllowed",
-    };
-    (v[key].as_bool() == Some(false)).then(|| no_merge_method(repo))
+    let methods = [
+        (SQUASH, "squashMergeAllowed", "squash merging"),
+        (REBASE, "rebaseMergeAllowed", "rebase merging"),
+        (MERGE, "mergeCommitAllowed", "merge commits"),
+    ];
+    let off = |key: &str| v[key].as_bool() == Some(false);
+    let (_, key, name) = methods.iter().find(|(f, ..)| *f == flag)?;
+    if !off(key) {
+        return None;
+    }
+    if methods.iter().all(|(_, key, _)| off(key)) {
+        return Some(no_merge_method(repo));
+    }
+    Some(format!(
+        "{repo} turned off {name} after this run read its settings. Answer to land it with a \
+         method {repo} allows now; the next run picks one."
+    ))
 }
 
+/// The question for a repository whose settings leave Paja no way to merge.
 fn no_merge_method(repo: &str) -> String {
     format!(
         "Paja can't land this change: {repo} allows no merge method Paja can use. Under \
@@ -444,17 +455,25 @@ mod tests {
                 "{text}"
             );
         }
-        for (flag, key) in [
-            (super::SQUASH, "squashMergeAllowed"),
-            (super::REBASE, "rebaseMergeAllowed"),
-            (super::MERGE, "mergeCommitAllowed"),
+        // The method Paja chose was switched off, but another is still on: an answer is enough.
+        for (flag, key, name) in [
+            (super::SQUASH, "squashMergeAllowed", "squash merging"),
+            (super::REBASE, "rebaseMergeAllowed", "rebase merging"),
+            (super::MERGE, "mergeCommitAllowed", "merge commits"),
         ] {
             let v = json!({ "viewerPermission": "ADMIN", key: false });
-            assert!(
-                why(v, flag).unwrap().contains("allow squash merging"),
-                "{flag}"
-            );
+            let text = why(v, flag).unwrap();
+            assert!(text.contains(&format!("turned off {name}")), "{text}");
+            assert!(text.contains("the next run picks one"), "{text}");
         }
+        // All three off: the setting to change.
+        let none = json!({"squashMergeAllowed": false, "rebaseMergeAllowed": false,
+                          "mergeCommitAllowed": false});
+        assert!(why(none, super::REBASE)
+            .unwrap()
+            .contains("allow squash merging"));
+        // An empty permission says nothing either.
+        assert_eq!(why(json!({"viewerPermission": ""}), super::SQUASH), None);
         // Another method being off says nothing about this one.
         let v = json!({"viewerPermission": "ADMIN", "rebaseMergeAllowed": false});
         assert_eq!(why(v, super::SQUASH), None);
