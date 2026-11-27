@@ -301,22 +301,27 @@ Then, for at most five rounds:
    An entry matches as a prefix, and an entry that is a single name (`.cargo/`, `CLAUDE.md`) also matches that name,
    or the name with an extension, at any depth, in any letter case.
 
-Each agent runs on the model `.paja/models` names for its role, read from the default branch like the checks, so a change can't
-pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
-build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
-the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, the cheapest model), `plan` (the pool's
-planner), `arbiter` (the read-only agent that settles an escalation before it reaches the person, on the `review` model
-when it has no line; see `landing.md`) and `init` (`paja init`'s detection agent: it reads the default branch under the read-only deny-list hook and
-proposes the stacks, checks, commands and environment, and `paja init` keeps only what files on the default branch back
-up; it also runs from a checkout that is not yet set up, so it reads `.paja/models` from there when the file exists and
-otherwise runs on the account's default). Mestari passes `--model` and, when given, `--effort`; a role
-with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
-(left out where it is the role's own model), so a busy model doesn't fail the round. A line naming a role this Paja
-doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going, and
-`paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr would not; an
-unknown effort or a malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the
-`fallback` it was given; `fell_back: true` marks a step the fallback model spent something in (its name, or an alias
-such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role didn't run only on its model.
+Each agent runs on the model `.paja/models` names for its role, read from the default branch like the checks, so a
+change can't pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build`
+(the first build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review
+of only the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, the cheapest model), `plan` (the
+pool's planner), `arbiter` (the read-only agent that settles an escalation before it reaches the person, on the `review`
+model when it has no line; see `landing.md`) and `init` (`paja init`'s detection agent: it reads the default branch
+under the read-only deny-list hook and proposes the stacks, checks, commands and environment, and `paja init` keeps only
+what files on the default branch back up; it also runs from a checkout that is not yet set up, so it reads
+`.paja/models` from there when the file exists and otherwise runs on the account's default). Mestari passes `--model`
+and, when given, `--effort`; a role with no line passes neither and runs on the account's default. A `fallback <model>`
+line adds `--fallback-model` (left out where it is the role's own model), so a busy model doesn't fail the round. A line
+naming a role this Paja doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's
+file keeps going, and `paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr
+would not. Posti tells of each skipped role once per repository (one `skipped_role` notice for the roles a pass finds
+new, each quoted and escaped, cut at 64 characters, ten at most and the rest counted), so an unattended runner's person
+hears of it without running doctor. A notice that was tried counts, delivered or not, and Posti's lock for the
+repository, held from reading the log until the notice is recorded, keeps a pool's lanes starting together from each
+sending it. An unknown effort or a malformed line stops the run with an error naming the line. Each recorded step names
+its `role` and `model`, and the `fallback` it was given; `fell_back: true` marks a step the fallback model spent
+something in (its name, or an alias such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role
+didn't run only on its model.
 
 Every session also gets `--max-turns`, from `max-turns <role> <turns>` lines in the same file (80 for `build` and
 `fix`, 30 for the reviews when a role has no line), so an agent going in circles can't spend the account's usage
@@ -396,13 +401,19 @@ review and its verdict, waiting for CI, landed or asked, and with `--every` each
 ### Posti
 
 The comment on the issue is posted with the person's own token, so GitHub doesn't notify them about it. Posti
-(`posti.rs`) tells them instead, next to that comment: when an item escalates (or is parked on an error), when a pass
-of `paja run` fails (with or without `--every`; of failed passes in a row, only the first), and when a run stops for a
-person, and when a change lands with review findings still open at the round limit, which no issue holds. Each notice
-names the repository and, for an item, the issue, its title and the answer command. An escalated item's issue also
-gets the `needs-answer` label (created when the repository lacks it), which `paja work answer` removes, so the person
-can filter or subscribe to it on GitHub; a label that can't be set is reported on stderr and the run carries on.
-`paja work list` shows escalated items first, each with its answer command. A notice goes to two channels:
+(`posti.rs`) tells them instead, next to that comment: when an item escalates (or is parked on an error, or is set
+`escalated` by hand with `paja work set` or the `work_set` tool), when a pass of `paja run` fails (with or without
+`--every`; of failed passes in a row, only the first; not for a mistake in how a single `paja run` was started, such as
+a `--repo` that isn't a directory or an `--item` that isn't queued, which is in front of the person already), when a
+run stops for a person, when a change lands with review findings still open at the round limit, which no issue holds,
+and once per repository for each `.paja/models` role this Paja skips. Each notice names the repository and, for an
+item, the issue, its title and the answer command. An escalated item's issue also gets the `needs-answer` label
+(created when the repository lacks it), which `paja work answer` removes, so the person can filter or subscribe to it
+on GitHub. An item set `escalated` by hand gets its own notice: it says so and points to `paja work show`, since its
+note stays on this machine. Setting an item that is already escalated to `escalated` again sends no second notice and
+only tries the label again. The notice goes first, so a slow `gh` doesn't hold it up; a label that can't be set is
+reported on stderr and the run carries on. `paja work list` shows escalated items first, each with its answer command.
+A notice goes to two channels:
 
 - **Local.** `PAJA_NOTIFIER` names a program, run with the title and the text as its two arguments; `desktop` asks for
   a desktop notification (a Windows toast through Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere,
@@ -421,12 +432,13 @@ worktree could move. That could send the notice's text to a URL it picks, or cha
 whether Jono takes follow-ups, for the passes that read them.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `left_findings`,
-`pass_failed` or `stopped`, `channel`, and the `error`), so Paja Desk can show the same inbox. A notice that can't be
-delivered never stops the run: it says so on stderr once per channel, and every notifier is stopped after 15 seconds.
-The other waits are 15 seconds too: the repository name Jono asks `gh` for (the notice goes without it after that),
-and the home lock its record waits for (the record is skipped after that), and a `gh` stopped while it runs takes what
-it started with it. With every channel on, one notice holds up the run for about a minute and a half at most; only the
-local git calls that read `.paja/notify` from the default branch have no limit of their own.
+`pass_failed`, `stopped` or `skipped_role`, `channel`, the `error`, and for `skipped_role` the roles it named as
+`subject`), so Paja Desk can show the same inbox. A notice that can't be delivered never stops the run: it says so on
+stderr once per channel, and every notifier is stopped after 15 seconds. The other waits are 15 seconds too: the
+repository name Jono asks `gh` for (the notice goes without it after that), and the home lock its record waits for (the
+record is skipped after that), and a `gh` stopped while it runs takes what it started with it. With every channel on,
+one notice holds up the run for about a minute and a half at most, and a skipped-role notice up to 15 seconds more for
+Posti's lock; only the local git calls that read `.paja/notify` from the default branch have no limit of their own.
 
 ## The deny-list hook
 

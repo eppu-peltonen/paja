@@ -439,6 +439,63 @@ impl std::fmt::Display for Declined {
 
 impl std::error::Error for Declined {}
 
+/// A mistake in how `paja run` was started (a `--repo` that isn't a directory, an `--item`
+/// that isn't queued): the error goes to whoever started it (the person's terminal, or the pool
+/// that started a lane), so no notice goes out for it.
+#[derive(Debug)]
+pub struct Mistake(String);
+
+impl std::fmt::Display for Mistake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Mistake {}
+
+/// Whether `err` comes from how the run was started, not from a pass that ran: a [`Mistake`]
+/// or a run the person [`Declined`].
+pub fn is_mistake(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<Mistake>() || e.is::<Declined>())
+}
+
+/// Set an item's status by hand (`paja work set`, the `work_set` tool) in the checkout at
+/// `checkout`, and do what that means outside the log: queued frees its claim on GitHub, so any
+/// runner may take it; escalated, from another status, labels the issue as waiting for an
+/// answer and sends a Posti notice, as a run's escalation does (set again, it only labels).
+/// Neither can fail the set: what fails is said on stderr.
+pub fn set_status(
+    home: &Home,
+    checkout: &Path,
+    number: u64,
+    status: jono::Status,
+    note: Option<&str>,
+) -> Result<jono::WorkItem> {
+    let name = jono::repo_name(home, checkout)?;
+    let was = jono::get(home, &name, number).map(|item| item.status).ok();
+    let item = jono::set_status(home, &name, number, status, note)?;
+    match item.status {
+        jono::Status::Queued => jono::release_claim(home, checkout, item.number),
+        jono::Status::Escalated if was != Some(jono::Status::Escalated) => {
+            let notice =
+                crate::posti::Notice::escalated_by_hand(&item.repo, item.number, &item.title);
+            land::tell_with(home, checkout, &item, &notice);
+        }
+        // Already escalated: the person was told, but a label that failed the first time is
+        // tried again.
+        jono::Status::Escalated => {
+            if let Err(err) = jono::mark_needs_answer(home, checkout, item.number) {
+                progress(&format!(
+                    "couldn't label #{} as waiting for an answer: {err:#}",
+                    item.number
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(item)
+}
+
 /// What a run is about to do, on stderr, before the first agent starts.
 fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bool) {
     progress(&format!("repository: {}", item.repo));
@@ -472,7 +529,13 @@ fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bo
 /// Ask on stderr and read a yes or no from stdin. `PAJA_TEST_ANSWER` stands in for the person
 /// in tests (the smoke harness has no terminal).
 fn confirmed() -> Result<bool> {
-    eprint!("Go ahead? [y/N] ");
+    // Like `progress`, never a panic on a closed stderr.
+    {
+        use std::io::Write as _;
+        let mut err = std::io::stderr();
+        let _ = write!(err, "Go ahead? [y/N] ");
+        let _ = err.flush();
+    }
     let mut answer = String::new();
     match std::env::var("PAJA_TEST_ANSWER") {
         Ok(forced) if cfg!(debug_assertions) => answer = forced,
@@ -530,6 +593,13 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         return Ok(RunReport::Paused { resets_at });
     }
     let repo = std::path::absolute(opts.repo)?;
+    if !repo.is_dir() {
+        return Err(Mistake(format!(
+            "{} is not a directory; pass --repo with a path inside the checkout",
+            repo.display()
+        ))
+        .into());
+    }
     // A repository whose configuration was tampered with gets no git, not even a fetch, until
     // a person says it was checked.
     if opts.tamper_checked {
@@ -570,6 +640,15 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         jono::repo_name(home, &repo)?
     };
     let config = read_config(&repo, &base, target)?;
+    // A skipped `.paja/models` line is only a warning on stderr, which nobody reads at an
+    // unattended runner, so Posti tells of each skipped role once.
+    crate::posti::skipped_roles(
+        home,
+        &repo,
+        &name,
+        &config.target.branch,
+        &config.models.skipped,
+    );
     // A new item starts with a build, which a nearly used window would cut off, so it isn't
     // claimed at all (no status events) and the pass waits. A resumed item goes on to its round,
     // which makes the same check for each build.
@@ -610,10 +689,11 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
             }
         }
         if let Some(number) = opts.item {
-            bail!(
-                "work item #{number} is not queued (or another run holds it); see \
-                 `paja work list`"
-            );
+            return Err(Mistake(format!(
+                "work item #{number} is not queued (or another run holds it); see `paja work \
+                 list`"
+            ))
+            .into());
         }
         if let Some(waiting) = jono::waiting(home, &name)? {
             progress(&format!("nothing is ready: {waiting}"));
