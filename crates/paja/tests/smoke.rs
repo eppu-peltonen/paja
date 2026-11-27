@@ -1680,6 +1680,7 @@ fn usage_sums_recorded_steps_per_item_and_day_and_counts_unknown_ones() {
     assert_eq!(report["landed"]["items"], 1);
     assert_eq!(report["landed"]["rounds"]["median"], 1);
     assert_eq!(report["landed"]["tokens"]["p90"], 11 + 22 + 200 + 20);
+    assert_eq!(report["landed"]["wall_ms"]["p90"], one["wall_ms"]);
     // The text says unknown out loud.
     let gh = program(
         tmp.path(),
@@ -1696,6 +1697,12 @@ fn usage_sums_recorded_steps_per_item_and_day_and_counts_unknown_ones() {
         .unwrap();
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(text.contains("1 unknown"), "{text}");
+    assert!(text.contains(", wall median "), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("per landed item") && l.matches(" p90 ").count() == 3),
+        "rounds, tokens and wall time each give a p90: {text}"
+    );
 
     let (ok, only) = paja(&home, &repo, &["usage", "--item", "2"]);
     assert!(ok, "{only}");
