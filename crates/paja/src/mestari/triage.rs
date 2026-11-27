@@ -532,6 +532,12 @@ fn triage_holding(
                 format!("{err:#}")
             }
         });
+        // On stderr too, so the person sees a give-up even if the agent fails after it.
+        if let Some(error) = &error {
+            progress(&format!(
+                "triage: noting #{number} on #{on} failed: {error}"
+            ));
+        }
         retried_notes.push(RetriedNote { number, on, error });
     }
     // Recorded at once, so a pass that fails later doesn't post them again next time.
@@ -584,13 +590,22 @@ fn triage_holding(
         }
         // The original carries the duplicate's finding from now on: if it is closed without
         // being done, its comments say which issue to reopen.
-        if let (true, Some(of)) = (item.closed, item.duplicate_of) {
+        // A pair this pass already retried isn't noted twice: the retry posted it, or failed
+        // and stays pending for the next pass.
+        let retried = |of: u64| {
+            retried_notes
+                .iter()
+                .any(|n| (n.number, n.on) == (item.number, of))
+        };
+        if let (true, Some(of)) = (item.closed, item.duplicate_of.filter(|of| !retried(*of))) {
             let note = duplicate_note(item, &repo);
             if let Err(err) = run_gh(
                 &repo,
                 &["issue", "comment", &of.to_string(), "--body", &note],
             ) {
-                item.error = Some(format!("closed, but noting it on #{of} failed: {err:#}"));
+                item.error = Some(format!(
+                    "closed, but noting it on #{of} failed: {err:#}; the next triage pass tries again"
+                ));
             }
         }
     }
@@ -616,13 +631,6 @@ fn triage_holding(
         .iter()
         .filter(|i| i.closed && i.error.is_some())
         .filter_map(|i| i.duplicate_of.map(|on| (i.number, on)))
-        // A pair this pass already retried is counted once, in `triage.notes`.
-        .filter(|(number, on)| {
-            !report
-                .retried_notes
-                .iter()
-                .any(|n| (n.number, n.on) == (*number, *on))
-        })
         .map(|(number, on)| json!({ "number": number, "on": on }))
         .collect();
     record(
@@ -762,6 +770,7 @@ fn pending_notes(events: &[crate::events::Event], repo: &str) -> Vec<(u64, u64, 
         let noted = pairs(&event.data["noted"]);
         pending.retain(|(pair, _)| !noted.contains(pair));
         let mut failed = pairs(&event.data["note_failed"]);
+        failed.sort_unstable();
         failed.dedup();
         for pair in failed {
             match pending.iter_mut().find(|(p, _)| *p == pair) {

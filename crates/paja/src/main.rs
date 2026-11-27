@@ -938,7 +938,8 @@ fn describe_triage(report: &mestari::TriageReport) -> String {
                 (Verdict::NotWorthDoing, _) => "not worth doing".to_string(),
             };
             let state = match (&item.error, item.closed) {
-                (Some(error), true) => format!(" (closed; {error})"),
+                // A closed item's error is its note's, which says it was closed.
+                (Some(error), true) => format!(" ({error})"),
                 (Some(error), false) => format!(" (not closed: {error})"),
                 (None, true) => " (closed)".to_string(),
                 (None, false) => String::new(),
