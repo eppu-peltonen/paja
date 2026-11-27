@@ -293,15 +293,22 @@ async fn run_stop(
 }
 
 /// Close Desk after the person chose what happens to its runs: `stop` sends each one `stop
-/// now`; otherwise they keep going on their own.
+/// now` and waits for them to end, ending a `paja` still going after the grace period, so none
+/// is left stuck; otherwise they keep going on their own.
 #[tauri::command]
-fn close_desk(app: tauri::AppHandle, runner: tauri::State<'_, Runner>, stop: bool) {
+async fn close_desk(
+    app: tauri::AppHandle,
+    runner: tauri::State<'_, Runner>,
+    stop: bool,
+) -> Result<(), String> {
     if stop {
-        for repo in runner.running() {
-            let _ = runner.stop(&repo, true);
-        }
+        let runner = runner.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || runner.stop_all_now(runs::STOP_NOW_GRACE))
+            .await
+            .map_err(|err| err.to_string())?;
     }
     app.exit(0);
+    Ok(())
 }
 
 /// Desk's version and the `paja` it found: the one installed next to Desk (an installer puts

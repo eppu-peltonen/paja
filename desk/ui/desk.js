@@ -481,7 +481,16 @@ listen("paja://close-asked", (event) => {
   byId("closing").hidden = false;
 });
 byId("close-leave").addEventListener("click", () => invoke("close_desk", { stop: false }).catch(showError));
-byId("close-stop").addEventListener("click", () => invoke("close_desk", { stop: true }).catch(showError));
+// Desk waits for its runs to end (ending a stuck one after the grace period) before it closes.
+byId("close-stop").addEventListener("click", () => {
+  for (const id of ["close-leave", "close-stop", "close-cancel"]) byId(id).disabled = true;
+  byId("close-stop").textContent = "Stopping the runs...";
+  invoke("close_desk", { stop: true }).catch((err) => {
+    for (const id of ["close-leave", "close-stop", "close-cancel"]) byId(id).disabled = false;
+    byId("close-stop").textContent = "Stop them now and close";
+    showError(err);
+  });
+});
 byId("close-cancel").addEventListener("click", () => {
   byId("closing").hidden = true;
 });

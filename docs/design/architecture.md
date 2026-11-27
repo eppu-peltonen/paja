@@ -572,8 +572,9 @@ repository's checkout, so it is the CLI's run with its own lock and hook. "Stop 
 goes to `desk/<owner>@<name>.log` in the home, not to a pipe, so a run left going when Desk closes still has somewhere
 to write; Desk shows its end. Desk refuses to start a run while `paja doctor` has a failing check, while its own run of
 the repository is going, or while any active item's run lock is held (a run started from a terminal), probing it under
-the home lock as the run view does. Closing the window while Desk's runs are going asks whether to stop them (`stop now`)
-or leave them running. The log file holds output only, never state.
+the home lock as the run view does. Closing the window while Desk's runs are going asks whether to stop them or leave them
+running; stopping sends each `stop now` and waits for them to end before Desk exits, ending a `paja` still going after
+the same 15 seconds, so none is left stuck. The log file holds output only, never state.
 
 Each repository also has a pool view ("Pool"), read every two seconds and on every log change: `pool::status` (lanes
 with their item, stage, step, time in step, spend and admitted files; the lane landing and the merging queue; what
