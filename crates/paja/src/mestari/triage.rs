@@ -589,17 +589,27 @@ fn closing_comment(item: &Triaged, repo: &Path) -> String {
 }
 
 /// The account `gh` comments as, if it can name one that is safe to quote in a jq program (a
-/// GitHub login, or an app's `name[bot]`). A token that can't read `/user` (an app's
-/// installation token) gives none, and notes are then posted without looking for an earlier one.
+/// GitHub login, an app's `name[bot]` or a managed user's `name_shortcode`). When Paja runs on
+/// the person's own sign-in, that is the person, and their comments count as Paja's. A token
+/// that can't read `/user` (an app's installation token) gives none, and notes are then posted
+/// without looking for an earlier one; stderr says so.
 fn commenter(repo: &Path) -> Option<String> {
-    let login = run_gh(repo, &["api", "user", "--jq", ".login"]).ok()?;
-    comments_by(login.trim()).map(|_| login.trim().to_string())
+    let login = run_gh(repo, &["api", "user", "--jq", ".login"])
+        .ok()
+        .filter(|login| comments_by(login.trim()).is_some());
+    if login.is_none() {
+        progress(
+            "triage: `gh api user` didn't name the account Paja comments as, so pending notes \
+             are posted without checking for an earlier copy",
+        );
+    }
+    login.map(|login| login.trim().to_string())
 }
 
 /// The jq program that prints the first line of each comment `login` wrote, or `None` for a
 /// login that isn't safe to quote in it.
 fn comments_by(login: &str) -> Option<String> {
-    let plain = |c: char| c.is_ascii_alphanumeric() || "-[]".contains(c);
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_[]".contains(c);
     (!login.is_empty() && login.chars().all(plain)).then(|| {
         format!(".[] | select(.user.login == \"{login}\") | (.body // \"\") | split(\"\\n\")[0]")
     })
@@ -614,8 +624,16 @@ fn already_noted(repo: &Path, login: Option<&str>, on: u64, number: u64) -> bool
         return false;
     };
     let path = format!("repos/{{owner}}/{{repo}}/issues/{on}/comments");
-    run_gh(repo, &["api", &path, "--paginate", "--jq", &jq])
-        .is_ok_and(|first_lines| noted_in(&first_lines, number))
+    match run_gh(repo, &["api", &path, "--paginate", "--jq", &jq]) {
+        Ok(first_lines) => noted_in(&first_lines, number),
+        Err(err) => {
+            progress(&format!(
+                "triage: reading #{on}'s comments failed ({err:#}), so the note on #{number} is \
+                 posted without checking for an earlier copy"
+            ));
+            false
+        }
+    }
 }
 
 /// Whether one of `first_lines` (each the first line of a comment) is the start of a note on
@@ -1611,6 +1629,7 @@ mod tests {
         assert!(jq.contains(r#"select(.user.login == "paja-bot")"#), "{jq}");
         assert!(jq.ends_with(r#"split("\n")[0]"#), "{jq}");
         assert!(comments_by("my-app[bot]").is_some());
+        assert!(comments_by("jane_acme").is_some());
         for bad in ["", "a\"b", "a b", "a\\b", "x\") or true or (\"", "é"] {
             assert_eq!(comments_by(bad), None, "{bad}");
         }
