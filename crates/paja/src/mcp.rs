@@ -366,19 +366,20 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note. An escalated item can't be set to queued: use work_answer, so the next run gets the answer."
+        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note. Escalated also labels the GitHub issue as waiting for an answer and sends a Posti notice (uses gh); queued frees its claim. An escalated item can't be set to queued: use work_answer, so the next run gets the answer."
     )]
     async fn work_set(&self, Parameters(args): Parameters<SetArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
             let status = jono::parse_status(&args.status)?;
             let checkout = checkout(args.repo)?;
-            let name = jono::repo_name(&home, &checkout)?;
-            let item = jono::set_status(&home, &name, args.number, status, args.note.as_deref())?;
-            if status == jono::Status::Queued {
-                // Queued means any runner may take it: free its claim on GitHub too.
-                jono::release_claim(&home, &checkout, args.number);
-            }
+            let item = crate::mestari::set_status(
+                &home,
+                &checkout,
+                args.number,
+                status,
+                args.note.as_deref(),
+            )?;
             Ok(serde_json::to_value(item)?)
         })
         .await

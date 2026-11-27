@@ -396,12 +396,16 @@ review and its verdict, waiting for CI, landed or asked, and with `--every` each
 ### Posti
 
 The comment on the issue is posted with the person's own token, so GitHub doesn't notify them about it. Posti
-(`posti.rs`) tells them instead, next to that comment: when an item escalates (or is parked on an error), when a pass
-of `paja run` fails (with or without `--every`; of failed passes in a row, only the first), and when a run stops
-for a person. Each notice names the repository
-and, for an item, the issue, its title and the answer command. An escalated item's issue also gets the `needs-answer`
-label (created when the repository lacks it), which `paja work answer` removes, so the person can filter or
-subscribe to it on GitHub; a label that can't be set is reported on stderr and the run carries on. `paja work list`
+(`posti.rs`) tells them instead, next to that comment: when an item escalates (or is parked on an error, or is set
+`escalated` by hand with `paja work set` or the `work_set` tool), when a pass of `paja run` fails (with or without
+`--every`; of failed passes in a row, only the first; not for a mistake in how a single `paja run` was started, such as
+a `--repo` that isn't a directory or an `--item` that isn't queued, which is in front of the person already), and when
+a run stops for a person. Each notice names the repository and, for an item, the issue, its title and the answer
+command. An escalated item's issue also gets the `needs-answer` label (created when the repository lacks it), which
+`paja work answer` removes, so the person can filter or subscribe to it on GitHub. An item set `escalated` by hand gets
+its own notice: it says so and points to `paja work show`, since its note stays on this machine. Setting an item that is
+already escalated to `escalated` again sends no second notice and only tries the label again. The notice goes first, so a slow
+`gh` doesn't hold it up; a label that can't be set is reported on stderr and the run carries on. `paja work list`
 shows escalated items first, each with its answer command. A notice goes to two channels:
 
 - **Local.** `PAJA_NOTIFIER` names a program, run with the title and the text as its two arguments; `desktop` asks for

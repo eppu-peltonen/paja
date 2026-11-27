@@ -2255,6 +2255,7 @@ impl Factory {
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi\n\
                  if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  case \"$*\" in *\"--add-label factory-claimed\"*) touch {d}/labelled-$3 ;; *\"--remove-label factory-claimed\"*) rm -f {d}/labelled-$3 ;; esac ;;\n\
+                 \"label create\") if [ -f {d}/label-create-fails ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi ;;\n\
                  \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; id=${{4##*/}}; if [ \"$id\" -ge 88 ] 2>/dev/null; then if [ -f {d}/posted-5 ]; then grep -v \"issuecomment-$id\\\"\" {d}/posted-5 > {d}/posted-5.tmp; mv {d}/posted-5.tmp {d}/posted-5; fi; for x in {d}/after-race-before {d}/after-race-after; do if [ -f $x ] && grep -q \"issuecomment-$id\\\"\" $x; then rm -f $x; fi; done; else rm -f {d}/view-5.json; fi; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-down ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  p=; if [ -f {d}/posted-$3 ]; then p=$(tr '\\n' ',' < {d}/posted-$3 | sed 's/,$//'); fi\n\
@@ -4552,6 +4553,111 @@ fn an_escalation_reaches_the_notifier() {
     assert_eq!(sent[0]["data"]["kind"], "escalated");
     assert_eq!(sent[0]["data"]["number"], 5);
     assert_eq!(sent[0]["data"]["channel"], "PAJA_NOTIFIER");
+}
+
+#[test]
+fn a_mistake_in_how_a_single_run_was_started_sends_no_notice() {
+    let f = Factory::new("true\n", "land");
+    let (notifier, log) = fake_notifier(&f);
+    let missing = f.tmp.path().join("no-such-checkout");
+    for (args, says) in [
+        (vec!["run", "--item", "99"], "is not queued"),
+        (
+            vec!["run", "--repo", missing.to_str().unwrap()],
+            "is not a directory",
+        ),
+    ] {
+        let (ok, report) = paja_with(
+            &f.home,
+            &f.repo,
+            &args,
+            &[
+                ("PAJA_GH", f.gh.as_path()),
+                ("PAJA_CLAUDE", f.claude.as_path()),
+                ("PAJA_NOTIFIER", notifier.as_path()),
+            ],
+        );
+        assert!(!ok, "{args:?}: {report}");
+        assert!(report["error"].as_str().unwrap().contains(says), "{report}");
+    }
+    assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty());
+    assert!(events_of(&f, "notify.sent").is_empty());
+    assert!(events_of(&f, "notify.failed").is_empty());
+}
+
+#[test]
+fn an_item_set_escalated_by_hand_is_labelled_and_notified() {
+    let f = Factory::new("true\n", "land");
+    let (notifier, log) = fake_notifier(&f);
+    let vars = [
+        ("PAJA_GH", f.gh.as_path()),
+        ("PAJA_NOTIFIER", notifier.as_path()),
+    ];
+    let (ok, synced) = paja_with(&f.home, &f.repo, &["work", "sync"], &vars);
+    assert!(ok, "{synced}");
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "set", "5", "escalated", "--note", "Which API?"],
+        &vars,
+    );
+    assert!(ok, "{item}");
+    assert_eq!(item["status"], "escalated", "{item}");
+    let gh = f.gh_log();
+    assert!(
+        gh.contains("issue edit 5 --add-label factory-needs-answer"),
+        "{gh}"
+    );
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        notices.starts_with("Paja: acme/app#5 needs a decision|"),
+        "{notices}"
+    );
+    // No question is on the issue, and the note stays on this machine.
+    assert!(notices.contains("set escalated by hand"), "{notices}");
+    assert!(!notices.contains("Which API?"), "{notices}");
+    // Setting it escalated again tells no one twice.
+    let (ok, again) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "set", "5", "escalated", "--note", "Still?"],
+        &vars,
+    );
+    assert!(ok, "{again}");
+    let sent = events_of(&f, "notify.sent");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["data"]["kind"], "escalated");
+}
+
+#[test]
+fn an_escalation_and_its_answer_finish_when_every_label_call_fails() {
+    let f = Factory::new("true\n", "escalate");
+    let (notifier, log) = fake_notifier(&f);
+    // The label is missing and can't be made either.
+    std::fs::write(f.tmp.path().join("no-label"), "").unwrap();
+    std::fs::write(f.tmp.path().join("label-create-fails"), "").unwrap();
+    let (ok, report) = run_notified(&f, &notifier);
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(f.gh_log().contains("label create factory-needs-answer"));
+    // The notice went out anyway.
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    // Taking the label off fails too, and the answer is still recorded and the item queued.
+    std::fs::write(f.tmp.path().join("label-down"), "").unwrap();
+    let answer = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .args(["--json", "work", "answer", "5", "Use v2"])
+        .output()
+        .unwrap();
+    let item: Value = serde_json::from_slice(&answer.stdout).unwrap();
+    assert!(answer.status.success(), "{item}");
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["answers"][0]["answer"], "Use v2", "{item}");
+    let stderr = String::from_utf8_lossy(&answer.stderr);
+    assert!(stderr.contains("factory-needs-answer"), "{stderr}");
 }
 
 /// What the fake arbiter says next: its `structured_output`.
