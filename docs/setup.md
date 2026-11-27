@@ -293,7 +293,6 @@ item stays active, and the next `paja run` resumes it where its environment left
 once: Paja ends the agent or check and everything it started, and the item still resumes next time, without that
 step's unfinished work. Closing the terminal is like the second Ctrl+C; after a reboot the item resumes the same way.
 
-After pulling a newer Paja, run
-`cargo install --path crates/paja` again.
+To update, install the newer release, or pull `main` and run `cargo install --path crates/paja` again.
 
 Something went wrong, or you want to update or uninstall Paja: see [`troubleshooting.md`](./troubleshooting.md).
