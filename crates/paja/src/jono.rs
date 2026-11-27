@@ -1394,15 +1394,23 @@ fn view_issue(ok: &Untampered, number: u64) -> Result<View> {
     })
 }
 
-/// Who holds an issue, from its labels and comments: the runner in the latest claim comment,
-/// when the issue has the claimed label. An escalated item (it carries `needs_answer`) stays
-/// claimed however old its claim is.
+/// Who holds an issue, from its labels and comments, when the issue has the claimed label: the
+/// runner in the first live claim comment, the one that won the race (a loser whose comment
+/// couldn't be deleted is later), else in the latest claim comment. An escalated item (it
+/// carries `needs_answer`) stays claimed however old its claim is.
 fn holder(view: &View, labels: &Labels) -> Option<Claim> {
     if !view.has_label(&labels.claimed()) {
         return None;
     }
     let escalated = view.has_label(&labels.needs_answer);
-    Some(match view.claims().pop() {
+    let now = now_secs();
+    let mut claims = view.claims();
+    let first_live = claims.iter().position(|c| !c.is_stale(now));
+    let chosen = match first_live {
+        Some(i) => Some(claims.swap_remove(i)),
+        None => claims.pop(),
+    };
+    Some(match chosen {
         Some(c) => Claim {
             runner: c.runner,
             stale_after: (!escalated).then_some(c.stale_after),
@@ -1418,6 +1426,8 @@ fn holder(view: &View, labels: &Labels) -> Option<Claim> {
 /// holder when another runner's live claim comment came first, after deleting this runner's
 /// comment. The claimed label stays then: it is shared, and the winner's live claim is what it
 /// now marks, so taking it off would make the item look free until the winner's next renewal.
+/// When a step fails the claim is taken back the same way (see `take_back`) and the error says
+/// the item was not taken.
 fn claim_on_github(
     ok: &Untampered,
     labels: &Labels,
@@ -1443,39 +1453,67 @@ fn claim_on_github(
             &claim_text(me, now),
         ],
     );
-    let url = match posted {
-        Ok(out) => out.lines().last().unwrap_or_default().trim().to_string(),
+    let not_taken = |err: anyhow::Error| {
+        err.context(format!(
+            "claiming #{number} on GitHub failed, so it was not taken"
+        ))
+    };
+    let own = match posted {
+        Ok(out) => out
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim()
+            .rsplit_once("issuecomment-")
+            .and_then(|(_, id)| id.parse::<u64>().ok()),
         Err(err) => {
-            let _ = remove_label(ok, number, &claimed);
-            return Err(err.context(format!(
-                "claiming #{number} on GitHub failed, so it was not taken"
-            )));
+            take_back(ok, &claimed, number, me, None);
+            return Err(not_taken(err));
         }
     };
     let view = match view_issue(ok, number) {
         Ok(view) => view,
         Err(err) => {
-            let _ = remove_label(ok, number, &claimed);
-            return Err(err.context(format!(
-                "claiming #{number} on GitHub failed, so it was not taken"
-            )));
+            take_back(ok, &claimed, number, me, own);
+            return Err(not_taken(err));
         }
     };
     let first = view.claims().into_iter().find(|c| !c.is_stale(now));
     let Some(first) = first.filter(|c| c.runner != me) else {
         return Ok(None);
     };
-    if let Some(id) = url
-        .rsplit_once("issuecomment-")
-        .and_then(|(_, id)| id.parse::<u64>().ok())
-    {
-        let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
-        let _ = gh(ok, &["api", "-X", "DELETE", &path]);
+    if let Some(id) = own {
+        let _ = delete_comment(ok, id);
     }
     Ok(Some(Claim {
         runner: first.runner,
         stale_after: Some(first.stale_after),
     }))
+}
+
+fn delete_comment(ok: &Untampered, id: u64) -> Result<()> {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+    gh(ok, &["api", "-X", "DELETE", &path]).map(drop)
+}
+
+/// Undo a claim that failed part way: delete this runner's comment (`own`, when it was posted),
+/// then take the shared claimed label off unless another runner's live claim is on the issue,
+/// whose label it is. When the issue can't be read the label comes off, so a failure never
+/// leaves an item looking claimed by nobody in particular. Best effort: the caller reports the
+/// failure that brought it here.
+fn take_back(ok: &Untampered, claimed: &str, number: u64, me: &str, own: Option<u64>) {
+    if let Some(id) = own {
+        let _ = delete_comment(ok, id);
+    }
+    let now = now_secs();
+    let other = view_issue(ok, number).is_ok_and(|view| {
+        view.claims()
+            .iter()
+            .any(|c| c.runner != me && !c.is_stale(now))
+    });
+    if !other {
+        let _ = remove_label(ok, number, claimed);
+    }
 }
 
 fn add_label(
@@ -2513,6 +2551,37 @@ mod tests {
             url: format!("https://example.com/{number}"),
             priority: Priority::Work,
         }
+    }
+
+    #[test]
+    fn the_holder_is_the_race_winner_not_a_loser_left_behind() {
+        let labels = Labels::default();
+        let comment = |runner: &str, stale: &str, id: u64| {
+            json!({
+                "body": format!("Claimed by runner {runner} at 2020-01-01T00:00:00Z; stale after {stale}"),
+                "url": format!("https://example.com/acme/app/issues/5#issuecomment-{id}"),
+            })
+        };
+        let view = |comments: Value| -> View {
+            serde_json::from_value(json!({
+                "labels": [{"name": labels.claimed()}],
+                "comments": comments,
+            }))
+            .unwrap()
+        };
+        // A stale claim, the winner, then a loser whose comment couldn't be deleted.
+        let raced = view(json!([
+            comment("old", "2020-01-02T00:00:00Z", 1),
+            comment("winner", "2999-01-01T00:00:00Z", 2),
+            comment("loser", "2999-01-01T00:00:00Z", 3),
+        ]));
+        assert_eq!(holder(&raced, &labels).unwrap().runner, "winner");
+        // With every claim stale, the latest still names who held it last.
+        let stale = view(json!([
+            comment("a", "2020-01-02T00:00:00Z", 1),
+            comment("b", "2020-01-03T00:00:00Z", 2),
+        ]));
+        assert_eq!(holder(&stale, &labels).unwrap().runner, "b");
     }
 
     #[test]
