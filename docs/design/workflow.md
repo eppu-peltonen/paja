@@ -92,7 +92,9 @@ issue is kept. Each issue reaches the agent with when it was opened. Issue text 
 
 `--json` prints `{repo, base, items, closed, not_worth_doing}`, and `retried_notes` when a pass tried earlier notes
 again; each item has its `verdict`, `reason`, `duplicate_of` or
-`evidence` when it has one, and `closed` (or the `error` that stopped a close). Each pass is recorded as `triage.ran`
+`evidence` when it has one, and `closed` (or the `error` that stopped a close). Triage posts its reason as a comment
+from a file and then closes the issue, so an issue is never closed without saying why; one whose reason couldn't be
+posted stays open, with the `error`, for the next pass. Each pass is recorded as `triage.ran`
 with what was closed, kept and left for the person.
 
 `paja run --every` triages at most once a day, when a pass finds the queue idle. It reads `triage.ran` (and

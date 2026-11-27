@@ -42,6 +42,7 @@ use follow_ups::*;
 use land::*;
 use usage::*;
 
+pub(crate) use follow_ups::{body_file, redact_for_comment, QUOTED_CHARS};
 pub use progress::progress;
 use progress::*;
 pub use usage::{ModelUsage, StepUsage};
@@ -702,7 +703,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 )?;
                 return Err(err);
             }
-            let asked = comment(&repo, &item, &question);
+            let asked = comment(home, &repo, &item, &question);
             tell(home, &repo, &item);
             progress(&parked_line(
                 &format!("#{} stopped on an error and was parked", item.number),

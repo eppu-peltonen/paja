@@ -311,7 +311,7 @@ pub(super) fn settle(
         jono::answer_by_arbiter(home, &item.repo, item.number, question, &answer)?;
         // The branch keeps the work; the worktree and its ports are freed, as for an escalation.
         let _ = ahjo::remove(home, &env.name, true);
-        let said = comment_answer(repo, item, question, &answer, &ruling.reason);
+        let said = comment_answer(home, repo, item, question, &answer, &ruling.reason);
         progress(&match said {
             Ok(()) => format!(
                 "the arbiter answered #{}: {}; it is queued again, and `paja work answer {} \
@@ -360,12 +360,17 @@ pub(super) fn settle(
 /// Say on the issue what the arbiter decided and why, and how to override it. The text can quote
 /// CI logs or review text, so it is redacted first: the issue is public.
 fn comment_answer(
+    home: &Home,
     repo: &Path,
     item: &WorkItem,
     question: &str,
     answer: &str,
     reason: &str,
 ) -> Result<()> {
+    let public = |text: &str| {
+        follow_ups::redact_for_comment(text, repo, home.root(), follow_ups::QUOTED_CHARS)
+    };
+    let (answer, reason) = (public(answer), public(reason));
     let why = if reason.trim().is_empty() {
         String::new()
     } else {
@@ -375,21 +380,10 @@ fn comment_answer(
         "**Paja's arbiter answered this instead of asking you.**\n\nThe question was:\n\n{}\n\n\
          Decided: {answer}{why}\n\nThe item is queued again with that answer. To decide \
          otherwise before the next run, answer with `paja work answer {n} \"<your answer>\"`.",
-        clip(question),
+        public(question),
         n = item.number
     );
-    let body = follow_ups::redact_for_issue(&body, repo);
-    run_gh(
-        repo,
-        &[
-            "issue",
-            "comment",
-            &item.number.to_string(),
-            "--body",
-            &body,
-        ],
-    )?;
-    Ok(())
+    follow_ups::comment_on_issue(home, repo, item.number, &body)
 }
 
 #[cfg(test)]
