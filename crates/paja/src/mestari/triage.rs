@@ -16,8 +16,13 @@ const INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most issues one pass reads (the oldest first) and the most of each body the agent sees.
 const MAX_ISSUES: usize = 60;
 const MAX_BODY: usize = 2000;
-/// The Ahjo environment the triage agent runs in: a checkout of the default branch.
-const ENV_NAME: &str = "triage";
+/// The Ahjo environment the triage agent runs in for `repo` (`owner/name`): a checkout of the
+/// default branch, named like a work item's environment (the repository's name and a hash of
+/// `owner/name`), so each repository has its own and a person's `paja env create triage` is
+/// never reused or removed.
+pub fn env_name(repo: &str) -> String {
+    jono::env_name_for(repo, "triage")
+}
 
 /// What the triage agent decided about one issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -304,6 +309,25 @@ fn closing_comment(item: &Triaged, repo: &Path) -> String {
 /// and record the pass as `triage.ran`.
 pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
     let repo = std::path::absolute(repo)?;
+    let name = jono::repo_name(home, &repo)?;
+    let Some(lock) = home.try_triage_lock(&name)? else {
+        bail!(
+            "another triage pass of {name} is running (`paja triage`, the MCP tool or \
+             `paja run --every`); wait for it to finish, then run `paja triage` again"
+        );
+    };
+    triage_holding(home, &repo, &name, lock)
+}
+
+/// [`triage`], holding `repo`'s triage lock.
+fn triage_holding(
+    home: &Home,
+    repo: &Path,
+    name: &str,
+    _lock: crate::home::RunLock,
+) -> Result<TriageReport> {
+    let repo = repo.to_path_buf();
+    let name = name.to_string();
     ahjo::ensure_untampered(home, &repo)?;
     let target = RepoSettings::read(&repo)?;
     let branch = target.branch.as_str();
@@ -319,7 +343,6 @@ pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
         &read_from_base(&repo, &base, MODELS_FILE)?.unwrap_or_default(),
         branch,
     )?;
-    let name = jono::repo_name(home, &repo)?;
 
     let listed = run_gh(
         &repo,
@@ -352,7 +375,7 @@ pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
             if open.len() == 1 { "" } else { "s" }
         ));
         crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
-        let (answer, used) = ask(home, &repo, &base, &open, &models)?;
+        let (answer, used) = ask(home, &repo, &name, &base, &open, &models)?;
         usage = Some(used);
         items = decide(&open, answer, &|commit, file| {
             check_evidence(&repo, &base, commit, file)
@@ -417,20 +440,22 @@ pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
 fn ask(
     home: &Home,
     repo: &Path,
+    name: &str,
     base: &str,
     open: &[Open],
     models: &Models,
 ) -> Result<(Answer, StepUsage)> {
+    let env_name = env_name(name);
     // A checkout left behind by a pass that was killed is reused, put back on the default branch.
-    let env = match ahjo::get(home, ENV_NAME) {
+    let env = match ahjo::get(home, &env_name) {
         Ok(env) => env,
         Err(_) => {
-            let branch = format!("refs/heads/paja/{ENV_NAME}");
+            let branch = format!("refs/heads/paja/{env_name}");
             let resume = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
             ahjo::create(
                 home,
                 CreateOptions {
-                    name: ENV_NAME,
+                    name: &env_name,
                     repo,
                     base: if resume { None } else { Some(base) },
                 },
@@ -475,7 +500,7 @@ fn ask(
     })();
     // Nothing in the checkout is worth keeping, but a tampered repository gets no more git.
     if !matches!(&result, Err(err) if is_tampered(err)) {
-        let _ = ahjo::remove(home, ENV_NAME, true);
+        let _ = ahjo::remove(home, &env_name, true);
     }
     result
 }
@@ -497,7 +522,11 @@ pub fn triage_if_due(home: &Home, repo: &Path) -> Result<Option<TriageReport>> {
     if triaged_today(&home.events().read_all()?, &name, crate::events::now_ms()) {
         return Ok(None);
     }
-    match triage(home, repo) {
+    // A pass already running (a `paja triage` by hand, say) is this one's: skip it, unrecorded.
+    let Some(lock) = home.try_triage_lock(&name)? else {
+        return Ok(None);
+    };
+    match triage_holding(home, &std::path::absolute(repo)?, &name, lock) {
         Ok(report) => Ok(Some(report)),
         Err(err) => {
             if !is_fatal(&err) {

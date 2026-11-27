@@ -4526,6 +4526,49 @@ fn triage_closes_a_duplicate_and_an_already_fixed_issue_and_reports_all_three() 
 }
 
 #[test]
+fn triage_leaves_a_persons_triage_environment_alone_and_waits_for_a_running_pass() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "keep", "reason": "still open"},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // A person's own environment that happens to be called `triage`.
+    let (ok, env) = paja(&f.home, &f.repo, &["env", "create", "triage"]);
+    assert!(ok, "{env}");
+    let theirs = std::path::PathBuf::from(env["path"].as_str().unwrap());
+    std::fs::write(theirs.join("my-work.txt"), "unsaved").unwrap();
+    // While another pass holds the repository's triage lock, a second one doesn't start.
+    let home = paja::home::Home::at(&f.home).unwrap();
+    let held = home.try_triage_lock("acme/app").unwrap().unwrap();
+    let (ok, err) = triage(&f, &dir);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("another triage pass of acme/app") && msg.contains("paja triage"),
+        "{msg}"
+    );
+    assert!(!dir.join("claude-calls").exists(), "the agent ran");
+    drop(held);
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    // The pass ran in an environment of its own and removed only that one.
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    let names: Vec<&str> = envs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["triage"], "{envs}");
+    assert_eq!(
+        std::fs::read_to_string(theirs.join("my-work.txt")).unwrap(),
+        "unsaved"
+    );
+}
+
+#[test]
 fn triage_never_closes_not_worth_doing_or_what_it_cannot_back_up() {
     let (f, dir) = triage_factory(
         r#"{"issues": [

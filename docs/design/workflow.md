@@ -50,7 +50,10 @@ is never closed: the report lists it, and the person decides. An issue that also
 is left out.
 
 The agent reads the default branch only, in a checkout made from it for the pass, under the deny-list hook with
-read-only tools, like a reviewer. Its word is not enough to close anything: Paja closes a duplicate only when the
+read-only tools, like a reviewer. The checkout is an Ahjo environment named like a work item's (`<repo>-<hash>-triage`),
+so each repository has its own and an environment a person made is never reused or removed. One pass runs per
+repository at a time: a pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is
+held and says to wait, and `paja run --every` and an idle pool skip their pass then. Its word is not enough to close anything: Paja closes a duplicate only when the
 original is another open issue that stays open, and an already-fixed issue only when the named commit is on the default
 branch or the named file exists there; otherwise the issue is kept. Issue text reaches the agent as data to judge.
 
