@@ -157,7 +157,10 @@ is ready to take, so nothing is claimed on GitHub; with `none`
 landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
 creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
 `owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch
-(resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it claims anything,
+(resuming the branch an earlier run kept). An item started before environments carried the repository's name
+resumes its old `work-<issue>` environment when that was made in this checkout; one that belongs to another
+repository is never taken, and a hashed name found to belong to another repository stops the run with the
+`paja env remove <name>` fix. A mistake in that configuration stops the pass before it claims anything,
 with an error naming the file and line, so one fix on the default branch is all it takes. That holds even when the
 queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
 While it works on an item the run holds an OS file lock,

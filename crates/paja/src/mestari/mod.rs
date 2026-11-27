@@ -1751,13 +1751,43 @@ fn turn_limit_twice(scene: &Scene, note: &str, round: u32) -> Result<RunReport> 
     settle(scene, &question, "", round)
 }
 
+/// The environment an earlier run made for the item in `repo`, if there is one: the one named
+/// by [`WorkItem::env_name`], else the `work-<n>` one that releases before repositories were
+/// recorded made, so an item started before an upgrade keeps its branch and session.
+fn existing_environment(home: &Home, repo: &Path, item: &WorkItem) -> Result<Option<Env>> {
+    let name = item.env_name();
+    // The name holds only a short hash of the repository, so two repositories could in
+    // principle share it; never run one's item in the other's worktree.
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if let Ok(env) = ahjo::get(home, &name) {
+        if !same(&env.repo, repo) {
+            bail!(
+                "environment {name} belongs to the repository at {}, not {}; two repositories \
+                 got the same environment name, so remove it with `paja env remove {name}` \
+                 if it is stale",
+                env.repo.display(),
+                repo.display()
+            );
+        }
+        return Ok(Some(env));
+    }
+    // `work-<n>` carries no repository, so it is this item's only if it was made in `repo`.
+    let legacy = format!("work-{}", item.number);
+    Ok(ahjo::get(home, &legacy)
+        .ok()
+        .filter(|env| same(&env.repo, repo)))
+}
+
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
 /// run of the same item is resumed, so its work isn't thrown away.
 /// The flag says whether the branch (and so the work on it) was kept from an earlier run, as
 /// opposed to made again from the base.
 fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<(Env, bool)> {
     let name = item.env_name();
-    if let Ok(env) = ahjo::get(home, &name) {
+    if let Some(env) = existing_environment(home, repo, item)? {
         return Ok((env, true));
     }
     let branch = format!("refs/heads/paja/{name}");
@@ -2960,6 +2990,105 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    fn repo_with_commit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(path.join("f.txt"), "f\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-qm", "c"]);
+        path
+    }
+
+    fn work_item(repo: &str, number: u64) -> crate::jono::WorkItem {
+        crate::jono::WorkItem {
+            repo: repo.into(),
+            number,
+            title: "t".into(),
+            body: String::new(),
+            url: String::new(),
+            open: true,
+            status: crate::jono::Status::Active,
+            note: None,
+            usage: None,
+            answers: Vec::new(),
+            waiting_on: Vec::new(),
+            priority: crate::jono::Priority::Work,
+            claim: None,
+        }
+    }
+
+    #[test]
+    fn an_environment_of_another_repository_is_refused_and_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let (a, b) = (
+            repo_with_commit(tmp.path(), "a"),
+            repo_with_commit(tmp.path(), "b"),
+        );
+        let item = work_item("o/a", 5);
+        let name = item.env_name();
+        // As if another repository's item had the same environment name.
+        let theirs = crate::ahjo::create(
+            &home,
+            crate::ahjo::CreateOptions {
+                name: &name,
+                repo: &b,
+                base: None,
+            },
+        )
+        .unwrap();
+        let err = super::environment(&home, &a, "HEAD", &item)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belongs to the repository"), "{err}");
+        assert!(err.contains(&format!("paja env remove {name}")), "{err}");
+        assert!(theirs.path.exists());
+        assert_eq!(crate::ahjo::get(&home, &name).unwrap().repo, theirs.repo);
+        // The repository it belongs to resumes it.
+        let (env, resumed) = super::environment(&home, &b, "HEAD", &item).unwrap();
+        assert!(resumed);
+        assert_eq!(env.path, theirs.path);
+    }
+
+    #[test]
+    fn an_item_started_before_the_upgrade_resumes_its_work_n_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let (a, b) = (
+            repo_with_commit(tmp.path(), "a"),
+            repo_with_commit(tmp.path(), "b"),
+        );
+        let old = crate::ahjo::create(
+            &home,
+            crate::ahjo::CreateOptions {
+                name: "work-7",
+                repo: &a,
+                base: None,
+            },
+        )
+        .unwrap();
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &work_item("o/a", 7)).unwrap();
+        assert!(resumed);
+        assert_eq!(env.name, "work-7");
+        assert_eq!(env.path, old.path);
+        // Another checkout's item #7 doesn't take it over.
+        let (other, resumed) = super::environment(&home, &b, "HEAD", &work_item("o/b", 7)).unwrap();
+        assert!(!resumed);
+        assert_ne!(other.name, "work-7");
+    }
+
     #[test]
     fn reset_times_are_read_and_shown_in_utc() {
         // 2026-11-27 18:30:00 UTC.
