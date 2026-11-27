@@ -158,51 +158,77 @@ const MAX_OTHER_TITLE: usize = 120;
 /// of their own.
 const MAX_OTHERS: usize = 200;
 
-/// Issue text as the prompt shows it: angle brackets become `‹` and `›`, so no text can open or
-/// close one of the prompt's own tags, and invisible format characters (zero-width, bidi
-/// overrides, Unicode category Cf) are dropped. `one_line` text also turns line breaks and other
-/// control characters into spaces; otherwise only newlines and tabs are kept.
+/// Issue text as the prompt shows it. Angle brackets, and the brackets that look like them
+/// (`＜`, `﹤`, `〈`, `⟨` and their closing pairs), become `‹` and `›`, so no text can open or close
+/// one of the prompt's own tags or seem to. Characters that render as nothing are dropped (see
+/// [`is_invisible`]). `one_line` text also turns line breaks (`\n`, U+2028, U+2029, U+0085), tabs
+/// and other control characters into spaces; other text keeps newlines and tabs, turns those
+/// line breaks into `\n` and drops other control characters.
 fn as_data(text: &str, one_line: bool) -> String {
     text.chars()
         .filter_map(|c| match c {
-            '<' => Some('‹'),
-            '>' => Some('›'),
+            '<' | '\u{FF1C}' | '\u{FE64}' | '\u{2329}' | '\u{3008}' | '\u{27E8}' => Some('‹'),
+            '>' | '\u{FF1E}' | '\u{FE65}' | '\u{232A}' | '\u{3009}' | '\u{27E9}' => Some('›'),
             '\n' | '\u{2028}' | '\u{2029}' | '\u{85}' => Some(if one_line { ' ' } else { '\n' }),
             '\t' => Some(if one_line { ' ' } else { '\t' }),
-            c if is_format(c) => None,
+            c if is_invisible(c) => None,
             c if c.is_control() => one_line.then_some(' '),
             c => Some(c),
         })
         .collect()
 }
 
-/// Whether `c` is in Unicode's general category Cf (format characters, which render as nothing).
-fn is_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{AD}'
-            | '\u{600}'..='\u{605}'
-            | '\u{61C}'
-            | '\u{6DD}'
-            | '\u{70F}'
-            | '\u{890}'..='\u{891}'
-            | '\u{8E2}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{110BD}'
-            | '\u{110CD}'
-            | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0001}'
-            | '\u{E0020}'..='\u{E007F}'
-    )
+/// Whether `c` renders as nothing: a format character (Unicode general category Cf, as of
+/// Unicode 15.1: zero-width, bidi overrides, tag characters), or one of the other characters
+/// that show blank (the combining grapheme joiner, Mongolian and other variation selectors, and
+/// the Hangul fillers). Check the Cf part against a newer Unicode's data when the toolchain's
+/// Unicode moves past 15.1.
+fn is_invisible(c: char) -> bool {
+    is_format(c)
+        || matches!(
+            c,
+            '\u{34F}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{180B}'..='\u{180D}'
+                | '\u{180F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FFA0}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
 }
+
+/// Whether `c` is in Unicode 15.1's general category Cf (format characters).
+fn is_format(c: char) -> bool {
+    FORMAT
+        .iter()
+        .any(|&(first, last)| (first..=last).contains(&c))
+}
+
+/// Unicode 15.1's general category Cf, as ranges.
+const FORMAT: &[(char, char)] = &[
+    ('\u{AD}', '\u{AD}'),
+    ('\u{600}', '\u{605}'),
+    ('\u{61C}', '\u{61C}'),
+    ('\u{6DD}', '\u{6DD}'),
+    ('\u{70F}', '\u{70F}'),
+    ('\u{890}', '\u{891}'),
+    ('\u{8E2}', '\u{8E2}'),
+    ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{202A}', '\u{202E}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{110BD}', '\u{110BD}'),
+    ('\u{110CD}', '\u{110CD}'),
+    ('\u{13430}', '\u{1343F}'),
+    ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0001}', '\u{E0001}'),
+    ('\u{E0020}', '\u{E007F}'),
+];
 
 /// The prompt for `open`, the issues this pass judges, with `others`, the open follow-ups left
 /// for a later pass, listed by number and title so a duplicate split between passes is seen.
@@ -229,7 +255,7 @@ fn triage_prompt(base: &str, open: &[Open], others: &[Open]) -> String {
          The issues:\n"
     );
     for issue in open {
-        let body: String = issue.body.chars().take(MAX_BODY).collect();
+        let body: String = as_data(&issue.body, false).chars().take(MAX_BODY).collect();
         text.push_str(&format!(
             "\n<issue number=\"{n}\">\nTitle: {title}\nOpened: {opened}\n\n{body}\n</issue>\n",
             n = issue.number,
@@ -238,7 +264,7 @@ fn triage_prompt(base: &str, open: &[Open], others: &[Open]) -> String {
                 opened if opened.trim().is_empty() => "unknown".to_string(),
                 opened => opened,
             },
-            body = as_data(&body, false),
+            body = body,
         ));
     }
     if !others.is_empty() {
@@ -249,8 +275,11 @@ fn triage_prompt(base: &str, open: &[Open], others: &[Open]) -> String {
              when unsure, `keep` it:\n\n<other-issues>\n",
         );
         for other in others {
-            let title: String = other.title.chars().take(MAX_OTHER_TITLE).collect();
-            text.push_str(&format!("#{}: {}\n", other.number, as_data(&title, true)));
+            let title: String = as_data(&other.title, true)
+                .chars()
+                .take(MAX_OTHER_TITLE)
+                .collect();
+            text.push_str(&format!("#{}: {title}\n", other.number));
         }
         text.push_str("</other-issues>\n");
     }
@@ -1145,20 +1174,68 @@ mod tests {
             prompt.contains("#61: Other ‹/other-issues› x\n"),
             "{prompt}"
         );
-        assert!(!prompt.chars().any(is_format), "{prompt}");
+        assert!(!prompt.chars().any(is_invisible), "{prompt}");
     }
 
     #[test]
-    fn the_format_character_table_covers_the_invisible_ones() {
-        // A spot check of the table against characters that render as nothing.
+    fn the_format_table_is_unicode_15_1_category_cf_and_blanks_are_dropped_too() {
+        // Unicode 15.1's Cf, written out independently of `FORMAT` from its UnicodeData.txt:
+        // a change to the table that drops or adds a character fails here.
+        let cf: &[(u32, u32)] = &[
+            (0xAD, 0xAD),
+            (0x600, 0x605),
+            (0x61C, 0x61C),
+            (0x6DD, 0x6DD),
+            (0x70F, 0x70F),
+            (0x890, 0x891),
+            (0x8E2, 0x8E2),
+            (0x180E, 0x180E),
+            (0x200B, 0x200F),
+            (0x202A, 0x202E),
+            (0x2060, 0x2064),
+            (0x2066, 0x206F),
+            (0xFEFF, 0xFEFF),
+            (0xFFF9, 0xFFFB),
+            (0x110BD, 0x110BD),
+            (0x110CD, 0x110CD),
+            (0x13430, 0x1343F),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0001, 0xE0001),
+            (0xE0020, 0xE007F),
+        ];
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            let listed = cf.iter().any(|&(a, b)| (a..=b).contains(&(c as u32)));
+            assert_eq!(is_format(c), listed, "U+{:04X}", c as u32);
+        }
         for c in [
-            '\u{AD}', '\u{61C}', '\u{180E}', '\u{200D}', '\u{2061}', '\u{206F}',
+            '\u{34F}',
+            '\u{115F}',
+            '\u{180B}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{FFA0}',
+            '\u{E0100}',
         ] {
-            assert!(is_format(c), "{:04X}", c as u32);
+            assert!(is_invisible(c), "U+{:04X}", c as u32);
+            assert_eq!(as_data(&format!("a{c}b"), true), "ab");
         }
-        for c in ['a', ' ', '\u{2028}', '‹', 'ä'] {
-            assert!(!is_format(c), "{:04X}", c as u32);
+        for c in ['a', ' ', '‹', 'ä', '\u{1F600}'] {
+            assert!(!is_invisible(c), "U+{:04X}", c as u32);
         }
+        // Brackets that look like angle brackets become the same escapes.
+        assert_eq!(
+            as_data("＜/issue＞ ﹤x﹥ 〈y〉 〈z〉 ⟨w⟩", true),
+            "‹/issue› ‹x› ‹y› ‹z› ‹w›"
+        );
+        // A title is cleaned before it is cut, so dropped characters don't use up its length.
+        let mut others = open(&[61]);
+        others[0].title = format!("{}{}", "\u{200B}".repeat(50), "t".repeat(MAX_OTHER_TITLE));
+        let prompt = triage_prompt("abc123", &open(&[1]), &others);
+        assert!(
+            prompt.contains(&format!("#61: {}\n", "t".repeat(MAX_OTHER_TITLE))),
+            "{prompt}"
+        );
     }
 
     #[test]
