@@ -4688,6 +4688,12 @@ fn triage_closes_a_duplicate_and_an_already_fixed_issue_and_reports_all_three() 
     );
     let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
     assert!(log.contains("issue close 12 --comment"), "{log}");
+    // The original, which stays open, notes the duplicate so its finding isn't lost.
+    assert!(
+        log.contains("issue comment 11 --body **Paja triage closed #12 (Tidy the helper, again)"),
+        "{log}"
+    );
+    assert!(!log.contains("issue comment 13"), "{log}");
     assert!(log.contains("issue close 13 --comment"), "{log}");
     assert!(!log.contains("issue close 11"), "{log}");
     assert!(

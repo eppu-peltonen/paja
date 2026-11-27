@@ -47,7 +47,9 @@ read in full over a few passes. The verdicts:
 - `already_fixed`: the default branch already fixes it, with a commit on that branch or a file there that shows it.
 - `not_worth_doing`: valid but not worth the effort, with the reason.
 
-Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. "Not worth doing"
+Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. A duplicate's
+original also gets a comment naming the closed issue, so if the original is later closed without being done, the
+duplicate's finding can be found and reopened. "Not worth doing"
 is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
 is left out.
 

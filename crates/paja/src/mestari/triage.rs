@@ -365,6 +365,19 @@ fn closing_comment(item: &Triaged, repo: &Path) -> String {
     follow_ups::redact_for_issue(&text, repo)
 }
 
+/// The comment a duplicate's original gets, so the duplicate's finding isn't lost if the
+/// original is later closed without being done.
+fn duplicate_note(item: &Triaged, repo: &Path) -> String {
+    let text = format!(
+        "**Paja triage closed #{n} ({title}) as a duplicate of this issue.**\n\n{reason}\n\nIf \
+         this issue is closed without being done, reopen #{n} so its finding isn't lost.",
+        n = item.number,
+        title = item.title,
+        reason = item.reason
+    );
+    follow_ups::redact_for_issue(&text, repo)
+}
+
 /// Sort the repository's open follow-up issues, close the duplicates and the already-fixed ones,
 /// and record the pass as `triage.ran`.
 pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
@@ -461,6 +474,17 @@ fn triage_holding(
         ) {
             Ok(_) => item.closed = true,
             Err(err) => item.error = Some(format!("{err:#}")),
+        }
+        // The original carries the duplicate's finding from now on: if it is closed without
+        // being done, its comments say which issue to reopen.
+        if let (true, Some(of)) = (item.closed, item.duplicate_of) {
+            let note = duplicate_note(item, &repo);
+            if let Err(err) = run_gh(
+                &repo,
+                &["issue", "comment", &of.to_string(), "--body", &note],
+            ) {
+                item.error = Some(format!("closed, but noting it on #{of} failed: {err:#}"));
+            }
         }
     }
     let report = TriageReport {
