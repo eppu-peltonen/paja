@@ -4171,6 +4171,8 @@ fn findings_left_at_the_round_limit_reach_the_notifier() {
         notices.starts_with("Paja: acme/app#5 landed with 1 open finding|"),
         "{notices}"
     );
+    // The notice names the pull request that lists them.
+    assert!(notices.contains("are listed in https://"), "{notices}");
     let sent = events_of(&f, "notify.sent");
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["data"]["kind"], "left_findings");

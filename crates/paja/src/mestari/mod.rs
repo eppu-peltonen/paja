@@ -1558,8 +1558,21 @@ fn run_item(
                 Ok(Landing::Retry(why)) => {
                     progress("CI failed; sending the failure back to the builder");
                     feedback = why.clone();
+                    // Every finding in the change was fixed before landing, so only those outside
+                    // it are left for the re-reviewer to keep or drop.
+                    prior = Some(Prior {
+                        reviewed: judged,
+                        blockers: why.clone(),
+                        follow_ups: outside(&follow_ups),
+                    });
+                    let next = Next {
+                        feedback: &feedback,
+                        prior: prior.as_ref(),
+                    };
+                    record_round_next(home, item, round, "ci_failed", &why, steps, Some(next))?;
                     // At the round limit no round follows and the run escalates: keep what it
-                    // would have landed without in the log.
+                    // would have landed without in the log, after the round is recorded so a
+                    // resumed run does not log them twice.
                     if round == MAX_ROUNDS {
                         for (text, _) in &left {
                             record_follow_up(
@@ -1571,25 +1584,13 @@ fn run_item(
                             );
                         }
                     }
-                    // Below the limit every finding in the change was fixed before landing, so
-                    // only those outside it are left for the re-reviewer to keep or drop.
-                    prior = Some(Prior {
-                        reviewed: judged,
-                        blockers: why.clone(),
-                        follow_ups: outside(&follow_ups),
-                    });
-                    let next = Next {
-                        feedback: &feedback,
-                        prior: prior.as_ref(),
-                    };
-                    record_round_next(home, item, round, "ci_failed", &why, steps, Some(next))?;
                     continue;
                 }
                 Ok(Landing::Done(report)) => Ok(report),
                 Err(err) => Err(err),
             };
             match &report {
-                Ok(RunReport::Landed { .. }) => {
+                Ok(RunReport::Landed { pr, .. }) => {
                     for (text, why) in &left {
                         record_follow_up(home, item, text, None, why);
                     }
@@ -1601,6 +1602,7 @@ fn run_item(
                             &item.repo,
                             item.number,
                             &item.title,
+                            pr,
                             open,
                         );
                         crate::posti::send(home, repo, &notice);

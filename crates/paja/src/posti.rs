@@ -53,7 +53,7 @@ impl Notice {
 
     /// An item landed with review findings still open at the round limit, listed in its pull
     /// request; nothing else asks a person to read them.
-    pub fn left_findings(repo: &str, number: u64, title: &str, count: usize) -> Self {
+    pub fn left_findings(repo: &str, number: u64, title: &str, pr: &str, count: usize) -> Self {
         let findings = if count == 1 { "finding" } else { "findings" };
         Self {
             repo: Some(repo.to_string()),
@@ -62,7 +62,7 @@ impl Notice {
             title: format!("Paja: {repo}#{number} landed with {count} open {findings}"),
             text: format!(
                 "{title}. The reviewers' {findings} still open at the round limit are listed in \
-                 the pull request; read them and open an issue for any you want fixed."
+                 {pr}; read them and open an issue for any you want fixed."
             ),
         }
     }

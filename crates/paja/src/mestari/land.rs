@@ -103,11 +103,7 @@ pub(super) fn land(
     }
     // The body goes in a file: with ten findings of up to 4000 characters it is past Windows'
     // command-line limit.
-    if body.chars().count() > PR_BODY_CHARS {
-        let cut = "\n\n(cut short)";
-        body = body.chars().take(PR_BODY_CHARS - cut.len()).collect();
-        body.push_str(cut);
-    }
+    let body = cut_short(body, PR_BODY_CHARS);
     let body_path = super::body_file(home, &format!("pr-{}", item.number), &body)?;
     let body_arg = body_path.to_string_lossy().into_owned();
     // Reuse this branch's pull request only while it is still open, with this round's body.
@@ -371,5 +367,29 @@ pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// `body` cut to at most `limit` characters, ending "(cut short)" when it was longer.
+fn cut_short(body: String, limit: usize) -> String {
+    if body.chars().count() <= limit {
+        return body;
+    }
+    let cut = "\n\n(cut short)";
+    let mut kept: String = body.chars().take(limit - cut.chars().count()).collect();
+    kept.push_str(cut);
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_body_past_the_limit_is_cut_to_it_by_characters() {
+        let body = "ä".repeat(100);
+        let cut = super::cut_short(body.clone(), 50);
+        assert_eq!(cut.chars().count(), 50);
+        assert!(cut.ends_with("\n\n(cut short)"));
+        assert!(cut.starts_with("ää"));
+        assert_eq!(super::cut_short(body.clone(), 100), body);
     }
 }
