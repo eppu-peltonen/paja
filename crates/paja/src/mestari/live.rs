@@ -104,11 +104,14 @@ pub fn from_events(
     let mine: Vec<&Event> = jono::item_events(events, &item.repo, item.number).collect();
     let start = mine.iter().rposition(|e| e.kind == EV_STARTED)?;
     // A claim since that run started: by a new `paja run` that hasn't recorded `run.started`
-    // yet, or by hand. Either way the earlier run's steps aren't this one's.
+    // yet, or by hand. Either way the earlier run's steps aren't this one's, unless the claim
+    // was by hand while that run still holds the item: it is still working on it, and its
+    // steps go on (the item was put back and claimed by hand under a live run).
     let claim = mine[start..]
         .iter()
         .rposition(|e| e.kind == jono::EV_STATUS && e.data["status"] == "active")
-        .map(|at| mine[start + at]);
+        .map(|at| mine[start + at])
+        .filter(|c| !(held && c.data["run"] != true));
     let state = match item.status {
         Status::Active if held => "running".to_string(),
         Status::Active if claim.is_some_and(|c| c.data["run"] != true) => "claimed".to_string(),
@@ -296,6 +299,14 @@ mod tests {
         let live = from_events(&claimed(false), &item(Status::Active), false, |_| None).unwrap();
         assert_eq!(live.state, "claimed");
         assert!(live.steps.is_empty() && live.step.is_none());
+        // Claimed by hand while the run still holds it (put back, then claimed): the run is
+        // still at work, so the view keeps its steps rather than show it running with none.
+        let held = from_events(&claimed(false), &item(Status::Active), true, |_| None).unwrap();
+        let ran = from_events(&run(), &item(Status::Active), true, |_| None).unwrap();
+        assert_eq!(held.state, "running");
+        assert_eq!(held.steps, ran.steps);
+        assert_eq!(held.step, ran.step);
+        assert!(!held.steps.is_empty());
     }
 
     #[test]

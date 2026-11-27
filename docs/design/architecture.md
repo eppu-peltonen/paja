@@ -686,7 +686,7 @@ item is no longer active. An active item that no `paja run` holds (its
 of it at once, without creating it, holding the home lock that `paja run` claims items under, so a claim never meets it.
 A claim since the latest `run.started` means that run's steps aren't the current ones: a new `paja run` that hasn't
 started yet shows an empty view, and an item claimed by hand (`paja work claim`, which no run resumes) shows as
-claimed. `paja work show` and its MCP tool add
+claimed, unless a `paja run` still holds the item, whose steps then stay in the view. `paja work show` and its MCP tool add
 the same view as `run` for an active item.
 
 The person's two jobs are answering and writing work, and Desk does both through the core: an escalated item has an
