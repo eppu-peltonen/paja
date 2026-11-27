@@ -78,17 +78,13 @@ pub(super) fn unsettled(
     // Review text came from an agent that read untrusted code: keep each finding short, never
     // let it mention anyone, and keep tokens and local paths out of a public pull request and
     // the log.
-    let user_home = ["HOME", "USERPROFILE"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let mut places = vec![(home.root(), "<factory home>"), (repo, "<repository>")];
-    places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
+    let user_home = user_homes();
+    let places = public_places(home.root(), repo, &user_home);
     findings
         .iter()
         .map(|finding| {
-            let text = redact(&finding.shown(), &places);
+            // Mentions are made inert before the cut, so a cut can't leave a bare `@` behind.
+            let text = redact(&finding.shown(), &places).replace('@', "@\u{200b}");
             let mut cut: String = text.chars().take(4000).collect();
             if cut.len() < text.len() {
                 cut.push_str("\n\n(cut short)");
@@ -98,22 +94,135 @@ pub(super) fn unsettled(
             } else {
                 "not filed: round limit"
             };
-            (cut.replace('@', "@\u{200b}"), why)
+            (cut, why)
         })
         .collect()
 }
 
-/// `text` made fit for a public issue comment: tokens redacted, and the repository's and the
-/// user's home paths (the factory home is under the latter by default) named, not shown.
-pub(super) fn redact_for_issue(text: &str, repo: &Path) -> String {
-    let user_home = ["HOME", "USERPROFILE"]
+/// The user's home folders (`HOME`, and `USERPROFILE` on Windows), which a public text names
+/// as `<home>`.
+fn user_homes() -> Vec<PathBuf> {
+    ["HOME", "USERPROFILE"]
         .iter()
         .filter_map(std::env::var_os)
         .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let mut places = vec![(repo, "<repository>")];
+        .collect()
+}
+
+/// The places a text Paja posts on a public issue names instead of showing: the factory home,
+/// the repository and the user's home folders.
+fn public_places<'a>(
+    factory_home: &'a Path,
+    repo: &'a Path,
+    user_home: &'a [PathBuf],
+) -> Vec<(&'a Path, &'a str)> {
+    let mut places = vec![(factory_home, "<factory home>"), (repo, "<repository>")];
     places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
-    redact(text, &places)
+    places
+}
+
+/// `text` made fit for a comment on a public issue: tokens redacted, the factory home, the
+/// repository and the user's home named, not shown, mentions made inert so a quoted log or
+/// review can't ping anyone, code fences made plain text, and cut to `max` characters. All
+/// that is done first, so the cut counts the characters it adds. For the parts of a comment
+/// that quote agent text or logs, so the frame around them (how to answer, how to undo) is
+/// never what gets cut, and never renders as code.
+pub(crate) fn redact_for_comment(
+    text: &str,
+    repo: &Path,
+    factory_home: &Path,
+    max: usize,
+) -> String {
+    let user_home = user_homes();
+    // `<!--` would hide the rest of the comment, the frame's instructions too.
+    let text = redact(text, &public_places(factory_home, repo, &user_home))
+        .replace('@', "@\u{200b}")
+        .replace("<!--", "<\u{200b}!--");
+    let text = without_fences(&text);
+    let count = text.chars().count();
+    if count <= max {
+        return text;
+    }
+    // The middle goes: a question's start says what it is about, and its end often holds the
+    // root cause and what to do.
+    let head: String = text.chars().take(max / 2).collect();
+    let tail: String = text.chars().skip(count - max / 2).collect();
+    // The tail can start mid-line, just before backticks that were not at a line's start.
+    format!("{head}\n\n(cut short)\n\n{}", without_fences(&tail))
+}
+
+/// `text` with every line that would open or close a code fence (`` ``` `` or `~~~`, of any
+/// length, after any indent) broken by a zero-width space, so quoted text can't leave a fence
+/// open over what follows it, however it is cut.
+fn without_fences(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let indent = line.len() - line.trim_start().len();
+            let rest = &line[indent..];
+            if rest.starts_with("```") || rest.starts_with("~~~") {
+                format!("{}{}\u{200b}{}", &line[..indent], &rest[..1], &rest[1..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The most of one quoted part (a question, an answer, a reason) a comment shows: two or three
+/// fit GitHub's limit with the frame around them.
+pub(crate) const QUOTED_CHARS: usize = 20_000;
+
+/// Write `body` to a new file of its own in the factory home's `tmp`, out of the way of its
+/// state, for a `gh ... --body-file`: a long body would not fit a Windows command line. The name
+/// is unique to this call (the process id and a counter), and the file is created new, so two
+/// posts at once, in one process or two, never share one. The caller removes it.
+pub(crate) fn body_file(home: &Home, stem: &str, body: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = home.root().join("tmp");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("{stem}-{}-{n}.md", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    if let Err(err) = file.write_all(body.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(err).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(path)
+}
+
+/// GitHub's limit for a comment, in characters.
+const GITHUB_COMMENT_CHARS: usize = 65_536;
+
+// Three cut parts and a frame fit a GitHub comment.
+const _: () = assert!(3 * (QUOTED_CHARS + 30) + 1_000 < GITHUB_COMMENT_CHARS);
+
+/// Post `body`, whose quoted parts went through [`redact_for_comment`], as a comment on issue
+/// `number`, from a [`body_file`] removed once `gh` is done. A body past GitHub's limit is cut
+/// to it, so the comment still posts.
+pub(super) fn comment_on_issue(home: &Home, repo: &Path, number: u64, body: &str) -> Result<()> {
+    // Never reached while each comment quotes at most three parts of `QUOTED_CHARS`; a check
+    // at build time holds that sum under the limit.
+    let body: String = body.chars().take(GITHUB_COMMENT_CHARS).collect();
+    let file = body_file(home, &format!("comment-{number}"), &body)?;
+    let posted = run_gh(
+        repo,
+        &[
+            "issue",
+            "comment",
+            &number.to_string(),
+            "--body-file",
+            &file.to_string_lossy(),
+        ],
+    );
+    let _ = std::fs::remove_file(&file);
+    posted.map(|_| ())
 }
 
 /// Tokens that look like credentials become `<redacted>`, and each path in `places` (and
@@ -579,11 +688,53 @@ mod tests {
         let repo = Path::new("/work/acme-app");
         let token = format!("ghp_{}", "A1".repeat(12));
         let text = format!("test failed in /work/acme-app/src/lib.rs with {token}");
-        let shown = redact_for_issue(&text, repo);
+        let shown = redact_for_comment(&text, repo, Path::new("/srv/paja-home"), 1_000);
         assert_eq!(
             shown,
             "test failed in <repository>/src/lib.rs with <redacted>"
         );
+    }
+
+    #[test]
+    fn an_escalation_comment_names_the_factory_home_and_mentions_no_one() {
+        let repo = Path::new("/work/acme-app");
+        let factory = Path::new("/srv/paja-home");
+        let text = "see /srv/paja-home/envs/app-1/log and /work/acme-app/x, cc @octocat";
+        assert_eq!(
+            redact_for_comment(text, repo, factory, 100),
+            "see <factory home>/envs/app-1/log and <repository>/x, cc @\u{200b}octocat"
+        );
+        // Inert mentions count toward the cut, so a log full of them still fits a comment.
+        let mentions = redact_for_comment(&"@".repeat(65_536), repo, factory, 1_000);
+        assert!(mentions.chars().count() <= 1_020, "too long");
+        // The middle is cut: the start and the end stay.
+        let long = format!("start\n{}\nend", "a".repeat(2_000));
+        let shown = redact_for_comment(&long, repo, factory, 1_000);
+        assert!(shown.starts_with("start\n"), "{shown}");
+        assert!(shown.ends_with("\nend"), "{shown}");
+        assert!(shown.contains("\n\n(cut short)\n\n"), "{shown}");
+        assert!(shown.chars().count() <= 1_030, "too long");
+        // No line of quoted text opens a fence, of any kind or length, so however it is cut
+        // the frame after it never renders as code. Inline backticks stay.
+        for fence in ["```", "````rust", "  ~~~", "~~~~"] {
+            let shown = redact_for_comment(&format!("x\n{fence}\ny"), repo, factory, 100);
+            assert!(
+                !shown
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("``") || l.trim_start().starts_with("~~")),
+                "{shown:?}"
+            );
+        }
+        // A cut that lands just before backticks in the middle of a line doesn't open one.
+        let aimed = format!("{}x```yz", "a".repeat(1_000));
+        let shown = redact_for_comment(&aimed, repo, factory, 10);
+        assert!(!shown.lines().any(|l| l.starts_with("``")), "{shown:?}");
+        assert_eq!(
+            redact_for_comment("run `cargo test` ```now```", repo, factory, 100),
+            "run `cargo test` ```now```"
+        );
+        // A comment marker can't hide the frame.
+        assert!(!redact_for_comment("a <!-- b", repo, factory, 100).contains("<!--"));
     }
 
     #[test]

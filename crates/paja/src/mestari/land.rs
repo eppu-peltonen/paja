@@ -298,7 +298,7 @@ pub(super) fn escalate(
     )?;
     // The item is parked either way; a failed comment must not escalate it a second time.
     // The caller reports it, cleaned for the terminal.
-    let asked = comment(repo, item, question).err();
+    let asked = comment(home, repo, item, question).err();
     tell(home, repo, item);
     Ok(asked)
 }
@@ -318,8 +318,9 @@ pub(super) fn tell(home: &Home, repo: &Path, item: &WorkItem) {
 
 /// Ask the person on the issue. The question can quote CI logs or review text, so it is
 /// redacted first: the issue is public.
-pub(super) fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
-    let question = follow_ups::redact_for_issue(question, repo);
+pub(super) fn comment(home: &Home, repo: &Path, item: &WorkItem, question: &str) -> Result<()> {
+    let question =
+        follow_ups::redact_for_comment(question, repo, home.root(), follow_ups::QUOTED_CHARS);
     let body = format!(
         "**Paja needs a decision on this issue.**\n\n{question}\n\nAnswer with \
          `paja work answer {n} \"<your answer>\"` (or `/paja:answer` in Claude Code). That records \
@@ -327,17 +328,7 @@ pub(super) fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()
          reach the next run.",
         n = item.number
     );
-    run_gh(
-        repo,
-        &[
-            "issue",
-            "comment",
-            &item.number.to_string(),
-            "--body",
-            &body,
-        ],
-    )?;
-    Ok(())
+    follow_ups::comment_on_issue(home, repo, item.number, &body)
 }
 
 /// Wait until GitHub has registered checks on the pull request, then until they finish.

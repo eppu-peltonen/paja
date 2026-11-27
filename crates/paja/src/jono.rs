@@ -2417,17 +2417,29 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
             );
         }
     }
-    gh(
-        &ok,
-        &[
-            "issue",
-            "comment",
-            &number.to_string(),
-            "--body",
-            &format!("**Answer to Paja's question.**\n\n{text}"),
-        ],
-    )
-    .with_context(|| {
+    // Redacted like Paja's own comments: an agent can write the answer (`/paja:answer`, the
+    // MCP tool), so tokens and local paths stay off the public issue and mentions are inert.
+    // From a file: a long answer would not fit a Windows command line.
+    let top = crate::ahjo::top_level(&ok).unwrap_or_else(|_| ok.path().to_path_buf());
+    let text =
+        crate::mestari::redact_for_comment(text, &top, home.root(), crate::mestari::QUOTED_CHARS);
+    let body = format!("**Answer to Paja's question.**\n\n{text}");
+    let posted =
+        crate::mestari::body_file(home, &format!("answer-{number}"), &body).and_then(|file| {
+            let posted = gh(
+                &ok,
+                &[
+                    "issue",
+                    "comment",
+                    &number.to_string(),
+                    "--body-file",
+                    &file.to_string_lossy(),
+                ],
+            );
+            let _ = std::fs::remove_file(&file);
+            posted
+        });
+    posted.with_context(|| {
         format!(
             "the answer is recorded and #{number} is queued, so the next run uses it, but posting \
              it on the issue failed; post it there by hand if others should see it"
