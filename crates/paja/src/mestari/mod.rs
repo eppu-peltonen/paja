@@ -185,9 +185,16 @@ pub struct Models {
     pub fallback: Option<String>,
     /// `max-turns <role> <n>` lines: the most turns one session of the role may take.
     pub max_turns: std::collections::BTreeMap<String, u32>,
+    /// `window <percent>`: the share of the usage window that counts as nearly used up.
+    pub window: Option<u32>,
 }
 
 impl Models {
+    /// The used share of the usage window, in percent, from which Mestari starts no build.
+    pub fn window_percent(&self) -> u32 {
+        self.window.unwrap_or(90)
+    }
+
     /// Read the file's text. `#` starts a comment line. A line naming a role this Paja doesn't
     /// know is skipped with a warning on stderr. Anything else that isn't a plain model name
     /// (and a known effort) is an error naming the line and the fix.
@@ -241,6 +248,19 @@ impl Models {
                         "{}: `max-turns {named}` is named twice; keep one line",
                         at()
                     );
+                }
+                continue;
+            }
+            if role == "window" {
+                let [Ok(percent)] = rest.iter().map(|n| n.parse::<u32>()).collect::<Vec<_>>()[..]
+                else {
+                    bail!("{}: write it as `window <percent>`", at());
+                };
+                if !(1..=100).contains(&percent) {
+                    bail!("{}: the window share must be from 1 to 100 percent", at());
+                }
+                if models.window.replace(percent).is_some() {
+                    bail!("{}: `window` is named twice; keep one line", at());
                 }
                 continue;
             }
@@ -475,6 +495,24 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
+    // A new item starts with a build, which a nearly used window would cut off: put it back and
+    // wait. A resumed item goes on to its round, which makes the same check for each build.
+    if !resumed {
+        if let Some(resets_at) = window_nearly_used(
+            &home.events().read_all()?,
+            crate::events::now_ms(),
+            config.models.window_percent(),
+        ) {
+            jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
+            progress(&format!(
+                "the usage window is nearly used up, so #{} wasn't started; `paja run` can run \
+                 again at {}",
+                item.number,
+                format_utc(resets_at)
+            ));
+            return Ok(RunReport::Paused { resets_at });
+        }
+    }
     summary(
         &item,
         &config.target,
@@ -842,6 +880,22 @@ fn run_item(
             ));
         }
         let role = if round == 1 { "build" } else { "fix" };
+        // A build the window can't finish buys nothing: keep the work and wait for the reset.
+        // Reviews still start, so a built change isn't left unreviewed for a whole window.
+        if !skip_build {
+            if let Some(resets_at) = window_nearly_used(
+                &home.events().read_all()?,
+                crate::events::now_ms(),
+                models.window_percent(),
+            ) {
+                let limit = UsageLimit {
+                    result: None,
+                    resets_at: Some(resets_at),
+                    nearly: true,
+                };
+                return usage_stopped(home, repo, &env, item, round, &limit, steps);
+            }
+        }
         // An earlier run's session is offered to the first build only.
         let earlier = if skip_build { None } else { carried.take() };
         if !skip_build {
@@ -1444,6 +1498,10 @@ fn usage_stopped(
     let again = limit.resets_at.is_none()
         && limit_without_reset(&home.events().read_all()?, &item.repo, item.number);
     let note = match limit.resets_at {
+        Some(ms) if limit.nearly => format!(
+            "the usage window is nearly used up, so no build was started; it resets at {}",
+            format_utc(ms)
+        ),
         Some(ms) => format!(
             "Claude Code hit its usage limit; the window resets at {}",
             format_utc(ms)
