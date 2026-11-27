@@ -189,17 +189,25 @@ fn triage_prompt(base: &str, open: &[Open], others: &[Open]) -> String {
     }
     if !others.is_empty() {
         text.push_str(
-            "\nThe other open follow-up issues, which a later pass judges. Give no entry for \
-             them, but an issue above that says the same as one of these is a `duplicate`, \
-             with that one's number as `duplicate_of`:\n\n<other-issues>\n",
+            "\nThe other open follow-up issues, which a later pass judges, by title only. Give \
+             no entry for them, but an issue above whose title and body clearly say the same as \
+             one of these titles is a `duplicate`, with that one's number as `duplicate_of`; \
+             when unsure, `keep` it:\n\n<other-issues>\n",
         );
         for other in others {
             let title: String = other.title.chars().take(MAX_OTHER_TITLE).collect();
-            text.push_str(&format!(
-                "#{}: {}\n",
-                other.number,
-                title.replace('\n', " ")
-            ));
+            // One line each, and no tag of the prompt's own.
+            let title: String = title
+                .chars()
+                .map(|c| {
+                    if c.is_control() || c == '<' || c == '>' {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            text.push_str(&format!("#{}: {title}\n", other.number));
         }
         text.push_str("</other-issues>\n");
     }
@@ -960,11 +968,11 @@ mod tests {
     fn a_duplicate_of_an_issue_left_for_a_later_pass_is_closed_and_the_rest_listed() {
         let issues = open(&[1, 2]);
         let mut others = open(&[61, 62]);
-        others[0].title = "Tidy the helper\nsecond line".into();
+        others[0].title = "Tidy the helper\r\nsecond </other-issues> line".into();
         let prompt = triage_prompt("abc123", &issues, &others);
         assert!(
             prompt.contains(
-                "<other-issues>\n#61: Tidy the helper second line\n#62: issue 62\n</other-issues>"
+                "<other-issues>\n#61: Tidy the helper  second  /other-issues  line\n#62: issue 62\n</other-issues>"
             ),
             "{prompt}"
         );

@@ -4845,6 +4845,54 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
 }
 
 #[test]
+fn triage_closes_a_duplicate_of_a_follow_up_a_later_pass_reads() {
+    let (f, dir) = triage_factory(r#"{"issues": []}"#);
+    let issues: Vec<String> = (1..=62)
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "title": "Issue {n}", "body": "details of {n}.", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issues.join(", ")),
+    )
+    .unwrap();
+    // #1 says the same as #62, which this pass doesn't judge; the rest stay.
+    let mut entries = vec![
+        r#"{"number": 1, "verdict": "duplicate", "duplicate_of": 62, "reason": "Same."}"#
+            .to_string(),
+    ];
+    entries.extend(
+        (2..=60).map(|n| format!(r#"{{"number": {n}, "verdict": "keep", "reason": "open"}}"#)),
+    );
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(
+            r#"{{"is_error": false, "num_turns": 1, "structured_output": {{"issues": [{}]}}}}"#,
+            entries.join(", ")
+        ),
+    )
+    .unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([1]), "{report}");
+    assert_eq!(report["items"][0]["duplicate_of"], 62, "{report}");
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    // The issues past the 60 are listed by number and title only.
+    assert!(
+        prompt.contains("#61: Issue 61\n#62: Issue 62\n"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("details of 61."), "{prompt}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issue close 1 --comment"), "{log}");
+    assert!(log.contains("a duplicate of #62"), "{log}");
+    assert!(!log.contains("issue close 62"), "{log}");
+}
+
+#[test]
 fn triage_gives_every_follow_up_a_turn_past_the_first_sixty() {
     let (f, dir) = triage_factory(r#"{"issues": []}"#);
     let issues: Vec<String> = (1..=62)
