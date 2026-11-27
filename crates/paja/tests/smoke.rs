@@ -4802,6 +4802,56 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
 }
 
 #[test]
+fn triage_gives_every_follow_up_a_turn_past_the_first_sixty() {
+    let (f, dir) = triage_factory(r#"{"issues": []}"#);
+    let issues: Vec<String> = (1..=62)
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "title": "Issue {n}", "body": "details of {n}.", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issues.join(", ")),
+    )
+    .unwrap();
+    let keep = |numbers: std::ops::RangeInclusive<u64>| {
+        let entries: Vec<String> = numbers
+            .map(|n| format!(r#"{{"number": {n}, "verdict": "keep", "reason": "open"}}"#))
+            .collect();
+        std::fs::write(
+            dir.join("answer.json"),
+            format!(
+                r#"{{"is_error": false, "num_turns": 1, "structured_output": {{"issues": [{}]}}}}"#,
+                entries.join(", ")
+            ),
+        )
+        .unwrap();
+    };
+    let prompt = || std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    // The first pass reads the oldest 60.
+    keep(1..=60);
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["items"].as_array().unwrap().len(), 60, "{report}");
+    assert!(prompt().contains("details of 60.") && !prompt().contains("details of 61."));
+    // The next starts with the two no pass has read, then those read longest ago.
+    keep(1..=62);
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let numbers: Vec<u64> = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(&numbers[..3], [61, 62, 1], "{report}");
+    assert_eq!(numbers.len(), 60, "{report}");
+    assert!(prompt().contains("details of 62."), "{}", prompt());
+}
+
+#[test]
 fn triage_never_closes_not_worth_doing_or_what_it_cannot_back_up() {
     let (f, dir) = triage_factory(
         r#"{"issues": [

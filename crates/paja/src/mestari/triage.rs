@@ -5,6 +5,7 @@
 //! hook, and Paja checks what it says before it closes anything.
 
 use super::*;
+use std::collections::BTreeMap;
 
 /// A triage pass finished: `{repo, base, items, closed, not_worth_doing, failed}`.
 pub const EV_TRIAGE_RAN: &str = "triage.ran";
@@ -13,7 +14,8 @@ pub const EV_TRIAGE_RAN: &str = "triage.ran";
 pub const EV_TRIAGE_FAILED: &str = "triage.failed";
 /// `paja run --every` triages at most once in this long.
 const INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
-/// The most issues one pass reads (the oldest first) and the most of each body the agent sees.
+/// The most issues one pass reads (those read longest ago first) and the most of each body the
+/// agent sees.
 const MAX_ISSUES: usize = 60;
 const MAX_BODY: usize = 2000;
 /// The Ahjo environment the triage agent runs in for `repo` (`owner/name`): a checkout of the
@@ -421,7 +423,10 @@ fn triage_holding(
         .context("`gh issue list` printed something that is not a list of issues")?;
     // An issue that is also a work item is queued work, not a stale finding.
     open.retain(|issue| !issue.labels.iter().any(|l| l.name == labels.work));
-    open.sort_by_key(|issue| issue.number);
+    // Each issue gets a turn: the ones no pass has read yet first, then the ones read longest
+    // ago, oldest issue first among equals, so a long list is read in full over a few passes.
+    let read = last_read(&home.events().read_all()?, &name);
+    open.sort_by_key(|issue| (read.get(&issue.number).copied(), issue.number));
     open.truncate(MAX_ISSUES);
 
     let mut items = Vec::new();
@@ -561,6 +566,30 @@ fn ask(
         let _ = ahjo::remove(home, &env_name, true);
     }
     result
+}
+
+/// For each issue a triage pass of `repo` read, the sequence number of the last such pass,
+/// from the numbers its `triage.ran` lists as closed, kept, not worth doing or failed.
+fn last_read(events: &[crate::events::Event], repo: &str) -> BTreeMap<u64, u64> {
+    let mut read = BTreeMap::new();
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EV_TRIAGE_RAN && e.data["repo"].as_str() == Some(repo))
+    {
+        let closed = event.data["closed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["number"].as_u64());
+        let listed = ["kept", "not_worth_doing", "failed"]
+            .into_iter()
+            .flat_map(|key| event.data[key].as_array().into_iter().flatten())
+            .filter_map(Value::as_u64);
+        for number in closed.chain(listed) {
+            read.insert(number, event.seq);
+        }
+    }
+    read
 }
 
 /// Whether `events` hold a triage pass (or a failed attempt) of `repo` less than a day before
@@ -732,6 +761,38 @@ mod tests {
                 .iter()
                 .any(|o| o.number == of && o.verdict == Verdict::Keep));
         }
+    }
+
+    #[test]
+    fn issues_are_read_in_turn_unread_first_then_longest_ago() {
+        let ran = |seq: u64, repo: &str, data: Value| {
+            let mut data = data;
+            data["repo"] = json!(repo);
+            crate::events::Event {
+                v: 1,
+                seq,
+                ts_ms: seq,
+                kind: EV_TRIAGE_RAN.into(),
+                data,
+            }
+        };
+        let events = [
+            ran(
+                1,
+                "a/b",
+                json!({"kept": [1, 2], "closed": [{"number": 3}], "failed": [4]}),
+            ),
+            ran(2, "a/b", json!({"kept": [2], "not_worth_doing": [5]})),
+            ran(3, "c/d", json!({"kept": [1]})),
+        ];
+        let read = last_read(&events, "a/b");
+        assert_eq!(
+            read,
+            BTreeMap::from([(1, 1), (2, 2), (3, 1), (4, 1), (5, 2)])
+        );
+        let mut order = vec![1u64, 2, 5, 6, 7];
+        order.sort_by_key(|n| (read.get(n).copied(), *n));
+        assert_eq!(order, [6, 7, 1, 2, 5]);
     }
 
     #[test]
