@@ -296,42 +296,24 @@ fn match_at(text: &str, needle: &str, fold: bool) -> Option<usize> {
 }
 
 /// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
-/// `label`. With `fold`, the path matches in any letter case, as Windows itself does.
+/// `label`. With `fold`, the path matches in any letter case, as Windows itself does: each
+/// character of the text against the path's, by its lowercase form (so `İ` or the Kelvin sign
+/// fold as Unicode says, not only ASCII letters).
 ///
-/// Its cost is linear in the text for a path spelled in ASCII, case folded or not: matches are
-/// found with `str::find`, in a lowercased copy when folding (ASCII lowercasing keeps every
-/// byte offset). Only a folded path with other letters (a home like `C:\Users\Jöhn`) is matched
-/// char by char at each place its first letter matches.
+/// Its cost is linear in the text: matches are found with `str::find`, in a lowercased copy
+/// when folding, whose offsets are mapped back to the text's, and each is confirmed character by
+/// character.
 fn replace_path(text: &str, path: &str, label: &str, fold: bool) -> String {
-    let lowered;
-    let (haystack, needle) = if fold && path.is_ascii() {
-        lowered = (text.to_ascii_lowercase(), path.to_ascii_lowercase());
-        (lowered.0.as_str(), Some(lowered.1.as_str()))
-    } else if fold {
-        (text, None)
+    let matches = if fold {
+        folded_matches(text, path)
     } else {
-        (text, Some(path))
-    };
-    // The next match at or after `at`: its start and its length in `text`.
-    let next = |at: usize| -> Option<(usize, usize)> {
-        if let Some(needle) = needle {
-            return haystack[at..].find(needle).map(|i| (at + i, needle.len()));
-        }
-        let first = path.chars().next()?;
-        text[at..].char_indices().find_map(|(i, c)| {
-            let starts = c == first || c.to_lowercase().eq(first.to_lowercase());
-            starts
-                .then(|| match_at(&text[at + i..], path, true).map(|len| (at + i, len)))
-                .flatten()
-        })
+        text.match_indices(path)
+            .map(|(at, found)| (at, found.len()))
+            .collect()
     };
     let mut out = String::with_capacity(text.len());
     let mut from = 0;
-    let mut at = 0;
-    while at < text.len() {
-        let Some((start, len)) = next(at) else {
-            break;
-        };
+    for (start, len) in matches {
         let end = start + len;
         // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
         // around the path, so a path before one is still redacted.
@@ -339,10 +321,51 @@ fn replace_path(text: &str, path: &str, label: &str, fold: bool) -> String {
         out.push_str(&text[from..start]);
         out.push_str(if ends { label } else { &text[start..end] });
         from = end;
-        at = end;
     }
     out.push_str(&text[from..]);
     out
+}
+
+/// Where `path` is in `text`, letters in any case, left to right and not overlapping: each
+/// match's start and length in `text`.
+fn folded_matches(text: &str, path: &str) -> Vec<(usize, usize)> {
+    let needle: String = path.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    // The lowercased text, and for each of its offsets that starts a character of the text,
+    // that character's offset in `text` (`NONE` elsewhere); and back from `text`'s offsets.
+    const NONE: usize = usize::MAX;
+    let mut folded = String::with_capacity(text.len());
+    let mut to_text = Vec::with_capacity(text.len() + 1);
+    let mut to_folded = vec![NONE; text.len() + 1];
+    for (at, c) in text.char_indices() {
+        to_folded[at] = folded.len();
+        let before = folded.len();
+        folded.extend(c.to_lowercase());
+        to_text.push(at);
+        to_text.resize(folded.len(), NONE);
+        debug_assert!(folded.len() > before);
+    }
+    to_text.push(text.len());
+    to_folded[text.len()] = folded.len();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(i) = folded[from..].find(&needle) {
+        let at = from + i;
+        let confirmed = match to_text[at] {
+            NONE => None,
+            start => match_at(&text[start..], path, true).map(|len| (start, len)),
+        };
+        match confirmed {
+            Some((start, len)) => {
+                found.push((start, len));
+                from = to_folded[start + len];
+            }
+            None => from = at + folded[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    found
 }
 
 /// Prefixes of credentials that are safe to recognise by their start.
@@ -429,6 +452,18 @@ fn opens_fence(gap: &str, rest: &str) -> bool {
     backticks || tildes
 }
 
+/// Whether `word` reads as a fence's language name (`text`, `sh`, `c++`, `objective-c`): up to
+/// 15 lowercase ASCII letters and `+`, `#`, `-` or `.`, with no digit, so a value written after
+/// the fence (`hunter2`, a random string) isn't taken for one. `python3` is redacted, which is
+/// the side to err on.
+fn language_tag(word: &str) -> bool {
+    word.len() <= 15
+        && word.starts_with(|c: char| c.is_ascii_lowercase())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || matches!(c, '+' | '#' | '-' | '.'))
+}
+
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
 /// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole; after
 /// a lead it runs to the next space, quote, backtick, comma or backslash, so symbols stay inside.
@@ -466,12 +501,24 @@ fn redact_tokens(text: &str) -> String {
             break;
         }
         // A fence opened after a lead: its info string (```` ```text ````, `~~~ sh`) names the
-        // language, not the value, which is on the lines after it. The info line is scanned on
-        // its own, so a token in it still goes, and the lead carries on past it.
+        // language, and the value is on the lines after it, so the lead carries on past the
+        // line. A first word that doesn't look like a language name may be the value written
+        // on the fence's own line, so it goes; the rest of the line is scanned on its own.
         if led.is_some() && opens_fence(gap, rest) {
-            let line_end = rest.find('\n').unwrap_or(rest.len());
-            out.push_str(&redact_tokens(&rest[..line_end]));
-            rest = &rest[line_end..];
+            let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+            let tag_at = line.len() - line.trim_start_matches(['~', ' ', '\t']).len();
+            let tag_end = line[tag_at..]
+                .find(char::is_whitespace)
+                .map_or(line.len(), |i| tag_at + i);
+            let tag = &line[tag_at..tag_end];
+            out.push_str(&line[..tag_at]);
+            out.push_str(if tag.is_empty() || language_tag(tag) {
+                tag
+            } else {
+                "<redacted>"
+            });
+            out.push_str(&redact_tokens(&line[tag_end..]));
+            rest = &rest[line.len()..];
             delimited = true;
             continue;
         }
@@ -805,6 +852,22 @@ mod tests {
             "password:\n```<redacted>\n<redacted>\n```"
         );
         assert_eq!(
+            redact_tokens(&format!("password:\n```text {gh}\n{short}\n```")),
+            "password:\n```text <redacted>\n<redacted>\n```"
+        );
+        // A value written on the fence's own line isn't a language name, so it goes, short or
+        // long, after backticks or tildes, and the lead still reaches the next line.
+        let long = "AbCdEfGh12345678ZZ";
+        for fence in ["```", "~~~", "~~~ "] {
+            for value in [short, long, "python3"] {
+                assert_eq!(
+                    redact_tokens(&format!("password:\n{fence}{value}\n{short}\n")),
+                    format!("password:\n{fence}<redacted>\n<redacted>\n"),
+                    "{fence}{value}"
+                );
+            }
+        }
+        assert_eq!(
             redact_tokens(&format!("password:\n```{short}```")),
             "password:\n```<redacted>```"
         );
@@ -824,22 +887,46 @@ mod tests {
 
     #[test]
     fn redacting_paths_in_a_long_text_stays_fast() {
-        // Near misses at every place: a scan that compared the whole path at each character
-        // would read this text once per character of the path.
-        let path = format!("/home/me/{}", "a".repeat(200));
-        let near = format!("/home/me/{}b ", "a".repeat(199));
-        let text = format!("{near}{path}/x ").repeat(2000);
+        // A path that matches part of itself, over text that nearly matches it at every
+        // place: a scan that compared the path at each character reads the text a hundred
+        // times over, which takes many seconds here even in a release build.
+        let path = format!("{}/b", "/a".repeat(100));
+        let text = format!("{}{path} x", "/a".repeat(1_000_000));
         let started = std::time::Instant::now();
         let shown = replace_path(&text, &path, "<home>", false);
-        assert_eq!(shown.matches("<home>/x").count(), 2000);
-        let windows = text.replace('/', "\\").to_uppercase();
-        let shown = replace_path(&windows, &path.replace('/', "\\"), "<home>", true);
-        assert_eq!(shown.matches("<home>\\X").count(), 2000);
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(shown.ends_with("<home> x"));
+        let upper = text.to_uppercase();
+        let shown = replace_path(&upper, &path, "<home>", true);
+        assert!(shown.ends_with("<home> X"));
+        // Other letters than ASCII ones fold the same linear way.
+        let path = format!("{}/ö", "/ä".repeat(100));
+        let text = format!("{}{} x", "/Ä".repeat(500_000), path.to_uppercase());
+        let shown = replace_path(&text, &path, "<home>", true);
+        assert!(shown.ends_with("<home> x"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
         // A folded path with other letters still matches in any case.
         assert_eq!(
             replace_path(r"C:\USERS\JÖHN\x", r"C:\Users\Jöhn", "<home>", true),
             r"<home>\x"
+        );
+        // Characters whose lowercase is longer (`İ`), before and after a folded path, keep
+        // every offset right; the Kelvin sign folds to `k`, as before.
+        assert_eq!(
+            replace_path("İÄ C:\\USERS\\ME\\x İ end", r"C:\Users\me", "<home>", true),
+            "İÄ <home>\\x İ end"
+        );
+        assert_eq!(
+            replace_path("İC:\\USERS\\MİKE x", r"C:\Users\mike", "<home>", true),
+            "İC:\\USERS\\MİKE x"
+        );
+        assert_eq!(
+            replace_path(
+                "at C:\\Users\\Mi\u{212A}e x",
+                r"C:\Users\mike",
+                "<home>",
+                true
+            ),
+            "at <home> x"
         );
     }
 
