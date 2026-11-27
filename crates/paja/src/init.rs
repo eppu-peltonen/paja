@@ -20,8 +20,10 @@ use crate::home::Home;
 use crate::jono::{self, Labels, LABELS_FILE};
 
 mod detect;
+mod recommend;
 mod scaffold;
 pub use detect::{Check, Dropped, Environment, Service, Source, StackDir, Toolchain};
+pub use recommend::{choose_stack, recommend, Recommendation, Recommendations};
 pub use scaffold::{run_new, NewOptions, NewReport, STACKS};
 
 /// The branch the pull request comes from.

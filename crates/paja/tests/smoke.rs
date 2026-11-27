@@ -6268,6 +6268,95 @@ fn init_with_agent(
 }
 
 #[test]
+fn init_recommend_returns_options_best_first_and_paja_decides_the_skeleton() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, d) = (tmp.path().join("home"), slash(tmp.path()));
+    let answer = serde_json::json!({
+        "recommendations": [
+            {"stack": "go", "why": "Fast to ship a small service.", "tradeoffs": "Fewer web libraries."},
+            {"stack": "rust", "why": "You prefer it.", "tradeoffs": "Slower to write."},
+            {"stack": "node", "why": "Big ecosystem.", "tradeoffs": "Many moving parts."},
+            {"stack": "python", "why": "Fourth, so dropped.", "tradeoffs": "None."}
+        ],
+        "questions": ["Will it need a database?"]
+    });
+    std::fs::write(
+        tmp.path().join("answer.json"),
+        serde_json::json!({"is_error": false, "num_turns": 1, "structured_output": answer})
+            .to_string(),
+    )
+    .unwrap();
+    let claude = program(
+        tmp.path(),
+        "claude",
+        &format!("#!/bin/sh\ncat > {d}/prompt.txt\ncat {d}/answer.json\n"),
+    );
+    let (ok, out) = paja_with(
+        &home,
+        tmp.path(),
+        &[
+            "init",
+            "--recommend",
+            "a reading list web app",
+            "--prefer",
+            "rust",
+            "--prefer",
+            "axum",
+        ],
+        &[("PAJA_CLAUDE", claude.as_path())],
+    );
+    assert!(ok, "{out}");
+    let options = out["recommendations"].as_array().unwrap();
+    let shape: Vec<(&str, &str)> = options
+        .iter()
+        .map(|o| {
+            (
+                o["stack"].as_str().unwrap(),
+                o["skeleton"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("go", "generated"),
+            ("rust", "built-in"),
+            ("node", "built-in")
+        ]
+    );
+    assert_eq!(options[0]["why"], "Fast to ship a small service.");
+    assert_eq!(options[0]["tradeoffs"], "Fewer web libraries.");
+    assert_eq!(
+        out["questions"],
+        serde_json::json!(["Will it need a database?"])
+    );
+    let prompt = std::fs::read_to_string(tmp.path().join("prompt.txt")).unwrap();
+    assert!(
+        prompt.contains("a reading list web app") && prompt.contains("rust, axum"),
+        "{prompt}"
+    );
+
+    // Nothing is left of the agent's scratch repository.
+    let left = std::fs::read_dir(home.join("envs"))
+        .map(|dir| dir.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0);
+}
+
+#[test]
+fn init_new_without_a_stack_and_without_a_terminal_says_to_recommend_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (ok, out) = paja_with(&home, tmp.path(), &["init", "--new", "app"], &[]);
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("--stack") && error.contains("paja init --recommend"),
+        "{error}"
+    );
+}
+
+#[test]
 fn init_takes_the_agents_checks_and_environment_for_a_stack_the_table_does_not_know() {
     let answer = serde_json::json!({
         "stacks": [{

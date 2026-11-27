@@ -119,12 +119,28 @@ enum Command {
         /// Start a new project instead: create this GitHub repository under the signed-in
         /// account, clone it, and push a walking skeleton (a minimal app with a passing test, a
         /// formatter, a linter, a CI workflow, and the `.paja/` files and `CLAUDE.md`) as the
-        /// first commit on the default branch. Needs --stack.
-        #[arg(long, value_name = "NAME", requires = "stack")]
+        /// first commit on the default branch. Without --stack, on a terminal, it asks what you
+        /// are building and which language or framework you prefer, shows recommended stacks, and
+        /// takes a number or a stack name. With --json or no terminal, --stack is required.
+        #[arg(long, value_name = "NAME", conflicts_with = "recommend")]
         new: Option<String>,
-        /// The skeleton's stack, with --new.
+        /// The skeleton's stack, with --new. For a stack to choose, see --recommend.
         #[arg(long, value_parser = paja::init::STACKS, requires = "new")]
         stack: Option<String>,
+        /// Recommend stacks for a project that doesn't exist yet instead of setting one up: an
+        /// agent reads this description (and any --prefer) and answers with one to three options,
+        /// best first, each with why, trade-offs and whether its skeleton is `built-in` (rust,
+        /// node, python) or `generated`. Changes nothing.
+        #[arg(
+            long,
+            value_name = "WHAT YOU ARE BUILDING",
+            conflicts_with_all = ["ci", "force", "no_agent"]
+        )]
+        recommend: Option<String>,
+        /// With --recommend: a language or framework you prefer; repeat it for several. It wins
+        /// unless it is a poor fit for what you are building.
+        #[arg(long, requires = "recommend")]
+        prefer: Vec<String>,
         /// With --new: make the repository public (the default is private).
         #[arg(long, requires = "new", conflicts_with = "private")]
         public: bool,
@@ -395,18 +411,46 @@ fn run(cli: &Cli) -> Result<()> {
             }
         }
         Command::Init {
+            recommend: Some(building),
+            prefer,
+            ..
+        } => {
+            let found = paja::init::recommend(&home, building, prefer)?;
+            emit(cli, serde_json::to_value(&found)?, || {
+                describe_recommendations(&found)
+            });
+        }
+        Command::Init {
             new: Some(name),
             stack,
             public,
             dir,
             ..
         } => {
+            let stack = match stack {
+                Some(stack) => stack.clone(),
+                None => {
+                    let stdin = std::io::stdin();
+                    if cli.json || !std::io::IsTerminal::is_terminal(&stdin) {
+                        anyhow::bail!(
+                            "`paja init --new {name}` needs --stack rust, node or python here; run \
+                             `paja init --recommend \"<what you are building>\"` first to get \
+                             options, then pass the one you pick as --stack"
+                        );
+                    }
+                    paja::init::choose_stack(
+                        &mut stdin.lock(),
+                        &mut std::io::stderr(),
+                        &mut |building, prefer| paja::init::recommend(&home, building, prefer),
+                    )?
+                }
+            };
             let report = paja::init::run_new(
                 &home,
                 &std::env::current_dir()?,
                 paja::init::NewOptions {
                     name: name.clone(),
-                    stack: stack.clone().unwrap_or_default(),
+                    stack,
                     private: !*public,
                     dir: dir.clone(),
                 },
@@ -928,6 +972,28 @@ fn describe_run(report: &mestari::RunReport) -> String {
             mestari::format_utc(*resets_at)
         ),
     }
+}
+
+fn describe_recommendations(found: &paja::init::Recommendations) -> String {
+    let mut text = String::from("Recommended stacks, best first:\n");
+    for (i, o) in found.recommendations.iter().enumerate() {
+        text.push_str(&format!(
+            "\n{}. {} ({} skeleton)\n   Why: {}\n   Trade-offs: {}\n",
+            i + 1,
+            o.stack,
+            o.skeleton,
+            o.why,
+            o.tradeoffs
+        ));
+    }
+    if !found.questions.is_empty() {
+        text.push_str("\nQuestions that could change this:\n");
+        for q in &found.questions {
+            text.push_str(&format!("  {q}\n"));
+        }
+    }
+    text.push_str("\nThen: paja init --new NAME --stack <rust|node|python>");
+    text
 }
 
 fn describe_new(report: &paja::init::NewReport) -> String {

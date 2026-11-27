@@ -29,7 +29,7 @@ mod progress;
 mod triage;
 mod usage;
 
-pub use detect::init_agent;
+pub use detect::{init_agent, recommend_agent};
 pub use triage::{
     triage, triage_if_due, TriageReport, Triaged, Verdict, EV_TRIAGE_FAILED, EV_TRIAGE_RAN,
 };

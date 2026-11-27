@@ -118,6 +118,15 @@ pub struct FileArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct RecommendArgs {
+    /// What the person is building, in their words.
+    building: String,
+    /// Languages or frameworks the person prefers, if any. They win unless one is a poor fit.
+    #[serde(default)]
+    prefer: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct InitArgs {
     /// Any path inside the repository. Defaults to the directory the server runs in.
     repo: Option<String>,
@@ -132,7 +141,8 @@ pub struct InitArgs {
     #[serde(default)]
     no_agent: bool,
     /// Start a new project instead: the name of a GitHub repository to create under the
-    /// signed-in account. Needs `stack`; `repo`, `ci`, `force` and `no_agent` are not used.
+    /// signed-in account. Needs `stack` (call `init_recommend` first to choose one); `repo`, `ci`,
+    /// `force` and `no_agent` are not used.
     new: Option<String>,
     /// With `new`: rust, node or python.
     stack: Option<String>,
@@ -419,7 +429,10 @@ impl PajaMcp {
         call(move || {
             if let Some(name) = args.new {
                 let Some(stack) = args.stack else {
-                    anyhow::bail!("`new` needs `stack`: rust, node or python");
+                    anyhow::bail!(
+                        "`new` needs `stack`: rust, node or python; call `init_recommend` first \
+                         to get options"
+                    );
                 };
                 let report = crate::init::run_new(
                     &home,
@@ -443,6 +456,24 @@ impl PajaMcp {
                 },
             )?;
             Ok(serde_json::to_value(report)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Recommend stacks for a project that doesn't exist yet (paja init --recommend): an agent on the init role, with no repository to read, takes what the person is building and the languages or frameworks they prefer (preferences win unless one is a poor fit, and then why says so) and returns {recommendations: [{stack, why, tradeoffs, skeleton}], questions}: one to three options, best first. skeleton is built-in for rust, node and python, and generated otherwise. Changes nothing; pass the chosen stack to init with new."
+    )]
+    async fn init_recommend(
+        &self,
+        Parameters(args): Parameters<RecommendArgs>,
+    ) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            Ok(serde_json::to_value(crate::init::recommend(
+                &home,
+                &args.building,
+                &args.prefer,
+            )?)?)
         })
         .await
     }

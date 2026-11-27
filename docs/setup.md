@@ -160,7 +160,22 @@ For a project that doesn't exist yet, with `gh` signed in:
 paja init --new my-app --stack rust     # or node, python; --public for a public repository (default --private)
 ```
 
-It creates the repository `my-app` under your account with `gh repo create`, clones it to `my-app` in the current
+Without `--stack`, on a terminal, `paja init --new my-app` asks on stdin what you are building and whether you prefer a
+language or framework, shows the recommendations (why, trade-offs and the kind of skeleton) and takes a number or a
+stack name. With `--json`, or with no terminal, `--stack` is required and the error says to run
+`paja init --recommend` first:
+
+```sh
+paja init --recommend "a reading list web app" [--prefer rust]...
+```
+
+An agent on the `init` role, with no repository to read, answers `{recommendations: [{stack, why, tradeoffs,
+skeleton}], questions}`: one to three options, best first. Stated preferences win unless one is a poor fit for what you
+are building, and then `why` says so. `skeleton` is `built-in` for `rust`, `node` and `python`, and `generated`
+otherwise; until Paja can generate a skeleton, picking a `generated` stack stops with an error that names the built-in
+ones. The MCP tool `init_recommend` (`building`, `prefer`) returns the same JSON.
+
+`--new` creates the repository `my-app` under your account with `gh repo create`, clones it to `my-app` in the current
 directory (`--dir <path>` to clone elsewhere), and pushes one first commit holding a walking skeleton:
 
 - a minimal app with one passing test, with a formatter and a linter configured (Rust: `rustfmt` and `clippy`; Node:

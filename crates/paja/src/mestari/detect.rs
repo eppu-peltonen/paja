@@ -67,3 +67,67 @@ pub fn init_agent(
     crate::sandbox::activate(None);
     result
 }
+
+/// Run the init agent for `paja init --recommend`: no repository to read, so it starts in an empty
+/// scratch repository (made under the home's `envs` folder, which the sandbox can reach, and
+/// removed afterwards) with no file or command it may use, and answers from the prompt alone.
+pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Value> {
+    let envs = home.envs_dir();
+    let dir = envs.join(format!("recommend-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).with_context(|| {
+            format!(
+                "removing {}; delete it by hand and run again",
+                dir.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let result = (|| {
+        git(&dir, &["init", "-q"])?;
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.name=paja",
+                "-c",
+                "user.email=paja@localhost",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "empty",
+            ],
+        )?;
+        let base = git(&dir, &["rev-parse", "HEAD"])?;
+        let env = Env {
+            name: "init".to_string(),
+            repo: dir.clone(),
+            path: dir.clone(),
+            branch: git(&dir, &["symbolic-ref", "--short", "HEAD"])?,
+            base_commit: base.clone(),
+            port_base: 0,
+            port_count: 0,
+            created_ms: 0,
+        };
+        crate::sandbox::activate(start_sandbox(home, &dir, &base)?);
+        let out = claude(
+            home,
+            &env,
+            &base,
+            prompt,
+            // Nothing is pre-approved but a command that prints the folder: no file to read, no
+            // other command.
+            &["Bash(pwd)"],
+            Some(schema),
+            true,
+            &Models::default().args("init"),
+        );
+        crate::sandbox::activate(None);
+        out?.get("structured_output")
+            .cloned()
+            .context("the init agent returned no answer")
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
