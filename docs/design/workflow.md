@@ -43,7 +43,8 @@ pass has read (oldest first), then those whose last read (in `triage.ran`) is lo
 read in full over a few passes. The next 200 open follow-ups past the 60 are listed too, by number and title only, so an
 issue of the pass can be called a duplicate of one a later pass reads. Issue text is data in the prompt: its angle
 brackets, and brackets that look like them, become `‹` and `›`, so it can't open or close one of the prompt's tags or
-seem to, and characters that render as nothing (format characters, variation selectors, Hangul fillers) are dropped.
+seem to, and characters that render as nothing (format characters and the other default-ignorable code points, such as
+variation selectors and Hangul fillers, and the braille blank) are dropped.
 The verdicts:
 
 - `keep`: still valid. Also what anything Paja can't back up becomes.

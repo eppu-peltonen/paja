@@ -167,8 +167,8 @@ const MAX_OTHERS: usize = 200;
 fn as_data(text: &str, one_line: bool) -> String {
     text.chars()
         .filter_map(|c| match c {
-            '<' | '\u{FF1C}' | '\u{FE64}' | '\u{2329}' | '\u{3008}' | '\u{27E8}' => Some('‹'),
-            '>' | '\u{FF1E}' | '\u{FE65}' | '\u{232A}' | '\u{3009}' | '\u{27E9}' => Some('›'),
+            c if OPENING.contains(&c) => Some('‹'),
+            c if CLOSING.contains(&c) => Some('›'),
             '\n' | '\u{2028}' | '\u{2029}' | '\u{85}' => Some(if one_line { ' ' } else { '\n' }),
             '\t' => Some(if one_line { ' ' } else { '\t' }),
             c if is_invisible(c) => None,
@@ -178,25 +178,53 @@ fn as_data(text: &str, one_line: bool) -> String {
         .collect()
 }
 
-/// Whether `c` renders as nothing: a format character (Unicode general category Cf, as of
-/// Unicode 15.1: zero-width, bidi overrides, tag characters), or one of the other characters
-/// that show blank (the combining grapheme joiner, Mongolian and other variation selectors, and
-/// the Hangul fillers). Check the Cf part against a newer Unicode's data when the toolchain's
-/// Unicode moves past 15.1.
+/// `<` and the characters that look like it, which issue text shows as `‹`.
+const OPENING: &[char] = &[
+    '<', '\u{2C2}', '\u{1438}', '\u{2329}', '\u{276C}', '\u{276E}', '\u{2770}', '\u{27E8}',
+    '\u{29FC}', '\u{3008}', '\u{300A}', '\u{FE64}', '\u{FF1C}',
+];
+
+/// `>` and the characters that look like it, which issue text shows as `›`.
+const CLOSING: &[char] = &[
+    '>', '\u{2C3}', '\u{1433}', '\u{232A}', '\u{276D}', '\u{276F}', '\u{2771}', '\u{27E9}',
+    '\u{29FD}', '\u{3009}', '\u{300B}', '\u{FE65}', '\u{FF1E}',
+];
+
+/// Whether `c` renders as nothing: a format character (Unicode 15.1's category Cf: zero-width,
+/// bidi overrides, tag characters), any other default-ignorable code point (Unicode 15.1's
+/// `Default_Ignorable_Code_Point`: the combining grapheme joiner, variation selectors, Hangul
+/// fillers, Khmer inherent vowels and the unassigned ignorables), the braille blank or the null
+/// notehead. Check both tables against a newer Unicode's data when the toolchain's Unicode moves
+/// past 15.1 (`python3 -c "import unicodedata; print(unicodedata.unidata_version)"`, and
+/// `DerivedCoreProperties.txt` for the default-ignorables).
 fn is_invisible(c: char) -> bool {
     is_format(c)
-        || matches!(
-            c,
-            '\u{34F}'
-                | '\u{115F}'..='\u{1160}'
-                | '\u{180B}'..='\u{180D}'
-                | '\u{180F}'
-                | '\u{3164}'
-                | '\u{FE00}'..='\u{FE0F}'
-                | '\u{FFA0}'
-                | '\u{E0100}'..='\u{E01EF}'
-        )
+        || IGNORABLE
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&c))
+        || matches!(c, '\u{2800}' | '\u{1D159}')
 }
+
+/// Unicode 15.1's `Default_Ignorable_Code_Point`, as ranges.
+const IGNORABLE: &[(char, char)] = &[
+    ('\u{AD}', '\u{AD}'),
+    ('\u{34F}', '\u{34F}'),
+    ('\u{61C}', '\u{61C}'),
+    ('\u{115F}', '\u{1160}'),
+    ('\u{17B4}', '\u{17B5}'),
+    ('\u{180B}', '\u{180F}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{202A}', '\u{202E}'),
+    ('\u{2060}', '\u{206F}'),
+    ('\u{3164}', '\u{3164}'),
+    ('\u{FE00}', '\u{FE0F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFA0}', '\u{FFA0}'),
+    ('\u{FFF0}', '\u{FFF8}'),
+    ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0000}', '\u{E0FFF}'),
+];
 
 /// Whether `c` is in Unicode 15.1's general category Cf (format characters).
 fn is_format(c: char) -> bool {
@@ -1179,8 +1207,9 @@ mod tests {
 
     #[test]
     fn the_format_table_is_unicode_15_1_category_cf_and_blanks_are_dropped_too() {
-        // Unicode 15.1's Cf, written out independently of `FORMAT` from its UnicodeData.txt:
-        // a change to the table that drops or adds a character fails here.
+        // Unicode 15.1's Cf, written out again apart from `FORMAT`, so a change to the table
+        // that drops or adds a character fails here. Recheck it with `python3 -c "import
+        // unicodedata as u; print([hex(c) for c in range(0x110000) if u.category(chr(c)) == 'Cf'])"`.
         let cf: &[(u32, u32)] = &[
             (0xAD, 0xAD),
             (0x600, 0x605),
@@ -1211,11 +1240,18 @@ mod tests {
         for c in [
             '\u{34F}',
             '\u{115F}',
+            '\u{17B4}',
             '\u{180B}',
+            '\u{2065}',
+            '\u{2800}',
             '\u{3164}',
             '\u{FE0F}',
             '\u{FFA0}',
+            '\u{FFF0}',
+            '\u{1D159}',
+            '\u{E0000}',
             '\u{E0100}',
+            '\u{E0FFF}',
         ] {
             assert!(is_invisible(c), "U+{:04X}", c as u32);
             assert_eq!(as_data(&format!("a{c}b"), true), "ab");
@@ -1224,16 +1260,35 @@ mod tests {
             assert!(!is_invisible(c), "U+{:04X}", c as u32);
         }
         // Brackets that look like angle brackets become the same escapes.
+        let looks: String = OPENING
+            .iter()
+            .zip(CLOSING)
+            .map(|(open, close)| format!("{open}/issue{close} "))
+            .collect();
+        assert_eq!(as_data(&looks, true), "‹/issue› ".repeat(OPENING.len()));
         assert_eq!(
-            as_data("＜/issue＞ ﹤x﹥ 〈y〉 〈z〉 ⟨w⟩", true),
-            "‹/issue› ‹x› ‹y› ‹z› ‹w›"
+            as_data(
+                "\u{FF1C}/issue\u{FF1E} \u{2329}x\u{232A} \u{300A}y\u{300B}",
+                true
+            ),
+            "‹/issue› ‹x› ‹y›"
         );
+        // An ignorable character in the middle of a word is gone, not a space.
+        assert_eq!(as_data("tri\u{E0041}age", false), "triage");
         // A title is cleaned before it is cut, so dropped characters don't use up its length.
         let mut others = open(&[61]);
         others[0].title = format!("{}{}", "\u{200B}".repeat(50), "t".repeat(MAX_OTHER_TITLE));
         let prompt = triage_prompt("abc123", &open(&[1]), &others);
         assert!(
             prompt.contains(&format!("#61: {}\n", "t".repeat(MAX_OTHER_TITLE))),
+            "{prompt}"
+        );
+        // So is a body.
+        let mut issues = open(&[1]);
+        issues[0].body = format!("{}{}", "\u{200B}".repeat(50), "b".repeat(MAX_BODY + 5));
+        let prompt = triage_prompt("abc123", &issues, &[]);
+        assert!(
+            prompt.contains(&format!("\n\n{}\n</issue>", "b".repeat(MAX_BODY))),
             "{prompt}"
         );
     }
