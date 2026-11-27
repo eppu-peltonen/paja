@@ -1565,6 +1565,163 @@ fn run_never_claims_another_repositorys_item() {
 }
 
 #[test]
+fn usage_sums_recorded_steps_per_item_and_day_and_counts_unknown_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    // 2026-03-01 and 2026-03-02, UTC.
+    let (day1, day2) = (1_772_323_200_000u64, 1_772_409_600_000u64);
+    let step = |role: &str, i: u64, o: u64, turns: u64, ms: u64| {
+        serde_json::json!({"step": "build", "role": role, "model": "opus",
+            "input_tokens": i, "output_tokens": o, "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 10, "num_turns": turns, "duration_ms": ms})
+    };
+    // A step whose result had no usage: unknown, not zero.
+    let unknown = serde_json::json!({"step": "review", "role": "review", "model": "opus",
+        "input_tokens": null, "output_tokens": null, "cache_read_input_tokens": null,
+        "cache_creation_input_tokens": null, "num_turns": null, "duration_ms": null});
+    let event = |kind: &str, ts: u64, data: Value| {
+        serde_json::json!({"v": 1, "seq": 0, "ts_ms": ts, "kind": kind, "data": data}).to_string()
+    };
+    let round = |number: u64, round: u64, verdict: &str, steps: Vec<Value>| {
+        serde_json::json!({"repo": "acme/app", "number": number, "round": round,
+            "verdict": verdict, "detail": "", "steps": steps})
+    };
+    let imported = |number: u64, title: &str| {
+        serde_json::json!({"repo": "acme/app", "number": number, "title": title,
+            "body": "", "url": "https://example.com/x"})
+    };
+    let mut lines = vec![
+        event("work.imported", day1, imported(1, "Lands at once")),
+        event("work.imported", day1, imported(2, "Needs a person")),
+        event(
+            "run.round",
+            day1,
+            round(
+                1,
+                1,
+                "approve",
+                vec![
+                    step("build", 10, 20, 3, 60_000),
+                    step("review", 1, 2, 1, 5_000),
+                ],
+            ),
+        ),
+        event(
+            "run.landed",
+            day1 + 1,
+            serde_json::json!({"repo": "acme/app", "number": 1, "pr": "p", "rounds": 1}),
+        ),
+    ];
+    for (n, verdict) in [(1, "changes"), (2, "changes"), (3, "changes")] {
+        let steps = if n == 3 {
+            vec![step("fix", 5, 5, 2, 1_000), unknown.clone()]
+        } else {
+            vec![step("build", 5, 5, 2, 1_000)]
+        };
+        lines.push(event("run.round", day2, round(2, n, verdict, steps)));
+    }
+    lines.push(event(
+        "run.escalated",
+        day2 + 1,
+        serde_json::json!({"repo": "acme/app", "number": 2, "rounds": 3}),
+    ));
+    std::fs::write(home.join("events.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let (ok, report) = paja(&home, &repo, &["usage"]);
+    assert!(ok, "{report}");
+    let items = report["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{report}");
+    let (one, two) = (&items[0], &items[1]);
+    assert_eq!(
+        (one["number"].as_u64(), one["outcome"].as_str()),
+        (Some(1), Some("landed"))
+    );
+    assert_eq!(one["title"], "Lands at once");
+    assert_eq!(one["rounds"], 1);
+    assert_eq!(
+        (one["steps"].as_u64(), one["unknown_steps"].as_u64()),
+        (Some(2), Some(0))
+    );
+    assert_eq!(one["input_tokens"], 11);
+    assert_eq!(one["output_tokens"], 22);
+    assert_eq!(one["cache_read_input_tokens"], 200);
+    assert_eq!(one["cache_creation_input_tokens"], 20);
+    assert_eq!(
+        (one["turns"].as_u64(), one["wall_ms"].as_u64()),
+        (Some(4), Some(65_000))
+    );
+    assert_eq!(one["by_role"].as_array().unwrap().len(), 2, "{one}");
+    assert_eq!(two["outcome"], "escalated");
+    assert_eq!(two["rounds"], 3);
+    assert_eq!(
+        (two["steps"].as_u64(), two["unknown_steps"].as_u64()),
+        (Some(4), Some(1))
+    );
+    assert_eq!(two["input_tokens"], 15);
+    assert_eq!(two["output_tokens"], 15);
+    assert_eq!(two["turns"], 6);
+    // Days and the overall total: the unknown step is counted, and adds nothing.
+    let days = report["days"].as_array().unwrap();
+    assert_eq!(days.len(), 2, "{report}");
+    assert_eq!(days[0]["date"], "2026-03-01");
+    assert_eq!(days[0]["steps"], 2);
+    assert_eq!(days[1]["date"], "2026-03-02");
+    assert_eq!(
+        (days[1]["steps"].as_u64(), days[1]["unknown_steps"].as_u64()),
+        (Some(4), Some(1))
+    );
+    assert_eq!(report["total"]["steps"], 6);
+    assert_eq!(report["total"]["unknown_steps"], 1);
+    assert_eq!(report["total"]["input_tokens"], 26);
+    assert_eq!(report["total"]["output_tokens"], 37);
+    // Per landed item: one item, so the median and 90th percentile are its own.
+    assert_eq!(report["landed"]["items"], 1);
+    assert_eq!(report["landed"]["rounds"]["median"], 1);
+    assert_eq!(report["landed"]["tokens"]["p90"], 11 + 22 + 200 + 20);
+    // The text says unknown out loud.
+    let gh = program(
+        tmp.path(),
+        "gh",
+        "#!/bin/sh\necho '{\"nameWithOwner\": \"acme/app\"}'\n",
+    );
+    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .arg("usage")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("1 unknown"), "{text}");
+
+    let (ok, only) = paja(&home, &repo, &["usage", "--item", "2"]);
+    assert!(ok, "{only}");
+    assert_eq!(only["items"].as_array().unwrap().len(), 1);
+    assert_eq!(only["total"]["steps"], 4);
+    let (ok, since) = paja(&home, &repo, &["usage", "--since", "2026-03-02"]);
+    assert!(ok, "{since}");
+    assert_eq!(since["items"].as_array().unwrap().len(), 1, "{since}");
+    assert_eq!(since["total"]["steps"], 4);
+    assert_eq!(since["since"], "2026-03-02");
+    let (ok, bad) = paja(&home, &repo, &["usage", "--since", "soon"]);
+    assert!(!ok);
+    assert!(
+        bad["error"].as_str().unwrap().contains("YYYY-MM-DD"),
+        "{bad}"
+    );
+
+    // The MCP tool gives the same JSON.
+    let mut mcp = Mcp::start(&home, &repo, &[("PAJA_GH", gh.as_path())]);
+    mcp.initialize();
+    let (ok, by_mcp) = mcp.call("usage", serde_json::json!({}));
+    assert!(ok, "{by_mcp}");
+    assert_eq!(by_mcp, report);
+}
+
+#[test]
 fn work_list_all_needs_no_checkout_once_the_log_names_its_repositories() {
     let tmp = tempfile::tempdir().unwrap();
     let (elsewhere, home) = (tmp.path().join("elsewhere"), tmp.path().join("home"));

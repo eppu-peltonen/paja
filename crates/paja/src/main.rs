@@ -165,6 +165,20 @@ enum Command {
     /// stdout carries the MCP protocol, so this is the one command that never prints a
     /// result of its own; its errors go to stderr.
     Mcp,
+    /// What each work item and each day spent: rounds, steps by role and model, tokens, turns,
+    /// wall time and outcome per item; totals per day and overall; the median and 90th
+    /// percentile per landed item. Steps whose usage couldn't be read are counted as unknown.
+    Usage {
+        /// Any path inside the repository's checkout (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Only this work item.
+        #[arg(long, value_name = "NUMBER")]
+        item: Option<u64>,
+        /// Only steps recorded on or after this UTC date (YYYY-MM-DD).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+    },
     /// Show the event log, newest last.
     Log {
         /// Only the last N events.
@@ -765,6 +779,13 @@ fn run(cli: &Cli) -> Result<()> {
                 });
             }
         },
+        Command::Usage { repo, item, since } => {
+            let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+            let report = paja::usage::report(&home, &name, *item, since.as_deref())?;
+            emit(cli, paja::usage::to_json(&report)?, || {
+                paja::usage::describe(&report)
+            });
+        }
         Command::Log { limit } => {
             let events = home.events().tail(*limit)?;
             emit(cli, serde_json::to_value(&events)?, || {
