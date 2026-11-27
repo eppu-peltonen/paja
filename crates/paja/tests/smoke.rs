@@ -2750,6 +2750,8 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     let models = checks.iter().find(|c| c["name"] == "models").unwrap();
     assert_eq!(models["status"], "warning", "{report}");
     let detail = models["detail"].as_str().unwrap();
+    // The branch is named by its short name, the ref doctor read it from.
+    assert!(detail.contains("on origin/HEAD"), "{report}");
     assert!(
         detail.contains(": \"reveiw\"") && detail.matches("reveiw").count() == 1,
         "{report}"
@@ -4960,7 +4962,11 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"workflow list\") echo 'CI	active	1' ;;\n\
              \"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/followups.json ;; *) echo '[]' ;; esac ;;\n\
-             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi ;;\n\
+             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi; \
+             if [ -f {d}/comment-posts-then-fails ]; then n=$3; shift 3; echo \"$2\" | head -n 1 >> {d}/posted-$n; echo 'connection reset' >&2; exit 1; fi ;;\n\
+             \"api user\") if [ -f {d}/user-fails ]; then echo 'HTTP 403' >&2; exit 1; fi; echo paja-bot ;;\n\
+             \"api \"*) case \"$2\" in *comments) if [ -f {d}/comments-fail ]; then echo 'HTTP 502' >&2; exit 1; fi; \
+             n=${{2#*issues/}}; n=${{n%%/*}}; if [ -f {d}/posted-$n ]; then cat {d}/posted-$n; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
     );
@@ -5492,6 +5498,162 @@ fn a_duplicate_note_that_fails_is_reported_and_tried_again_next_pass() {
     // A pass after that has nothing left to retry.
     let (_, report) = triage(&f, &dir);
     assert!(report.get("retried_notes").is_none(), "{report}");
+}
+
+#[test]
+fn a_duplicate_note_github_took_though_gh_failed_is_not_posted_again() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // GitHub takes the note on #11, but gh exits non-zero, so the pass records it as failed.
+    std::fs::write(dir.join("comment-posts-then-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran[0]["data"]["note_failed"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{ran:?}"
+    );
+    let posted = std::fs::read_to_string(dir.join("posted-11")).unwrap();
+    assert!(posted.starts_with("**Paja triage closed #12 ("), "{posted}");
+    // The next pass finds the note on #11 and records it as noted without posting it again.
+    std::fs::remove_file(dir.join("comment-posts-then-fails")).unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(
+        report["retried_notes"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issues/11/comments"), "{log}");
+    // Only the account gh comments as counts.
+    assert!(log.contains("api user --jq .login"), "{log}");
+    assert!(
+        log.contains(r#"select(.user.login == "paja-bot")"#),
+        "{log}"
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        1,
+        "{log}"
+    );
+    let notes = events_of(&f, "triage.notes");
+    assert_eq!(
+        notes.last().unwrap()["data"]["noted"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn a_retried_note_github_took_is_found_and_an_unreadable_listing_posts_the_note() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    let comments = || {
+        std::fs::read_to_string(dir.join("gh.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count()
+    };
+    // The first note fails outright; the retry's short form is taken though gh fails.
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("comment-posts-then-fails"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(report["retried_notes"][0]["error"].is_string(), "{report}");
+    let posted = std::fs::read_to_string(dir.join("posted-11")).unwrap();
+    assert_eq!(
+        posted.trim(),
+        "**Paja triage closed #12 as a duplicate of this issue.**"
+    );
+    assert_eq!(comments(), 2);
+    // The third pass finds the short form and posts nothing.
+    std::fs::remove_file(dir.join("comment-posts-then-fails")).unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    assert_eq!(comments(), 2);
+    // With the note gone and the comments unreadable, a pending note is posted as before.
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("comments-fail"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        2,
+        "{log}"
+    );
+    // Nor when gh can't say who it comments as (an app token can't read /user): no listing is
+    // read, and the pending note is posted.
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("user-fails"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("api user"), "{log}");
+    assert!(!log.contains("/comments"), "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        2,
+        "{log}"
+    );
 }
 
 #[test]
@@ -7432,6 +7594,92 @@ fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
         error.contains(".paja/checks is already on main") && error.contains("--force"),
         "{error}"
     );
+}
+
+#[test]
+fn init_force_rewrites_the_branch_without_a_tracking_ref_and_adds_no_second_section() {
+    let (tmp, repo, home, gh) = init_fixture(&[
+        ("requirements.txt", "pytest\n"),
+        ("ruff.toml", ""),
+        (
+            "CLAUDE.md",
+            "# App\n\n## Working with Paja\n\nAlready here.\n",
+        ),
+    ]);
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci", "--no-agent"], &vars);
+    assert!(ok, "{out}");
+    let workflow = show(&repo, "paja/init", ".github/workflows/paja.yml");
+    assert!(
+        workflow.contains("pip install -r requirements.txt pytest ruff"),
+        "{workflow}"
+    );
+    assert!(workflow.contains("run: ruff check ."), "{workflow}");
+    assert!(
+        !out["files"].to_string().contains("CLAUDE.md"),
+        "the section is already there: {out}"
+    );
+
+    // Without --force the second run fails at the push, and says what to do.
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "more"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci", "--no-agent"], &vars);
+    assert!(!ok, "{out}");
+    assert!(out["error"].as_str().unwrap().contains("--force"), "{out}");
+
+    // With --force and no local tracking ref for origin/paja/init, the push still lands.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["update-ref", "-d", "refs/remotes/origin/paja/init"])
+        .status();
+    let (ok, out) = paja_with(
+        &home,
+        &repo,
+        &["init", "--ci", "--no-agent", "--force"],
+        &vars,
+    );
+    assert!(ok, "{out}");
+    let origin = tmp.path().join("origin.git");
+    let tip = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args(["rev-list", "--count", "main..paja/init"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), "1");
+    let claude = show(&repo, "paja/init", "CLAUDE.md");
+    assert_eq!(claude.matches("## Working with Paja").count(), 1);
+}
+
+#[test]
+fn init_reports_an_open_pull_request_when_creating_one_fails_and_says_how_to_recover_otherwise() {
+    let (tmp, repo, home, _) = init_fixture(&[("go.mod", "module x\n")]);
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             \"pr create\") echo 'HTTP 422' >&2; exit 1 ;;\n\
+             \"pr list\") if [ -f {d}/open-pr ]; then echo '[{{\"url\": \"https://example.com/pull/9\"}}]'; else echo '[]'; fi ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--no-agent"], &vars);
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("by hand") && error.contains("--force"),
+        "{error}"
+    );
+
+    std::fs::write(tmp.path().join("open-pr"), "").unwrap();
+    let (ok, out) = paja_with(&home, &repo, &["init", "--no-agent", "--force"], &vars);
+    assert!(ok, "{out}");
+    assert_eq!(out["pull_request"], "https://example.com/pull/9");
 }
 
 #[test]

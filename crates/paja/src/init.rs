@@ -700,6 +700,19 @@ fn review_section(d: &Detected) -> String {
     text
 }
 
+/// The URL of an open pull request from `paja/init`, if there is one.
+fn open_pull_request(ok: &ahjo::Untampered) -> Option<String> {
+    let out = jono::gh(
+        ok,
+        &[
+            "pr", "list", "--head", BRANCH, "--state", "open", "--json", "url",
+        ],
+    )
+    .ok()?;
+    let list: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+    list.get(0)?.get("url")?.as_str().map(str::to_string)
+}
+
 fn prepare_and_open(
     home: &Home,
     ok: &ahjo::Untampered,
@@ -782,13 +795,21 @@ fn prepare_and_open(
         &["commit", "-q", "-m", "Set this repository up for Paja"],
     )?;
     let mut push = vec!["push", "-q", "-u", "origin", BRANCH];
+    // A bare lease compares against the local remote-tracking ref, which a fresh clone may lack; name
+    // the value the remote has right now instead (no lease when the branch is not there).
+    let lease;
     if options.force {
-        push.push("--force-with-lease");
+        let refname = format!("refs/heads/{BRANCH}");
+        let remote = git(work, &["ls-remote", "--heads", "origin", &refname])?;
+        if let Some(sha) = remote.split_whitespace().next() {
+            lease = format!("--force-with-lease={refname}:{sha}");
+            push.push(&lease);
+        }
     }
     git(work, &push).map_err(|err| {
         err.context(format!(
             "pushing {BRANCH} (never {branch}); check the `origin` remote, or run `paja init --force` if an \
-             earlier {BRANCH} is on it"
+             earlier {BRANCH} is on it (if its pull request was never opened, open one by hand)"
         ))
     })?;
     let body = format!(
@@ -808,7 +829,7 @@ fn prepare_and_open(
         review_section(&d),
         labels.work
     );
-    let out = jono::gh(
+    let created = jono::gh(
         ok,
         &[
             "pr",
@@ -822,7 +843,22 @@ fn prepare_and_open(
             "--body",
             &body,
         ],
-    )?;
+    );
+    let out = match created {
+        Ok(out) => out,
+        Err(err) => {
+            // The branch is already pushed: an open pull request from it is the one to report.
+            match open_pull_request(ok) {
+                Some(url) => url,
+                None => {
+                    return Err(err.context(format!(
+                        "{BRANCH} is pushed but its pull request could not be opened; open one from \
+                         {BRANCH} into {branch} by hand, or fix the error and run `paja init --force`"
+                    )))
+                }
+            }
+        }
+    };
     let mut notes = Vec::new();
     if d.checks.is_empty() {
         notes.push(format!(

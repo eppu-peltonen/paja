@@ -588,6 +588,65 @@ fn closing_comment(item: &Triaged, repo: &Path) -> String {
     follow_ups::redact_for_issue(&text, repo)
 }
 
+/// The account `gh` comments as, if it can name one that is safe to quote in a jq program (a
+/// GitHub login, an app's `name[bot]` or a managed user's `name_shortcode`). When Paja runs on
+/// the person's own sign-in, that is the person, and their comments count as Paja's. A token
+/// that can't read `/user` (an app's installation token) gives none, and notes are then posted
+/// without looking for an earlier one; stderr says so.
+fn commenter(repo: &Path) -> Option<String> {
+    let login = run_gh(repo, &["api", "user", "--jq", ".login"])
+        .ok()
+        .filter(|login| comments_by(login.trim()).is_some());
+    if login.is_none() {
+        progress(
+            "triage: `gh api user` didn't name the account Paja comments as, so pending notes \
+             are posted without checking for an earlier copy",
+        );
+    }
+    login.map(|login| login.trim().to_string())
+}
+
+/// The jq program that prints the first line of each comment `login` wrote, or `None` for a
+/// login that isn't safe to quote in it.
+fn comments_by(login: &str) -> Option<String> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_[]".contains(c);
+    (!login.is_empty() && login.chars().all(plain)).then(|| {
+        format!(".[] | select(.user.login == \"{login}\") | (.body // \"\") | split(\"\\n\")[0]")
+    })
+}
+
+/// Whether issue `on` already has a note on duplicate `number` that `login` (see [`commenter`])
+/// wrote, in either form a pass writes. Only the account Paja comments as counts, so nobody
+/// else's comment can stand in for a note. No login, or a listing `gh` can't give, counts as no:
+/// the note is posted, as before.
+fn already_noted(repo: &Path, login: Option<&str>, on: u64, number: u64) -> bool {
+    let Some(jq) = login.and_then(comments_by) else {
+        return false;
+    };
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{on}/comments");
+    match run_gh(repo, &["api", &path, "--paginate", "--jq", &jq]) {
+        Ok(first_lines) => noted_in(&first_lines, number),
+        Err(err) => {
+            progress(&format!(
+                "triage: reading #{on}'s comments failed ({err:#}), so the note on #{number} is \
+                 posted without checking for an earlier copy"
+            ));
+            false
+        }
+    }
+}
+
+/// Whether one of `first_lines` (each the first line of a comment) is the start of a note on
+/// duplicate `number`: `**Paja triage closed #<n> (title) as a duplicate of this issue.**` or
+/// `**Paja triage closed #<n> as a duplicate of this issue.**`.
+fn noted_in(first_lines: &str, number: u64) -> bool {
+    let start = format!("**Paja triage closed #{number} ");
+    first_lines.lines().any(|line| {
+        let line = line.trim_end();
+        line.starts_with(&start) && line.ends_with("as a duplicate of this issue.**")
+    })
+}
+
 /// The comment a duplicate's original gets, so the duplicate's finding isn't lost if the
 /// original is later closed without being done.
 fn duplicate_note(item: &Triaged, repo: &Path) -> String {
@@ -676,6 +735,12 @@ fn triage_holding(
     // duplicate's reason is in its own closing comment. They go first, so a pass whose agent
     // fails still posts them.
     let mut retried_notes = Vec::new();
+    // The account Paja comments as, asked once per pass and only when a note is pending.
+    let login = if pending.is_empty() {
+        None
+    } else {
+        commenter(&repo)
+    };
     for (number, on, tries) in pending {
         let note = follow_ups::redact_for_issue(
             &format!(
@@ -684,11 +749,17 @@ fn triage_holding(
             ),
             &repo,
         );
-        let error = run_gh(
-            &repo,
-            &["issue", "comment", &on.to_string(), "--body", &note],
-        )
-        .err()
+        // A post that went through while `gh` still failed (a dropped connection after the
+        // write, say) is on the original already: record it as noted rather than post it again.
+        let error = if already_noted(&repo, login.as_deref(), on, number) {
+            None
+        } else {
+            run_gh(
+                &repo,
+                &["issue", "comment", &on.to_string(), "--body", &note],
+            )
+            .err()
+        }
         .map(|err| {
             // This try is the last: say so, so the person adds the note by hand.
             if tries + 1 >= MAX_NOTE_TRIES {
@@ -1575,6 +1646,46 @@ mod tests {
         let mut order = vec![1u64, 2, 5, 6, 7];
         order.sort_by_key(|n| (read.get(n).copied(), *n));
         assert_eq!(order, [6, 7, 1, 2, 5]);
+    }
+
+    #[test]
+    fn only_a_plain_login_is_quoted_into_the_comment_filter() {
+        let jq = comments_by("paja-bot").unwrap();
+        assert!(jq.contains(r#"select(.user.login == "paja-bot")"#), "{jq}");
+        assert!(jq.ends_with(r#"split("\n")[0]"#), "{jq}");
+        assert!(comments_by("my-app[bot]").is_some());
+        assert!(comments_by("jane_acme").is_some());
+        for bad in ["", "a\"b", "a b", "a\\b", "x\") or true or (\"", "é"] {
+            assert_eq!(comments_by(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_note_is_found_in_either_form_and_only_for_its_own_duplicate() {
+        let lines =
+            "**Paja triage closed #12 (Tidy the helper) as a duplicate of this issue.**\r\n\
+                     Thanks!\n";
+        assert!(noted_in(lines, 12));
+        assert!(!noted_in(lines, 1));
+        assert!(!noted_in(lines, 120));
+        assert!(noted_in(
+            "**Paja triage closed #120 as a duplicate of this issue.**",
+            120
+        ));
+        assert!(!noted_in(
+            "**Paja triage closed #120 as a duplicate of this issue.**",
+            12
+        ));
+        // The closing comment on the duplicate, or a note quoted mid-line, isn't one.
+        assert!(!noted_in(
+            "Paja triage closed this issue as a duplicate of #11.",
+            12
+        ));
+        assert!(!noted_in(
+            "> **Paja triage closed #12 as a duplicate of this issue.**",
+            12
+        ));
+        assert!(!noted_in("", 12));
     }
 
     #[test]
