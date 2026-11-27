@@ -1758,6 +1758,21 @@ fn turn_limit_twice(scene: &Scene, note: &str, round: u32) -> Result<RunReport> 
 fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<(Env, bool)> {
     let name = item.env_name();
     if let Ok(env) = ahjo::get(home, &name) {
+        // The name holds only a short hash of the repository, so two repositories could in
+        // principle share it; never run one's item in the other's worktree.
+        let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        };
+        if !same(&env.repo, repo) {
+            bail!(
+                "environment {name} belongs to the repository at {}, not {}; two repositories \
+                 got the same environment name, so remove it with `paja env remove {name}` \
+                 if it is stale",
+                env.repo.display(),
+                repo.display()
+            );
+        }
         return Ok((env, true));
     }
     let branch = format!("refs/heads/paja/{name}");
