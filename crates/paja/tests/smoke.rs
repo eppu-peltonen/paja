@@ -4569,7 +4569,7 @@ fn a_skipped_models_role_reaches_the_notifier_once() {
     let sent = events_of(&f, "notify.sent");
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["data"]["kind"], "skipped_role");
-    assert_eq!(sent[0]["data"]["subject"], "newrole");
+    assert_eq!(sent[0]["data"]["subject"], serde_json::json!(["newrole"]));
     // A second unknown role is news, so it gets a notice of its own.
     f.on_main(".paja/models", "build sonnet\nnewrole haiku\nother haiku\n");
     let (ok, report) = pass();
@@ -4577,6 +4577,70 @@ fn a_skipped_models_role_reaches_the_notifier_once() {
     let notices = std::fs::read_to_string(&log).unwrap();
     assert_eq!(notices.lines().count(), 2, "{notices}");
     assert!(notices.contains("role \"other\""), "{notices}");
+}
+
+#[test]
+fn a_skipped_role_notice_that_fails_is_not_tried_again() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(".paja/models", "build sonnet\nnewrole haiku\n");
+    let notifier = program(f.tmp.path(), "notifier", "#!/bin/sh\nexit 1\n");
+    for _ in 0..2 {
+        let (ok, report) = paja_with(
+            &f.home,
+            &f.repo,
+            &["run"],
+            &[
+                ("PAJA_GH", f.gh.as_path()),
+                ("PAJA_CLAUDE", f.claude.as_path()),
+                ("PAJA_NOTIFIER", notifier.as_path()),
+            ],
+        );
+        assert!(ok, "{report}");
+    }
+    let failed = events_of(&f, "notify.failed");
+    assert_eq!(failed.len(), 1, "a tried notice counts as told: {failed:?}");
+    assert_eq!(failed[0]["data"]["kind"], "skipped_role");
+}
+
+#[test]
+fn runs_starting_together_send_a_skipped_role_notice_once() {
+    // A pool's lanes start together; each reads the log before the other's notice is recorded
+    // unless Posti's lock orders them.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(".paja/models", "build sonnet\nnewrole haiku\n");
+    let log = f.tmp.path().join("notices.log");
+    let notifier = program(
+        f.tmp.path(),
+        "notifier",
+        &format!(
+            "#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$1\" >> {}\n",
+            slash(&log)
+        ),
+    );
+    let start = || {
+        Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_NOTIFIER", &notifier)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "run"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let runs = [start(), start()];
+    for run in runs {
+        let out = run.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    assert_eq!(events_of(&f, "notify.sent").len(), 1);
 }
 
 /// What the fake arbiter says next: its `structured_output`.

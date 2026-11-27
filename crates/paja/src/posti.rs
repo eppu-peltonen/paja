@@ -13,7 +13,8 @@ use serde_json::json;
 
 use crate::home::Home;
 
-/// A notice reached a channel: `{"repo", "number", "kind", "channel"}`.
+/// A notice reached a channel: `{"repo", "number", "kind", "channel"}`, plus `subject` (the
+/// roles it named) for a `skipped_role` notice.
 pub const EV_SENT: &str = "notify.sent";
 /// A notice didn't reach a channel: the same fields plus `error`.
 pub const EV_FAILED: &str = "notify.failed";
@@ -32,9 +33,9 @@ pub struct Notice {
     pub number: Option<u64>,
     /// `escalated`, `pass_failed`, `stopped` or `skipped_role`.
     pub kind: &'static str,
-    /// What the notice is about beyond the item, recorded with it: the role of a
-    /// `skipped_role` notice, so each role is told once.
-    pub subject: Option<String>,
+    /// What the notice is about beyond the item, recorded with it: the roles a `skipped_role`
+    /// notice names, so each role is told once.
+    pub subject: Option<Vec<String>>,
     pub title: String,
     pub text: String,
 }
@@ -87,37 +88,71 @@ impl Notice {
     }
 }
 
+/// The longest role word a notice shows; longer ones are cut, so a notice's arguments and push
+/// body stay small whatever main's file holds.
+const ROLE_SHOWN: usize = 64;
+
+/// A role as a notice shows it: quoted and escaped, as the run's warning shows it, so a
+/// control character in the file never reaches a terminal or a phone, and cut at `ROLE_SHOWN`
+/// characters.
+fn shown_role(role: &str) -> String {
+    if role.chars().count() <= ROLE_SHOWN {
+        return format!("{role:?}");
+    }
+    let cut: String = role.chars().take(ROLE_SHOWN).collect();
+    format!("{cut:?}…")
+}
+
 impl Notice {
-    /// `.paja/models` on `branch` names a role this Paja doesn't know, so its line is skipped.
-    /// The role is shown quoted and escaped, as the run's warning shows it, so a control
-    /// character in the file never reaches a terminal or a phone.
-    pub fn skipped_role(repo: &str, branch: &str, role: &str) -> Self {
+    /// `.paja/models` on `branch` names roles this Paja doesn't know, so their lines are
+    /// skipped.
+    pub fn skipped_roles(repo: &str, branch: &str, roles: &[String]) -> Self {
+        let shown: Vec<String> = roles.iter().map(|r| shown_role(r)).collect();
+        let (named, these) = if roles.len() == 1 {
+            (format!("a line for role {}", shown[0]), "the role runs")
+        } else {
+            (
+                format!("lines for roles {}", shown.join(", ")),
+                "the roles run",
+            )
+        };
         Self {
             repo: Some(repo.to_string()),
             number: None,
             kind: "skipped_role",
-            subject: Some(role.to_string()),
+            subject: Some(roles.to_vec()),
             title: format!("Paja: {repo} names a role this Paja doesn't know"),
             text: format!(
-                ".paja/models on {branch} has a line for role {role:?}, which this Paja skips, \
-                 so the role runs on the default model or turn cap. If the role is new, install \
-                 the newer Paja; if it is a typo, fix the line."
+                ".paja/models on {branch} has {named}, which this Paja skips, so {these} on \
+                 the default model or turn cap. If a role is new, install the newer Paja; if it \
+                 is a typo, fix the line."
             ),
         }
     }
 }
 
-/// Tell the person once about each role in `skipped` (the `.paja/models` roles this Paja
-/// doesn't know) that no earlier notice for `repo` named, so a runner left unattended hears of
-/// it without anyone running `paja doctor`. A notice that was tried counts, delivered or not, so
-/// a channel that is down doesn't bring the same notice back at every pass.
+/// Tell the person, in one notice, of the roles in `skipped` (the `.paja/models` roles this
+/// Paja doesn't know) that no earlier notice for `repo` named, so a runner left unattended
+/// hears of them without anyone running `paja doctor`. A notice that was tried counts,
+/// delivered or not, so a channel that is down doesn't bring the same notice back at every
+/// pass. Posti's lock for `repo` is held from reading the log until the notice is recorded, so
+/// processes starting together (a pool's lanes) send it once; a process that can't get it in
+/// time leaves the notice to the next pass.
 pub fn skipped_roles(home: &Home, checkout: &Path, repo: &str, branch: &str, skipped: &[String]) {
     if skipped.is_empty() {
         return;
     }
+    let Ok(Some(_lock)) = home.posti_lock_within(repo, LIMIT) else {
+        return;
+    };
     let told = told_roles(home, repo);
-    for role in skipped.iter().filter(|r| !told.contains(*r)) {
-        send(home, checkout, &Notice::skipped_role(repo, branch, role));
+    let new: Vec<String> = skipped
+        .iter()
+        .filter(|r| !told.contains(*r))
+        .cloned()
+        .collect();
+    if !new.is_empty() {
+        send(home, checkout, &Notice::skipped_roles(repo, branch, &new));
     }
 }
 
@@ -131,7 +166,9 @@ fn told_roles(home: &Home, repo: &str) -> Vec<String> {
         .iter()
         .filter(|e| e.kind == EV_SENT || e.kind == EV_FAILED)
         .filter(|e| e.data["kind"] == "skipped_role" && e.data["repo"] == repo)
-        .filter_map(|e| e.data["subject"].as_str().map(str::to_string))
+        .filter_map(|e| e.data["subject"].as_array())
+        .flatten()
+        .filter_map(|r| r.as_str().map(str::to_string))
         .collect()
 }
 
@@ -380,13 +417,20 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_role_is_named_escaped() {
-        let n = Notice::skipped_role("acme/app", "main", "rev\u{1b}[2Jiewer");
+    fn skipped_roles_are_named_escaped_and_cut() {
+        let n = Notice::skipped_roles("acme/app", "main", &["rev\u{1b}[2Jiewer".into()]);
         assert_eq!(n.kind, "skipped_role");
-        assert_eq!(n.subject.as_deref(), Some("rev\u{1b}[2Jiewer"));
+        assert_eq!(n.subject, Some(vec!["rev\u{1b}[2Jiewer".to_string()]));
         assert!(!n.text.contains('\u{1b}'), "{}", n.text);
-        assert!(n.text.contains(r#""rev\u{1b}[2Jiewer""#), "{}", n.text);
+        assert!(n.text.contains(r#"role "rev\u{1b}[2Jiewer""#), "{}", n.text);
         assert!(n.text.contains(".paja/models on main"), "{}", n.text);
+        // Several roles go in one notice; a long one is cut in the text, not in the record.
+        let long = "x".repeat(500);
+        let n = Notice::skipped_roles("acme/app", "main", &["a".into(), long.clone()]);
+        assert!(n.text.contains(r#"roles "a", "xxx"#), "{}", n.text);
+        assert!(n.text.contains("x\"…"), "{}", n.text);
+        assert!(n.text.len() < 400, "{}", n.text);
+        assert_eq!(n.subject, Some(vec!["a".to_string(), long]));
     }
 
     #[test]
