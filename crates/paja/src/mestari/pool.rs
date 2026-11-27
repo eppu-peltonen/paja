@@ -934,6 +934,33 @@ pub struct WaitingItem {
     pub paths: Vec<String>,
 }
 
+/// Why a queued item isn't in a lane, which [`WaitingItem::why`] says in words.
+enum Why {
+    /// It waits on these other items.
+    WaitsOn(Vec<u64>),
+    NoPool,
+    /// Its files overlap this lane's item's, for this reason.
+    Overlaps(u64, String),
+    Planning,
+    /// Nothing but a busy pool: it is ready.
+    NoFreeLane,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Why::WaitsOn(on) => {
+                let on: Vec<String> = on.iter().map(|n| format!("#{n}")).collect();
+                write!(f, "waits on {}", on.join(", "))
+            }
+            Why::NoPool => f.write_str("no pool is running"),
+            Why::Overlaps(other, why) => write!(f, "overlaps #{other}: {why}"),
+            Why::Planning => f.write_str("planning which files it touches"),
+            Why::NoFreeLane => f.write_str("no free lane"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Landing {
     pub number: u64,
@@ -1082,28 +1109,39 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
     };
     let admitted: Vec<u64> = lanes.iter().map(|lane| lane.number).collect();
     let (landing, merging) = land_turns(events, repo, &lanes, &begun);
-    let waiting: Vec<WaitingItem> = items
+    let why_waiting = |item: &WorkItem| {
+        if !item.waiting_on.is_empty() {
+            Why::WaitsOn(item.waiting_on.clone())
+        } else if !running {
+            Why::NoPool
+        } else if let Some((other, why)) = plans
+            .get(&item.number)
+            .and_then(|plan| blocked_by(plan, &lane_plans))
+        {
+            Why::Overlaps(other, why)
+        } else if planning(item.number) {
+            Why::Planning
+        } else {
+            Why::NoFreeLane
+        }
+    };
+    let queued: Vec<(&WorkItem, Why)> = items
         .iter()
         .filter(|item| item.open && item.status == Status::Queued)
         .filter(|item| !admitted.contains(&item.number))
-        .map(|item| WaitingItem {
+        .map(|item| (item, why_waiting(item)))
+        .collect();
+    // Ready: nothing holds it back but a busy pool.
+    let ready = queued
+        .iter()
+        .filter(|(_, why)| matches!(why, Why::NoFreeLane))
+        .count();
+    let waiting: Vec<WaitingItem> = queued
+        .into_iter()
+        .map(|(item, why)| WaitingItem {
             number: item.number,
             title: item.title.clone(),
-            why: if !item.waiting_on.is_empty() {
-                let on: Vec<String> = item.waiting_on.iter().map(|n| format!("#{n}")).collect();
-                format!("waits on {}", on.join(", "))
-            } else if !running {
-                "no pool is running".to_string()
-            } else if let Some((other, why)) = plans
-                .get(&item.number)
-                .and_then(|plan| blocked_by(plan, &lane_plans))
-            {
-                format!("overlaps #{other}: {why}")
-            } else if planning(item.number) {
-                "planning which files it touches".to_string()
-            } else {
-                "no free lane".to_string()
-            },
+            why: why.to_string(),
             paths: plans
                 .get(&item.number)
                 .map(|plan| plan.paths.clone())
@@ -1140,10 +1178,6 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
     let held = items
         .iter()
         .filter(|item| item.open && item.status == Status::Escalated)
-        .count();
-    let ready = waiting
-        .iter()
-        .filter(|item: &&WaitingItem| item.why == "no free lane")
         .count();
     PoolStatus {
         repo: repo.to_string(),
