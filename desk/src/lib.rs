@@ -31,10 +31,38 @@ async fn work_list() -> Value {
 /// [`work_list`] for `home`. `checkout` is only asked for its repository when the log still
 /// holds events from before items carried one.
 pub fn work_list_in(home: &Home, checkout: &Path) -> Value {
-    match jono::list_all_from(home, checkout).and_then(|items| Ok(serde_json::to_value(items)?)) {
+    match list_items(home, checkout).and_then(|items| Ok(serde_json::to_value(items)?)) {
         Ok(items) => items,
         Err(err) => error(err),
     }
+}
+
+/// [`jono::list_all_from`] in `cwd`; when that fails (Desk started from a shortcut, so `cwd` is
+/// `/` or `System32` and a log from before items carried a repository can't ask `gh` there), in
+/// each checkout Paja remembers, and the first error when none of them helps.
+fn list_items(home: &Home, cwd: &Path) -> anyhow::Result<Vec<jono::WorkItem>> {
+    let first = match jono::list_all_from(home, cwd) {
+        Ok(items) => return Ok(items),
+        Err(err) => err,
+    };
+    let mut repos: Vec<String> = home
+        .events()
+        .read_all()
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e.kind == jono::EV_CHECKOUT)
+        .filter_map(|e| e.data["repo"].as_str().map(str::to_string))
+        .collect();
+    repos.sort();
+    repos.dedup();
+    for repo in repos {
+        for path in jono::known_checkouts(home, &repo).unwrap_or_default() {
+            if let Ok(items) = jono::list_all_from(home, &path) {
+                return Ok(items);
+            }
+        }
+    }
+    Err(first)
 }
 
 /// Where an item's latest run is, for the run view: [`paja::mestari::live::live`], or null when
@@ -135,7 +163,7 @@ async fn repos(runner: tauri::State<'_, Runner>) -> Result<Value, String> {
 /// [`repos`] for `home`.
 pub fn repos_in(home: &Home, runner: &Runner, cwd: &Path) -> Value {
     let listed = (|| -> anyhow::Result<Value> {
-        let mut names: Vec<String> = jono::list_all_from(home, cwd)?
+        let mut names: Vec<String> = list_items(home, cwd)?
             .into_iter()
             .map(|item| item.repo)
             .filter(|repo| !repo.is_empty())
