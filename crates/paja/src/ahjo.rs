@@ -841,50 +841,99 @@ pub(crate) const DEFAULT_REFS: [(&str, &str); 3] = [
     ("refs/heads/main", "main"),
 ];
 
-/// A file as it is on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
-/// remote's default branch, whatever its name), else `origin/main`, else a local `main`. None
-/// when the file isn't there, or when there is none of these. Never the branch checked out,
-/// which may be the change under review.
+/// The prefix of the branches Paja itself creates and pushes (`paja/<name>`), the change under
+/// review among them.
+const BRANCH_PREFIX: &str = "paja/";
+
+/// The default branch of the checkout `ok` proved safe, as its commit and the short name
+/// messages use, or None when no ref names it. Never the branch checked out, which may be the
+/// change under review.
 ///
-/// Errors when `origin/HEAD` points outside `refs/remotes/origin/` (code in a worktree can
-/// point it at the branch under review), and when the checkout has an `origin` remote but
-/// none of the three refs, so a default branch with another name isn't silently ignored.
-pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
-    let head = git_command()
-        .arg("-C")
-        .arg(ok.path())
-        .args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
-        .output()
-        .context("running git (is it installed?)")?;
-    if head.status.success() {
-        let target = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        if !target.starts_with("refs/remotes/origin/") {
-            bail!(
-                "origin/HEAD in {} points at {target}, outside refs/remotes/origin/, so it is not \
-                 trusted as the default branch; fix it with `git remote set-head origin -a`",
+/// GitHub's name for it decides when `gh repo view` names a usable branch within 15 seconds:
+/// Paja reads `origin/<name>` and nothing else, and errors when that isn't fetched. Code in a
+/// worktree can move `origin/HEAD` (`git remote set-head`, `git update-ref`), which would point
+/// inside `refs/remotes/origin/` once the branch under review is pushed, and can make a local
+/// `main`. Otherwise `origin/HEAD` (the remote's default branch, whatever its name), else
+/// `origin/main`, else a local `main`; `origin/HEAD` must then be a symbolic ref to a
+/// remote-tracking branch that isn't one of Paja's own (`paja/...`), or this errors.
+pub(crate) fn default_branch(ok: &Untampered) -> Result<Option<(String, String)>> {
+    if let Some(name) = github_default_branch(ok) {
+        // GitHub's branch, or an error: a local `main` or `origin/main` may be something else,
+        // and code in a worktree can make one.
+        return match ref_commit(ok.path(), &format!("refs/remotes/origin/{name}"))? {
+            Some(commit) => Ok(Some((commit, format!("origin/{name}")))),
+            None => bail!(
+                "GitHub's default branch is {name}, but {} has no origin/{name}; run `git fetch \
+                 origin {name}` there",
                 ok.path().display()
-            );
-        }
+            ),
+        };
     }
-    // The commit a ref names, so the file is read from it and the ref isn't looked up twice.
-    let resolves = |full: &str| ref_commit(ok.path(), full);
-    let at = |rev: &str, commit: &str| {
-        show_at(ok.path(), commit, path)
-            .with_context(|| format!("reading {path} from {rev}, the default branch"))
-    };
+    trusted_origin_head(ok)?;
     // Full ref names: a short one such as `origin/main` would let a tag or branch of that name
     // (`refs/tags/origin/main`) stand in for the default branch.
     for (full, rev) in DEFAULT_REFS {
-        if let Some(commit) = resolves(full)? {
-            return at(rev, &commit);
+        if let Some(commit) = ref_commit(ok.path(), full)? {
+            return Ok(Some((commit, rev.to_string())));
         }
     }
-    // No origin/HEAD and no main: ask GitHub for the default branch's name, as `RepoSettings`
-    // does, and read it from the remote-tracking ref.
-    if let Some(name) = github_default_branch(ok) {
-        if let Some(commit) = resolves(&format!("refs/remotes/origin/{name}"))? {
-            return at(&format!("origin/{name}"), &commit);
+    Ok(None)
+}
+
+/// Errors when `origin/HEAD` exists but can't be trusted to name the default branch: when it
+/// isn't a symbolic ref (one written with `git update-ref`), or points outside
+/// `refs/remotes/origin/` or at one of Paja's own branches.
+pub(crate) fn trusted_origin_head(ok: &Untampered) -> Result<()> {
+    let git = |args: &[&str]| {
+        git_command()
+            .arg("-C")
+            .arg(ok.path())
+            .args(args)
+            .output()
+            .context("running git (is it installed?)")
+    };
+    let fix = "fix it with `git remote set-head origin -a`";
+    let head = git(&["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])?;
+    if !head.status.success() {
+        // Not symbolic: refused if it exists at all.
+        let exists = git(&["show-ref", "--verify", "-q", "refs/remotes/origin/HEAD"])?;
+        if exists.status.success() {
+            bail!(
+                "origin/HEAD in {} is not a symbolic ref, so it is not trusted as the default \
+                 branch; {fix}",
+                ok.path().display()
+            );
         }
+        return Ok(());
+    }
+    let target = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let Some(branch) = target.strip_prefix("refs/remotes/origin/") else {
+        bail!(
+            "origin/HEAD in {} points at {target}, outside refs/remotes/origin/, so it is not \
+             trusted as the default branch; {fix}",
+            ok.path().display()
+        );
+    };
+    if branch.starts_with(BRANCH_PREFIX) {
+        bail!(
+            "origin/HEAD in {} points at {target}, one of Paja's own branches, so it is not \
+             trusted as the default branch; {fix}",
+            ok.path().display()
+        );
+    }
+    Ok(())
+}
+
+/// A file as it is on the default branch (see [`default_branch`]) of the checkout `ok` proved
+/// safe. None when the file isn't there, or when the checkout has no `origin` remote and no
+/// `main`.
+///
+/// Errors when `origin/HEAD` can't be trusted, and when the checkout has an `origin` remote but
+/// no default branch, so a default branch with another name isn't silently ignored.
+pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
+    if let Some((commit, rev)) = default_branch(ok)? {
+        return show_at(ok.path(), &commit, path)
+            .with_context(|| format!("reading {path} from {rev}, the default branch"));
     }
     let has_origin = git_command()
         .arg("-C")
@@ -896,20 +945,83 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
         .success();
     if has_origin {
         bail!(
-            "{} has an origin remote but none of origin/HEAD, origin/main or main, so the \
-             default branch is unknown; run `git remote set-head origin -a` there",
+            "{} has an origin remote but gh can't name its default branch, and there is no \
+             origin/HEAD, origin/main or main; run `git fetch origin` and `git remote set-head \
+             origin -a` there",
             ok.path().display()
         );
     }
     Ok(None)
 }
 
-/// The default branch's name as `gh repo view` reports it, or None when gh can't say.
+/// How long a default branch name from `gh` is reused, so a `work sync`, which reads two
+/// files from the default branch, asks once; and how long gh's failure to say is, so a gh
+/// that hangs costs one wait, not two, while the next pass asks again.
+const NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const NO_NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The default branch's name as `gh repo view` reports it, or None when gh can't say within 15
+/// seconds or names something that can't be a branch Paja would trust. The answer is reused
+/// per repository: a name for a few minutes, a None for half a minute.
 fn github_default_branch(ok: &Untampered) -> Option<String> {
-    let out = crate::jono::gh(ok, &["repo", "view", "--json", "defaultBranchRef"]).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-    let name = v["defaultBranchRef"]["name"].as_str()?.trim();
-    (!name.is_empty()).then(|| name.to_string())
+    // Unit tests run without `gh`, whatever the machine has (`GH_REPO`, a signed-in `gh`).
+    if cfg!(test) {
+        return None;
+    }
+    type Names = BTreeMap<String, (std::time::Instant, Option<String>)>;
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<Names>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(Default::default);
+    // A panic elsewhere while the lock was held leaves the map as it was, which is still right.
+    let lock = || {
+        names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some((at, name)) = lock().get(&ok.key) {
+        let reuse = if name.is_some() {
+            NAME_REUSE
+        } else {
+            NO_NAME_REUSE
+        };
+        if at.elapsed() < reuse {
+            return name.clone();
+        }
+    }
+    let name = crate::jono::gh_within(
+        ok,
+        &["repo", "view", "--json", "defaultBranchRef"],
+        Some(std::time::Duration::from_secs(15)),
+    )
+    .ok()
+    .and_then(|out| serde_json::from_str::<serde_json::Value>(&out).ok())
+    .and_then(|v| {
+        v["defaultBranchRef"]["name"]
+            .as_str()
+            .map(|n| n.trim().to_string())
+    })
+    .filter(|name| branch_like(name));
+    lock().insert(ok.key.clone(), (std::time::Instant::now(), name.clone()));
+    name
+}
+
+/// Whether `name` could be a branch's name (git's rules, roughly) that isn't one of Paja's own.
+fn branch_like(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        // Any letter case: on Windows and macOS `head` opens the same ref file as `HEAD`.
+        && !name.eq_ignore_ascii_case("HEAD")
+        && !name.starts_with(BRANCH_PREFIX)
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("/.")
+        && !name.contains(".lock/")
+        && !name.contains("@{")
+        && !name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
 }
 
 /// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
@@ -1264,6 +1376,83 @@ mod tests {
             err.contains("from origin/HEAD, the default branch"),
             "{err}"
         );
+        // origin/HEAD pointing at one of Paja's own branches, such as a pushed review branch,
+        // is refused.
+        git_unchecked(
+            repo,
+            &["update-ref", "refs/remotes/origin/paja/app-1", "HEAD"],
+        )
+        .unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/paja/app-1",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one of Paja's own branches"), "{err}");
+        // So is an origin/HEAD that isn't a symbolic ref.
+        git_unchecked(
+            repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        )
+        .unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "update-ref",
+                "--no-deref",
+                "refs/remotes/origin/HEAD",
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a symbolic ref"), "{err}");
+        assert!(err.contains("git remote set-head origin -a"), "{err}");
+    }
+
+    #[test]
+    fn a_default_branch_name_from_gh_must_look_like_a_branch() {
+        for good in ["main", "trunk", "release/1.0", "dev-x"] {
+            assert!(branch_like(good), "{good}");
+        }
+        for bad in [
+            "",
+            "@",
+            "HEAD",
+            "head",
+            "paja/app-1",
+            "-x",
+            "/x",
+            ".x",
+            "x/",
+            "x.",
+            "x.lock",
+            "a..b",
+            "a//b",
+            "a/.b",
+            "a.lock/b",
+            "a@{1}",
+            "a b",
+            "a\tb",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?",
+            "a*",
+            "a[",
+            "a\\b",
+        ] {
+            assert!(!branch_like(bad), "{bad:?}");
+        }
     }
 
     #[test]
