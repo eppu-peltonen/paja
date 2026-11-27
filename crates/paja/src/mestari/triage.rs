@@ -588,23 +588,32 @@ fn closing_comment(item: &Triaged, repo: &Path) -> String {
     follow_ups::redact_for_issue(&text, repo)
 }
 
-/// Whether issue `on` already has a note on duplicate `number` that this `gh` user wrote, in
-/// either form a pass writes. Only the account Paja comments as counts, so nobody else's
-/// comment can stand in for a note. A listing `gh` can't give, or a login it can't name, counts
-/// as no: the note is posted, as before.
-fn already_noted(repo: &Path, on: u64, number: u64) -> bool {
-    let Ok(login) = run_gh(repo, &["api", "user", "--jq", ".login"]) else {
+/// The account `gh` comments as, if it can name one that is safe to quote in a jq program (a
+/// GitHub login, or an app's `name[bot]`). A token that can't read `/user` (an app's
+/// installation token) gives none, and notes are then posted without looking for an earlier one.
+fn commenter(repo: &Path) -> Option<String> {
+    let login = run_gh(repo, &["api", "user", "--jq", ".login"]).ok()?;
+    comments_by(login.trim()).map(|_| login.trim().to_string())
+}
+
+/// The jq program that prints the first line of each comment `login` wrote, or `None` for a
+/// login that isn't safe to quote in it.
+fn comments_by(login: &str) -> Option<String> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-[]".contains(c);
+    (!login.is_empty() && login.chars().all(plain)).then(|| {
+        format!(".[] | select(.user.login == \"{login}\") | (.body // \"\") | split(\"\\n\")[0]")
+    })
+}
+
+/// Whether issue `on` already has a note on duplicate `number` that `login` (see [`commenter`])
+/// wrote, in either form a pass writes. Only the account Paja comments as counts, so nobody
+/// else's comment can stand in for a note. No login, or a listing `gh` can't give, counts as no:
+/// the note is posted, as before.
+fn already_noted(repo: &Path, login: Option<&str>, on: u64, number: u64) -> bool {
+    let Some(jq) = login.and_then(comments_by) else {
         return false;
     };
-    let login = login.trim();
-    // A GitHub login (or an app's `name[bot]`) is safe to quote in the jq program.
-    let plain = |c: char| c.is_ascii_alphanumeric() || "-[]".contains(c);
-    if login.is_empty() || !login.chars().all(plain) {
-        return false;
-    }
     let path = format!("repos/{{owner}}/{{repo}}/issues/{on}/comments");
-    let jq =
-        format!(".[] | select(.user.login == \"{login}\") | (.body // \"\") | split(\"\\n\")[0]");
     run_gh(repo, &["api", &path, "--paginate", "--jq", &jq])
         .is_ok_and(|first_lines| noted_in(&first_lines, number))
 }
@@ -708,6 +717,12 @@ fn triage_holding(
     // duplicate's reason is in its own closing comment. They go first, so a pass whose agent
     // fails still posts them.
     let mut retried_notes = Vec::new();
+    // The account Paja comments as, asked once per pass and only when a note is pending.
+    let login = if pending.is_empty() {
+        None
+    } else {
+        commenter(&repo)
+    };
     for (number, on, tries) in pending {
         let note = follow_ups::redact_for_issue(
             &format!(
@@ -718,7 +733,7 @@ fn triage_holding(
         );
         // A post that went through while `gh` still failed (a dropped connection after the
         // write, say) is on the original already: record it as noted rather than post it again.
-        let error = if already_noted(&repo, on, number) {
+        let error = if already_noted(&repo, login.as_deref(), on, number) {
             None
         } else {
             run_gh(
@@ -1588,6 +1603,17 @@ mod tests {
         let mut order = vec![1u64, 2, 5, 6, 7];
         order.sort_by_key(|n| (read.get(n).copied(), *n));
         assert_eq!(order, [6, 7, 1, 2, 5]);
+    }
+
+    #[test]
+    fn only_a_plain_login_is_quoted_into_the_comment_filter() {
+        let jq = comments_by("paja-bot").unwrap();
+        assert!(jq.contains(r#"select(.user.login == "paja-bot")"#), "{jq}");
+        assert!(jq.ends_with(r#"split("\n")[0]"#), "{jq}");
+        assert!(comments_by("my-app[bot]").is_some());
+        for bad in ["", "a\"b", "a b", "a\\b", "x\") or true or (\"", "é"] {
+            assert_eq!(comments_by(bad), None, "{bad}");
+        }
     }
 
     #[test]

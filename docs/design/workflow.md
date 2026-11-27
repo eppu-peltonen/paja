@@ -59,10 +59,10 @@ duplicate's finding can be found and reopened. If that note fails, the item stay
 report). Retries run before the agent and are recorded at once as `triage.notes` (`noted`, `note_failed`), so a pass
 whose agent fails still makes them and never posts them twice; a failed retry is also written to stderr. A duplicate
 closed again in a pass that retries its note gets no second note. Before a retry posts, it reads the original's
-comments by the account Paja comments as: a note GitHub took while `gh` still failed is recorded as `noted`, not posted
-again. After three passes fail the same note, Paja gives up
-on it, and the last failure's error says to add the comment by hand. "Not worth doing" is never closed: the report lists
-it, and the person decides. An issue that also has the work label is a work item and
+comments by the account Paja comments as (`gh api user`): a note GitHub took while `gh` still failed is recorded as
+`noted`, not posted again. A token that can't name its account posts the note without looking. After three passes
+fail the same note, Paja gives up on it, and the last failure's error says to add the comment by hand. "Not worth
+doing" is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
 is left out.
 
 The agent reads the default branch only, in a checkout made from it for the pass, under the deny-list hook with
