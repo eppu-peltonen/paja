@@ -3104,12 +3104,28 @@ fn a_bad_config_on_main_fails_a_pass_with_nothing_to_do() {
     // there is nothing to claim, instead of hiding behind `idle`.
     let f = Factory::new("true\n", "land");
     std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
-    f.on_main(".paja/models", "nobody sonnet\n");
+    f.on_main(".paja/models", "build sonnet loud\n");
     let (ok, report) = f.run();
     assert!(!ok, "{report}");
     let error = report["error"].as_str().unwrap_or_default();
-    assert!(error.contains("unknown role"), "{report}");
+    assert!(error.contains("unknown effort"), "{report}");
     assert!(error.contains(".paja/models"), "{report}");
+}
+
+#[test]
+fn a_role_main_names_that_this_paja_doesnt_know_is_only_a_warning() {
+    // Main's `.paja/models` may name a role a newer Paja added. An older runner skips that
+    // line, says so, and keeps working instead of failing every pass.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(".paja/models", "build sonnet\nnewrole haiku\n");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "idle", "{report}\n{stderr}");
+    assert!(
+        stderr.contains(".paja/models on main, line 2")
+            && stderr.contains("unknown role \"newrole\", so this line is skipped"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -3128,10 +3144,10 @@ fn run_every_says_when_it_waits() {
 
 #[test]
 fn run_every_keeps_going_after_a_pass_fails() {
-    // A `.paja/models` on main that names no real role fails every pass, idle or not; the loop
-    // reports the error and waits for the next pass instead of stopping.
+    // A malformed `.paja/models` on main fails every pass, idle or not; the loop reports the
+    // error and waits for the next pass instead of stopping.
     let f = Factory::new("true\n", "land");
-    f.on_main(".paja/models", "nobody sonnet\n");
+    f.on_main(".paja/models", "build sonnet loud\n");
     let (waiting, still_running, first) = first_wait_of_every(&f);
     assert!(
         waiting.contains("that pass failed; Paja keeps going; checking again in 1 minute"),
@@ -3142,7 +3158,7 @@ fn run_every_keeps_going_after_a_pass_fails() {
         first["error"]
             .as_str()
             .unwrap_or("")
-            .contains("unknown role"),
+            .contains("unknown effort"),
         "{first}"
     );
 }
@@ -3318,14 +3334,14 @@ fn the_second_high_risk_reviewer_runs_as_review_2() {
 #[test]
 fn a_bad_models_file_says_which_line_to_fix() {
     let f = Factory::new("true\n", "land");
-    f.on_main(".paja/models", "build sonnet\nreviewer opus\n");
+    f.on_main(".paja/models", "build sonnet\nreview opus loud\n");
     // One fix on main is all it takes, so the pass stops before it claims an item, rather than
     // parking each item in turn with the same error.
     let (ok, err) = f.run();
     assert!(!ok, "{err}");
     let error = err["error"].as_str().unwrap();
     assert!(
-        error.contains(".paja/models on main, line 2") && error.contains("unknown role"),
+        error.contains(".paja/models on main, line 2") && error.contains("unknown effort"),
         "{error}"
     );
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
@@ -3559,7 +3575,7 @@ fn the_needs_answer_label_follows_the_labels_file() {
 fn a_failed_pass_of_run_every_reaches_the_notifier() {
     let f = Factory::new("true\n", "land");
     std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
-    f.on_main(".paja/models", "nobody sonnet\n");
+    f.on_main(".paja/models", "build sonnet loud\n");
     let (notifier, log) = fake_notifier(&f);
     let (waiting, _, first) =
         first_wait_of_every_with(&f, &[("PAJA_NOTIFIER", notifier.as_path())]);
