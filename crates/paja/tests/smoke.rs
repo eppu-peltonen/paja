@@ -3222,7 +3222,7 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
 
 #[test]
 fn rounds_spent_count_toward_the_cap_when_the_environment_is_lost() {
-    let f = Factory::new("true\n", "fix");
+    let f = Factory::new("true\n", "changes");
     let dir = f.tmp.path();
     // Round 1 builds and is told to fix; round 2's fix is cut off.
     std::fs::write(dir.join("hang-fix"), "").unwrap();
