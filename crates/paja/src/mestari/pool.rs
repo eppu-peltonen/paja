@@ -619,7 +619,9 @@ fn choose<'p>(
     let mut to_plan = Vec::new();
     let mut unplanned_before = false;
     for number in queue {
-        match plans.get(number) {
+        // An item being planned again has only its old, failed plan: it waits for the new one.
+        let plan = plans.get(number).filter(|_| !planning.contains(number));
+        match plan {
             None => {
                 unplanned_before = true;
                 if !planning.contains(number) && to_plan.len() < room {
@@ -1230,6 +1232,25 @@ pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_item_being_planned_again_waits_for_its_new_plan() {
+        let failed = Plan {
+            repo: "acme/app".into(),
+            number: 5,
+            paths: Vec::new(),
+            source: "failed".into(),
+            high_risk: false,
+            error: Some("network".into()),
+        };
+        let plans = BTreeMap::from([(5, failed)]);
+        let planning = BTreeSet::from([5]);
+        let (chosen, to_plan) = choose(&[5], &plans, &[], &planning, 1, 1);
+        assert!(chosen.is_empty() && to_plan.is_empty());
+        // Once its planner is done, the plan it recorded decides.
+        let (chosen, _) = choose(&[5], &plans, &[], &BTreeSet::new(), 1, 1);
+        assert_eq!(chosen.len(), 1);
+    }
 
     #[test]
     fn a_failed_plan_from_before_the_last_timed_sync_is_planned_again() {
