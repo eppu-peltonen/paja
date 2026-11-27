@@ -57,8 +57,8 @@ so each repository has its own and an environment a person made is never reused 
 repository at a time: a pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is
 held and says to wait, and `paja run --every` and an idle pool skip their pass then. Its word is not enough to close anything: Paja closes a duplicate only when the
 original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
-named commit must be on the default branch, committed after the issue was opened, and change a file the issue names,
-and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
+named commit must be on the default branch, committed after the issue was opened, and change a file the issue names
+(a merge against its first parent), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
 a longer or shorter one ending in it at a `/`), and a bare file name with an extension names any file of that name;
 paths use `/` whichever way the agent wrote them. Otherwise the issue is kept. Each issue reaches the agent with when
 it was opened. Issue text reaches the agent as data to judge.

@@ -157,7 +157,8 @@ fn triage_prompt(base: &str, open: &[Open]) -> String {
          number of the one to keep (the more complete, or else the older).\n\
          - `already_fixed`: the default branch already fixes it. Give `commit` (a commit hash on \
          the default branch, made after the issue was opened, that changes a file the issue \
-         names) or `file` (a path that exists there and that the issue names) that shows it, and say in `reason` what you saw.\n\
+         names) or `file` (a path that exists there and that the issue names) that shows it, \
+         and say in `reason` what you saw.\n\
          - `not_worth_doing`: valid but not worth the effort or moot. Say why in `reason`. Paja \
          never closes these; a person decides.\n\n\
          Paja closes `duplicate` and `already_fixed` issues on your word, with your `reason` as \
@@ -269,9 +270,9 @@ fn decide(
 }
 
 /// The commit or file the agent named for `issue`, if it checks out on `base` and has to do with
-/// the issue: a commit that is an ancestor of `base` and was committed after the issue was
-/// opened, or a plain path that exists there and that the issue's title or body names (the whole
-/// path, or its file name). What it returns is what the comment shows.
+/// the issue: a commit that is an ancestor of `base`, was committed after the issue was opened
+/// and changes a file the issue names, or a plain path that exists there and that the issue's
+/// title or body names (see [`names_file`]). What it returns is what the comment shows.
 fn check_evidence(
     repo: &Path,
     base: &str,
@@ -324,28 +325,24 @@ fn check_evidence(
     (!shown.is_empty()).then(|| shown.join(", "))
 }
 
-/// Whether `commit` changes a file that `issue` names (against its first parent; a root
-/// commit against nothing).
+/// Whether `commit` changes a file that `issue` names, against its first parent (a merge's
+/// other side doesn't count), or against nothing for a root commit.
 fn touches_named_file(repo: &Path, issue: &Open, commit: &str) -> bool {
-    git(
+    let parent = git(
         repo,
-        &[
-            "diff-tree",
-            "-r",
-            "-m",
-            "--first-parent",
-            "--root",
-            "--no-commit-id",
-            "--name-only",
-            "-z",
-            commit,
-        ],
+        &["rev-parse", "--verify", "-q", &format!("{commit}^1")],
     )
-    .is_ok_and(|names| {
+    .ok();
+    let mut args = vec!["diff-tree", "-r", "--no-commit-id", "--name-only", "-z"];
+    match parent.as_deref() {
+        Some(parent) => args.extend([parent.trim(), commit]),
+        None => args.extend(["--root", commit]),
+    }
+    git(repo, &args).is_ok_and(|names| {
         names
             .split('\0')
-            .filter(|n| !n.trim().is_empty())
-            .any(|n| names_file(issue, n.trim()))
+            .filter(|n| !n.is_empty())
+            .any(|n| names_file(issue, n))
     })
 }
 
@@ -775,6 +772,45 @@ mod tests {
         run(&["commit", "-q", "-m", "fix b"]);
         let head = run(&["rev-parse", "HEAD"]);
         (tmp, head)
+    }
+
+    #[test]
+    fn a_merge_counts_only_for_what_it_brings_to_its_first_parent() {
+        let (tmp, _) = evidence_repo();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // A side branch adds s.txt; the main line meanwhile adds m.txt; then a merge.
+        let main = run(&["symbolic-ref", "--short", "HEAD"]);
+        run(&["checkout", "-q", "-b", "side", "HEAD~1"]);
+        std::fs::write(dir.join("s.txt"), "s\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "side"]);
+        run(&["checkout", "-q", &main]);
+        std::fs::write(dir.join("m.txt"), "m\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "main line"]);
+        run(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+        let merge = run(&["rev-parse", "HEAD"]);
+        let old = "2020-01-01T00:00:00Z";
+        let brought = check_evidence(dir, "HEAD", &issue_naming("Fix s.txt", old), &merge, "");
+        assert!(brought.is_some_and(|e| e.contains("merge side")));
+        // m.txt was already on the merge's first parent, so the merge doesn't change it.
+        let already = check_evidence(dir, "HEAD", &issue_naming("Fix m.txt", old), &merge, "");
+        assert_eq!(already, None);
+        // A root commit is compared against nothing.
+        let root = run(&["rev-list", "--max-parents=0", "HEAD"]);
+        let first = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &root, "");
+        assert!(first.is_some_and(|e| e.contains("base")));
     }
 
     fn issue_naming(title: &str, created_at: &str) -> Open {
