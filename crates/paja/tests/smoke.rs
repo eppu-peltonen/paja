@@ -4909,6 +4909,37 @@ fn agents_and_checks_run_through_the_sandbox() {
 }
 
 #[test]
+fn paja_sbx_name_names_the_sandbox_paja_creates_and_runs_in() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx(f.tmp.path());
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+            ("PAJA_SBX_NAME", Path::new("paja-test")),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    // The named sandbox is the one created and used; the default `paja` is never touched.
+    assert_eq!(
+        log.matches("create --name paja-test claude").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains(" paja-test -- "), "{log}");
+    assert!(
+        !log.contains(" paja -- ") && !log.contains("--name paja "),
+        "{log}"
+    );
+}
+
+#[test]
 fn agents_outside_the_sandbox_run_in_auto_mode_too() {
     let f = Factory::new("true\n", "land");
     let (ok, report) = f.run();
