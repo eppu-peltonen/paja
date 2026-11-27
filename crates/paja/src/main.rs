@@ -500,7 +500,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Env { command } => match command {
             EnvCommand::Create { name, repo, base } => {
-                let env = ahjo::create(
+                let env = ahjo::create_by_person(
                     &home,
                     CreateOptions {
                         name,

@@ -735,6 +735,13 @@ fn the_mcp_server_serves_the_same_core() {
         err["error"].as_str().unwrap().contains("already exists"),
         "{err}"
     );
+    // The names Paja gives its own environments are refused here too.
+    let (ok, err) = mcp.call("env_create", serde_json::json!({"name": "plan-5"}));
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("shape Paja gives"),
+        "{err}"
+    );
     // Jono over MCP: nothing imported yet, so next is null and show says how to import.
     let (ok, next) = mcp.call("work_next", serde_json::json!({}));
     assert!(ok);
@@ -5111,9 +5118,20 @@ fn triage_leaves_another_clones_triage_environment_alone() {
         .unwrap();
     assert!(status.success());
     let name = paja::jono::env_name_for("acme/app", "triage");
-    let (ok, env) = paja(&f.home, &clone, &["env", "create", &name]);
-    assert!(ok, "{env}");
-    let theirs = std::path::PathBuf::from(env["path"].as_str().unwrap());
+    // A person can't make one of that name, so it is made the way the killed pass made it.
+    let (ok, err) = paja(&f.home, &clone, &["env", "create", &name]);
+    assert!(!ok, "{err}");
+    let home = paja::home::Home::at(&f.home).unwrap();
+    let env = paja::ahjo::create(
+        &home,
+        paja::ahjo::CreateOptions {
+            name: &name,
+            repo: &clone,
+            base: None,
+        },
+    )
+    .unwrap();
+    let theirs = env.path.clone();
     std::fs::write(theirs.join("my-work.txt"), "unsaved").unwrap();
     let (ok, err) = triage(&f, &dir);
     assert!(!ok, "{err}");
@@ -5134,6 +5152,40 @@ fn triage_leaves_another_clones_triage_environment_alone() {
     assert!(!theirs.exists(), "the environment was left behind");
     let (_, envs) = paja(&f.home, &clone, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]), "{envs}");
+}
+
+#[test]
+fn env_create_refuses_the_names_paja_gives_its_own_environments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, repo) = (tmp.path().join("home"), tmp.path().join("repo"));
+    init_repo(&repo);
+    let paja_names = ["triage", "work-5"]
+        .map(|what| paja::jono::env_name_for("acme/app", what))
+        .into_iter()
+        .chain(["work-5".to_string(), "plan-5".to_string()]);
+    for name in paja_names {
+        let (ok, err) = paja(&home, &repo, &["env", "create", &name]);
+        assert!(!ok, "{err}");
+        let msg = err["error"].as_str().unwrap();
+        assert!(
+            msg.contains("shape Paja gives its own environments") && msg.contains("another name"),
+            "{msg}"
+        );
+    }
+    // Names that only look a little like them are a person's to use.
+    for name in ["triage", "work-5-notes", "app-triage"] {
+        let (ok, env) = paja(&home, &repo, &["env", "create", name]);
+        assert!(ok, "{env}");
+    }
+    // A refused name left nothing behind.
+    let (_, envs) = paja(&home, &repo, &["env", "list"]);
+    let names: Vec<&str> = envs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 3, "{envs}");
 }
 
 #[test]

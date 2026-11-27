@@ -199,14 +199,14 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed."
+        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed. Names shaped like the ones Paja gives its own environments (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`) are refused."
     )]
     async fn env_create(&self, Parameters(args): Parameters<CreateArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
             // Absolute, so errors name the real directory rather than `.`.
             let repo = std::path::absolute(PathBuf::from(args.repo.unwrap_or_else(|| ".".into())))?;
-            let env = ahjo::create(
+            let env = ahjo::create_by_person(
                 &home,
                 CreateOptions {
                     name: &args.name,
