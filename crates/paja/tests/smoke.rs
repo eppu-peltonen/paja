@@ -2857,7 +2857,10 @@ fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_br
     let branch = named(&report, "default branch").unwrap();
     assert_eq!(branch["status"], "failed", "{report}");
     assert!(
-        branch["fix"].as_str().unwrap().contains("git fetch origin"),
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no origin/gone; run `git fetch origin gone`"),
         "{report}"
     );
 }

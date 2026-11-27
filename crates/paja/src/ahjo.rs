@@ -849,21 +849,25 @@ const BRANCH_PREFIX: &str = "paja/";
 /// messages use, or None when no ref names it. Never the branch checked out, which may be the
 /// change under review.
 ///
-/// GitHub's name for it decides when `gh repo view` can say (within 15 seconds): Paja reads
-/// `origin/<name>`, and nothing else, so an unfetched one is none. `origin/HEAD` is local state that code in a worktree can move (`git remote
-/// set-head`, `git update-ref`), and once the branch under review is pushed it would point
-/// inside `refs/remotes/origin/`, so it is skipped then. Otherwise `origin/HEAD` (the remote's
-/// default branch, whatever its name), else `origin/main`, else a local `main`; `origin/HEAD`
-/// must then be a symbolic ref to a remote-tracking branch that isn't one of Paja's own
-/// (`paja/...`), or this errors.
+/// GitHub's name for it decides when `gh repo view` names a usable branch within 15 seconds:
+/// Paja reads `origin/<name>` and nothing else, and errors when that isn't fetched. Code in a
+/// worktree can move `origin/HEAD` (`git remote set-head`, `git update-ref`), which would point
+/// inside `refs/remotes/origin/` once the branch under review is pushed, and can make a local
+/// `main`. Otherwise `origin/HEAD` (the remote's default branch, whatever its name), else
+/// `origin/main`, else a local `main`; `origin/HEAD` must then be a symbolic ref to a
+/// remote-tracking branch that isn't one of Paja's own (`paja/...`), or this errors.
 pub(crate) fn default_branch(ok: &Untampered) -> Result<Option<(String, String)>> {
     if let Some(name) = github_default_branch(ok) {
-        // GitHub's branch, or none: a local `main` or `origin/main` may be something else, and
-        // code in a worktree can make one.
-        return Ok(
-            ref_commit(ok.path(), &format!("refs/remotes/origin/{name}"))?
-                .map(|commit| (commit, format!("origin/{name}"))),
-        );
+        // GitHub's branch, or an error: a local `main` or `origin/main` may be something else,
+        // and code in a worktree can make one.
+        return match ref_commit(ok.path(), &format!("refs/remotes/origin/{name}"))? {
+            Some(commit) => Ok(Some((commit, format!("origin/{name}")))),
+            None => bail!(
+                "GitHub's default branch is {name}, but {} has no origin/{name}; run `git fetch \
+                 origin {name}` there",
+                ok.path().display()
+            ),
+        };
     }
     trusted_origin_head(ok)?;
     // Full ref names: a short one such as `origin/main` would let a tag or branch of that name
@@ -941,9 +945,9 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
         .success();
     if has_origin {
         bail!(
-            "{} has an origin remote but no default branch Paja can read: GitHub's isn't fetched \
-             (or gh can't say), and there is no origin/main or main and no origin/HEAD Paja \
-             uses; run `git fetch origin` and `git remote set-head origin -a` there",
+            "{} has an origin remote but gh can't name its default branch, and there is no \
+             origin/HEAD, origin/main or main; run `git fetch origin` and `git remote set-head \
+             origin -a` there",
             ok.path().display()
         );
     }

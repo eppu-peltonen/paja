@@ -458,7 +458,7 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             checks.push(failed(
                 "default branch",
                 format!("{err:#}"),
-                "run `git remote set-head origin -a`, and `git fsck` if git itself failed",
+                "run the command the message names; if git itself failed, run `git fsck` here",
             ));
             return;
         }
@@ -466,8 +466,8 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     let Some((commit, rev)) = found else {
         checks.push(failed(
             "default branch",
-            "no default branch Paja can read in this checkout: GitHub's isn't fetched (or gh \
-             can't say), and there is no origin/main or main and no origin/HEAD Paja uses",
+            "gh can't name the default branch, and none of origin/HEAD, origin/main or main \
+             exists in this checkout",
             "run `git fetch origin`; if the default branch isn't pushed yet, push it \
              (`git push -u origin main`), then run `git remote set-head origin -a`",
         ));

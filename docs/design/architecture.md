@@ -430,12 +430,13 @@ Unlike the settings `paja run` reads from the default branch's tip as fetched, `
 `.paja/queue` are read from local refs, which an agent with local git in a worktree could move. That could send the
 notice's text to a URL it picks, or change the work and follow-up labels and whether Jono takes follow-ups, for the
 passes that read them. The default branch is the one `gh repo view` names, read as `origin/<name>` and nothing else
-(when it isn't fetched, Paja says to run `git fetch origin`), since code in a worktree can point `origin/HEAD` at the
-pushed review branch or make a local `main`. When `gh` can't say within 15 seconds it is `origin/HEAD`, else
-`origin/main`, else `main`, and an `origin/HEAD` that isn't a symbolic ref, or points outside `refs/remotes/origin/` or
-at one of Paja's own `paja/` branches, is refused with the fix, `git remote set-head origin -a`. A name from `gh` is
-reused for five minutes per repository, so a `work sync` asks once, and its failure to say for 30 seconds. `paja doctor`
-finds the branch the same way, and warns when it skipped an `origin/HEAD` it wouldn't trust.
+(when it isn't fetched, Paja says to run `git fetch origin <name>`), since code in a worktree can point `origin/HEAD` at
+the pushed review branch or make a local `main`. When `gh` can't say (it fails, takes over 15 seconds, or names no
+usable branch) it is `origin/HEAD`, else `origin/main`, else `main`, and an `origin/HEAD` that isn't a symbolic ref, or
+points outside `refs/remotes/origin/` or at one of Paja's own `paja/` branches, is refused with the fix,
+`git remote set-head origin -a`. A name from `gh` is reused for five minutes per repository, so a `work sync` asks once,
+and its failure to say for 30 seconds. `paja doctor` finds the branch the same way, and warns when it skipped an
+`origin/HEAD` it wouldn't trust.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `left_findings`,
 `pass_failed`, `stopped` or `skipped_role`, `channel`, the `error`, and for `skipped_role` the roles it named as
