@@ -550,20 +550,75 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
 /// remote's default branch, whatever its name), else `origin/main`, else a local `main`. None
 /// when the file isn't there, or when there is none of these. Never the branch checked out,
 /// which may be the change under review.
+///
+/// Errors when `origin/HEAD` points outside `refs/remotes/origin/` (code in a worktree can
+/// point it at the branch under review), and when the checkout has an `origin` remote but
+/// none of the three refs, so a default branch with another name isn't silently ignored.
 pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
-    for rev in ["origin/HEAD", "origin/main", "main"] {
+    let head = git_command()
+        .arg("-C")
+        .arg(ok.path())
+        .args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+        .output()
+        .context("running git (is it installed?)")?;
+    if head.status.success() {
+        let target = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if !target.starts_with("refs/remotes/origin/") {
+            bail!(
+                "origin/HEAD in {} points at {target}, outside refs/remotes/origin/, so it is not \
+                 trusted as the default branch; fix it with `git remote set-head origin -a`",
+                ok.path().display()
+            );
+        }
+    }
+    let resolves = |rev: &str| -> Result<bool> {
         let spec = format!("{rev}^{{commit}}");
-        let found = git_command()
+        Ok(git_command()
             .arg("-C")
             .arg(ok.path())
             .args(["rev-parse", "--verify", "-q", &spec])
             .output()
-            .context("running git (is it installed?)")?;
-        if found.status.success() {
+            .context("running git (is it installed?)")?
+            .status
+            .success())
+    };
+    for rev in ["origin/HEAD", "origin/main", "main"] {
+        if resolves(rev)? {
             return show_at(ok.path(), rev, path);
         }
     }
+    // No origin/HEAD and no main: ask GitHub for the default branch's name, as `RepoSettings`
+    // does, and read it from the remote-tracking ref.
+    if let Some(name) = github_default_branch(ok) {
+        let rev = format!("origin/{name}");
+        if resolves(&rev)? {
+            return show_at(ok.path(), &rev, path);
+        }
+    }
+    let has_origin = git_command()
+        .arg("-C")
+        .arg(ok.path())
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .context("running git (is it installed?)")?
+        .status
+        .success();
+    if has_origin {
+        bail!(
+            "{} has an origin remote but none of origin/HEAD, origin/main or main, so the \
+             default branch is unknown; run `git remote set-head origin -a` there",
+            ok.path().display()
+        );
+    }
     Ok(None)
+}
+
+/// The default branch's name as `gh repo view` reports it, or None when gh can't say.
+fn github_default_branch(ok: &Untampered) -> Option<String> {
+    let out = crate::jono::gh(ok, &["repo", "view", "--json", "defaultBranchRef"]).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let name = v["defaultBranchRef"]["name"].as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
@@ -643,6 +698,67 @@ mod tests {
         assert!(
             err.contains("git show no-such-rev:kept.txt failed in"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn default_branch_refuses_a_moved_origin_head_and_a_remote_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_unchecked(repo, &["init", "-q", "-b", "trunk"]).unwrap();
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/labels"), "work x\n").unwrap();
+        git_unchecked(repo, &["add", "-A"]).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "c"]);
+        git_unchecked(repo, &args).unwrap();
+        let ok = Untampered {
+            key: "k".into(),
+            path: repo.to_path_buf(),
+        };
+        // No remote: nothing to say about a default branch.
+        assert_eq!(show_on_default_branch(&ok, ".paja/labels").unwrap(), None);
+        // A remote, but no origin/HEAD and no main: say what to do.
+        git_unchecked(
+            repo,
+            &["remote", "add", "origin", "https://example.com/r.git"],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git remote set-head origin -a"), "{err}");
+        // origin/HEAD pointing at a local branch is refused.
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/heads/trunk",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside refs/remotes/origin/"), "{err}");
+        // Pointing inside refs/remotes/origin/ is read.
+        git_unchecked(repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]).unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            show_on_default_branch(&ok, ".paja/labels")
+                .unwrap()
+                .as_deref(),
+            Some("work x\n")
         );
     }
 
