@@ -2041,7 +2041,8 @@ impl Factory {
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
                  \"pr checks\") while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
                  if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
-                 if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
+                 case \"$*\" in *--json*) if [ -f {d}/ci-red-seen ]; then rm {d}/ci-red-seen; echo '[{{\"name\": \"check (ubuntu-latest)\", \"bucket\": \"fail\", \"link\": \"https://example.com/acme/app/actions/runs/7/job/8\"}}]'; else echo '[]'; fi; exit 0 ;; esac\n\
+                 if [ -f {d}/ci-red-once ]; then mv {d}/ci-red-once {d}/ci-red-seen; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
@@ -7175,6 +7176,22 @@ fn a_merge_the_builder_leaves_unfinished_stays_in_progress_for_the_next_round() 
         .find(|c| c.contains("isn't finished: these files still have conflicts: feature.txt"))
         .unwrap_or_else(|| panic!("{calls:#?}"));
     assert!(fix.contains("finish the merge"), "{fix}");
+    // Paja started the merge again, so the files hold markers for the builder.
+    assert!(fix.contains("started the merge again"), "{fix}");
+}
+
+#[test]
+fn a_gh_failure_after_main_moved_escalates_instead_of_costing_a_round() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-silent"), "").unwrap();
+    f.main_moves("other.txt", "elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 1, "{report}");
+    assert!(
+        !stderr.contains("CI failed; sending the failure back to the builder"),
+        "{stderr}"
+    );
 }
 
 #[test]

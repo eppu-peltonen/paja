@@ -958,6 +958,8 @@ fn run_item(
     let mut builder: Option<StepUsage> = None;
     // How often each kind of step hit its turn limit in this run: a second hit escalates.
     let (mut builder_limits, mut review_limits) = (0u32, 0u32);
+    // Whether the last round ended on a red CI, whose feedback holds a CI log.
+    let mut ci_red = false;
     progress(&format!("working in {}", env.path.display()));
     for round in start..=MAX_ROUNDS {
         run.round = round;
@@ -974,6 +976,7 @@ fn run_item(
         }
         let steps = &mut run.steps;
         steps.clear();
+        ci_red = false;
         // Only the round that was cut off may reuse what it had: the build, and the checks if
         // nothing has changed since they passed.
         let reused = if round == start { reuse.take() } else { None };
@@ -1120,19 +1123,44 @@ fn run_item(
             Vec::new()
         };
         if !left.is_empty() {
-            feedback = format!(
-                "The merge of {} isn't finished: these files still have conflicts: {}. Resolve \
-                 each one, keeping what both sides meant, then `git add` the files and \
-                 `git commit -m '<message>'` to finish the merge.",
-                target.branch,
-                left.join(", ")
-            );
-            if let Some(p) = &prior {
-                feedback.push_str(&format!(
-                    "\n\nThe review's blockers still need fixing too:\n\n{}",
-                    p.blockers
-                ));
-            }
+            // The next round starts from the conflicts again: restart the merge, so the files
+            // hold markers for the builder to resolve.
+            git(&env.path, &["merge", "--abort"])?;
+            feedback = match catch_up(repo, &env, &target.branch)? {
+                CatchUp::Conflict(files) => {
+                    let mut text = format!(
+                        "The merge of {} isn't finished: these files still have conflicts: {}. \
+                         Paja started the merge again, so they hold conflict markers. Resolve \
+                         each one, keeping what both sides meant, then `git add` the files and \
+                         `git commit -m '<message>'` to finish the merge.",
+                        target.branch,
+                        files.join(", ")
+                    );
+                    if let Some(p) = &prior {
+                        text.push_str(&format!(
+                            "\n\nThe review's blockers still need fixing too:\n\n{}",
+                            p.blockers
+                        ));
+                    }
+                    text
+                }
+                // The default branch moved so the merge is clean now, or the branch already
+                // holds it: nothing is left to resolve.
+                _ => {
+                    let mut text = format!(
+                        "The merge of {} wasn't finished and Paja has started it again. Make the \
+                         change and commit it.",
+                        target.branch
+                    );
+                    if let Some(p) = &prior {
+                        text.push_str(&format!(
+                            "\n\nThe review's blockers still need fixing too:\n\n{}",
+                            p.blockers
+                        ));
+                    }
+                    text
+                }
+            };
             progress("the builder left the merge unfinished; asking again");
             let next = Next {
                 feedback: &feedback,
@@ -1498,6 +1526,7 @@ fn run_item(
             let report = match landed {
                 Ok(Landing::Retry(why)) => {
                     progress("CI failed; sending the failure back to the builder");
+                    ci_red = true;
                     feedback = why.clone();
                     prior = Some(Prior {
                         reviewed: judged,
@@ -1598,8 +1627,17 @@ fn run_item(
             Some(next),
         )?;
     }
+    // A CI log can hold anything the build printed, and the question goes to a public issue.
+    let (reason, feedback) = if ci_red {
+        (
+            "CI still failed",
+            follow_ups::redact_for_issue(&feedback, repo),
+        )
+    } else {
+        ("the change still isn't ready", feedback)
+    };
     let question = format!(
-        "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
+        "Paja tried {MAX_ROUNDS} rounds and {reason}. Last feedback:\n\n{feedback}\n\n\
          Answer with what should change, or what is out of scope."
     );
     let scene = Scene {

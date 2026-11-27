@@ -134,17 +134,28 @@ pub(super) fn land(
         progress(&format!("opened {pr}; waiting for CI"));
         // A red CI is the builder's to fix, like a failed check: the pull request stays open
         // and the next round pushes to it.
-        if let Err(err) = wait_for_ci(repo, &pr) {
-            let err = format!("{err:#}");
+        let outcome = wait_for_ci(repo, &pr);
+        if !matches!(outcome, Ci::Green) {
             // Only a failed check, or checks that never start because the default branch moved
             // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
             // `gh` or network error, or a repository whose workflows never run, is not.
-            let failed_check = err.contains("\tfail\t");
-            if !failed_check && !default_branch_moved(repo, &target.branch, judged) {
-                let question =
-                    format!("CI did not report on {pr}, so Paja did not land it:\n\n{err}");
-                return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
-            }
+            let err = match outcome {
+                Ci::Failed(rows) => rows,
+                Ci::Unreported {
+                    text,
+                    never_started,
+                } => {
+                    if !(never_started && default_branch_moved(repo, &target.branch, judged)) {
+                        let question = format!(
+                            "CI did not report on {pr}, so Paja did not land it:\n\n{text}"
+                        );
+                        return escalated(home, repo, env, item, &question, rounds)
+                            .map(Landing::Done);
+                    }
+                    text
+                }
+                Ci::Green => unreachable!(),
+            };
             let mut why = format!(
                 "CI failed on {pr}, so Paja did not land it. CI runs on GitHub's machines, which \
                  differ from this one (no git identity, a fresh checkout, other temp folders), so \
@@ -165,6 +176,16 @@ pub(super) fn land(
             let question = format!(
                 "GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{}",
                 no_merge_method(&item.repo)
+            );
+            return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+        }
+        // The default branch moved again after the catch-up. The branch is kept; the person
+        // can queue the item again and Paja merges the new tip in.
+        if text.contains("conflict") || text.contains("not mergeable") {
+            let question = format!(
+                "{pr} no longer merges: the default branch moved while the review and CI ran, so \
+                 Paja did not land it:\n\n{err:#}\n\nAnswer that it should try again and Paja \
+                 will merge the new tip into the branch and check it again."
             );
             return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
         }
@@ -330,21 +351,77 @@ pub(super) fn comment(repo: &Path, item: &WorkItem, question: &str) -> Result<()
     Ok(())
 }
 
+/// How CI ended on a pull request.
+pub(super) enum Ci {
+    Green,
+    /// At least one check failed; one row per failed check, with its job link.
+    Failed(String),
+    /// No verdict: `gh` or the network failed, or no check ever appeared (`never_started`, which
+    /// is also what a pull request that conflicts with its base looks like).
+    Unreported {
+        text: String,
+        never_started: bool,
+    },
+}
+
 /// Wait until GitHub has registered checks on the pull request, then until they finish.
-/// A pull request that gets no checks at all is not treated as green.
-pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
+/// A pull request that gets no checks at all is not treated as green. Only checks in gh's
+/// `fail` bucket are failures: a cancelled one (`cancel` bucket) is not the code's fault, so
+/// it is `Unreported` and escalates.
+pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Ci {
     const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
     let start = std::time::Instant::now();
     loop {
         match run_gh(repo, &["pr", "checks", pr, "--watch", "--fail-fast"]) {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ci::Green,
             Err(err) if format!("{err:#}").contains("no checks reported") => {
                 if start.elapsed() > APPEAR {
-                    bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
+                    return Ci::Unreported {
+                        text: format!(
+                            "no CI checks appeared on {pr} within 5 minutes; check the workflows"
+                        ),
+                        never_started: true,
+                    };
                 }
                 std::thread::sleep(std::time::Duration::from_secs(10));
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // Ask for the buckets and links as JSON: the watch's text is clipped to its last
+                // 4000 bytes, which can drop the failed row of a pull request with many checks.
+                let failed = run_gh(repo, &["pr", "checks", pr, "--json", "name,bucket,link"])
+                    .ok()
+                    .map(|json| failed_checks(&json))
+                    .unwrap_or_default();
+                return if failed.is_empty() {
+                    Ci::Unreported {
+                        text: format!("{err:#}"),
+                        never_started: false,
+                    }
+                } else {
+                    Ci::Failed(failed)
+                };
+            }
         }
     }
+}
+
+/// One row (`name`, `fail`, `link`) per check in `json` (the output of `gh pr checks --json
+/// name,bucket,link`) whose bucket is `fail`.
+fn failed_checks(json: &str) -> String {
+    let Ok(serde_json::Value::Array(checks)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return String::new();
+    };
+    checks
+        .iter()
+        .filter(|c| c["bucket"] == "fail")
+        .map(|c| {
+            format!(
+                "{}\tfail\t{}",
+                c["name"].as_str().unwrap_or("check"),
+                c["link"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
