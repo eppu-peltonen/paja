@@ -459,6 +459,16 @@ fn main_repo(ok: &Untampered, path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("can't find the main checkout for {}", path.display()))
 }
 
+/// Whether `env` was made from the repository `path` is in (any checkout or worktree of it).
+/// Environment names hold only a short hash of `owner/name`, so two clones of one repository
+/// under one home share them; only git in `path` runs, after `path`'s tamper check.
+pub fn belongs_to(home: &Home, env: &Env, path: &Path) -> Result<bool> {
+    let ok = untampered(home, path)?;
+    let main = main_repo(&ok, path)?;
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok(canonical(&main) == canonical(&env.repo))
+}
+
 /// Whether git still lists `path` as one of `repo`'s worktrees.
 fn is_registered_worktree(ok: &Untampered, repo: &Path, path: &Path) -> bool {
     let Ok(list) = git(ok, repo, &["worktree", "list", "--porcelain"]) else {

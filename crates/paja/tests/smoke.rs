@@ -4859,9 +4859,14 @@ fn triage_vars(dir: &Path) -> [(&'static str, std::path::PathBuf); 2] {
 }
 
 fn triage(f: &Factory, dir: &Path) -> (bool, Value) {
+    triage_in(f, dir, &f.repo)
+}
+
+/// `paja triage` run from `repo`.
+fn triage_in(f: &Factory, dir: &Path, repo: &Path) -> (bool, Value) {
     let vars = triage_vars(dir);
     let vars: Vec<(&str, &Path)> = vars.iter().map(|(k, v)| (*k, v.as_path())).collect();
-    paja_with(&f.home, &f.repo, &["triage"], &vars)
+    paja_with(&f.home, repo, &["triage"], &vars)
 }
 
 #[test]
@@ -4964,6 +4969,46 @@ fn triage_leaves_a_persons_triage_environment_alone_and_waits_for_a_running_pass
         std::fs::read_to_string(theirs.join("my-work.txt")).unwrap(),
         "unsaved"
     );
+}
+
+#[test]
+fn triage_leaves_another_clones_triage_environment_alone() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "keep", "reason": "still open"},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // A second clone of acme/app under the same home, whose killed pass left its environment.
+    let clone = f.tmp.path().join("second-clone");
+    let status = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&f.repo)
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let name = paja::jono::env_name_for("acme/app", "triage");
+    let (ok, env) = paja(&f.home, &clone, &["env", "create", &name]);
+    assert!(ok, "{env}");
+    let theirs = std::path::PathBuf::from(env["path"].as_str().unwrap());
+    std::fs::write(theirs.join("my-work.txt"), "unsaved").unwrap();
+    let (ok, err) = triage(&f, &dir);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("belongs to the repository at") && msg.contains("paja env remove"),
+        "{msg}"
+    );
+    assert!(!dir.join("claude-calls").exists(), "the agent ran");
+    assert_eq!(
+        std::fs::read_to_string(theirs.join("my-work.txt")).unwrap(),
+        "unsaved"
+    );
+    // From a worktree of the clone itself, the environment is its own and is reused.
+    let (ok, report) = triage_in(&f, &dir, &theirs);
+    assert!(ok, "{report}");
 }
 
 #[test]
