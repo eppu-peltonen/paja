@@ -384,35 +384,8 @@ impl Pool<'_> {
 
     /// Free the plans that ended; one that ended without recording a plan failed.
     fn reap_planners(&mut self) -> Result<()> {
-        for number in end_overdue(&mut self.planners, PLAN_LIMIT) {
-            self.planners.remove(&number);
-            let why = format!(
-                "the plan of #{number} took longer than {} minutes",
-                PLAN_LIMIT.as_secs() / 60
-            );
+        for (number, why) in reap(self.home, self.name, &mut self.planners, PLAN_LIMIT)? {
             self.plan_failed(number, &why)?;
-        }
-        let done: Vec<u64> = self
-            .planners
-            .iter_mut()
-            .filter_map(|(&n, (child, _, _))| (!matches!(child.try_wait(), Ok(None))).then_some(n))
-            .collect();
-        for number in done {
-            let Some((_, at, _)) = self.planners.remove(&number) else {
-                continue;
-            };
-            // The plan may have been recorded after this tick read the log.
-            let events = self.home.events().read_all()?;
-            let planned = events.iter().any(|e| {
-                e.seq > at
-                    && e.kind == EV_POOL_PLANNED
-                    && e.data["repo"] == self.name
-                    && e.data["number"] == number
-            });
-            if !planned {
-                let why = format!("the plan of #{number} ended without one");
-                self.plan_failed(number, &why)?;
-            }
         }
         Ok(())
     }
@@ -571,6 +544,52 @@ fn stop_children<'c>(children: impl Iterator<Item = &'c mut Child>, grace: Durat
 
 /// End the planners in `planners` that have run longer than `limit`, and return their items.
 /// They stay in the map: the caller records why and removes them.
+/// Take out of `planners` the plans that ended, ending first any going longer than `limit`, and
+/// return each that recorded no plan with why. A plan killed for its time may still have
+/// recorded one in the instant before, which counts like any other.
+fn reap(
+    home: &Home,
+    repo: &str,
+    planners: &mut BTreeMap<u64, (Child, u64, Instant)>,
+    limit: Duration,
+) -> Result<Vec<(u64, String)>> {
+    let overdue = end_overdue(planners, limit);
+    let ended: Vec<(u64, u64)> = planners
+        .iter_mut()
+        .filter_map(|(&n, (child, at, _))| {
+            (!matches!(child.try_wait(), Ok(None))).then_some((n, *at))
+        })
+        .collect();
+    if ended.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The plan may have been recorded after this tick read the log.
+    let events = home.events().read_all()?;
+    let mut failed = Vec::new();
+    for (number, at) in ended {
+        planners.remove(&number);
+        let planned = events.iter().any(|e| {
+            e.seq > at
+                && e.kind == EV_POOL_PLANNED
+                && e.data["repo"] == repo
+                && e.data["number"] == number
+        });
+        if planned {
+            continue;
+        }
+        let why = if overdue.contains(&number) {
+            format!(
+                "the plan of #{number} took longer than {} minutes",
+                limit.as_secs() / 60
+            )
+        } else {
+            format!("the plan of #{number} ended without one")
+        };
+        failed.push((number, why));
+    }
+    Ok(failed)
+}
+
 fn end_overdue(planners: &mut BTreeMap<u64, (Child, u64, Instant)>, limit: Duration) -> Vec<u64> {
     let mut overdue = Vec::new();
     for (&number, (child, _, started)) in planners.iter_mut() {
@@ -1338,6 +1357,46 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(stuck.try_wait().unwrap().is_some());
         assert!(quick.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaping_planners_fails_only_the_plans_that_recorded_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let at = record(&home, "test.start", json!({})).unwrap().seq;
+        let planned = |number: u64| {
+            let plan = json!({"repo": "acme/app", "number": number, "paths": ["src/"],
+                "source": "plan"});
+            record(&home, EV_POOL_PLANNED, plan).unwrap();
+        };
+        let ended = || {
+            let mut child = Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child
+        };
+        let long_ago = Instant::now() - Duration::from_secs(120);
+        let sleep = || Command::new("sleep").arg("60").spawn().unwrap();
+        let mut planners = BTreeMap::new();
+        // Hung past the limit, with and without a plan recorded just before it was ended.
+        planners.insert(1, (sleep(), at, long_ago));
+        planners.insert(2, (sleep(), at, long_ago));
+        // Ended by itself, with and without a plan.
+        planners.insert(3, (ended(), at, Instant::now()));
+        planners.insert(4, (ended(), at, Instant::now()));
+        // Still going, within the limit.
+        planners.insert(5, (sleep(), at, Instant::now()));
+        planned(2);
+        planned(3);
+        let failed = reap(&home, "acme/app", &mut planners, Duration::from_secs(60)).unwrap();
+        let numbers: Vec<u64> = failed.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, [1, 4], "{failed:?}");
+        assert!(failed[0].1.contains("took longer than"), "{failed:?}");
+        assert_eq!(failed[1].1, "the plan of #4 ended without one");
+        assert_eq!(planners.keys().copied().collect::<Vec<_>>(), [5]);
+        let (mut going, _, _) = planners.remove(&5).unwrap();
+        let _ = going.kill();
+        let _ = going.wait();
     }
 
     #[cfg(unix)]
