@@ -6943,6 +6943,7 @@ fn init_new_says_so_when_the_skeleton_agent_writes_nothing() {
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent wrote no files for the zig skeleton")
+            && error.contains("delete the new repository on GitHub")
             && error.contains("paja init --new"),
         "{error}"
     );
@@ -6973,6 +6974,7 @@ fn init_new_refuses_a_skeleton_the_agent_committed() {
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent committed or switched branches")
+            && error.contains("delete the new repository on GitHub")
             && error.contains("paja init --new"),
         "{error}"
     );

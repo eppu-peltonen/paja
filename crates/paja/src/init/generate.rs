@@ -32,6 +32,24 @@ const NEVER: &[&str] = &[
     "pwsh",
     "env",
     "xargs",
+    // Runners that start whatever command they are given.
+    "busybox",
+    "wsl",
+    "conhost",
+    "start",
+    "nohup",
+    "timeout",
+    "nice",
+    "time",
+    "setsid",
+    "stdbuf",
+    "script",
+    "watch",
+    "strace",
+    "cscript",
+    "wscript",
+    "mshta",
+    "rundll32",
     "sudo",
     "su",
     "doas",
@@ -189,7 +207,8 @@ mod tests {
     fn only_plain_program_names_the_agent_may_not_misuse_are_allowed() {
         let answer = json!({"programs": [
             "go", "gofmt", " go ", "bash", "curl", "../go", "-x", "", "a b", "GIT", "staticcheck",
-            "bash.exe", "CMD.EXE", "powershell.exe", "sh.exe", "cmd.bat", "pwsh.cmd", "git.exe"
+            "bash.exe", "CMD.EXE", "powershell.exe", "sh.exe", "cmd.bat", "pwsh.cmd", "git.exe",
+            "busybox", "wsl.exe", "nohup", "timeout", "mshta", "cscript"
         ]});
         assert_eq!(
             parse_programs(answer, "go").unwrap(),
