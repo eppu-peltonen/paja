@@ -4005,6 +4005,40 @@ fn run_records_what_each_agent_step_spent() {
 }
 
 #[test]
+fn a_re_review_after_changes_checks_the_findings_in_the_change_as_fixes() {
+    let f = Factory::new("true\n", "changes");
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": "Tidy the helper"},
+            {"kind": "outside", "finding": "The parser drops a line"}
+        ]),
+        true,
+    );
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let calls = f.claude_calls();
+    let reviews: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.contains("--json-schema"))
+        .collect();
+    let rereview = reviews.get(1).unwrap_or_else(|| panic!("{calls:#?}"));
+    // The finding in the change is among the fixes to check; only the one outside it is
+    // offered as a finding outside the change.
+    let (asked, outside) = rereview
+        .split_once("findings outside the change")
+        .unwrap_or_else(|| panic!("{rereview}"));
+    let asked = asked
+        .rsplit_once("asked for these fixes")
+        .map_or("", |(_, a)| a);
+    assert!(asked.contains("Tidy the helper"), "{rereview}");
+    assert!(!asked.contains("The parser drops a line"), "{rereview}");
+    let outside = outside.split("Judge").next().unwrap_or(outside);
+    assert!(outside.contains("The parser drops a line"), "{rereview}");
+    assert!(!outside.contains("Tidy the helper"), "{rereview}");
+}
+
+#[test]
 fn a_fix_round_hands_the_builder_the_findings() {
     // Round one asks for changes, so the findings go to the fix round, never to an issue.
     let f = Factory::new("true\n", "changes");
@@ -4102,6 +4136,122 @@ fn a_change_holding_a_finding_at_the_round_limit_lands_and_lists_it_without_an_i
     assert!(
         left.contains(&"not filed: round limit") && left.contains(&"not filed: outside the change"),
         "{left:?}"
+    );
+}
+
+#[test]
+fn findings_left_at_the_round_limit_reach_the_notifier() {
+    let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": "Tidy the helper"},
+            {"kind": "outside", "finding": "The parser drops a line"}
+        ]),
+        false,
+    );
+    let (notifier, log) = fake_notifier(&f);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_NOTIFIER", notifier.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let notices = std::fs::read_to_string(&log).unwrap();
+    // One finding in the change is left; the one outside it is not counted.
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    assert!(
+        notices.starts_with("Paja: acme/app#5 landed with 1 open finding|"),
+        "{notices}"
+    );
+    let sent = events_of(&f, "notify.sent");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["data"]["kind"], "left_findings");
+}
+
+#[test]
+fn a_change_landing_with_only_outside_findings_sends_no_notice() {
+    let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        false,
+    );
+    let (notifier, log) = fake_notifier(&f);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_NOTIFIER", notifier.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert!(!log.exists(), "{}", std::fs::read_to_string(&log).unwrap());
+}
+
+#[test]
+fn outside_findings_survive_a_red_ci_and_are_listed_once_in_the_pull_request_that_lands() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        false,
+    );
+    std::fs::write(f.tmp.path().join("ci-red-once"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let log = f.gh_log();
+    // The body goes in a file, never on the command line.
+    assert!(
+        log.lines()
+            .filter(|l| l.starts_with("pr create"))
+            .all(|l| l.contains("--body-file") && !l.contains("--body ")),
+        "{log}"
+    );
+    let last = log.rfind("pr create").expect(&log);
+    let body = &log[last..];
+    assert_eq!(body.matches("The parser drops a line").count(), 1, "{body}");
+    // The re-review after the red CI was asked to keep or drop it as a finding outside the
+    // change.
+    let calls = f.claude_calls();
+    let rereview = calls
+        .iter()
+        .rfind(|c| c.contains("--json-schema") && c.contains("CI failed on"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(
+        rereview.contains("findings outside the change"),
+        "{rereview}"
+    );
+    assert!(rereview.contains("The parser drops a line"), "{rereview}");
+    let left: Vec<Value> = events_of(&f, "run.follow_up");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["data"]["error"], "not filed: outside the change");
+}
+
+#[test]
+fn outside_findings_are_logged_as_not_landed_when_the_change_does_not_land() {
+    let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        false,
+    );
+    std::fs::write(f.tmp.path().join("ci-silent"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let left: Vec<Value> = events_of(&f, "run.follow_up");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(
+        left[0]["data"]["error"],
+        "not filed: the change did not land"
     );
 }
 

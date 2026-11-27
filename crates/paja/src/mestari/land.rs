@@ -7,6 +7,9 @@ pub(super) const EV_MERGING: &str = "pool.merging";
 /// change lands, or goes back to its builder.
 pub(super) const EV_LANDING: &str = "pool.landing";
 /// How often a run waiting for its turn to land looks again.
+/// GitHub's limit for a pull request's description, in characters.
+const PR_BODY_CHARS: usize = 65_536;
+
 const LAND_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Wait for this repository's turn to land, taken under the home lock and held for as long as
@@ -98,7 +101,12 @@ pub(super) fn land(
              Vasara's checks and the reviewers alone."
         ));
     }
-    // Reuse this branch's pull request only while it is still open.
+    // The body goes in a file: with ten findings of up to 4000 characters it is past Windows'
+    // command-line limit.
+    let body: String = body.chars().take(PR_BODY_CHARS).collect();
+    let body_path = super::body_file(home, &format!("pr-{}", item.number), &body)?;
+    let body_arg = body_path.to_string_lossy().into_owned();
+    // Reuse this branch's pull request only while it is still open, with this round's body.
     let pr = match run_gh(
         repo,
         &[
@@ -111,23 +119,35 @@ pub(super) fn land(
             "select(.state == \"OPEN\") | .url",
         ],
     ) {
-        Ok(url) if !url.is_empty() => url,
-        _ => run_gh(
-            repo,
-            &[
-                "pr",
-                "create",
-                "--base",
-                &target.branch,
-                "--head",
-                branch,
-                "--title",
-                &title,
-                "--body",
-                &body,
-            ],
-        )?,
+        Ok(url) if !url.is_empty() => {
+            let edited = run_gh(repo, &["pr", "edit", &url, "--body-file", &body_arg]);
+            if let Err(err) = edited {
+                let _ = std::fs::remove_file(&body_path);
+                return Err(err);
+            }
+            url
+        }
+        _ => {
+            let created = run_gh(
+                repo,
+                &[
+                    "pr",
+                    "create",
+                    "--base",
+                    &target.branch,
+                    "--head",
+                    branch,
+                    "--title",
+                    &title,
+                    "--body-file",
+                    &body_arg,
+                ],
+            );
+            let _ = std::fs::remove_file(&body_path);
+            created?
+        }
     };
+    let _ = std::fs::remove_file(&body_path);
     // Someone following the run sees the pull request from here on.
     record(
         home,

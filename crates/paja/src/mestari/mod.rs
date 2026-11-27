@@ -399,8 +399,18 @@ struct Prior {
     reviewed: String,
     /// The blockers they named.
     blockers: String,
-    /// Their non-blocking findings, for the next reviewer to keep or drop.
+    /// Their findings outside the change, for the next reviewer to keep or drop. Findings in
+    /// the change are among the fixes asked for (`blockers`), which the next review checks.
     follow_ups: Vec<Finding>,
+}
+
+/// The findings outside the change, the ones a re-review is asked to keep or drop.
+fn outside(findings: &[Finding]) -> Vec<Finding> {
+    findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::Outside)
+        .cloned()
+        .collect()
 }
 
 pub struct RunOptions<'a> {
@@ -1438,11 +1448,7 @@ fn run_item(
             prior = Some(Prior {
                 reviewed: checked,
                 blockers: list,
-                follow_ups: follow_ups
-                    .iter()
-                    .filter(|f| f.kind == FindingKind::Outside)
-                    .cloned()
-                    .collect(),
+                follow_ups: outside(&follow_ups),
             });
             let next = Next {
                 feedback: &feedback,
@@ -1552,10 +1558,20 @@ fn run_item(
                 Ok(Landing::Retry(why)) => {
                     progress("CI failed; sending the failure back to the builder");
                     feedback = why.clone();
+                    // Findings in the change still open at the round limit are fixes to check
+                    // too; only those outside it are the reviewer's to keep or drop.
+                    let mut asked = why.clone();
+                    let open: Vec<String> = to_fix(&follow_ups).iter().map(|f| f.shown()).collect();
+                    if !open.is_empty() {
+                        asked.push_str(&format!(
+                            "\n\nThe review's findings in the change, still open:\n\n{}",
+                            open.join("\n\n")
+                        ));
+                    }
                     prior = Some(Prior {
                         reviewed: judged,
-                        blockers: why.clone(),
-                        follow_ups: follow_ups.clone(),
+                        blockers: asked,
+                        follow_ups: outside(&follow_ups),
                     });
                     let next = Next {
                         feedback: &feedback,
@@ -1571,6 +1587,18 @@ fn run_item(
                 Ok(RunReport::Landed { .. }) => {
                     for (text, why) in &left {
                         record_follow_up(home, item, text, None, why);
+                    }
+                    // Findings in the change left at the round limit are for a person to read:
+                    // Posti tells them, since no issue holds them.
+                    let open = left.iter().filter(|(_, why)| *why == ROUND_LIMIT).count();
+                    if open > 0 {
+                        let notice = crate::posti::Notice::left_findings(
+                            &item.repo,
+                            item.number,
+                            &item.title,
+                            open,
+                        );
+                        crate::posti::send(home, repo, &notice);
                     }
                 }
                 // Not landed after all: keep the findings in the log, for later.
@@ -1629,11 +1657,19 @@ fn run_item(
                 others.join("\n\n")
             ));
         }
-        // Without named blockers there is nothing to narrow the next review to.
-        prior = (!blockers.is_empty()).then(|| Prior {
-            reviewed: checked,
-            blockers,
-            follow_ups: follow_ups.clone(),
+        // Without named blockers there is nothing to narrow the next review to. The other
+        // findings in the change join the fixes it checks; only those outside it are kept or
+        // dropped.
+        prior = (!blockers.is_empty()).then(|| {
+            let mut asked = blockers;
+            if !others.is_empty() {
+                asked.push_str(&format!("\n\n{}", others.join("\n\n")));
+            }
+            Prior {
+                reviewed: checked,
+                blockers: asked,
+                follow_ups: outside(&follow_ups),
+            }
         });
         let next = Next {
             feedback: &feedback,
