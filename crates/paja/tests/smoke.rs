@@ -2663,6 +2663,59 @@ fn doctor_checks_that_the_sandbox_program_works() {
 }
 
 #[test]
+fn doctor_warns_of_an_environment_left_by_a_closed_item() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    // Item 5 was parked with its environment kept, then its issue was closed; item 6 is open
+    // and parked, so its environment is still wanted.
+    let env = |number: u64| {
+        format!(
+            r#"{{"v":1,"seq":{number},"ts_ms":1,"kind":"env.created","data":{{"name":"app-a9afab-work-{number}","repo":"/nowhere/app","path":"/nowhere/app-{number}","branch":"paja/work-{number}","base_commit":"abc","port_base":4000,"port_count":10,"created_ms":1}}}}"#
+        )
+    };
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":5,"title":"A","body":"","url":"https://example.com/5"}}"#.to_string(),
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":6,"title":"B","body":"","url":"https://example.com/6"}}"#.to_string(),
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.status","data":{"repo":"acme/app","number":5,"status":"escalated","note":"Which API?"}}"#.to_string(),
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.status","data":{"repo":"acme/app","number":6,"status":"escalated","note":"Which API?"}}"#.to_string(),
+        env(5),
+        env(6),
+        r#"{"v":1,"seq":7,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":5}}"#.to_string(),
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(tmp.path())
+        .env("PAJA_HOME", &home)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "environments")
+        .unwrap_or_else(|| panic!("no environments check in {report}"));
+    assert_eq!(check["status"], "warning", "{check}");
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(WORK_5) && !detail.contains("work-6"),
+        "{check}"
+    );
+    assert!(
+        check["fix"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("`paja env remove {WORK_5}`")),
+        "{check}"
+    );
+}
+
+#[test]
 fn doctor_warns_when_claude_code_is_out_of_date() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
