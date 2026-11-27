@@ -506,6 +506,9 @@ fn touches_named_file(repo: &Path, issue: &Open, commit: &str) -> bool {
         {
             return false;
         }
+        // A parent the commit object names but git can't show (hidden by an `info/grafts`
+        // file, say) is no root either.
+        None if !raw_parents_absent(repo, commit) => return false,
         None => args.extend(["--root", commit]),
     }
     git(repo, &args).is_ok_and(|names| {
@@ -513,6 +516,16 @@ fn touches_named_file(repo: &Path, issue: &Open, commit: &str) -> bool {
             .split('\0')
             .filter(|n| !n.is_empty())
             .any(|n| names_file(issue, n))
+    })
+}
+
+/// Whether the commit object `commit` itself names no parent: its raw text, which grafts and
+/// shallow boundaries don't change, has no `parent` header line. Unreadable counts as no.
+fn raw_parents_absent(repo: &Path, commit: &str) -> bool {
+    git(repo, &["cat-file", "commit", commit]).is_ok_and(|raw| {
+        raw.lines()
+            .take_while(|line| !line.is_empty())
+            .all(|line| !line.starts_with("parent "))
     })
 }
 
@@ -534,24 +547,21 @@ fn names_file(issue: &Open, file: &str) -> bool {
     }
     let text = format!("{}\n{}", issue.title, issue.body).replace('\\', "/");
     let name = file.rsplit('/').next().unwrap_or(file);
-    // The words of the text that could be paths, without quotes or trailing punctuation. A
-    // link to a file of this repository on GitHub (`.../owner/name/blob/<ref>/<path>`) gives
-    // its path; any other link names nothing.
-    let blob = format!("/{}/blob/", issue.repo.to_ascii_lowercase());
-    let words = text
+    // The words of the text that could be paths, without quotes or trailing punctuation.
+    let words: Vec<&str> = text
         .split(|c: char| !(c.is_alphanumeric() || "/._-".contains(c)))
         .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
-        .filter_map(|word| {
-            if !word.starts_with("//") {
-                return Some(word);
-            }
-            let at = word.to_ascii_lowercase().find(&blob)?;
-            (!issue.repo.is_empty())
-                .then(|| word[at + blob.len()..].split_once('/'))
-                .flatten()
-                .map(|(_, path)| path)
-        })
-        .filter(|word| !word.is_empty());
+        .filter(|word| !word.is_empty())
+        .collect();
+    // A link to one of this repository's files on GitHub names exactly that file; any other
+    // link names nothing.
+    if words
+        .iter()
+        .filter(|word| word.starts_with("//"))
+        .any(|link| link_names(link, &issue.repo, file))
+    {
+        return true;
+    }
     // A path the issue gives is matched as a path: the same path, or one of the two ending in
     // the other at a `/` (`mestari/mod.rs` names `crates/paja/src/mestari/mod.rs`). A bare file
     // name with an extension (`triage.rs`) names any file of that name, but a path's last part
@@ -567,6 +577,45 @@ fn names_file(issue: &Open, file: &str) -> bool {
                 || (word.contains('/') && suffix(file, word))
                 || (named_name && !word.contains('/') && word == name)
         })
+}
+
+/// Whether `link` (a word from `//` on, without a `#` or `?` part) links to `file` in `repo`
+/// (`owner/name`) on GitHub: `//github.com/<repo>/{blob,tree,blame,raw}/<ref>/<file>` or
+/// `//raw.githubusercontent.com/<repo>/<ref>/<file>`, host and repository in any case. The ref
+/// is read as one part (a branch, tag or commit): a link to a branch with a `/` in its name
+/// (`feature/x`) can't be told from one to a path, so it names nothing rather than the wrong
+/// file.
+fn link_names(link: &str, repo: &str, file: &str) -> bool {
+    if repo.is_empty() {
+        return false;
+    }
+    let Some((host, rest)) = link.trim_start_matches('/').split_once('/') else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let Some(rest) = rest
+        .get(..repo.len())
+        .filter(|owner_name| owner_name.eq_ignore_ascii_case(repo))
+        .and_then(|_| rest[repo.len()..].strip_prefix('/'))
+    else {
+        return false;
+    };
+    let after_ref = match host.as_str() {
+        "github.com" | "www.github.com" => {
+            let Some((kind, after)) = rest.split_once('/') else {
+                return false;
+            };
+            if !matches!(kind, "blob" | "tree" | "blame" | "raw") {
+                return false;
+            }
+            after
+        }
+        "raw.githubusercontent.com" => rest,
+        _ => return false,
+    };
+    after_ref
+        .split_once('/')
+        .is_some_and(|(_, path)| path == file)
 }
 
 /// The comment that closes an issue: the reason, the evidence, and how to undo it.
@@ -1174,6 +1223,47 @@ mod tests {
         assert!(names_file(&issue, "crates/paja/src/hook.rs"));
         assert!(!names_file(&issue, "src/lib.rs"));
         assert!(!names_file(&issue, "lib.rs"));
+        // A link names exactly its file: not a longer or shorter path.
+        assert!(!names_file(&issue, "src/hook.rs"));
+        assert!(!names_file(&issue, "x/crates/paja/src/hook.rs"));
+        let linked = |body: &str| Open {
+            number: 3,
+            title: "Broken check".into(),
+            body: body.into(),
+            labels: Vec::new(),
+            created_at: String::new(),
+            repo: "acme/app".into(),
+        };
+        // The other kinds of file link.
+        for body in [
+            "https://github.com/acme/app/tree/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blame/v1.2/crates/paja/src/hook.rs?plain=1",
+            "https://github.com/acme/app/raw/main/crates/paja/src/hook.rs",
+            "https://raw.githubusercontent.com/Acme/App/main/crates/paja/src/hook.rs",
+            "https://www.github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+        ] {
+            assert!(
+                names_file(&linked(body), "crates/paja/src/hook.rs"),
+                "{body}"
+            );
+        }
+        // Another host, another kind of page, or a repository that only starts the same.
+        for body in [
+            "https://example.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/commits/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app-old/blob/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/crates/paja/src/hook.rs",
+            "https://github.com/acme/app",
+        ] {
+            assert!(
+                !names_file(&linked(body), "crates/paja/src/hook.rs"),
+                "{body}"
+            );
+        }
+        // A branch with a `/` can't be told from a path, so its link names neither reading.
+        let branch = linked("https://github.com/acme/app/blob/feature/x/crates/paja/src/hook.rs");
+        assert!(!names_file(&branch, "crates/paja/src/hook.rs"));
+        assert!(!names_file(&branch, "paja/src/hook.rs"));
         // Without a repository, no link names anything.
         let unknown = Open {
             repo: String::new(),
@@ -1193,7 +1283,12 @@ mod tests {
             format!("file:///{path}")
         };
         let shallow = tempfile::tempdir().unwrap();
+        // No system or global config, as the other test repositories use none of theirs.
+        let empty = shallow.path().join("empty.gitconfig");
+        std::fs::write(&empty, "").unwrap();
         let out = std::process::Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &empty)
             .args(["clone", "-q", "--depth", "1", &url])
             .arg(shallow.path().join("c"))
             .output()
@@ -1210,6 +1305,28 @@ mod tests {
             shown, None,
             "a boundary commit's own change can't be told apart here"
         );
+    }
+
+    #[test]
+    fn a_commit_whose_parent_a_graft_hides_is_not_taken_as_a_root() {
+        let (tmp, head) = evidence_repo();
+        let dir = tmp.path();
+        // A grafts file that says HEAD has no parent: against nothing it would add a.txt too.
+        std::fs::write(dir.join(".git/info/grafts"), format!("{head}\n")).unwrap();
+        let old = "2020-01-01T00:00:00Z";
+        let shown = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &head, "");
+        assert_eq!(shown, None);
+        // The real root still counts.
+        std::fs::remove_file(dir.join(".git/info/grafts")).unwrap();
+        let root = git(dir, &["rev-list", "--max-parents=0", "HEAD"]).unwrap();
+        let shown = check_evidence(
+            dir,
+            "HEAD",
+            &issue_naming("Fix a.txt", old),
+            root.trim(),
+            "",
+        );
+        assert!(shown.is_some());
     }
 
     #[test]
