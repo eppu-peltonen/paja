@@ -250,9 +250,12 @@ Then, for at most three rounds:
    "Usage limit" below. Reviewers never resume: each review is a fresh session reading cold.
    A resumed step records `resumed: true` and only its own share of the session's running `total_cost_usd` and
    `modelUsage`. When the issue leaves a decision only the person can make, the builder commits
-   nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
-   and its recommendation. Mestari then escalates at once with that question: no checks run and no more rounds are
-   spent, and the round is recorded with verdict `question`.
+   nothing and puts a line starting `PAJA-QUESTION:` in its final message (the first such line counts, and the
+   question runs to the end of the message), followed by the question, the options and its recommendation. Mestari
+   then escalates at once with that question: no checks run and no more rounds are spent, and the round is recorded
+   with verdict `question`. Commits the builder made stay on the branch for the next run; uncommitted edits are
+   dropped. Every escalation question, the builder's and a reviewer's alike, is redacted, cut to 4000 characters and
+   has its `@` broken before it goes on the issue, as a follow-up does.
 2. Vasara runs each command in `.paja/checks`, read from the default
    branch. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a

@@ -110,14 +110,7 @@ pub(super) fn file_follow_ups(
     }
     let shown: Vec<String> = filed
         .iter()
-        .map(|finding| {
-            let text = redact(&finding.shown(), &places);
-            let mut cut: String = text.chars().take(4000).collect();
-            if cut.len() < text.len() {
-                cut.push_str("\n\n(cut short)");
-            }
-            cut.replace('@', "@\u{200b}")
-        })
+        .map(|finding| defang(&redact(&finding.shown(), &places)))
         .collect();
     let first: String = shown[0]
         .lines()
@@ -184,6 +177,16 @@ pub(super) fn file_follow_ups(
             ),
         }
     }
+}
+
+/// Agent text made safe to post: cut to 4000 characters and with every `@` broken, so it never
+/// mentions anyone. Findings and escalation questions share it.
+pub(super) fn defang(text: &str) -> String {
+    let mut cut: String = text.chars().take(4000).collect();
+    if cut.len() < text.len() {
+        cut.push_str("\n\n(cut short)");
+    }
+    cut.replace('@', "@\u{200b}")
 }
 
 /// `text` made fit for a public issue comment: tokens redacted, and the repository's and the
@@ -662,6 +665,15 @@ mod tests {
         let places = [(proj, "<repository>"), (home, "<home>")];
         let shown = redact(r"C:\USERS\JÜRGEN\x and ~/SRC/PROJ/y", &places);
         assert_eq!(shown, r"<home>\x and <repository>/y");
+    }
+
+    #[test]
+    fn agent_text_is_cut_and_mentions_nobody() {
+        assert_eq!(defang("ping @bob"), "ping @\u{200b}bob");
+        let long = "é".repeat(5000);
+        let shown = defang(&long);
+        assert!(shown.starts_with(&"é".repeat(4000)), "cut on characters");
+        assert!(shown.ends_with("(cut short)"));
     }
 
     #[test]

@@ -2002,7 +2002,7 @@ impl Factory {
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
                  if [ -f {d}/build-429 ]; then echo \"{{\\\"is_error\\\": true, \\\"api_error_status\\\": 429, \\\"result\\\": \\\"Claude usage limit reached|$(cat {d}/reset-at 2>/dev/null)\\\", \\\"session_id\\\": \\\"s-1\\\", \\\"total_cost_usd\\\": 0.3}}\"; exit 1; fi\n\
-                 if [ -f {d}/ask ]; then printf '%s\\n' '{{\"is_error\": false, \"result\": \"I need a decision.\\nPAJA-QUESTION: Which API, A or B? I recommend A.\"}}'; git checkout -q -- . ; exit 0; fi\n\
+                 if [ -f {d}/ask ]; then printf '%s\\n' '{{\"is_error\": false, \"result\": \"I need a decision.\\nPAJA-QUESTION: Which API, A or B? I recommend A. Ask @bob.\"}}'; git checkout -q -- . ; exit 0; fi\n\
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
@@ -2731,8 +2731,9 @@ fn a_round_that_errors_still_records_what_it_spent() {
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     let detail = round["detail"].as_str().unwrap();
     assert!(!detail.is_empty(), "{round}");
+    let prefix: String = detail.chars().take(40).collect();
     assert!(
-        report["question"].as_str().unwrap().contains(&detail[..40]),
+        report["question"].as_str().unwrap().contains(&prefix),
         "{report}"
     );
     let steps = round["steps"].as_array().unwrap();
@@ -3981,6 +3982,17 @@ fn the_builder_can_ask_for_a_decision() {
     let gh = std::fs::read_to_string(f.tmp.path().join("gh.log")).unwrap();
     assert!(gh.contains("issue comment 5"), "{gh}");
     assert!(gh.contains("Which API, A or B?"), "{gh}");
+    // The comment never mentions anyone: the `@` is broken.
+    assert!(gh.contains("@\u{200b}bob"), "{gh}");
+    assert!(!gh.contains("@bob"), "{gh}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let round = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "run.round")
+        .unwrap_or_else(|| panic!("no round recorded: {log}"));
+    assert_eq!(round["data"]["verdict"], "question", "{round}");
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
     assert!(!args.contains("--json-schema"), "no review ran:\n{args}");
     assert!(
