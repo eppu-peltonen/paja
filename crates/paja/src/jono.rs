@@ -856,6 +856,15 @@ fn waiting_recorded(events: &[Event], legacy: &str) -> BTreeSet<Key> {
 /// The repository (`owner/name`) of the checkout at `path`, from `gh repo view`. Work items
 /// belong to it.
 pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
+    repo_name_within(home, path, None)
+}
+
+/// [`repo_name`], with `gh` stopped once it has run for `limit`.
+pub(crate) fn repo_name_within(
+    home: &Home,
+    path: &Path,
+    limit: Option<std::time::Duration>,
+) -> Result<String> {
     if !path.is_dir() {
         bail!(
             "{} is not a directory; pass --repo with a path inside the checkout",
@@ -863,7 +872,7 @@ pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
         );
     }
     match crate::ahjo::untampered(home, path) {
-        Ok(ok) => name_of(&ok),
+        Ok(ok) => name_of(&ok, limit),
         // gh runs git, which a tampered configuration could abuse, so Paja asks it nothing
         // there. The queue stays readable (and an item can still be set) under the repository
         // the stop recorded.
@@ -881,8 +890,8 @@ pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
     }
 }
 
-fn name_of(ok: &Untampered) -> Result<String> {
-    let out = gh(ok, &["repo", "view", "--json", "nameWithOwner"])?;
+fn name_of(ok: &Untampered, limit: Option<std::time::Duration>) -> Result<String> {
+    let out = gh_within(ok, &["repo", "view", "--json", "nameWithOwner"], limit)?;
     let name = serde_json::from_str::<Value>(&out)
         .ok()
         .and_then(|v| v["nameWithOwner"].as_str().map(str::to_string))
@@ -1581,7 +1590,7 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
         runner: me,
         stale_after: Some(format_utc(now + CLAIM_SECS)),
     };
-    let name = name_of(&ok)?;
+    let name = name_of(&ok, None)?;
     let lock = home.lock()?;
     home.events()
         .append(&lock, EV_CLAIM, claim_event(&name, number, Some(&mine)))?;
@@ -1666,7 +1675,7 @@ fn free_claim(home: &Home, checkout: &Path, number: u64, freeing: Freeing) {
                 failures.push(format!("deleting claim comment {id}: {err:#}"));
             }
         }
-        let name = name_of(&ok)?;
+        let name = name_of(&ok, None)?;
         if stays.is_none() && view.has_label(&labels.claimed()) {
             remove_label(&ok, number, &labels.claimed())?;
         }
@@ -1829,7 +1838,7 @@ pub fn sync_with(
         Some(rules) => *rules,
         None => QueueRules::of_default_branch(&ok)?,
     };
-    let name = name_of(&ok)?;
+    let name = name_of(&ok, None)?;
     let mut listed = fetch_issues(&ok, &labels.work)?;
     if rules.follow_ups {
         // An issue with both labels is a work item.
@@ -2215,7 +2224,7 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
     }
     // gh runs git in the checkout to find its GitHub repository.
     let ok = crate::ahjo::untampered(home, repo)?;
-    let name = name_of(&ok)?;
+    let name = name_of(&ok, None)?;
     let item = {
         let lock = home.lock()?;
         let log = home.events();
@@ -2406,15 +2415,40 @@ pub fn file(home: &Home, repo: &Path, title: &str, body: &str) -> Result<Filed> 
 /// Run gh in the checkout the tamper lock allowed (`ok`). Every gh Jono runs goes through
 /// here, and taking the proof means no command can run it without the check.
 fn gh_output(ok: &Untampered, args: &[&str]) -> Result<std::process::Output> {
+    gh_output_within(ok, args, None)
+}
+
+/// `gh args` in the checkout. With a `limit`, gh is stopped once it has run that long, and
+/// that is an error.
+fn gh_output_within(
+    ok: &Untampered,
+    args: &[&str],
+    limit: Option<std::time::Duration>,
+) -> Result<std::process::Output> {
     let gh = gh_program();
-    crate::platform::own_process_group(Command::new(&gh).env("GH_PROMPT_DISABLED", "1"))
+    let mut cmd = Command::new(&gh);
+    crate::platform::own_process_group(cmd.env("GH_PROMPT_DISABLED", "1"))
         .current_dir(ok.path())
-        .args(args)
-        .output()
-        .with_context(|| format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)"))
+        .args(args);
+    match limit {
+        None => cmd.output().with_context(|| {
+            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+        }),
+        Some(limit) => crate::platform::output_within(&mut cmd, limit).with_context(|| {
+            format!(
+                "running `{gh} {}` (if it didn't start, install the GitHub CLI and run `gh \
+                     auth login`)",
+                args.join(" ")
+            )
+        }),
+    }
 }
 
 pub(crate) fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
+    gh_within(ok, args, None)
+}
+
+fn gh_within(ok: &Untampered, args: &[&str], limit: Option<std::time::Duration>) -> Result<String> {
     let repo = ok.path();
     if !repo.is_dir() {
         bail!(
@@ -2423,7 +2457,7 @@ pub(crate) fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
         );
     }
     let gh = gh_program();
-    let output = gh_output(ok, args)?;
+    let output = gh_output_within(ok, args, limit)?;
     if !output.status.success() {
         bail!(
             "`{gh} {} {}` failed in {}: {}; check `gh auth status` and that this checkout has a \

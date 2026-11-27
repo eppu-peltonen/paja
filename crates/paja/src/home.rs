@@ -61,6 +61,12 @@ impl Home {
     /// sequence numbers and port blocks are never handed out twice. It is an OS file lock, so
     /// the operating system releases it if the process dies, even on Ctrl-C or a crash.
     pub fn lock(&self) -> Result<HomeLock> {
+        self.lock_within(LOCK_TIMEOUT)
+    }
+
+    /// Take the home lock as [`Home::lock`] does, but give up after `limit`: for a write that
+    /// matters less than not holding up the caller, such as a Posti notice's record.
+    pub fn lock_within(&self, limit: Duration) -> Result<HomeLock> {
         let path = self.root.join("lock");
         let file = OpenOptions::new()
             .create(true)
@@ -73,10 +79,10 @@ impl Home {
             match file.try_lock() {
                 Ok(()) => return Ok(HomeLock { _file: file }),
                 Err(TryLockError::WouldBlock) => {
-                    if started.elapsed() > LOCK_TIMEOUT {
+                    if started.elapsed() > limit {
                         bail!(
                             "timed out after {}s waiting for another paja process to release {}",
-                            LOCK_TIMEOUT.as_secs(),
+                            limit.as_secs(),
                             path.display()
                         );
                     }
@@ -189,6 +195,22 @@ pub struct HomeLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lock_taken_within_a_limit_gives_up_at_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let held = home.lock().unwrap();
+        let started = Instant::now();
+        let err = home.lock_within(Duration::from_millis(50)).err().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it waited past the limit"
+        );
+        assert!(format!("{err:#}").contains("timed out after"), "{err:#}");
+        drop(held);
+        assert!(home.lock_within(Duration::from_millis(50)).is_ok());
+    }
 
     #[test]
     fn run_held_sees_only_a_live_run_lock() {

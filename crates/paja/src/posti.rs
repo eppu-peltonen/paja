@@ -112,10 +112,12 @@ pub fn stopped(home: &Home, checkout: &Path) {
     send(home, checkout, &Notice::stopped(repo_of(home, checkout)));
 }
 
-/// The checkout's `owner/name`, when Jono can tell it.
+/// The checkout's `owner/name`, when Jono can tell it within Posti's time limit. Jono asks
+/// `gh`, which has no limit of its own, so Paja stops it at the limit: a `gh` that hangs
+/// costs the notice its repository name, not the run its next pass.
 fn repo_of(home: &Home, checkout: &Path) -> Option<String> {
     let path = std::path::absolute(checkout).ok()?;
-    crate::jono::repo_name(home, &path).ok()
+    crate::jono::repo_name_within(home, &path, Some(LIMIT)).ok()
 }
 
 static LOCAL_WARNED: AtomicBool = AtomicBool::new(false);
@@ -237,8 +239,9 @@ fn outcome(
             EV_FAILED
         }
     };
-    // The notice is the point; a log that can't be written mustn't stop the run either.
-    if let Ok(lock) = home.lock() {
+    // The notice is the point; a log that can't be written mustn't stop the run either, nor
+    // hold it up for long: a pass that failed waiting for the home lock may find it held still.
+    if let Ok(lock) = home.lock_within(LIMIT) {
         let _ = home.events().append(&lock, kind, data);
     }
 }
