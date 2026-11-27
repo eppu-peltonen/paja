@@ -147,6 +147,13 @@ fn check_name(name: &str) -> Result<()> {
              with a letter or digit, for example `paja init --new my-app --stack rust`"
         );
     }
+    // GitHub drops a `.git` ending, so the repository and the folder would differ.
+    if name.to_ascii_lowercase().ends_with(".git") {
+        bail!(
+            "{name:?} ends in `.git`, which GitHub drops from a repository name; use {:?}",
+            &name[..name.len() - 4]
+        );
+    }
     Ok(())
 }
 
@@ -194,6 +201,15 @@ fn gh(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Write `text` to `target`, creating its folders first.
+fn write_new(target: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(target, text).with_context(|| format!("writing {}", target.display()))
 }
 
 /// Create the repository on GitHub, clone it, write the skeleton, and push the first commit.
@@ -247,17 +263,10 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
     gh(cwd, &["repo", "clone", &url, &dir.display().to_string()]).map_err(after_create)?;
 
     let ok = ahjo::untampered(home, &dir).map_err(after_create)?;
-    let stacks = {
-        for (path, template) in templates {
-            let target = dir.join(path);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&target, render(template, &name))
-                .with_context(|| format!("writing {}", target.display()))?;
-        }
-        detect_stacks(&dir)
-    };
+    for (path, template) in templates {
+        write_new(&dir.join(path), &render(template, &name)).map_err(after_create)?;
+    }
+    let stacks = detect_stacks(&dir);
     let mut d = detected(&stacks);
     if stack == "python" {
         d.checks.push("ruff format --check .".into());
@@ -274,13 +283,7 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
         (WORKFLOW_FILE.into(), workflow_file(&stacks, &d)),
     ];
     for (path, text) in &files {
-        let target = dir.join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, text)
-            .with_context(|| format!("writing {}", target.display()))
-            .map_err(after_create)?;
+        write_new(&dir.join(path), text).map_err(after_create)?;
     }
     let mut names: Vec<String> = templates.iter().map(|(p, _)| p.to_string()).collect();
     names.extend(files.drain(..).map(|(p, _)| p));
