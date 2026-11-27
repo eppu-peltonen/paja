@@ -565,6 +565,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         crate::events::now_ms(),
         config.models.window_percent(),
     );
+    // Before the claim, so a repository without a workflow never has an item claimed and given
+    // back on GitHub at every pass; only when something could be taken, so an idle pass never
+    // calls GitHub for it; and before the build, because waiting for CI that will never run
+    // fails after the whole build.
+    if config.ci == CiMode::Required
+        && jono::runnable(home, &name)?
+            .iter()
+            .any(|i| opts.item.is_none_or(|n| n == i.number))
+    {
+        require_workflow(&repo)?;
+    }
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
@@ -596,14 +607,6 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
-    // After the claim, so an idle pass never calls GitHub for it; before the build, because
-    // waiting for CI that will never run fails after the whole build.
-    if config.ci == CiMode::Required {
-        if let Err(err) = require_workflow(&repo) {
-            unclaim(home, &repo, &item, resumed)?;
-            return Err(err);
-        }
-    }
     if let Some(number) = opts.item {
         if let Some(other) = jono::left_active(home, &name)?
             .into_iter()
@@ -3307,6 +3310,54 @@ mod tests {
     }
 
     #[test]
+    fn the_review_diff_names_renamed_mode_only_and_binary_files_past_the_cap() {
+        // The skipped files' names come from `git diff --name-only` and their sections from
+        // splitting the diff, matched by position: a rename, a mode-only change and a binary file
+        // each make one section, so every name keeps its own line count.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("m.sh"), "echo hi\n").unwrap();
+        std::fs::write(dir.join("old.txt"), "rename me\n".repeat(20)).unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["tag", "base"]);
+        std::fs::write(dir.join("a.txt"), "y".repeat(900)).unwrap();
+        std::fs::write(dir.join("c.bin"), [0u8, 1, 2, 0, 255, 0]).unwrap();
+        std::fs::write(dir.join("z.txt"), "one\ntwo\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["update-index", "--chmod=+x", "m.sh"]);
+        run(&["mv", "old.txt", "new.txt"]);
+        run(&["commit", "-q", "-m", "change"]);
+        let capped = super::review_diff(dir, "base...HEAD", 300).unwrap();
+        assert!(
+            capped.contains("The first file, a.txt, is over the cap"),
+            "{capped}"
+        );
+        // Header, mode and index lines plus `Binary files ... differ`; old and new mode; the
+        // similarity and rename lines; a new file's five header lines and its two added lines.
+        for skipped in [
+            "c.bin (4 lines)",
+            "m.sh (3 lines)",
+            "new.txt (4 lines)",
+            "z.txt (8 lines)",
+        ] {
+            assert!(capped.contains(skipped), "{skipped}: {capped}");
+        }
+        assert!(!capped.contains("(unknown file)"), "{capped}");
+    }
+
+    #[test]
     fn the_prompts_fit_this_repositorys_own_checks_and_commands() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let checks = super::lines(&std::fs::read_to_string(root.join(".paja/checks")).unwrap());
@@ -3364,28 +3415,72 @@ mod tests {
     fn every_source_file_is_high_risk_or_reviewed_as_standard_risk_on_purpose() {
         // A new module has to be placed in `.paja/high-risk` or in this list, so it can't land
         // at standard risk by being forgotten.
+        // Paths are relative to `crates/paja/src`, and every directory under it is read.
         const STANDARD: &[&str] = &[
             "doctor.rs",
             "home.rs",
             "init.rs",
+            "init/detect.rs",
+            "init/generate.rs",
+            "init/recommend.rs",
+            "init/scaffold.rs",
             "jono.rs",
             "mcp.rs",
+            "mestari/builder.rs",
+            "mestari/detect.rs",
+            "mestari/follow_ups.rs",
+            "mestari/live.rs",
+            "mestari/plan.rs",
+            "mestari/pool.rs",
+            "mestari/progress.rs",
+            "mestari/usage.rs",
             "posti.rs",
             "usage.rs",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let prefixes =
             super::lines(&std::fs::read_to_string(root.join(".paja/high-risk")).unwrap());
-        for entry in std::fs::read_dir(root.join("crates/paja/src")).unwrap() {
-            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".rs") {
-                continue;
+        let src = root.join("crates/paja/src");
+        let mut dirs = vec![src.clone()];
+        let mut seen = 0;
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // Always `/`, as `.paja/high-risk` writes paths, on Windows too.
+                let relative = path
+                    .strip_prefix(&src)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let full = format!("crates/paja/src/{relative}");
+                assert!(
+                    super::is_high_risk(&full, &prefixes) || STANDARD.contains(&relative.as_str()),
+                    "{full} is neither in .paja/high-risk nor in this test's standard-risk list; \
+                     decide which it is"
+                );
+                seen += 1;
             }
-            let path = format!("crates/paja/src/{name}");
+        }
+        // The walk reached the subdirectories, where most of Mestari's code is.
+        assert!(
+            seen > 25,
+            "only {seen} source files found under {}",
+            src.display()
+        );
+        // Each listed file still exists, so the list can't hide a rename.
+        for name in STANDARD {
             assert!(
-                super::is_high_risk(&path, &prefixes) || STANDARD.contains(&name.as_str()),
-                "{path} is neither in .paja/high-risk nor in this test's standard-risk list; \
-                 decide which it is"
+                src.join(name).is_file(),
+                "{name} is listed as standard risk but is gone"
             );
         }
     }
