@@ -6,6 +6,9 @@ pub(super) const EV_MERGING: &str = "pool.merging";
 /// A run that takes its turn to land: `{repo, number, round}`. It holds the turn until the
 /// change lands, or goes back to its builder.
 pub(super) const EV_LANDING: &str = "pool.landing";
+/// GitHub's limit for a pull request's description, in characters.
+const PR_BODY_CHARS: usize = 65_536;
+
 /// How often a run waiting for its turn to land looks again.
 const LAND_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -98,7 +101,12 @@ pub(super) fn land(
              Vasara's checks and the reviewers alone."
         ));
     }
-    // Reuse this branch's pull request only while it is still open.
+    // The body goes in a file: with ten findings of up to 4000 characters it is past Windows'
+    // command-line limit.
+    let body = cut_short(body, PR_BODY_CHARS);
+    let body_path = super::body_file(home, &format!("pr-{}", item.number), &body)?;
+    let body_arg = body_path.to_string_lossy().into_owned();
+    // Reuse this branch's pull request only while it is still open, with this round's body.
     let pr = match run_gh(
         repo,
         &[
@@ -111,7 +119,17 @@ pub(super) fn land(
             "select(.state == \"OPEN\") | .url",
         ],
     ) {
-        Ok(url) if !url.is_empty() => url,
+        // The description is only for people: a failed edit leaves last round's and the
+        // landing carries on.
+        Ok(url) if !url.is_empty() => {
+            if let Err(err) = run_gh(repo, &["pr", "edit", &url, "--body-file", &body_arg]) {
+                progress(&format!(
+                    "couldn't update {url}'s description, so it lists last round's findings: \
+                     {err:#}"
+                ));
+            }
+            Ok(url)
+        }
         _ => run_gh(
             repo,
             &[
@@ -123,11 +141,13 @@ pub(super) fn land(
                 branch,
                 "--title",
                 &title,
-                "--body",
-                &body,
+                "--body-file",
+                &body_arg,
             ],
-        )?,
+        ),
     };
+    let _ = std::fs::remove_file(&body_path);
+    let pr = pr?;
     // Someone following the run sees the pull request from here on.
     record(
         home,
@@ -354,5 +374,29 @@ pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// `body` cut to at most `limit` characters, ending "(cut short)" when it was longer.
+fn cut_short(body: String, limit: usize) -> String {
+    if body.chars().count() <= limit {
+        return body;
+    }
+    let cut = "\n\n(cut short)";
+    let mut kept: String = body.chars().take(limit - cut.chars().count()).collect();
+    kept.push_str(cut);
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_body_past_the_limit_is_cut_to_it_by_characters() {
+        let body = "ä".repeat(100);
+        let cut = super::cut_short(body.clone(), 50);
+        assert_eq!(cut.chars().count(), 50);
+        assert!(cut.ends_with("\n\n(cut short)"));
+        assert!(cut.starts_with("ää"));
+        assert_eq!(super::cut_short(body.clone(), 100), body);
     }
 }

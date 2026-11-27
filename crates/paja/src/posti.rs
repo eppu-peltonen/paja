@@ -31,7 +31,7 @@ pub struct Notice {
     pub repo: Option<String>,
     /// The work item, when the notice is about one.
     pub number: Option<u64>,
-    /// `escalated`, `pass_failed`, `stopped` or `skipped_role`.
+    /// `escalated`, `left_findings`, `pass_failed`, `stopped` or `skipped_role`.
     pub kind: &'static str,
     /// What the notice is about beyond the item, recorded with it: the roles a `skipped_role`
     /// notice names, so each role is told once.
@@ -64,6 +64,23 @@ impl Notice {
             text: format!(
                 "{title}. The question is on the issue; answer with \
                  paja work answer {number} \"<your answer>\"."
+            ),
+        }
+    }
+
+    /// An item landed with review findings still open at the round limit, listed in its pull
+    /// request; nothing else asks a person to read them.
+    pub fn left_findings(repo: &str, number: u64, title: &str, pr: &str, count: usize) -> Self {
+        let findings = if count == 1 { "finding" } else { "findings" };
+        Self {
+            repo: Some(repo.to_string()),
+            number: Some(number),
+            kind: "left_findings",
+            subject: None,
+            title: format!("Paja: {repo}#{number} landed with {count} open {findings}"),
+            text: format!(
+                "{title}. The reviewers' {findings} still open at the round limit are listed in \
+                 {pr}; read them and open an issue for any you want fixed."
             ),
         }
     }
