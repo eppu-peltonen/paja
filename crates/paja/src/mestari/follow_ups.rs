@@ -344,6 +344,22 @@ fn is_jwt(value: &str) -> bool {
         && value.split('.').all(|p| !p.is_empty())
 }
 
+/// Whether `gap`, the text between a lead and the next word, ends the lead: an empty quoted
+/// value (`"password": "", "user"`), a blank line, or a line break with no `:` or `=` before it
+/// (a lead at the end of a sentence). `password:` and its value on the next line still go.
+fn ends_lead(gap: &str) -> bool {
+    if ["\"\"", "''", "``"].iter().any(|empty| gap.contains(empty)) {
+        return true;
+    }
+    let lines: Vec<&str> = gap.split('\n').collect();
+    match lines.len() {
+        1 => false,
+        2 => !lines[0].contains([':', '=']),
+        // Two line breaks or more: a blank line, a new paragraph.
+        _ => true,
+    }
+}
+
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
 /// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole; after
 /// a lead it runs to the next space, quote, backtick, comma or backslash, so symbols stay inside.
@@ -368,6 +384,9 @@ fn redact_tokens(text: &str) -> String {
         .unwrap_or(rest.len());
         let gap = &rest[..start];
         out.push_str(gap);
+        if led.is_some() && ends_lead(gap) {
+            led = None;
+        }
         delimited |= gap
             .chars()
             .any(|c| matches!(c, ':' | '=' | '"' | '\'' | '`'));
@@ -383,7 +402,10 @@ fn redact_tokens(text: &str) -> String {
                 .unwrap_or(rest.len());
             let value = rest[..run_end].trim_end_matches(['.', ';', ')', ']', '}']);
             let starts_plain = value.starts_with(char::is_alphanumeric);
-            if value.len() >= 16 || (starts_plain && (strong || delimited)) {
+            // With nothing between, a strong lead's short value counts only when it isn't a
+            // plain lowercase word: "password hunter2" is a secret, "password field" is prose.
+            let wordlike = value.chars().all(|c| c.is_ascii_lowercase());
+            if value.len() >= 16 || (starts_plain && (delimited || (strong && !wordlike))) {
                 out.push_str("<redacted>");
                 rest = &rest[value.len()..];
                 led = None;
@@ -571,6 +593,22 @@ mod tests {
         assert_eq!(
             redact_tokens(&text),
             r#"token=\"<redacted>\" "access_token": "<redacted>" GITHUB_TOKEN=<redacted> client_secret=<redacted> password: <redacted> password: <redacted> password <redacted> token=<redacted> <redacted> a token of ours"#
+        );
+    }
+
+    #[test]
+    fn a_lead_before_prose_or_an_empty_value_redacts_nothing() {
+        let long = "f6".repeat(10);
+        let text = format!(
+            "the password field is empty; secret scanners flag it; \"password\": \"\", \"user\": \
+             \"bob\"; a secret\nmanager; the password.\n\nNext paragraph; password: Abc12; \
+             secret MyPass; api_key:\n  {long}"
+        );
+        assert_eq!(
+            redact_tokens(&text),
+            "the password field is empty; secret scanners flag it; \"password\": \"\", \"user\": \
+             \"bob\"; a secret\nmanager; the password.\n\nNext paragraph; password: <redacted>; \
+             secret <redacted>; api_key:\n  <redacted>"
         );
     }
 
