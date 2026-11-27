@@ -397,12 +397,12 @@ review and its verdict, waiting for CI, landed or asked, and with `--every` each
 
 The comment on the issue is posted with the person's own token, so GitHub doesn't notify them about it. Posti
 (`posti.rs`) tells them instead, next to that comment: when an item escalates (or is parked on an error), when a pass
-of `paja run` fails (with or without `--every`; of failed passes in a row, only the first), and when a run stops
-for a person. Each notice names the repository
-and, for an item, the issue, its title and the answer command. An escalated item's issue also gets the `needs-answer`
-label (created when the repository lacks it), which `paja work answer` removes, so the person can filter or
-subscribe to it on GitHub; a label that can't be set is reported on stderr and the run carries on. `paja work list`
-shows escalated items first, each with its answer command. A notice goes to two channels:
+of `paja run` fails (with or without `--every`; of failed passes in a row, only the first), and when a run stops for a
+person, and when a change lands with review findings still open at the round limit, which no issue holds. Each notice
+names the repository and, for an item, the issue, its title and the answer command. An escalated item's issue also
+gets the `needs-answer` label (created when the repository lacks it), which `paja work answer` removes, so the person
+can filter or subscribe to it on GitHub; a label that can't be set is reported on stderr and the run carries on.
+`paja work list` shows escalated items first, each with its answer command. A notice goes to two channels:
 
 - **Local.** `PAJA_NOTIFIER` names a program, run with the title and the text as its two arguments; `desktop` asks for
   a desktop notification (a Windows toast through Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere,

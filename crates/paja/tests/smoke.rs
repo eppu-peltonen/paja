@@ -2235,7 +2235,8 @@ impl Factory {
                  \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ -f {d}/workflows-down ]; then echo 'HTTP 403: Resource not accessible' >&2; exit 1; fi\n\
                  if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
-                 \"pr view\") exit 1 ;;\n\
+                 \"pr view\") if [ -f {d}/pr-open ]; then echo https://example.com/pull/1; else exit 1; fi ;;\n\
+                 \"pr edit\") if [ -f {d}/edit-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;;\n\
                  \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi\n\
                  if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
@@ -2246,6 +2247,7 @@ impl Factory {
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
+                 if [ -f {d}/reuse-prs ]; then touch {d}/pr-open; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  if [ -f {d}/view-down-after-claim ]; then touch {d}/view-down; fi\n\
@@ -4226,14 +4228,92 @@ fn outside_findings_survive_a_red_ci_and_are_listed_once_in_the_pull_request_tha
         .iter()
         .rfind(|c| c.contains("--json-schema") && c.contains("CI failed on"))
         .unwrap_or_else(|| panic!("{calls:#?}"));
-    assert!(
-        rereview.contains("findings outside the change"),
-        "{rereview}"
-    );
-    assert!(rereview.contains("The parser drops a line"), "{rereview}");
+    let (asked, outside) = rereview
+        .split_once("findings outside the change")
+        .unwrap_or_else(|| panic!("{rereview}"));
+    assert!(!asked.contains("The parser drops a line"), "{rereview}");
+    assert!(outside.contains("The parser drops a line"), "{rereview}");
     let left: Vec<Value> = events_of(&f, "run.follow_up");
     assert_eq!(left.len(), 1, "{left:?}");
     assert_eq!(left[0]["data"]["error"], "not filed: outside the change");
+}
+
+#[test]
+fn after_a_red_ci_the_open_pull_request_gets_the_new_rounds_description() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        false,
+    );
+    std::fs::write(f.tmp.path().join("ci-red-once"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reuse-prs"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let log = f.gh_log();
+    assert_eq!(log.matches("pr create").count(), 1, "{log}");
+    let edit = log
+        .find("pr edit https://example.com/pull/1 --body-file")
+        .unwrap_or_else(|| panic!("{log}"));
+    assert!(log[edit..].contains("The parser drops a line"), "{log}");
+    // No description file is left behind.
+    let left: Vec<_> = std::fs::read_dir(f.home.join("tmp"))
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_failed_description_edit_still_lands_the_change() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-red-once"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reuse-prs"), "").unwrap();
+    std::fs::write(f.tmp.path().join("edit-down"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("couldn't update https://example.com/pull/1's description"),
+        "{stderr}"
+    );
+    let left: Vec<_> = std::fs::read_dir(f.home.join("tmp"))
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_red_ci_at_the_round_limit_logs_what_the_change_would_have_landed_without() {
+    let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": "Tidy the helper"},
+            {"kind": "outside", "finding": "The parser drops a line"}
+        ]),
+        false,
+    );
+    std::fs::write(f.tmp.path().join("ci-red-once"), "").unwrap();
+    let (notifier, log) = fake_notifier(&f);
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_NOTIFIER", notifier.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert_eq!(report["rounds"], 5, "{report}");
+    let left: Vec<String> = events_of(&f, "run.follow_up")
+        .iter()
+        .filter_map(|e| e["data"]["error"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(left, ["not filed: the change did not land"; 2], "{left:?}");
+    // It didn't land, so there is no notice of findings left open, only the escalation.
+    let notices = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!notices.contains("open finding"), "{notices}");
 }
 
 #[test]

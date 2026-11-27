@@ -1558,19 +1558,24 @@ fn run_item(
                 Ok(Landing::Retry(why)) => {
                     progress("CI failed; sending the failure back to the builder");
                     feedback = why.clone();
-                    // Findings in the change still open at the round limit are fixes to check
-                    // too; only those outside it are the reviewer's to keep or drop.
-                    let mut asked = why.clone();
-                    let open: Vec<String> = to_fix(&follow_ups).iter().map(|f| f.shown()).collect();
-                    if !open.is_empty() {
-                        asked.push_str(&format!(
-                            "\n\nThe review's findings in the change, still open:\n\n{}",
-                            open.join("\n\n")
-                        ));
+                    // At the round limit no round follows and the run escalates: keep what it
+                    // would have landed without in the log.
+                    if round == MAX_ROUNDS {
+                        for (text, _) in &left {
+                            record_follow_up(
+                                home,
+                                item,
+                                text,
+                                None,
+                                "not filed: the change did not land",
+                            );
+                        }
                     }
+                    // Below the limit every finding in the change was fixed before landing, so
+                    // only those outside it are left for the re-reviewer to keep or drop.
                     prior = Some(Prior {
                         reviewed: judged,
-                        blockers: asked,
+                        blockers: why.clone(),
                         follow_ups: outside(&follow_ups),
                     });
                     let next = Next {

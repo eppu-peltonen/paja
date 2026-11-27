@@ -351,14 +351,15 @@ On Linux it needs WebKitGTK's development packages first (on Debian or Ubuntu:
 
 ## Notifications
 
-Paja tells you when an item needs your answer, a pass of `paja run --every` fails, or the loop stops. Run in a terminal,
-it shows a desktop notification; set `PAJA_NOTIFIER=desktop` to get one without a terminal, `PAJA_NOTIFIER=none` to
-turn them off, or point it at a program of your own, which gets the title and the text as two arguments. To hear about
-it on your phone, put an `https://` URL, such as an ntfy topic, in `PAJA_NOTIFY` or as the one line of `.paja/notify`
-on the default branch; Paja POSTs a short text there with `curl`: the repository, the issue's number and title, never
-the question or any local detail. A notice that can't be shown is reported once on stderr and the run carries on. An
-issue waiting for your answer also carries the `needs-answer` label of `.paja/labels` (`factory-needs-answer` by
-default) until you answer, so you can filter or subscribe to it on GitHub.
+Paja tells you when an item needs your answer, a pass of `paja run --every` fails, the loop stops, or a change lands
+with review findings still open, listed in its pull request. Run in a terminal, it shows a desktop notification; set
+`PAJA_NOTIFIER=desktop` to get one without a terminal, `PAJA_NOTIFIER=none` to turn them off, or point it at a program
+of your own, which gets the title and the text as two arguments. To hear about it on your phone, put an `https://` URL,
+such as an ntfy topic, in `PAJA_NOTIFY` or as the one line of `.paja/notify` on the default branch; Paja POSTs a short
+text there with `curl`: the repository, the issue's number and title, never the question or any local detail. A notice
+that can't be shown is reported once on stderr and the run carries on. An issue waiting for your answer also carries the
+`needs-answer` label of `.paja/labels` (`factory-needs-answer` by default) until you answer, so you can filter or
+subscribe to it on GitHub.
 
 ## What happens next
 

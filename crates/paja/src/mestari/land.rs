@@ -6,10 +6,10 @@ pub(super) const EV_MERGING: &str = "pool.merging";
 /// A run that takes its turn to land: `{repo, number, round}`. It holds the turn until the
 /// change lands, or goes back to its builder.
 pub(super) const EV_LANDING: &str = "pool.landing";
-/// How often a run waiting for its turn to land looks again.
 /// GitHub's limit for a pull request's description, in characters.
 const PR_BODY_CHARS: usize = 65_536;
 
+/// How often a run waiting for its turn to land looks again.
 const LAND_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Wait for this repository's turn to land, taken under the home lock and held for as long as
@@ -103,7 +103,11 @@ pub(super) fn land(
     }
     // The body goes in a file: with ten findings of up to 4000 characters it is past Windows'
     // command-line limit.
-    let body: String = body.chars().take(PR_BODY_CHARS).collect();
+    if body.chars().count() > PR_BODY_CHARS {
+        let cut = "\n\n(cut short)";
+        body = body.chars().take(PR_BODY_CHARS - cut.len()).collect();
+        body.push_str(cut);
+    }
     let body_path = super::body_file(home, &format!("pr-{}", item.number), &body)?;
     let body_arg = body_path.to_string_lossy().into_owned();
     // Reuse this branch's pull request only while it is still open, with this round's body.
@@ -119,35 +123,35 @@ pub(super) fn land(
             "select(.state == \"OPEN\") | .url",
         ],
     ) {
+        // The description is only for people: a failed edit leaves last round's and the
+        // landing carries on.
         Ok(url) if !url.is_empty() => {
-            let edited = run_gh(repo, &["pr", "edit", &url, "--body-file", &body_arg]);
-            if let Err(err) = edited {
-                let _ = std::fs::remove_file(&body_path);
-                return Err(err);
+            if let Err(err) = run_gh(repo, &["pr", "edit", &url, "--body-file", &body_arg]) {
+                progress(&format!(
+                    "couldn't update {url}'s description, so it lists last round's findings: \
+                     {err:#}"
+                ));
             }
-            url
+            Ok(url)
         }
-        _ => {
-            let created = run_gh(
-                repo,
-                &[
-                    "pr",
-                    "create",
-                    "--base",
-                    &target.branch,
-                    "--head",
-                    branch,
-                    "--title",
-                    &title,
-                    "--body-file",
-                    &body_arg,
-                ],
-            );
-            let _ = std::fs::remove_file(&body_path);
-            created?
-        }
+        _ => run_gh(
+            repo,
+            &[
+                "pr",
+                "create",
+                "--base",
+                &target.branch,
+                "--head",
+                branch,
+                "--title",
+                &title,
+                "--body-file",
+                &body_arg,
+            ],
+        ),
     };
     let _ = std::fs::remove_file(&body_path);
+    let pr = pr?;
     // Someone following the run sees the pull request from here on.
     record(
         home,
