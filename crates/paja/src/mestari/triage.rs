@@ -88,6 +88,9 @@ struct Open {
     body: String,
     #[serde(default)]
     labels: Vec<Label>,
+    /// When the issue was opened, as `gh` writes it (`2026-01-31T09:05:00Z`).
+    #[serde(default, rename = "createdAt")]
+    created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,8 +154,8 @@ fn triage_prompt(base: &str, open: &[Open]) -> String {
          - `duplicate`: says the same as another issue listed here. Give `duplicate_of`, the \
          number of the one to keep (the more complete, or else the older).\n\
          - `already_fixed`: the default branch already fixes it. Give `commit` (a commit hash on \
-         the default branch) or `file` (a path that exists there) that shows it, and say in \
-         `reason` what you saw.\n\
+         the default branch, made after the issue was opened) or `file` (a path that exists \
+         there and that the issue names) that shows it, and say in `reason` what you saw.\n\
          - `not_worth_doing`: valid but not worth the effort or moot. Say why in `reason`. Paja \
          never closes these; a person decides.\n\n\
          Paja closes `duplicate` and `already_fixed` issues on your word, with your `reason` as \
@@ -176,11 +179,11 @@ fn triage_prompt(base: &str, open: &[Open]) -> String {
 
 /// Turn the agent's answer into a decision for each issue, in issue order. Anything Paja can't
 /// back up is kept: a duplicate must name another open issue that stays open, and an
-/// already-fixed issue needs evidence that `evidence(commit, file)` confirms.
+/// already-fixed issue needs evidence that `evidence(issue, commit, file)` confirms.
 fn decide(
     open: &[Open],
     answer: Answer,
-    evidence: &dyn Fn(&str, &str) -> Option<String>,
+    evidence: &dyn Fn(&Open, &str, &str) -> Option<String>,
 ) -> Vec<Triaged> {
     let mut out: Vec<Triaged> = Vec::new();
     for issue in open {
@@ -220,7 +223,7 @@ fn decide(
                     );
                 }
             },
-            Some(Verdict::AlreadyFixed) => match evidence(&said.commit, &said.file) {
+            Some(Verdict::AlreadyFixed) => match evidence(issue, &said.commit, &said.file) {
                 Some(shown) => {
                     done.verdict = Verdict::AlreadyFixed;
                     done.evidence = Some(shown);
@@ -228,7 +231,8 @@ fn decide(
                 None => {
                     done.reason = format!(
                         "kept: the agent called it already fixed, but named no commit on the \
-                         default branch or file there that shows it ({})",
+                         default branch made after the issue was opened, nor a file there that \
+                         the issue names ({})",
                         done.reason
                     );
                 }
@@ -257,33 +261,87 @@ fn decide(
     out
 }
 
-/// The commit or file the agent named, if it checks out on `base`: a commit that is an ancestor
-/// of `base`, or a plain path that exists there. What it returns is what the comment shows.
-fn check_evidence(repo: &Path, base: &str, commit: &str, file: &str) -> Option<String> {
+/// The commit or file the agent named for `issue`, if it checks out on `base` and has to do with
+/// the issue: a commit that is an ancestor of `base` and was committed after the issue was
+/// opened, or a plain path that exists there and that the issue's title or body names (the whole
+/// path, or its file name). What it returns is what the comment shows.
+fn check_evidence(
+    repo: &Path,
+    base: &str,
+    issue: &Open,
+    commit: &str,
+    file: &str,
+) -> Option<String> {
     let mut shown = Vec::new();
     let commit = commit.trim();
     if !commit.is_empty() && commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        let opened = jono::parse_utc(&issue.created_at);
         let full = git(
             repo,
             &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
         )
-        .ok()?;
-        git(repo, &["merge-base", "--is-ancestor", &full, base]).ok()?;
-        let subject = git(repo, &["log", "-1", "--format=%s", &full]).unwrap_or_default();
-        shown.push(format!(
-            "commit {} \"{subject}\"",
-            &full[..full.len().min(10)]
-        ));
+        .ok();
+        let on_base = full
+            .as_deref()
+            .filter(|full| git(repo, &["merge-base", "--is-ancestor", full, base]).is_ok());
+        let committed = on_base.and_then(|full| {
+            git(repo, &["log", "-1", "--format=%ct", full])
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        });
+        // An issue whose opening time Paja can't read takes no commit as evidence.
+        if let (Some(full), Some(opened), Some(committed)) = (on_base, opened, committed) {
+            if committed >= opened {
+                let subject = git(repo, &["log", "-1", "--format=%s", full]).unwrap_or_default();
+                shown.push(format!(
+                    "commit {} \"{subject}\"",
+                    &full[..full.len().min(10)]
+                ));
+            }
+        }
     }
     let file = file.trim();
     if !file.is_empty()
         && !file.starts_with(['-', '/'])
         && !file.split(['/', '\\']).any(|part| part == "..")
-        && read_from_base(repo, base, file).ok().flatten().is_some()
+        && names_file(issue, file)
+        && is_file_on(repo, base, file)
     {
         shown.push(format!("file `{file}`"));
     }
     (!shown.is_empty()).then(|| shown.join(", "))
+}
+
+/// Whether `file` is a file (not a directory) on `base`.
+fn is_file_on(repo: &Path, base: &str, file: &str) -> bool {
+    git(repo, &["cat-file", "-t", &format!("{base}:{file}")])
+        .is_ok_and(|kind| kind.trim() == "blob")
+}
+
+/// Whether `issue`'s title or body names `file`: the whole path, or its file name when that
+/// has an extension (`triage.rs`), so a file the issue never mentions can't close it.
+fn names_file(issue: &Open, file: &str) -> bool {
+    let file = file.replace('\\', "/");
+    let file = file.trim_start_matches("./");
+    // A path to a file: no empty, `.` or `..` part, so `./`, `a//b` or a directory name with a
+    // trailing `/` never matches the empty words between two separators.
+    if file.split('/').any(|part| matches!(part, "" | "." | "..")) {
+        return false;
+    }
+    let text = format!("{}\n{}", issue.title, issue.body).replace('\\', "/");
+    let name = file.rsplit('/').next().unwrap_or(file);
+    // The words of the text that could be paths, without quotes or trailing punctuation.
+    let words = text
+        .split(|c: char| !(c.is_alphanumeric() || "/._-".contains(c)))
+        .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
+        .filter(|word| !word.is_empty());
+    let is = |word: &str, path: &str| word == path || word.ends_with(&format!("/{path}"));
+    let named_name = name.contains('.') && name.len() > 3;
+    words
+        .into_iter()
+        .any(|word| is(word, file) || (named_name && is(word, name)))
 }
 
 /// The comment that closes an issue: the reason, the evidence, and how to undo it.
@@ -356,7 +414,7 @@ fn triage_holding(
             "--limit",
             "500",
             "--json",
-            "number,title,body,labels",
+            "number,title,body,labels,createdAt",
         ],
     )?;
     let mut open: Vec<Open> = serde_json::from_str(&listed)
@@ -377,8 +435,8 @@ fn triage_holding(
         crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
         let (answer, used) = ask(home, &repo, &name, &base, &open, &models)?;
         usage = Some(used);
-        items = decide(&open, answer, &|commit, file| {
-            check_evidence(&repo, &base, commit, file)
+        items = decide(&open, answer, &|issue, commit, file| {
+            check_evidence(&repo, &base, issue, commit, file)
         });
     }
     for item in items
@@ -553,8 +611,43 @@ mod tests {
                 title: format!("issue {n}"),
                 body: String::new(),
                 labels: Vec::new(),
+                created_at: String::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn evidence_files_must_be_named_by_the_issue() {
+        let issue = Open {
+            number: 1,
+            title: "Tidy `crates/paja/src/hook.rs`".into(),
+            body: "The check in triage.rs, and docs\\design\\workflow.md.".into(),
+            labels: Vec::new(),
+            created_at: String::new(),
+        };
+        for named in [
+            "crates/paja/src/hook.rs",
+            "./crates/paja/src/hook.rs",
+            "crates/paja/src/mestari/triage.rs",
+            "docs/design/workflow.md",
+            "docs\\design\\workflow.md",
+        ] {
+            assert!(names_file(&issue, named), "{named}");
+        }
+        for unnamed in [
+            "README.md",
+            "crates/paja/src/mod.rs",
+            "docs",
+            "a.rs",
+            "./",
+            ".\\",
+            "././",
+            "",
+            "crates/paja/",
+            "crates//paja/src/hook.rs",
+        ] {
+            assert!(!names_file(&issue, unnamed), "{unnamed}");
+        }
     }
 
     fn sorted(number: u64, verdict: &str, of: Option<u64>, file: &str) -> Sorted {
@@ -568,7 +661,7 @@ mod tests {
         }
     }
 
-    fn found(_: &str, file: &str) -> Option<String> {
+    fn found(_: &Open, _: &str, file: &str) -> Option<String> {
         (file == "src/lib.rs").then(|| "file `src/lib.rs`".to_string())
     }
 
