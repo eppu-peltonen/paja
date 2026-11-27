@@ -886,6 +886,106 @@ fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
     )
 }
 
+/// A run's fetch sweeps the `refs/paja/fetch/*` refs a killed run left over an hour ago, and
+/// moves `origin/main` wherever a force-push put the default branch.
+#[test]
+fn a_fetch_sweeps_stale_fetch_refs_and_follows_a_rewritten_main() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main("one.txt", "one\n");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let stale = "refs/paja/fetch/1-1000-0";
+    let fresh = format!("refs/paja/fetch/1-{now}-0");
+    git(&f.repo, &["update-ref", stale, "HEAD"]);
+    git(&f.repo, &["update-ref", &fresh, "HEAD"]);
+    // main rewritten elsewhere: the same parent, another commit.
+    let before = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["commit", "-q", "--amend", "-m", "rewritten"]);
+    let rewritten = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &before],
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let refs = git_out(
+        &f.repo,
+        &["for-each-ref", "--format=%(refname)", "refs/paja/fetch/"],
+    );
+    assert_eq!(refs, fresh, "{refs}");
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        rewritten
+    );
+    // Rewound to a commit origin/main already holds: followed too, since fetches in the
+    // checkout take turns and a slower one can't come last.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD~1:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &rewritten],
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        git_out(&f.repo, &["rev-parse", "HEAD~1"])
+    );
+}
+
+/// A fetch that waited its time for another holding the fetch lock goes ahead without it, and
+/// then never moves `origin/main` back onto a commit it holds, since a slower fetch looks so.
+#[test]
+fn a_fetch_without_the_lock_follows_main_only_away_from_what_it_holds() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main("one.txt", "one\n");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(f.repo.join(".git").join("paja-fetch.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let run = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_TEST_FETCH_WAIT_MS", "200")
+            .args(["--json", "run"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("fetching without it"), "{stderr}");
+    };
+    let tip = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    // Rewound: origin/main stays where it was.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD~1:main"]);
+    git(&f.repo, &["update-ref", "refs/remotes/origin/main", &tip]);
+    run();
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        tip
+    );
+    // Moved on: followed.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", "HEAD~1"],
+    );
+    run();
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        tip
+    );
+}
+
 #[test]
 fn a_closed_stdout_ends_paja_with_its_exit_code_not_a_panic() {
     // The program that started paja exited without reading or redirecting stdout: the report

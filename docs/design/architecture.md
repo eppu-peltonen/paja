@@ -227,7 +227,10 @@ lane is told `stop now`, none starts, and the pool ends with the tamper error, a
 any other error stops its lanes the same way first, and ends a lane's run still going 30 seconds after `stop now`, so
 a stuck run can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
 (`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes;
-`origin/<branch>` is then moved to that tip, as a plain fetch would.
+`origin/<branch>` is then moved to that tip, as a plain fetch would, also back after a force-push. The fetches in a
+checkout take turns (`paja-fetch.lock` in its git directory), so the last to move it is the newest; a fetch that waited a
+minute for the lock goes ahead without it, and then never moves it back onto a commit it holds. A fetch ref a killed
+run left behind is deleted by the first fetch in that checkout once it is over an hour old.
 
 Changes land one at a time per repository, each on the latest default branch, whether from a pool's lanes or from
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
