@@ -704,8 +704,9 @@ const PROTECTED_NAMES: [&str; 11] = [
 
 /// A Windows 8.3 short name such as `GIT~1` or `RUST-T~1.TOM`: the start of a protected name
 /// (leading dot dropped), then `~` and digits. After several names collide, NTFS keeps only
-/// the first two letters and adds four hex digits of a hash (`GI3F2A~1`), so any such stem
-/// whose first two letters start a protected name counts too.
+/// the first two letters and adds hex digits of a hash, eight characters in all with the `~`
+/// and counter (`GI3F2A~1`, `GI3F2~10`), so any such stem whose first two letters start a
+/// protected name counts too.
 fn short_name_of_protected(word: &str) -> bool {
     let upper = word.to_uppercase();
     let (stem, tail) = match upper.split_once('~') {
@@ -717,7 +718,7 @@ fn short_name_of_protected(word: &str) -> bool {
         return false;
     }
     let chars: Vec<char> = stem.chars().collect();
-    // Eight characters in all: a longer counter (`GI3F2~10`) takes the hash's last digit.
+    // Eight characters in all: a longer counter shortens the hash (`GI3F2~10`, `GI3F~100`).
     let hashed = (chars.len() >= 3
         && chars.len() + 1 + digits == 8
         && chars[2..].iter().all(char::is_ascii_hexdigit))
@@ -1876,6 +1877,8 @@ mod program_tests {
             "npm test 'clippy.toml::$DATA'",
             "npm test 'x=GIT~1.'",
             "npm test GI3F2~10",
+            "npm test GI3F~100",
+            "npm test GI3~1000",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -2156,6 +2159,8 @@ mod tests {
             "clippy.toml ",
             "clippy.toml::$DATA",
             ".git./config",
+            "GIT~1/config",
+            "GI3F2A~1/config",
         ] {
             assert!(
                 decide("Write", json!({ "file_path": path })).is_some(),

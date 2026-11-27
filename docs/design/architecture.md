@@ -463,9 +463,9 @@ recommended.
   value, and each dot name inside a cluster (`.git` in `-xf.git`) is checked like a path, as is what follows any `=`
   (`out=/tmp/x`, `out=clippy.toml`). Protected names compare in Unicode's upper case, as NTFS folds them
   (`ruſtfmt.toml`), without trailing dots and spaces or a `:` stream (`clippy.toml.`, `clippy.toml::$DATA`). Windows 8.3
-  short names of protected names count too, also the hashed form NTFS falls back to (`GI3F2A~1`: two letters, four hex
-  digits). A program not on the list is refused with a message naming `.paja/commands` on the default branch as the fix.
-  Only `cargo` and `git` have per-subcommand flag lists.
+  short names of protected names count too, also the hashed form NTFS falls back to (`GI3F2A~1`, `GI3F2~10`: two
+  letters, then hex digits, eight characters with the counter). A program not on the list is refused with a message
+  naming `.paja/commands` on the default branch as the fix. Only `cargo` and `git` have per-subcommand flag lists.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
