@@ -137,21 +137,21 @@ paja run --once
 ```
 
 Paja syncs the issues, says which item it picked and where it will work, and asks `Go ahead? [y/N]`. Then, for at
-most three rounds, it prints what each step is doing:
+most five rounds, it prints what each step is doing:
 
-- `round 1 of 3: Claude is building the change`: a builder agent implements the issue in its own worktree and
+- `round 1 of 5: Claude is building the change`: a builder agent implements the issue in its own worktree and
   commits.
 - `running Vasara's checks`: the commands in `.paja/checks`, run against the commit.
 - `reviewer 1 of 1 is reading the change`: an independent reviewer agent reads the diff against the issue.
 - `opened <url>; waiting for CI`: the pull request is open on GitHub, and Paja waits for its checks.
 - `landed #<number> (<url>)`: Paja merged it.
 
-A failed check or a reviewer's blocker goes back to the builder for another round. The last line is the outcome:
+A failed check or any reviewer finding goes back to the builder for another round. The last line is the outcome:
 landed, or escalated with a question.
 
 ## 6. When Paja asks
 
-When a run can't decide something (reviewers disagree, three rounds weren't enough, or the issue needs a decision),
+When a run can't decide something (reviewers disagree, five rounds weren't enough, or the issue needs a decision),
 Paja escalates: it asks on the issue, labels it so it stands out, and Posti tells you: a desktop notification when
 `paja` runs in a terminal (`PAJA_NOTIFIER=desktop` gets one without), or a program of your own (`PAJA_NOTIFIER`) or a push URL such as an ntfy topic for your phone (`PAJA_NOTIFY`
 or `.paja/notify`); see [Notifications](./setup.md#notifications). Answer in any of three ways, and the item goes back

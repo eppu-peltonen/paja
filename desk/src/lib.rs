@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(view["state"], "interrupted", "{view}");
         assert_eq!(
             (&view["round"], &view["max_rounds"]),
-            (&json!(2), &json!(3))
+            (&json!(2), &json!(5))
         );
         assert_eq!(view["step"]["role"], "fix", "{view}");
         assert!(view["step"]["started_ms"].as_u64().unwrap() > 0, "{view}");
