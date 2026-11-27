@@ -214,15 +214,19 @@ mod tests {
         drop(lock);
         assert!(home.runs_lock_path(repo, "7").exists());
         // A child another test forked in the instant before the drop shares the lock until it
-        // execs, so the lock may be let go a moment later.
+        // execs, so the lock may be let go a moment later. `run_held` probes by taking the lock
+        // for an instant, and a child forked during a probe shares that too, so the next run
+        // may find it held for a moment as well: both checks wait out such a child.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while home.run_held(repo, 7).unwrap() {
-            assert!(
-                Instant::now() < deadline,
-                "the dropped run lock is still held"
-            );
+        let wait = |what: &str| {
+            assert!(Instant::now() < deadline, "{what}");
             thread::sleep(Duration::from_millis(20));
+        };
+        while home.run_held(repo, 7).unwrap() {
+            wait("the dropped run lock is still held");
         }
-        assert!(home.try_run_lock(repo, 7).unwrap().is_some());
+        while home.try_run_lock(repo, 7).unwrap().is_none() {
+            wait("a new run can't take the dropped run lock");
+        }
     }
 }
