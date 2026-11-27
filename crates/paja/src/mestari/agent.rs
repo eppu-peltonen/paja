@@ -111,6 +111,9 @@ pub(super) struct UsageLimit {
     pub(super) result: Option<Value>,
     /// When the window resets, in milliseconds since the epoch, if Claude Code said so.
     pub(super) resets_at: Option<u64>,
+    /// Not a stop Claude Code made: the recorded window was nearly used up, so the step was
+    /// never started.
+    pub(super) nearly: bool,
 }
 
 /// The usage limit behind `err`, if that is what stopped the step.
@@ -123,6 +126,7 @@ pub(super) fn usage_limit(err: &anyhow::Error) -> Option<UsageLimit> {
     limited.then(|| UsageLimit {
         resets_at: reset_time(result.as_ref(), text),
         result: result.clone(),
+        nearly: false,
     })
 }
 

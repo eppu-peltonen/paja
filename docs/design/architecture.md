@@ -273,6 +273,14 @@ finished verdict is kept. If it hits the limit again, its worktree is put back a
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
+A step also records the usage window when its result carries a `rate_limit_info` object (`window_status`,
+`window_used_percent`, `window_resets_at`; all absent for a Claude Code that reports nothing). Before a `build` or
+`fix` session, and before a new item is claimed, Mestari reads the latest recorded state: if it is a warning (or
+rejected) status, or at least `window <percent>` of the window (a line in `.paja/models`, default 90) is used, and its
+reset time is still ahead, the step isn't started. The round is recorded as `usage_limit`, as when Claude Code stops
+at the limit, so the item stays active with its worktree and `paja run` resumes it after the reset, and stderr says
+when. A new item is put back in the queue instead. Reviews still start, so a built change isn't left unreviewed.
+
 **Usage limit.** When any agent step (a fresh or resumed build, either reviewer) fails on the usage window
 (`api_error_status` 429), nothing needs deciding: the window only has to reset. Mestari records the step's spend from
 the failed result and the round with the verdict `usage_limit`, adding `resets_at` (milliseconds since the epoch) when

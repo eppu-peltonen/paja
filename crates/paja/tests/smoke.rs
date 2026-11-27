@@ -1844,6 +1844,7 @@ impl Factory {
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add $file\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
+                 if [ -f {d}/window-warning ]; then echo \"{{\\\"is_error\\\": false, \\\"result\\\": \\\"done\\\", \\\"session_id\\\": \\\"s-1\\\", \\\"total_cost_usd\\\": 0.25, \\\"rate_limit_info\\\": {{\\\"status\\\": \\\"allowed_warning\\\", \\\"utilization\\\": 0.93, \\\"resetsAt\\\": $(cat {d}/reset-at)}}}}\"; exit 0; fi\n\
                  if [ -f {d}/no-session ]; then echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi\n\
                  echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4, \"duration_ms\": 900, \"session_id\": \"s-1\", \"total_cost_usd\": 0.25, \"usage\": {{\"input_tokens\": 100, \"output_tokens\": 20, \"cache_read_input_tokens\": 3000, \"cache_creation_input_tokens\": 400}}, \"modelUsage\": {{\"claude-test\": {{\"inputTokens\": 100, \"outputTokens\": 20, \"cacheReadInputTokens\": 3000, \"cacheCreationInputTokens\": 400, \"costUSD\": 0.25}}}}}}' ;;\nesac\n"
             ),
@@ -4272,6 +4273,32 @@ fn a_usage_limit_in_a_fresh_build_keeps_the_work_and_waits_for_the_reset() {
     assert_eq!(again["resets_at"], resets * 1000, "{again}");
     assert!(stderr.contains("can run again at"), "{stderr}");
     assert_eq!(f.claude_calls().len(), calls, "no agent started");
+}
+
+#[test]
+fn a_nearly_used_window_holds_back_the_next_build_but_not_the_review() {
+    let f = Factory::new("true\n", "changes");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    assert_eq!(report["resets_at"], resets * 1000, "{report}");
+    assert!(stderr.contains("nearly used up"), "{stderr}");
+    assert!(stderr.contains("resumes it from"), "{stderr}");
+    // The item stays active with its worktree; the one build was reviewed, and no fix started.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    let calls = f.claude_calls();
+    let reviews = calls.iter().filter(|c| c.contains("--json-schema")).count();
+    assert_eq!(calls.len() - reviews, 1, "one build only: {calls:?}");
+    assert_eq!(reviews, 1, "{calls:?}");
+    // The step recorded the window it was told about.
+    let rounds = round_events(&f);
+    let build = &rounds[0]["data"]["steps"][0];
+    assert_eq!(build["window_status"], "allowed_warning", "{build}");
+    assert_eq!(build["window_resets_at"], resets * 1000, "{build}");
+    assert_eq!(rounds.last().unwrap()["data"]["verdict"], "usage_limit");
 }
 
 #[test]

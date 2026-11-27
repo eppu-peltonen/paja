@@ -1,3 +1,19 @@
+//! What a step spent, and what the usage window looked like afterwards.
+//!
+//! The window: `claude -p --output-format json` is read as one JSON result. Claude Code reports
+//! the account's rate-limit state as a `rate_limit_event` message in `--output-format
+//! stream-json`, whose `rate_limit_info` holds `status` (`allowed`, `allowed_warning` or
+//! `rejected`), `utilization` (the share used, 0 to 1) and `resetsAt` (epoch seconds). Paja still
+//! reads the single JSON result, so it takes the same `rate_limit_info` object from the result
+//! when one is there, and records `status`, the used percent and the reset time on the step
+//! (`window_status`, `window_used_percent`, `window_resets_at`). A Claude Code whose result has no
+//! `rate_limit_info` leaves all three `None`, and then nothing is held back: the window is only
+//! ever judged on what was reported.
+//!
+//! Before a `build` or `fix` session, and before a new item is claimed, Mestari reads the latest
+//! recorded state ([`window_nearly_used`]); `window <percent>` in `.paja/models` on the default
+//! branch sets the used share that counts as nearly used (default 90).
+
 use super::*;
 
 /// What one agent step spent, kept from the `claude -p` result. A field the result doesn't
@@ -37,6 +53,49 @@ pub struct StepUsage {
     /// didn't run only on the model `.paja/models` chose for it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fell_back: bool,
+    /// The usage window's status as the step's result reported it (`allowed`, `allowed_warning`,
+    /// `rejected`), if it reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_status: Option<String>,
+    /// How much of the window was used, in percent, if the result said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_used_percent: Option<f64>,
+    /// When the window resets, in milliseconds since the epoch, if the result said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_resets_at: Option<u64>,
+}
+
+/// The window state the latest step that reported one recorded, when it says the window is nearly
+/// used up (a warning or rejected status, or at least `threshold_percent` used) and its reset
+/// time, still ahead of `now_ms`, is known: that reset time, in milliseconds since the epoch.
+/// A state that has already reset, or that has no reset time, never holds anything back.
+pub fn window_nearly_used(
+    events: &[crate::events::Event],
+    now_ms: u64,
+    threshold_percent: u32,
+) -> Option<u64> {
+    let latest = events
+        .iter()
+        .filter(|e| e.kind == EV_ROUND)
+        .filter_map(|e| e.data["steps"].as_array())
+        .flatten()
+        .filter_map(|s| serde_json::from_value::<StepUsage>(s.clone()).ok())
+        .rfind(|s| {
+            s.window_status.is_some()
+                || s.window_used_percent.is_some()
+                || s.window_resets_at.is_some()
+        })?;
+    let warned = latest
+        .window_status
+        .as_deref()
+        .is_some_and(|s| s.contains("warning") || s == "rejected");
+    let used = latest
+        .window_used_percent
+        .is_some_and(|p| p >= f64::from(threshold_percent));
+    (warned || used)
+        .then_some(latest.window_resets_at)
+        .flatten()
+        .filter(|&resets| resets > now_ms)
 }
 
 /// Whether `fallback` spent anything in a step's `models`. Claude Code names models by their
@@ -133,7 +192,13 @@ impl StepUsage {
             })
             .unwrap_or_default();
         let fallback = chosen.fallback_for(role).map(str::to_string);
+        // The window, if the result reports it: see the module doc comment.
+        let window = &result["rate_limit_info"];
+        let as_ms = |n: u64| if n < 100_000_000_000 { n * 1000 } else { n };
         StepUsage {
+            window_status: window["status"].as_str().map(str::to_string),
+            window_used_percent: window["utilization"].as_f64().map(|u| u * 100.0),
+            window_resets_at: window["resetsAt"].as_u64().map(as_ms),
             step: step.to_string(),
             reviewer,
             role: Some(role.to_string()),
@@ -212,6 +277,47 @@ pub(super) fn recorded_totals(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_latest_reported_window_decides_whether_it_is_nearly_used() {
+        use super::{window_nearly_used, Models, StepUsage};
+        let none = Models::default();
+        let step = |info: serde_json::Value| {
+            let result = serde_json::json!({ "rate_limit_info": info });
+            let step = StepUsage::from_result("build", None, &none, "build", &result);
+            crate::events::Event {
+                v: 1,
+                seq: 1,
+                ts_ms: 0,
+                kind: super::EV_ROUND.to_string(),
+                data: serde_json::json!({ "steps": [step] }),
+            }
+        };
+        let now = 1_000_000;
+        let warned = step(serde_json::json!({"status": "allowed_warning", "resetsAt": 5_000}));
+        assert_eq!(
+            window_nearly_used(std::slice::from_ref(&warned), now, 90),
+            Some(5_000_000)
+        );
+        // A used share over the threshold counts; under it, or already reset, does not.
+        let used =
+            step(serde_json::json!({"status": "allowed", "utilization": 0.91, "resetsAt": 5_000}));
+        let used_only = std::slice::from_ref(&used);
+        assert_eq!(window_nearly_used(used_only, now, 90), Some(5_000_000));
+        assert_eq!(window_nearly_used(used_only, now, 95), None);
+        assert_eq!(window_nearly_used(used_only, 6_000_000, 90), None);
+        // Without a reset time, or with nothing reported, nothing is held back.
+        let unknown = step(serde_json::json!({"status": "allowed_warning"}));
+        assert_eq!(window_nearly_used(&[unknown], now, 90), None);
+        assert_eq!(
+            window_nearly_used(&[step(serde_json::json!(null))], now, 90),
+            None
+        );
+        // A later report that the window is fine replaces an earlier warning.
+        let fine =
+            step(serde_json::json!({"status": "allowed", "utilization": 0.2, "resetsAt": 5_000}));
+        assert_eq!(window_nearly_used(&[warned, fine], now, 90), None);
+    }
+
     #[test]
     fn a_resumed_step_counts_only_its_own_spend() {
         use super::{Models, StepUsage};
