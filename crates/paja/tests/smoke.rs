@@ -1816,6 +1816,7 @@ impl Factory {
                  *PAJA-PLAN*) p='\"feature.txt\"'; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) p=\"\\\"$t.txt\\\"\" ;; esac; done\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"paths\\\": [$p]}}}}\" ;;\n\
                  *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 if [ -f {d}/review-429 ]; then echo \"{{\\\"is_error\\\": true, \\\"api_error_status\\\": 429, \\\"result\\\": \\\"Claude usage limit reached|$(cat {d}/reset-at 2>/dev/null)\\\", \\\"session_id\\\": \\\"r-1\\\", \\\"total_cost_usd\\\": 0.07}}\"; exit 1; fi\n\
                  if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
@@ -1835,6 +1836,7 @@ impl Factory {
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
+                 if [ -f {d}/build-429 ]; then echo \"{{\\\"is_error\\\": true, \\\"api_error_status\\\": 429, \\\"result\\\": \\\"Claude usage limit reached|$(cat {d}/reset-at 2>/dev/null)\\\", \\\"session_id\\\": \\\"s-1\\\", \\\"total_cost_usd\\\": 0.3}}\"; exit 1; fi\n\
                  if [ -f {d}/ask ]; then printf '%s\\n' '{{\"is_error\": false, \"result\": \"I need a decision.\\nPAJA-QUESTION: Which API, A or B? I recommend A.\"}}'; git checkout -q -- . ; exit 0; fi\n\
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
@@ -4194,12 +4196,10 @@ fn a_resume_at_a_usage_limit_stops_instead_of_starting_fresh() {
     std::fs::write(f.tmp.path().join("resume-limited"), "").unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
-    assert_eq!(report["outcome"], "escalated", "{report}");
-    let question = report["question"].as_str().unwrap();
-    assert!(
-        question.contains("usage or rate limit") && question.contains("wait until it resets"),
-        "{question}"
-    );
+    // Not parked: the item stays active and resumes once the window has reset.
+    assert_eq!(report["outcome"], "usage_limit", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
     // One fresh build, one review, one resume that hit the limit: no fresh session after it.
     let calls = f.claude_calls();
     let builds: Vec<&String> = calls
@@ -4221,6 +4221,98 @@ fn a_resume_at_a_usage_limit_stops_instead_of_starting_fresh() {
     assert_eq!(builds.len(), 2, "{steps:?}");
     let cost = builds[1]["cost_usd"].as_f64().unwrap();
     assert!((cost - 0.15).abs() < 1e-9, "{steps:?}");
+}
+
+/// Seconds since the epoch, `ahead` from now.
+fn epoch_secs_in(ahead: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + ahead
+}
+
+/// The `run.round` events of the log.
+fn round_events(f: &Factory) -> Vec<Value> {
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    log.as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_usage_limit_in_a_fresh_build_keeps_the_work_and_waits_for_the_reset() {
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    assert_eq!(report["resets_at"], resets * 1000, "{report}");
+    // The item stays active, and the builder's uncommitted file is still in its worktree.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    let path = envs[0]["path"].as_str().expect("the environment is kept");
+    let kept = std::fs::read_to_string(Path::new(path).join("feature.txt")).unwrap();
+    assert!(kept.contains("built"), "{kept}");
+    // The round has its own verdict and the failed step's spend.
+    let rounds = round_events(&f);
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["verdict"], "usage_limit", "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["resets_at"], resets * 1000, "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["steps"][0]["cost_usd"], 0.3, "{rounds:?}");
+    // Before the reset a second run claims nothing, and says when it can run.
+    let calls = f.claude_calls().len();
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "paused", "{again}\n{stderr}");
+    assert_eq!(again["resets_at"], resets * 1000, "{again}");
+    assert!(stderr.contains("can run again at"), "{stderr}");
+    assert_eq!(f.claude_calls().len(), calls, "no agent started");
+}
+
+#[test]
+fn a_usage_limit_in_a_review_keeps_the_work_and_waits_for_the_reset() {
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("review-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
+    let rounds = round_events(&f);
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["verdict"], "usage_limit", "{rounds:?}");
+    let steps = rounds[0]["data"]["steps"].as_array().unwrap();
+    // The build that finished and the review that hit the limit both spent something.
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert_eq!(steps[1]["step"], "review", "{steps:?}");
+    assert_eq!(steps[1]["cost_usd"], 0.07, "{steps:?}");
+}
+
+#[test]
+fn a_second_usage_limit_without_a_reset_time_parks_the_item() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
+    // No reset time: the first stop leaves the item for the next run to try again.
+    let (first, stderr) = f.run_with_stderr();
+    assert_eq!(first["outcome"], "usage_limit", "{first}\n{stderr}");
+    assert!(first["resets_at"].is_null(), "{first}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    // The second in a row is a question for the person, not a loop.
+    let (second, stderr) = f.run_with_stderr();
+    assert_eq!(second["outcome"], "escalated", "{second}\n{stderr}");
+    let question = second["question"].as_str().unwrap();
+    assert!(question.contains("Wait until it resets"), "{question}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
 }
 
 #[test]

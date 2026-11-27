@@ -107,6 +107,16 @@ pub enum RunReport {
     /// The person pressed Ctrl-C. The item stays active, and the next `paja run` resumes it in
     /// the same environment.
     Stopped { number: u64, rounds: u32 },
+    /// A step hit the usage limit. The item stays active with its worktree, and the next
+    /// `paja run` resumes it after `resets_at` (milliseconds since the epoch; null when Claude
+    /// Code gave none).
+    UsageLimit {
+        number: u64,
+        rounds: u32,
+        resets_at: Option<u64>,
+    },
+    /// A recorded usage limit hasn't reset yet, so nothing was claimed or resumed.
+    Paused { resets_at: u64 },
 }
 
 /// The run reached a step boundary after the person pressed Ctrl-C.
@@ -389,6 +399,15 @@ fn confirmed() -> Result<bool> {
 
 /// Take the next work item and run it to an outcome.
 pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
+    // The usage window is the account's: before it resets, nothing is claimed or resumed.
+    if let Some(resets_at) = usage_pause(&home.events().read_all()?, crate::events::now_ms()) {
+        progress(&format!(
+            "Claude Code's usage limit hasn't reset; nothing was started. `paja run` can run \
+             again at {}",
+            format_utc(resets_at)
+        ));
+        return Ok(RunReport::Paused { resets_at });
+    }
     let repo = std::path::absolute(opts.repo)?;
     // A repository whose configuration was tampered with gets no git, not even a fetch, until
     // a person says it was checked.
@@ -848,6 +867,10 @@ fn run_item(
             None => None,
             Some(Ok(built)) => Some(built),
             Some(Err(err)) => {
+                // The window, not the change: keep the worktree and resume after the reset.
+                if let Some(limit) = usage_limit(&err) {
+                    return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                }
                 let Some(limit) = turn_limit(&err) else {
                     return Err(err);
                 };
@@ -1140,7 +1163,21 @@ fn run_item(
                         limited = Some(note);
                         break;
                     }
-                    None => return Err(err),
+                    None => {
+                        if let Some(limit) = usage_limit(&err) {
+                            if let Some(result) = &limit.result {
+                                steps.push(StepUsage::from_result(
+                                    "review",
+                                    Some(reviewer),
+                                    &models,
+                                    role,
+                                    result,
+                                ));
+                            }
+                            return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                        }
+                        return Err(err);
+                    }
                 },
             }
         }
@@ -1360,6 +1397,118 @@ fn run_item(
          Answer with what should change, or what is out of scope."
     );
     escalated(home, repo, &env, item, &question, MAX_ROUNDS)
+}
+
+/// The latest reset time any usage-limit stop recorded, in milliseconds since the epoch, when it
+/// is still ahead of `now_ms`. The window is the account's, so it holds every item and repository.
+pub fn usage_pause(events: &[crate::events::Event], now_ms: u64) -> Option<u64> {
+    events
+        .iter()
+        .filter(|e| e.kind == EV_ROUND && e.data["verdict"] == "usage_limit")
+        .filter_map(|e| e.data["resets_at"].as_u64())
+        .max()
+        .filter(|&resets| resets > now_ms)
+}
+
+/// Whether the item's last round, since it was queued, claimed or answered, already stopped on
+/// the usage limit without a reset time: a second such stop in a row parks it.
+fn limit_without_reset(events: &[crate::events::Event], repo: &str, number: u64) -> bool {
+    let mut last = false;
+    for event in jono::item_events(events, repo, number) {
+        match event.kind.as_str() {
+            EV_ROUND => {
+                last = event.data["verdict"] == "usage_limit" && event.data["resets_at"].is_null()
+            }
+            jono::EV_STATUS | jono::EV_ANSWERED | jono::EV_REOPENED | EV_LANDED | EV_ESCALATED => {
+                last = false
+            }
+            _ => {}
+        }
+    }
+    last
+}
+
+/// A step stopped at the usage limit. Record the round as `usage_limit` with what it spent (and
+/// `resets_at`, when known) and leave the item active with its worktree in place, so the next
+/// `paja run` resumes it after the window resets. Without a reset time the next run may simply
+/// try again, but a second stop in a row parks the item, so a broken sign-in or account can't loop.
+fn usage_stopped(
+    home: &Home,
+    repo: &Path,
+    env: &Env,
+    item: &WorkItem,
+    round: u32,
+    limit: &UsageLimit,
+    steps: &mut Vec<StepUsage>,
+) -> Result<RunReport> {
+    let again = limit.resets_at.is_none()
+        && limit_without_reset(&home.events().read_all()?, &item.repo, item.number);
+    let note = match limit.resets_at {
+        Some(ms) => format!(
+            "Claude Code hit its usage limit; the window resets at {}",
+            format_utc(ms)
+        ),
+        None => "Claude Code hit its usage limit and gave no reset time".to_string(),
+    };
+    let steps = std::mem::take(steps);
+    record(
+        home,
+        EV_ROUND,
+        json!({
+            "repo": item.repo,
+            "number": item.number,
+            "round": round,
+            "verdict": "usage_limit",
+            "detail": note,
+            "resets_at": limit.resets_at,
+            "steps": steps,
+        }),
+    )?;
+    if again {
+        let question =
+            "Paja's run hit Claude Code's usage or rate limit twice in a row and neither \
+                        time was told when the window resets, so it stopped instead of trying \
+                        again. Wait until it resets (and check that `claude` is signed in to the \
+                        right account), then answer the item to run it again.";
+        return escalated(home, repo, env, item, question, round);
+    }
+    progress(&match limit.resets_at {
+        Some(ms) => format!(
+            "{note}; #{} stays active and `paja run` resumes it from {}",
+            item.number,
+            format_utc(ms)
+        ),
+        None => format!(
+            "{note}; #{} stays active and the next `paja run` tries it again",
+            item.number
+        ),
+    });
+    Ok(RunReport::UsageLimit {
+        number: item.number,
+        rounds: round,
+        resets_at: limit.resets_at,
+    })
+}
+
+/// A time in milliseconds since the epoch as `2026-11-27 18:30 UTC`.
+pub fn format_utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a calendar date (proleptic Gregorian).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
 }
 
 /// The same kind of step hit its turn limit a second time in this run: ask a person rather
@@ -1727,7 +1876,12 @@ fn build(
                         }
                         _ => raw,
                     });
-                    // A fresh session would fail the same way: stop and say what to do.
+                    // A fresh session would fail the same way: the run keeps the work and waits
+                    // for the window (see `run_item`).
+                    if usage_limit(&err).is_some() {
+                        return Err(err);
+                    }
+                    // A sign-in that no longer works: stop and say what to do.
                     if let Some(fix) = not_retried(out) {
                         return Err(err.context(fix));
                     }
@@ -1747,12 +1901,26 @@ fn build(
     let mut args = vec!["--session-id".to_string(), id.clone()];
     args.extend(models.args(role));
     record_step_started(home, env, item, round, role, &id, false)?;
-    let out = note_discarded(
+    let tried = note_discarded(
         home,
         item,
         &id,
         claude(home, env, base, &prompt, &tools, None, false, &args),
-    )?;
+    );
+    let out = match tried {
+        Ok(out) => out,
+        Err(err) => {
+            // A usage limit still spent something.
+            if let Some(UsageLimit {
+                result: Some(result),
+                ..
+            }) = usage_limit(&err)
+            {
+                spent.push(StepUsage::from_result("build", None, models, role, &result));
+            }
+            return Err(err);
+        }
+    };
     let raw = StepUsage::from_result("build", None, models, role, &out);
     Ok((raw.clone(), raw, builder_question(&out)))
 }
@@ -2516,6 +2684,23 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_times_are_read_and_shown_in_utc() {
+        // 2026-11-27 18:30:00 UTC.
+        assert_eq!(super::format_utc(1_795_804_200_000), "2026-11-27 18:30 UTC");
+        assert_eq!(super::format_utc(0), "1970-01-01 00:00 UTC");
+        let limited = serde_json::json!({"result": "Claude usage limit reached|1795804200"});
+        assert_eq!(
+            super::reset_time(Some(&limited), ""),
+            Some(1_795_804_200_000)
+        );
+        let field = serde_json::json!({"resets_at": 1_795_804_200_000u64});
+        assert_eq!(super::reset_time(Some(&field), ""), Some(1_795_804_200_000));
+        // No time, or a stray number that is no epoch: unknown.
+        assert_eq!(super::reset_time(None, "limit reached|42"), None);
+        assert_eq!(super::reset_time(None, "limit reached"), None);
+    }
+
     #[test]
     fn sandbox_and_platform_are_high_risk() {
         let text = std::fs::read_to_string(
