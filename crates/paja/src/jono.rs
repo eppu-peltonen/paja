@@ -228,10 +228,12 @@ pub const EV_CLAIM: &str = "work.claim";
 /// How long a claim lasts without being renewed. A run renews it at each round.
 pub const CLAIM_SECS: u64 = 6 * 60 * 60;
 
-/// Who holds an item on GitHub: the claimed label, and the runner in its latest claim comment.
+/// Who holds an item on GitHub: the claimed label, and the runner in its first live claim comment
+/// (else the latest).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
-    /// The runner id in the latest claim comment; `unknown` when the label has no comment.
+    /// The runner id in the first live claim comment (else the latest); `unknown` when the label
+    /// has no comment.
     pub runner: String,
     /// The UTC time after which another runner may take the item. None when the claim can't go
     /// stale: the item is escalated and waits on a person, or the label has no comment.
@@ -1403,15 +1405,23 @@ fn view_issue(ok: &Untampered, number: u64) -> Result<View> {
     })
 }
 
-/// Who holds an issue, from its labels and comments: the runner in the latest claim comment,
-/// when the issue has the claimed label. An escalated item (it carries `needs_answer`) stays
-/// claimed however old its claim is.
+/// Who holds an issue, from its labels and comments, when the issue has the claimed label: the
+/// runner in the first live claim comment, the one that won the race (a loser whose comment
+/// couldn't be deleted is later), else in the latest claim comment. An escalated item (it
+/// carries `needs_answer`) stays claimed however old its claim is.
 fn holder(view: &View, labels: &Labels) -> Option<Claim> {
     if !view.has_label(&labels.claimed()) {
         return None;
     }
     let escalated = view.has_label(&labels.needs_answer);
-    Some(match view.claims().pop() {
+    let now = now_secs();
+    let mut claims = view.claims();
+    let first_live = claims.iter().position(|c| !c.is_stale(now));
+    let chosen = match first_live {
+        Some(i) => Some(claims.swap_remove(i)),
+        None => claims.pop(),
+    };
+    Some(match chosen {
         Some(c) => Claim {
             runner: c.runner,
             stale_after: (!escalated).then_some(c.stale_after),
@@ -1424,8 +1434,11 @@ fn holder(view: &View, labels: &Labels) -> Option<Claim> {
 }
 
 /// Write this runner's claim on issue `number` and check that it won. None when it did; the
-/// holder when another runner's live claim comment came first, after taking this runner's label
-/// and comment back off.
+/// holder when another runner's live claim comment came first, after deleting this runner's
+/// comment. The claimed label stays then: it is shared, and the winner's live claim is what it
+/// now marks, so taking it off would make the item look free until the winner's next renewal.
+/// When a step fails the claim is taken back the same way (see `take_back`) and the error says
+/// the item was not taken.
 fn claim_on_github(
     ok: &Untampered,
     labels: &Labels,
@@ -1451,40 +1464,74 @@ fn claim_on_github(
             &claim_text(me, now),
         ],
     );
-    let url = match posted {
-        Ok(out) => out.lines().last().unwrap_or_default().trim().to_string(),
+    let not_taken = |err: anyhow::Error| {
+        err.context(format!(
+            "claiming #{number} on GitHub failed, so it was not taken"
+        ))
+    };
+    let own = match posted {
+        Ok(out) => out
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim()
+            .rsplit_once("issuecomment-")
+            .and_then(|(_, id)| id.parse::<u64>().ok()),
         Err(err) => {
-            let _ = remove_label(ok, number, &claimed);
-            return Err(err.context(format!(
-                "claiming #{number} on GitHub failed, so it was not taken"
-            )));
+            take_back(ok, &claimed, number, me, None);
+            return Err(not_taken(err));
         }
     };
     let view = match view_issue(ok, number) {
         Ok(view) => view,
         Err(err) => {
-            let _ = remove_label(ok, number, &claimed);
-            return Err(err.context(format!(
-                "claiming #{number} on GitHub failed, so it was not taken"
-            )));
+            take_back(ok, &claimed, number, me, own);
+            return Err(not_taken(err));
         }
     };
     let first = view.claims().into_iter().find(|c| !c.is_stale(now));
     let Some(first) = first.filter(|c| c.runner != me) else {
         return Ok(None);
     };
-    let _ = remove_label(ok, number, &claimed);
-    if let Some(id) = url
-        .rsplit_once("issuecomment-")
-        .and_then(|(_, id)| id.parse::<u64>().ok())
-    {
-        let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
-        let _ = gh(ok, &["api", "-X", "DELETE", &path]);
+    if let Some(id) = own {
+        let _ = delete_comment(ok, id);
     }
     Ok(Some(Claim {
         runner: first.runner,
         stale_after: Some(first.stale_after),
     }))
+}
+
+fn delete_comment(ok: &Untampered, id: u64) -> Result<()> {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+    gh(ok, &["api", "-X", "DELETE", &path]).map(drop)
+}
+
+/// Undo a claim that failed part way: delete this runner's comment (`own`, when it was posted),
+/// then take the shared claimed label off unless another runner's live claim is on the issue,
+/// whose label it is (see `label_is_another_runners`). When the issue can't be read the label
+/// comes off, so a failure never leaves an item looking claimed by nobody in particular. Best
+/// effort: the caller reports the failure that brought it here.
+fn take_back(ok: &Untampered, claimed: &str, number: u64, me: &str, own: Option<u64>) {
+    if let Some(id) = own {
+        let _ = delete_comment(ok, id);
+    }
+    let now = now_secs();
+    let other = view_issue(ok, number)
+        .is_ok_and(|view| label_is_another_runners(&view.claims(), me, own, now));
+    if !other {
+        let _ = remove_label(ok, number, claimed);
+    }
+}
+
+/// Whether another runner's live claim holds the claimed label, so taking back this runner's
+/// claim leaves it on. With `own` (this runner's comment id) known, only a claim posted before
+/// it counts: a later one lost the race to this runner's comment and is about to delete itself.
+/// A claim whose id can't be read counts, which keeps the label.
+fn label_is_another_runners(claims: &[ClaimComment], me: &str, own: Option<u64>, now: u64) -> bool {
+    claims.iter().any(|c| {
+        c.runner != me && !c.is_stale(now) && own.is_none_or(|own| c.id.is_none_or(|id| id < own))
+    })
 }
 
 fn add_label(
@@ -1627,7 +1674,8 @@ pub fn release_own_claim(home: &Home, checkout: &Path, number: u64) {
 /// None every claim goes. With `me`, this runner's own go, and so does every other runner's
 /// posted after its first one: those lost the race (the first live claim wins), and one left
 /// behind would win every later runner's race check while nobody builds the item. A claim
-/// posted before this runner's first stays; the latest of those holds the item.
+/// posted before this runner's first stays; the first of those (the race's winner) holds the
+/// item.
 fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>) {
     let first_mine = match me {
         None => 0,
@@ -1638,7 +1686,7 @@ fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>)
     };
     let (ahead, rest) = live.split_at(first_mine);
     let delete = rest.iter().filter_map(|c| c.id).collect();
-    let stays = ahead.last().map(|c| Claim {
+    let stays = ahead.first().map(|c| Claim {
         runner: c.runner.clone(),
         stale_after: Some(c.stale_after.clone()),
     });
@@ -2550,6 +2598,37 @@ mod tests {
     }
 
     #[test]
+    fn the_holder_is_the_race_winner_not_a_loser_left_behind() {
+        let labels = Labels::default();
+        let comment = |runner: &str, stale: &str, id: u64| {
+            json!({
+                "body": format!("Claimed by runner {runner} at 2020-01-01T00:00:00Z; stale after {stale}"),
+                "url": format!("https://example.com/acme/app/issues/5#issuecomment-{id}"),
+            })
+        };
+        let view = |comments: Value| -> View {
+            serde_json::from_value(json!({
+                "labels": [{"name": labels.claimed()}],
+                "comments": comments,
+            }))
+            .unwrap()
+        };
+        // A stale claim, the winner, then a loser whose comment couldn't be deleted.
+        let raced = view(json!([
+            comment("old", "2020-01-02T00:00:00Z", 1),
+            comment("winner", "2999-01-01T00:00:00Z", 2),
+            comment("loser", "2999-01-01T00:00:00Z", 3),
+        ]));
+        assert_eq!(holder(&raced, &labels).unwrap().runner, "winner");
+        // With every claim stale, the latest still names who held it last.
+        let stale = view(json!([
+            comment("a", "2020-01-02T00:00:00Z", 1),
+            comment("b", "2020-01-03T00:00:00Z", 2),
+        ]));
+        assert_eq!(holder(&stale, &labels).unwrap().runner, "b");
+    }
+
+    #[test]
     fn claim_times_round_trip_and_claim_comments_read_back() {
         for secs in [0, 951_782_400, 1_785_000_123, 4_102_444_799] {
             assert_eq!(parse_utc(&format_utc(secs)), Some(secs), "{secs}");
@@ -2585,10 +2664,45 @@ mod tests {
         // With no earlier claim, nothing stays and the label comes off too.
         let (delete, stays) = to_free(&live[1..], Some("aaaa"));
         assert_eq!((delete, stays), (vec![2, 3], None));
-        // A runner with no live claim of its own deletes nothing; the latest claim holds.
+        // A runner with no live claim of its own deletes nothing; the race's winner holds.
         let (delete, stays) = to_free(&live, Some("dddd"));
         assert!(delete.is_empty());
-        assert_eq!(stays.unwrap().runner, "cccc");
+        assert_eq!(stays.unwrap().runner, "bbbb");
+        // Two claims ahead of this runner's (cccc lost to bbbb, its comment left behind): the
+        // earlier one holds the item.
+        let raced = [comment("bbbb", 1), comment("cccc", 2), comment("aaaa", 3)];
+        let (delete, stays) = to_free(&raced, Some("aaaa"));
+        assert_eq!(delete, vec![3]);
+        assert_eq!(stays.unwrap().runner, "bbbb");
+    }
+
+    #[test]
+    fn taking_back_a_claim_keeps_only_an_earlier_runners_label() {
+        let comment = |runner: &str, id: u64| {
+            let url = format!("https://github.com/a/b/issues/5#issuecomment-{id}");
+            parse_claim_comment(&claim_text(runner, 1_785_000_000), &url).unwrap()
+        };
+        let now = 1_785_000_001;
+        let earlier = [comment("bbbb", 1), comment("aaaa", 2)];
+        assert!(label_is_another_runners(&earlier, "aaaa", Some(2), now));
+        // A later claim lost the race to this runner's comment.
+        let later = [comment("aaaa", 2), comment("cccc", 3)];
+        assert!(!label_is_another_runners(&later, "aaaa", Some(2), now));
+        // With no comment of its own to order against, any other live claim keeps the label.
+        assert!(label_is_another_runners(&later, "aaaa", None, now));
+        // A stale claim holds nothing.
+        assert!(!label_is_another_runners(
+            &earlier,
+            "aaaa",
+            Some(2),
+            now + CLAIM_SECS
+        ));
+        assert!(!label_is_another_runners(
+            &[comment("aaaa", 2)],
+            "aaaa",
+            None,
+            now
+        ));
     }
 
     #[test]
