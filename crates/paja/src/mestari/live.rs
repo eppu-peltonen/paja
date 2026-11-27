@@ -17,8 +17,8 @@ use crate::jono::{self, Status, WorkItem};
 pub struct Live {
     /// `running` while a `paja run` holds the item's run lock, `interrupted` when the item is
     /// still active but no run holds it (the run stopped or was killed), `claimed` when the
-    /// item was claimed by hand (`paja work claim`) since its last run and no `paja run` holds
-    /// it, which no `paja run` resumes, else the item's status (`queued`, `landed`, `escalated`).
+    /// item was claimed by hand (`paja work claim`, which no `paja run` resumes) since its last
+    /// run and no run holds it, else the item's status (`queued`, `landed`, `escalated`).
     pub state: String,
     /// The run's Ahjo environment, while it exists.
     pub env: Option<LiveEnv>,
