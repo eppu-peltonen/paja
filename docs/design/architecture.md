@@ -407,7 +407,11 @@ shows escalated items first, each with its answer command. A notice goes to two 
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed` or
 `stopped`, `channel`, and the `error`), so Paja Desk can show the same inbox. A notice that can't be delivered never
-stops the run: it says so on stderr once per channel, and every notifier is stopped after 15 seconds.
+stops the run: it says so on stderr once per channel, and every notifier is stopped after 15 seconds. The other
+waits are 15 seconds too: the repository name Jono asks `gh` for (the notice goes without it after that), and the home
+lock its record waits for (the record is skipped after that), and a `gh` stopped while it runs takes what it started
+with it. With every channel on, one notice holds up the run for about a minute and a half at most; only the local git
+calls that read `.paja/notify` from the default branch have no limit of their own.
 
 ## The deny-list hook
 
