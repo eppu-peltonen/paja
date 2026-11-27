@@ -500,7 +500,8 @@ fn touches_named_file(repo: &Path, issue: &Open, commit: &str) -> bool {
     match parent.as_deref() {
         Some(parent) => args.extend([parent.trim(), commit]),
         // In a shallow clone a commit at the boundary has no parent here either, and against
-        // nothing it would change every file, so only a real root counts as one.
+        // nothing it would change every file, so only a real root counts as one. (Grafts and
+        // replace objects can't hide a parent: `git_command` turns both off.)
         None if git(repo, &["rev-parse", "--is-shallow-repository"])
             .map_or(true, |shallow| shallow.trim() != "false") =>
         {
@@ -523,7 +524,9 @@ fn is_file_on(repo: &Path, base: &str, file: &str) -> bool {
 }
 
 /// Whether `issue`'s title or body names `file`: the whole path, or its file name when that
-/// has an extension (`triage.rs`), so a file the issue never mentions can't close it.
+/// has an extension (`triage.rs`), so a file the issue never mentions can't close it. A link
+/// names exactly the file it links to in this repository ([`link_names`]); the path rules below
+/// apply only to the text outside links.
 fn names_file(issue: &Open, file: &str) -> bool {
     let file = file.replace('\\', "/");
     let file = file.trim_start_matches("./");
@@ -534,39 +537,173 @@ fn names_file(issue: &Open, file: &str) -> bool {
     }
     let text = format!("{}\n{}", issue.title, issue.body).replace('\\', "/");
     let name = file.rsplit('/').next().unwrap_or(file);
-    // The words of the text that could be paths, without quotes or trailing punctuation. A
-    // link to a file of this repository on GitHub (`.../owner/name/blob/<ref>/<path>`) gives
-    // its path; any other link names nothing.
-    let blob = format!("/{}/blob/", issue.repo.to_ascii_lowercase());
-    let words = text
-        .split(|c: char| !(c.is_alphanumeric() || "/._-".contains(c)))
-        .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
-        .filter_map(|word| {
-            if !word.starts_with("//") {
-                return Some(word);
+    // Each run of text between spaces, quotes and brackets is split into the text before a link
+    // in it and the link, which runs to the run's end.
+    let mut plain = Vec::new();
+    for run in text.split(|c: char| c.is_whitespace() || "<>()[]{}\"'`".contains(c)) {
+        match link_in(run) {
+            Some((at, link)) => {
+                if link_names(&link, &issue.repo, file) {
+                    return true;
+                }
+                plain.push(&run[..at]);
             }
-            let at = word.to_ascii_lowercase().find(&blob)?;
-            (!issue.repo.is_empty())
-                .then(|| word[at + blob.len()..].split_once('/'))
-                .flatten()
-                .map(|(_, path)| path)
-        })
-        .filter(|word| !word.is_empty());
+            None => plain.push(run),
+        }
+    }
     // A path the issue gives is matched as a path: the same path, or one of the two ending in
     // the other at a `/` (`mestari/mod.rs` names `crates/paja/src/mestari/mod.rs`). A bare file
     // name with an extension (`triage.rs`) names any file of that name, but a path's last part
-    // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`).
+    // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`). `:` and `@` end a word, so
+    // `hook.rs:42`, `C:/.../hook.rs` and `@CLAUDE.md` name their file; `%` doesn't, so an
+    // encoded name (`a.rs%20old`) isn't read as another file.
     let suffix = |long: &str, short: &str| long.ends_with(&format!("/{short}"));
     let named_name = name.contains('.') && name.len() > 3;
-    words
+    plain
         .into_iter()
-        .filter(|word| !word.contains("//"))
+        .flat_map(|text| text.split(|c: char| !(c.is_alphanumeric() || "/._-%".contains(c))))
+        .map(|word| {
+            word.trim_matches('%')
+                .trim_end_matches('.')
+                .trim_start_matches("./")
+        })
+        .filter(|word| !word.is_empty())
         .any(|word| {
             word == file
                 || (file.contains('/') && suffix(word, file))
                 || (word.contains('/') && suffix(file, word))
                 || (named_name && !word.contains('/') && word == name)
         })
+}
+
+/// The link in `run` (text without spaces, quotes or brackets), if there is one: where it
+/// starts, and the link from its host on, as `//host/path`, without a `?` or `#` part, a
+/// `:line` or `:line:column`, or trailing punctuation. A link is a `scheme://` one (its scheme
+/// is part of it), or one whose host, written without a scheme ([`github_host_at`]), is GitHub's;
+/// it starts wherever the first of the two does, and runs to the run's end.
+fn link_in(run: &str) -> Option<(usize, String)> {
+    // `scheme://host/...`, or `//host/...` at the start; a `//` inside other text
+    // (`evil.com//github.com/...`) makes the whole run a link to its first host.
+    let slashes = run.find("//").map(|at| {
+        if at == 0 {
+            (0, run.to_string())
+        } else if let Some(before) = run[..at].strip_suffix(':') {
+            // The scheme is part of the link, so `hook.rs://evil.com` names nothing.
+            let scheme = before
+                .char_indices()
+                .rev()
+                .take_while(|&(_, c)| c.is_ascii_alphanumeric() || "+.-".contains(c))
+                .last()
+                .map_or(before.len(), |(start, _)| start);
+            (scheme, run[at..].to_string())
+        } else {
+            (0, format!("//{run}"))
+        }
+    });
+    let host = github_host_at(run).map(|at| (at, format!("//{}", &run[at..])));
+    // Whichever starts first, so a link with a later `https://` in it is still one link.
+    let (at, link) = match (slashes, host) {
+        (Some(slashes), Some(host)) => {
+            if host.0 < slashes.0 {
+                host
+            } else {
+                slashes
+            }
+        }
+        (slashes, host) => slashes.or(host)?,
+    };
+    let mut to = link.split(['?', '#']).next().unwrap_or(&link);
+    loop {
+        let trimmed = to.trim_end_matches(['.', ',', ';', '!']);
+        let trimmed = match trimmed.rsplit_once(':') {
+            Some((before, after)) if after.chars().all(|c| c.is_ascii_digit()) => before,
+            _ => trimmed,
+        };
+        if trimmed == to {
+            break;
+        }
+        to = trimmed;
+    }
+    Some((at, to.to_string()))
+}
+
+/// Where in `run` a host written without a scheme starts that is `github.com`,
+/// `githubusercontent.com` or a subdomain of either: at the run's start or after a `/`, `:`,
+/// `@` or other character a host can't have.
+fn github_host_at(run: &str) -> Option<usize> {
+    let host_part = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
+    let lower = run.to_ascii_lowercase();
+    lower.match_indices("github").find_map(|(i, _)| {
+        let start = run[..i]
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| host_part(c))
+            .last()
+            .map_or(i, |(at, _)| at);
+        let host = lower[start..].split(['/', ':', '@']).next().unwrap_or("");
+        let host = host.trim_end_matches('.');
+        let github = ["github.com", "githubusercontent.com"]
+            .iter()
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")));
+        github.then_some(start)
+    })
+}
+
+/// Whether `link` (from [`link_in`]) links to `file` in `repo`
+/// (`owner/name`) on GitHub: `//github.com/<repo>/{blob,tree,blame,raw}/<ref>/<file>` or
+/// `//raw.githubusercontent.com/<repo>/<ref>/<file>`, host and repository in any case. The ref
+/// is read as one part (a branch, tag or commit), since a branch with a `/` in its name can't
+/// be told from a path here: `blob/feature/x/a.rs` names `x/a.rs`, never `a.rs`. A file whose
+/// path starts with the rest of such a branch's name is rare, and the file must still exist on
+/// the base (and a named commit must touch it).
+fn link_names(link: &str, repo: &str, file: &str) -> bool {
+    if repo.is_empty() {
+        return false;
+    }
+    let Some((host, rest)) = link.trim_start_matches('/').split_once('/') else {
+        return false;
+    };
+    // Without any `user@` part or `:port`.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
+    // A `.` or `..` part (also as `%2e`) would lead to another repository or file.
+    if rest.split('/').any(|part| {
+        matches!(
+            part.to_ascii_lowercase().replace("%2e", ".").as_str(),
+            "." | ".."
+        )
+    }) {
+        return false;
+    }
+    let Some(rest) = rest
+        .get(..repo.len())
+        .filter(|owner_name| owner_name.eq_ignore_ascii_case(repo))
+        .and_then(|_| rest[repo.len()..].strip_prefix('/'))
+    else {
+        return false;
+    };
+    let after_ref = match host {
+        "github.com" | "www.github.com" => {
+            let Some((kind, after)) = rest.split_once('/') else {
+                return false;
+            };
+            if !matches!(kind, "blob" | "tree" | "blame" | "raw") {
+                return false;
+            }
+            after
+        }
+        "raw.githubusercontent.com" => rest,
+        _ => return false,
+    };
+    // A full ref name (`refs/heads/<branch>`, `refs/tags/<tag>`) is read the same way.
+    let after_ref = ["refs/heads/", "refs/tags/"]
+        .iter()
+        .find_map(|full| after_ref.strip_prefix(full))
+        .unwrap_or(after_ref);
+    after_ref
+        .split_once('/')
+        .is_some_and(|(reference, path)| !reference.is_empty() && path == file)
 }
 
 /// The comment that closes an issue: the reason, the evidence, and how to undo it.
@@ -1160,6 +1297,62 @@ mod tests {
     }
 
     #[test]
+    fn only_a_github_host_without_a_scheme_starts_a_link() {
+        for (host, is_link) in [
+            ("github.com", true),
+            ("gist.github.com", true),
+            ("GitHub.com", true),
+            ("x-github.com", false),
+            ("evilgithub.com", false),
+            ("github.com.evil.com", false),
+            ("github.com.", true),
+            ("evil_github.com", false),
+            ("githubusercontent.com", true),
+            ("raw.githubusercontent.com", true),
+        ] {
+            let run = format!("Ref:{host}/a/b");
+            assert_eq!(github_host_at(&run).is_some(), is_link, "{run}");
+        }
+    }
+
+    #[test]
+    fn a_path_with_a_line_a_drive_or_an_at_sign_names_its_file() {
+        for body in [
+            "panics at crates/paja/src/hook.rs:42",
+            "--> crates/paja/src/hook.rs:12:5",
+            "In C:\\Projects\\paja\\crates\\paja\\src\\hook.rs it fails.",
+            "Read @crates/paja/src/hook.rs first.",
+            "See hook.rs: the check.",
+            "Read @./crates/paja/src/hook.rs first.",
+            "Up 50% in crates/paja/src/hook.rs%",
+            "Was %crates/paja/src/hook.rs",
+            "crates/paja/src/hook.rs:github.com/x",
+            "crates/paja/src/hook.rs:https://example.com",
+        ] {
+            let issue = Open {
+                number: 1,
+                title: "Fix the hook".into(),
+                body: body.into(),
+                labels: Vec::new(),
+                created_at: String::new(),
+                repo: "acme/app".into(),
+            };
+            assert!(names_file(&issue, "crates/paja/src/hook.rs"), "{body}");
+            assert!(!names_file(&issue, "crates/paja/src/mcp.rs"), "{body}");
+        }
+        // An encoded name is another file.
+        let issue = Open {
+            number: 2,
+            title: "Fix the hook".into(),
+            body: "See crates/paja/src/hook.rs%20old".into(),
+            labels: Vec::new(),
+            created_at: String::new(),
+            repo: "acme/app".into(),
+        };
+        assert!(!names_file(&issue, "crates/paja/src/hook.rs"));
+    }
+
+    #[test]
     fn a_link_to_a_file_of_this_repository_names_it_and_other_links_name_nothing() {
         let issue = Open {
             number: 3,
@@ -1174,6 +1367,122 @@ mod tests {
         assert!(names_file(&issue, "crates/paja/src/hook.rs"));
         assert!(!names_file(&issue, "src/lib.rs"));
         assert!(!names_file(&issue, "lib.rs"));
+        // A link names exactly its file: not a longer or shorter path.
+        assert!(!names_file(&issue, "src/hook.rs"));
+        assert!(!names_file(&issue, "x/crates/paja/src/hook.rs"));
+        let linked = |body: &str| Open {
+            number: 3,
+            title: "Broken check".into(),
+            body: body.into(),
+            labels: Vec::new(),
+            created_at: String::new(),
+            repo: "acme/app".into(),
+        };
+        // The other kinds of file link.
+        for body in [
+            "https://github.com/acme/app/tree/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blame/v1.2/crates/paja/src/hook.rs?plain=1",
+            "https://github.com/acme/app/raw/main/crates/paja/src/hook.rs",
+            "https://raw.githubusercontent.com/Acme/App/main/crates/paja/src/hook.rs",
+            "https://www.github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "https://raw.githubusercontent.com/acme/app/refs/heads/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/refs/tags/v1/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs:12",
+            "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs:12:5",
+            "Fix https://github.com/acme/app/blob/main/crates/paja/src/hook.rs: it fails.",
+        ] {
+            assert!(
+                names_file(&linked(body), "crates/paja/src/hook.rs"),
+                "{body}"
+            );
+        }
+        // Another host, another kind of page, or a repository that only starts the same.
+        for body in [
+            "https://example.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/commits/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app-old/blob/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/crates/paja/src/hook.rs",
+            "https://github.com/acme/app",
+        ] {
+            assert!(
+                !names_file(&linked(body), "crates/paja/src/hook.rs"),
+                "{body}"
+            );
+        }
+        // A branch with a `/` is read as its first part: the rest of its name starts the path.
+        let branch = linked("https://github.com/acme/app/blob/feature/x/crates/paja/src/hook.rs");
+        assert!(!names_file(&branch, "crates/paja/src/hook.rs"));
+        assert!(!names_file(&branch, "paja/src/hook.rs"));
+        assert!(names_file(&branch, "x/crates/paja/src/hook.rs"));
+        // An empty ref, an encoded name, and another repository behind a user, a port or no
+        // scheme name nothing; this repository's link without a scheme or with a port does.
+        for body in [
+            "https://github.com/acme/app/blob//crates/paja/src/hook.rs",
+            "https://github.com/acme/app//blob/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs:12/x",
+            "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs%20old",
+            "https://u@github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "https://github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
+            "see github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "user@github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
+            "Ref:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "https:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "evil.com:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "Ref:github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
+            "https://github.com/search?q=crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/README.md#crates/paja/src/hook.rs",
+            "https://example.com/r?to=crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/x~crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/x+crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/x,crates/paja/src/hook.rs",
+            "https:/github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "Ref:/github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "/github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "http:\\github.com\\other\\repo\\blob\\main\\crates\\paja\\src\\hook.rs",
+            "x/y@github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "raw.githubusercontent.com/other/repo/main/crates/paja/src/hook.rs",
+            "www.github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "gist.github.com/other/crates/paja/src/hook.rs",
+            "api.github.com/repos/other/repo/contents/crates/paja/src/hook.rs",
+            "github.com@evil.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "evil.com//github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "github.com/other/repo/blob/main/crates/paja/src/hook.rs?next=https://example.com",
+            "github.com/other/repo/blob/main/crates/paja/src/hook.rs:https://x",
+            "raw.githubusercontent.com/other/repo/main/crates/paja/src/hook.rs#https://x",
+            "Ref:github.com/other/repo/blob/main/crates/paja/src/hook.rs,see:https://x",
+            "[see](https://github.com/other/repo/blob/main/crates/paja/src/hook.rs)",
+            "HTTPS://GITHUB.COM/other/repo/blob/main/crates/paja/src/hook.rs",
+            "raw.githubusercontent.com/acme/app/../crates/paja/src/hook.rs",
+            "https://raw.githubusercontent.com/acme/app/%2E%2e/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/../crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/./crates/paja/src/hook.rs",
+            "github.com./other/repo/blob/main/crates/paja/src/hook.rs",
+            "hook.rs://evil.com/x",
+        ] {
+            assert!(
+                !names_file(&linked(body), "crates/paja/src/hook.rs"),
+                "{body}"
+            );
+        }
+        for body in [
+            "see github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "https://github.com:443/acme/app/blob/main/crates/paja/src/hook.rs",
+            "github.com:443/acme/app/blob/main/crates/paja/src/hook.rs",
+            "raw.githubusercontent.com/acme/app/main/crates/paja/src/hook.rs",
+            "https://u@github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "Ref:github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "See https://github.com/acme/app/blob/main/crates/paja/src/hook.rs, and more.",
+            "(https://github.com/acme/app/blob/main/crates/paja/src/hook.rs#L3)",
+            "[the hook](https://github.com/acme/app/blob/main/crates/paja/src/hook.rs)",
+            "HTTPS://GITHUB.COM/acme/app/blob/main/crates/paja/src/hook.rs!",
+            "See https://github.com/acme/app/blob/main/crates/paja/src/hook.rs;",
+        ] {
+            assert!(
+                names_file(&linked(body), "crates/paja/src/hook.rs"),
+                "{body}"
+            );
+        }
         // Without a repository, no link names anything.
         let unknown = Open {
             repo: String::new(),
@@ -1193,7 +1502,12 @@ mod tests {
             format!("file:///{path}")
         };
         let shallow = tempfile::tempdir().unwrap();
+        // No system or global config, as the other test repositories use none of theirs.
+        let empty = shallow.path().join("empty.gitconfig");
+        std::fs::write(&empty, "").unwrap();
         let out = std::process::Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &empty)
             .args(["clone", "-q", "--depth", "1", &url])
             .arg(shallow.path().join("c"))
             .output()
@@ -1210,6 +1524,42 @@ mod tests {
             shown, None,
             "a boundary commit's own change can't be told apart here"
         );
+    }
+
+    #[test]
+    fn a_grafts_file_is_ignored_so_a_commit_keeps_its_real_parent() {
+        let (tmp, head) = evidence_repo();
+        let dir = tmp.path();
+        // A grafts file that says HEAD has no parent. Were it read, HEAD would be a root and,
+        // against nothing, seem to add a.txt too; `git_command` turns grafts off, so HEAD keeps
+        // its parent and changes only b.txt.
+        std::fs::write(dir.join(".git/info/grafts"), format!("{head}\n")).unwrap();
+        let old = "2020-01-01T00:00:00Z";
+        let shown = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &head, "");
+        assert_eq!(shown, None);
+        let shown = check_evidence(dir, "HEAD", &issue_naming("Fix b.txt", old), &head, "");
+        assert!(shown.is_some());
+    }
+
+    #[test]
+    fn a_replace_object_is_ignored_so_a_commit_keeps_its_real_parent() {
+        let (tmp, head) = evidence_repo();
+        let dir = tmp.path();
+        // A replacement for HEAD with no parent. Were it used, HEAD would be a root and seem
+        // to add a.txt too; `git_command` turns replace objects off.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(["replace", "--graft", &head])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let old = "2020-01-01T00:00:00Z";
+        let shown = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &head, "");
+        assert_eq!(shown, None);
+        let shown = check_evidence(dir, "HEAD", &issue_naming("Fix b.txt", old), &head, "");
+        assert!(shown.is_some());
     }
 
     #[test]
