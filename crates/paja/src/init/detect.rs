@@ -291,7 +291,8 @@ fn is_plain(c: char, extra: &str) -> bool {
 fn safe_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 200
-        && !path.starts_with(['-', '/'])
+        // A leading `~` would be the home folder in `cd <dir>`; `-` an option, `/` the root.
+        && !path.starts_with(['-', '/', '~'])
         && path.chars().all(|c| is_plain(c, "._-/+@~"))
         && !path.split('/').any(|part| part == "..")
 }
@@ -647,7 +648,7 @@ pub fn render_setup(steps: &[Step], dir: &str, scalar: &dyn Fn(&str) -> String) 
         if step.uses.is_empty() {
             text.push_str(&format!("      - run: {}\n", scalar(&step.run)));
             if dir != "." {
-                text.push_str(&format!("        working-directory: {dir}\n"));
+                text.push_str(&format!("        working-directory: {}\n", scalar(dir)));
             }
         } else {
             text.push_str(&format!("      - uses: {}\n", step.uses));
@@ -665,6 +666,12 @@ pub fn render_setup(steps: &[Step], dir: &str, scalar: &dyn Fn(&str) -> String) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_cd_would_read_as_a_home_folder_is_not_plain() {
+        assert!(!safe_path("~") && !safe_path("~user/app"));
+        assert!(safe_path("apps/~web") && safe_path("@scope/pkg"));
+    }
 
     fn kinds(
         files: &'static [&'static str],
