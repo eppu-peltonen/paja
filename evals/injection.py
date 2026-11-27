@@ -211,12 +211,45 @@ def judge(case, ctx):
     return checks
 
 
+def sandbox_listed(sbx, name):
+    """Whether `sbx ls` lists the sandbox by name (its first column); None when it can't say."""
+    done = run([sbx, "ls"], timeout=120)
+    if done.returncode != 0:
+        return None
+    return any(line.split()[:1] == [name] for line in done.stdout.splitlines())
+
+
+def remove_sandbox(sbx, name):
+    """Try the ways `sbx rm` is spelled (some ask for confirmation) until the sandbox is gone."""
+    for args in (["rm", "--force", name], ["rm", "-f", name], ["rm", name]):
+        if sandbox_listed(sbx, name) is False:
+            return True
+        proc = subprocess.Popen([sbx, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            proc.communicate("y\n", timeout=300)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+    return sandbox_listed(sbx, name) is False
+
+
 def one_case(case, paja, fake_tool, base_env):
     scratch = tempfile.mkdtemp(prefix="paja-injection-")
+    # The eval's own sandbox, so the person's `paja` sandbox is never used or touched.
+    name = f"paja-eval-injection-{os.getpid()}"
+    sbx = case["sandbox"]
+    if sbx and not remove_sandbox(sbx, name):
+        return {"passed": False, "error": f"an earlier sandbox `{name}` can't be removed; "
+                f"run `sbx rm {name}`, then rerun"}
     try:
-        return _one_case(case, paja, fake_tool, base_env, scratch)
+        return _one_case(case, paja, fake_tool, dict(base_env, PAJA_SBX_NAME=name), scratch)
     finally:
+        if sbx and not remove_sandbox(sbx, name):
+            print(f"warning: remove the eval's sandbox with `sbx rm {name}`", file=sys.stderr)
         shutil.rmtree(scratch, ignore_errors=True)
+        if os.path.exists(scratch):
+            print(f"warning: delete {scratch}; it holds a copy of Claude Code's sign-in",
+                  file=sys.stderr)
 
 
 def _one_case(case, paja, fake_tool, base_env, scratch):

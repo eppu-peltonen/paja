@@ -5,13 +5,16 @@ and only `Bash(pwd)` among its tools, still answers with structured output.
 The smoke tests drive this path with a fake `claude` that prints a canned answer, so they can't
 show that a real agent, under the deny-list hook (and, with the sandbox, inside it), returns an
 answer of the right shape. This eval runs `paja --json init --recommend` twice: with the sandbox
-(`PAJA_SBX`, the `sbx` program) and without. The verdict never rests on the model's report. It
+(`PAJA_SBX`, the `sbx` program; a sandbox of the eval's own, removed before and after, so the
+person's `paja` sandbox is never touched) and without. The verdict never rests on the model's report. It
 comes from evidence:
 
 - `paja` exits 0 and prints one JSON value;
 - it holds one to three recommendations, each with a stack, a why, tradeoffs and a skeleton of
   `built-in` or `generated` (`built-in` exactly for rust, node and python);
-- a stated preference that fits is honoured: `python` is among the recommendations;
+- a stated preference that fits is honoured: `python` is among the recommendations (a failure
+  of this alone is the model's choice, not the harness);
+- `paja` says on stderr that it is starting the sandbox (or that there is none);
 - nothing is left of the agent's scratch repository under the home's `envs/`.
 
 Needs a signed-in `claude` (and `sbx` for the sandbox case), so it runs on the owner's machine,
@@ -64,11 +67,33 @@ def run(cmd, cwd=None, env=None, timeout=STEP_TIMEOUT):
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
+def sandbox_listed(sbx, name):
+    """Whether `sbx ls` lists the sandbox by name (its first column); None when it can't say."""
+    done = run([sbx, "ls"], timeout=120)
+    if done.returncode != 0:
+        return None
+    return any(line.split()[:1] == [name] for line in done.stdout.splitlines())
+
+
+def remove_sandbox(sbx, name):
+    """Try the ways `sbx rm` is spelled (some ask for confirmation) until the sandbox is gone."""
+    for args in (["rm", "--force", name], ["rm", "-f", name], ["rm", name]):
+        if sandbox_listed(sbx, name) is False:
+            return True
+        proc = subprocess.Popen([sbx, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            proc.communicate("y\n", timeout=300)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+    return sandbox_listed(sbx, name) is False
+
+
 def evidence(passed, detail=""):
     return {"passed": bool(passed), "detail": detail}
 
 
-def judge(done, paja_home):
+def judge(done, paja_home, sandboxed):
     ev = {}
     try:
         out = json.loads(done.stdout)
@@ -90,16 +115,22 @@ def judge(done, paja_home):
         for field in ("why", "tradeoffs"):
             if not isinstance(option.get(field), str) or not option[field].strip():
                 bad.append(f"{stack}: no {field}")
-        want = "built-in" if stack in BUILT_IN else "generated"
+        # Paja decides the skeleton by the stack's lowercase name.
+        want = "built-in" if stack.strip().lower() in BUILT_IN else "generated"
         if option.get("skeleton") != want:
             bad.append(f"{stack}: skeleton {option.get('skeleton')!r}, want {want!r}")
     ev["one to three well-formed recommendations"] = evidence(
         shaped and not bad, f"recommendations: {options!r}; problems: {bad}"
     )
-    stacks = [o.get("stack") for o in options if isinstance(o, dict)] if shaped else []
+    stacks = [str(o.get("stack", "")).strip().lower() for o in options if isinstance(o, dict)] \
+        if shaped else []
     ev["the preferred python is offered"] = evidence("python" in stacks, f"stacks: {stacks}")
     envs = os.path.join(paja_home, "envs")
     left = sorted(os.listdir(envs)) if os.path.isdir(envs) else []
+    # Paja says on stderr which way the agent ran; with PAJA_SBX set it fails closed rather than
+    # running without the sandbox, and this pins that it took the sandbox path at all.
+    said = "starting the sandbox" if sandboxed else "no sandbox"
+    ev[f"paja says {said!r}"] = evidence(said in done.stderr, f"stderr: {done.stderr.strip()[-500:]}")
     ev["nothing is left of the scratch repository"] = evidence(not left, f"left in envs/: {left}")
     return ev
 
@@ -122,15 +153,28 @@ def one_case(case, paja, base_env):
         env = dict(base_env)
         env.update({"HOME": home, "USERPROFILE": home, "PAJA_HOME": paja_home})
         env.pop("PAJA_SBX", None)
+        # The eval's own sandbox, so the person's `paja` sandbox is never used or touched.
+        name = f"paja-eval-recommend-{os.getpid()}"
+        env["PAJA_SBX_NAME"] = name
         if case["sandbox"]:
             env["PAJA_SBX"] = case["sandbox"]
-        done = run(
-            [paja, "--json", "init", "--recommend", BUILDING, "--prefer", "python"], cwd, env
-        )
-        ev = judge(done, paja_home)
+            if not remove_sandbox(case["sandbox"], name):
+                return {"passed": False, "error": f"an earlier sandbox `{name}` can't be removed; "
+                        f"run `sbx rm {name}`, then rerun"}
+        try:
+            done = run(
+                [paja, "--json", "init", "--recommend", BUILDING, "--prefer", "python"], cwd, env
+            )
+        finally:
+            if case["sandbox"] and not remove_sandbox(case["sandbox"], name):
+                print(f"warning: remove the eval's sandbox with `sbx rm {name}`", file=sys.stderr)
+        ev = judge(done, paja_home, bool(case["sandbox"]))
         return {"passed": all(e["passed"] for e in ev.values()), "evidence": ev}
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+        if os.path.exists(scratch):
+            print(f"warning: delete {scratch}; it holds a copy of Claude Code's sign-in",
+                  file=sys.stderr)
 
 
 def main():
