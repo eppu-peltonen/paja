@@ -156,8 +156,9 @@ fn triage_prompt(base: &str, open: &[Open]) -> String {
          - `duplicate`: says the same as another issue listed here. Give `duplicate_of`, the \
          number of the one to keep (the more complete, or else the older).\n\
          - `already_fixed`: the default branch already fixes it. Give `commit` (a commit hash on \
-         the default branch, made after the issue was opened) or `file` (a path that exists \
-         there and that the issue names) that shows it, and say in `reason` what you saw.\n\
+         the default branch, made after the issue was opened, that changes a file the issue \
+         names) or `file` (a path that exists there and that the issue names) that shows it, \
+         and say in `reason` what you saw.\n\
          - `not_worth_doing`: valid but not worth the effort or moot. Say why in `reason`. Paja \
          never closes these; a person decides.\n\n\
          Paja closes `duplicate` and `already_fixed` issues on your word, with your `reason` as \
@@ -171,9 +172,14 @@ fn triage_prompt(base: &str, open: &[Open]) -> String {
     for issue in open {
         let body: String = issue.body.chars().take(MAX_BODY).collect();
         text.push_str(&format!(
-            "\n<issue number=\"{n}\">\nTitle: {title}\n\n{body}\n</issue>\n",
+            "\n<issue number=\"{n}\">\nTitle: {title}\nOpened: {opened}\n\n{body}\n</issue>\n",
             n = issue.number,
-            title = issue.title
+            title = issue.title,
+            opened = if issue.created_at.trim().is_empty() {
+                "unknown"
+            } else {
+                issue.created_at.trim()
+            }
         ));
     }
     text
@@ -233,8 +239,8 @@ fn decide(
                 None => {
                     done.reason = format!(
                         "kept: the agent called it already fixed, but named no commit on the \
-                         default branch made after the issue was opened, nor a file there that \
-                         the issue names ({})",
+                         default branch made after the issue was opened that changes a file the \
+                         issue names, nor such a file there ({})",
                         done.reason
                     );
                 }
@@ -264,9 +270,9 @@ fn decide(
 }
 
 /// The commit or file the agent named for `issue`, if it checks out on `base` and has to do with
-/// the issue: a commit that is an ancestor of `base` and was committed after the issue was
-/// opened, or a plain path that exists there and that the issue's title or body names (the whole
-/// path, or its file name). What it returns is what the comment shows.
+/// the issue: a commit that is an ancestor of `base`, was committed after the issue was opened
+/// and changes a file the issue names, or a plain path that exists there and that the issue's
+/// title or body names (see [`names_file`]). What it returns is what the comment shows.
 fn check_evidence(
     repo: &Path,
     base: &str,
@@ -293,9 +299,10 @@ fn check_evidence(
                 .parse::<u64>()
                 .ok()
         });
-        // An issue whose opening time Paja can't read takes no commit as evidence.
+        // An issue whose opening time Paja can't read takes no commit as evidence, and a commit
+        // counts only when it changes a file the issue names.
         if let (Some(full), Some(opened), Some(committed)) = (on_base, opened, committed) {
-            if committed >= opened {
+            if committed >= opened && touches_named_file(repo, issue, full) {
                 let subject = git(repo, &["log", "-1", "--format=%s", full]).unwrap_or_default();
                 shown.push(format!(
                     "commit {} \"{subject}\"",
@@ -304,7 +311,9 @@ fn check_evidence(
             }
         }
     }
-    let file = file.trim();
+    // One form for the check, for git and for the comment: `/` between parts, no leading `./`.
+    let file = file.trim().replace('\\', "/");
+    let file = file.trim_start_matches("./");
     if !file.is_empty()
         && !file.starts_with(['-', '/'])
         && !file.split(['/', '\\']).any(|part| part == "..")
@@ -314,6 +323,27 @@ fn check_evidence(
         shown.push(format!("file `{file}`"));
     }
     (!shown.is_empty()).then(|| shown.join(", "))
+}
+
+/// Whether `commit` changes a file that `issue` names, against its first parent (a merge's
+/// other side doesn't count), or against nothing for a root commit.
+fn touches_named_file(repo: &Path, issue: &Open, commit: &str) -> bool {
+    let parent = git(
+        repo,
+        &["rev-parse", "--verify", "-q", &format!("{commit}^1")],
+    )
+    .ok();
+    let mut args = vec!["diff-tree", "-r", "--no-commit-id", "--name-only", "-z"];
+    match parent.as_deref() {
+        Some(parent) => args.extend([parent.trim(), commit]),
+        None => args.extend(["--root", commit]),
+    }
+    git(repo, &args).is_ok_and(|names| {
+        names
+            .split('\0')
+            .filter(|n| !n.is_empty())
+            .any(|n| names_file(issue, n))
+    })
 }
 
 /// Whether `file` is a file (not a directory) on `base`.
@@ -339,11 +369,21 @@ fn names_file(issue: &Open, file: &str) -> bool {
         .split(|c: char| !(c.is_alphanumeric() || "/._-".contains(c)))
         .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
         .filter(|word| !word.is_empty());
-    let is = |word: &str, path: &str| word == path || word.ends_with(&format!("/{path}"));
+    // A path the issue gives is matched as a path: the same path, or one of the two ending in
+    // the other at a `/` (`mestari/mod.rs` names `crates/paja/src/mestari/mod.rs`). A bare file
+    // name with an extension (`triage.rs`) names any file of that name, but a path's last part
+    // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`). URLs (`//`) name nothing.
+    let suffix = |long: &str, short: &str| long.ends_with(&format!("/{short}"));
     let named_name = name.contains('.') && name.len() > 3;
     words
         .into_iter()
-        .any(|word| is(word, file) || (named_name && is(word, name)))
+        .filter(|word| !word.contains("//"))
+        .any(|word| {
+            word == file
+                || (file.contains('/') && suffix(word, file))
+                || (word.contains('/') && suffix(file, word))
+                || (named_name && !word.contains('/') && word == name)
+        })
 }
 
 /// The comment that closes an issue: the reason, the evidence, and how to undo it.
@@ -701,6 +741,135 @@ mod tests {
         ] {
             assert!(!names_file(&issue, unnamed), "{unnamed}");
         }
+        // A path the issue gives names that path, not every file with its last part's name.
+        let issue = Open {
+            number: 2,
+            title: "Split mestari/mod.rs".into(),
+            body: "See https://example.com/acme/app/blob/main/LICENSE and lib.rs.".into(),
+            labels: Vec::new(),
+            created_at: String::new(),
+        };
+        for named in [
+            "crates/paja/src/mestari/mod.rs",
+            "mestari/mod.rs",
+            "crates/paja/src/lib.rs",
+        ] {
+            assert!(names_file(&issue, named), "{named}");
+        }
+        for unnamed in ["crates/paja/src/init/mod.rs", "mod.rs", "LICENSE"] {
+            assert!(!names_file(&issue, unnamed), "{unnamed}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_shows_when_each_issue_was_opened() {
+        let mut issues = open(&[1, 2]);
+        issues[0].created_at = "2026-11-01T10:00:00Z".into();
+        let prompt = triage_prompt("abc123", &issues);
+        assert!(prompt.contains("Opened: 2026-11-01T10:00:00Z"), "{prompt}");
+        assert!(prompt.contains("Opened: unknown"), "{prompt}");
+    }
+
+    /// A repository with a base commit and one that changes `b.txt`, made after 2020.
+    fn evidence_repo() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q"]);
+        std::fs::create_dir_all(dir.join("docs/design")).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("docs/design/workflow.md"), "w\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "fix b"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        (tmp, head)
+    }
+
+    #[test]
+    fn a_merge_counts_only_for_what_it_brings_to_its_first_parent() {
+        let (tmp, _) = evidence_repo();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // A side branch adds s.txt; the main line meanwhile adds m.txt; then a merge.
+        let main = run(&["symbolic-ref", "--short", "HEAD"]);
+        run(&["checkout", "-q", "-b", "side", "HEAD~1"]);
+        std::fs::write(dir.join("s.txt"), "s\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "side"]);
+        run(&["checkout", "-q", &main]);
+        std::fs::write(dir.join("m.txt"), "m\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "main line"]);
+        run(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+        let merge = run(&["rev-parse", "HEAD"]);
+        let old = "2020-01-01T00:00:00Z";
+        let brought = check_evidence(dir, "HEAD", &issue_naming("Fix s.txt", old), &merge, "");
+        assert!(brought.is_some_and(|e| e.contains("merge side")));
+        // m.txt was already on the merge's first parent, so the merge doesn't change it.
+        let already = check_evidence(dir, "HEAD", &issue_naming("Fix m.txt", old), &merge, "");
+        assert_eq!(already, None);
+        // A root commit is compared against nothing.
+        let root = run(&["rev-list", "--max-parents=0", "HEAD"]);
+        let first = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &root, "");
+        assert!(first.is_some_and(|e| e.contains("base")));
+    }
+
+    fn issue_naming(title: &str, created_at: &str) -> Open {
+        Open {
+            number: 1,
+            title: title.into(),
+            body: String::new(),
+            labels: Vec::new(),
+            created_at: created_at.into(),
+        }
+    }
+
+    #[test]
+    fn a_commit_counts_only_when_it_changes_a_file_the_issue_names() {
+        let (tmp, head) = evidence_repo();
+        let dir = tmp.path();
+        let old = "2020-01-01T00:00:00Z";
+        let fixed = check_evidence(dir, "HEAD", &issue_naming("Fix b.txt", old), &head, "");
+        assert!(fixed.is_some_and(|e| e.contains("fix b")));
+        // The same commit, for an issue about a file it doesn't change.
+        let other = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &head, "");
+        assert_eq!(other, None);
+        // An issue whose opening time can't be read takes no commit.
+        let unread = check_evidence(dir, "HEAD", &issue_naming("Fix b.txt", "soon"), &head, "");
+        assert_eq!(unread, None);
+        let empty = check_evidence(dir, "HEAD", &issue_naming("Fix b.txt", ""), &head, "");
+        assert_eq!(empty, None);
+    }
+
+    #[test]
+    fn a_backslash_path_is_checked_and_shown_with_slashes() {
+        let (tmp, _) = evidence_repo();
+        let issue = issue_naming("Say more in docs\\design\\workflow.md", "");
+        let shown = check_evidence(tmp.path(), "HEAD", &issue, "", "docs\\design\\workflow.md");
+        assert_eq!(shown.as_deref(), Some("file `docs/design/workflow.md`"));
     }
 
     fn sorted(number: u64, verdict: &str, of: Option<u64>, file: &str) -> Sorted {
