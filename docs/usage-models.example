@@ -1,0 +1,27 @@
+# An example `.paja/models` for a smaller Claude plan. Copy it to `.paja/models` on your
+# default branch to use it; Paja reads that file from the default branch, never from a branch
+# under review. Paja's own file runs build and fix on sonnet, review on opus, and gives
+# build and fix 80 turns; see docs/usage.md for what each line costs.
+
+# Building and fixing are most of the spend, so they run on the cheaper model.
+build sonnet
+fix haiku
+# The first full review reads the whole change, so it keeps a model that catches mistakes.
+review sonnet
+re-review haiku
+review-2 haiku
+triage haiku
+plan haiku
+# A model to use when the chosen one is busy.
+fallback haiku
+
+# Fewer turns per session: a session that hits its cap stops and the next round continues.
+max-turns build 50
+max-turns fix 40
+max-turns review 20
+max-turns re-review 15
+max-turns review-2 15
+max-turns plan 10
+
+# Start no build once this share of the usage window is used (default 90).
+window 80

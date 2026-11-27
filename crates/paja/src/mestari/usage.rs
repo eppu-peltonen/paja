@@ -278,6 +278,16 @@ pub(super) fn recorded_totals(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_example_models_file_for_a_smaller_plan_parses() {
+        let text = include_str!("../../../../docs/usage-models.example");
+        let models = super::Models::parse(text).unwrap();
+        assert_eq!(models.roles["build"].model, "sonnet");
+        assert_eq!(models.roles["fix"].model, "haiku");
+        assert_eq!(models.max_turns["build"], 50);
+        assert_eq!(models.window_percent(), 80);
+    }
+
+    #[test]
     fn the_latest_reported_window_decides_whether_it_is_nearly_used() {
         use super::{window_nearly_used, Models, StepUsage};
         let none = Models::default();
