@@ -6709,6 +6709,18 @@ fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its
 /// by what the prompt says. The detection names `check` as the one check. Returns the temp dir, the
 /// bare origin, and the command's result.
 fn init_new_generated(check: &str) -> (tempfile::TempDir, std::path::PathBuf, bool, Value) {
+    init_new_generated_with(
+        check,
+        "echo 'const std = @import(\"std\");' > build.zig\necho 'zig-out/' > .gitignore",
+    )
+}
+
+/// `paja init --new zippy --stack zig` with a fake skeleton agent that runs `skeleton` (shell) in
+/// the clone, and a detection that backs `check` (none when it is empty).
+fn init_new_generated_with(
+    check: &str,
+    skeleton: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, bool, Value) {
     let tmp = tempfile::tempdir().unwrap();
     let d = slash(tmp.path());
     let gh = program(
@@ -6737,7 +6749,11 @@ fn init_new_generated(check: &str) -> (tempfile::TempDir, std::path::PathBuf, bo
         "detect.json",
         serde_json::json!({"stacks": [{
             "name": "zig", "dir": ".", "file": "build.zig",
-            "checks": [{"command": check, "file": "build.zig"}],
+            "checks": if check.is_empty() {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([{"command": check, "file": "build.zig"}])
+            },
             "commands": ["test"]
         }]}),
     );
@@ -6756,8 +6772,7 @@ fn init_new_generated(check: &str) -> (tempfile::TempDir, std::path::PathBuf, bo
              if [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
              if grep -q 'Name the bare program names' {d}/prompt.txt; then cat {d}/programs.json\n\
              elif grep -q 'Write its walking skeleton here' {d}/prompt.txt; then\n\
-               echo 'const std = @import(\"std\");' > build.zig\n\
-               echo 'zig-out/' > .gitignore\n\
+               {skeleton}\n\
                cat {d}/skeleton.json\n\
              else cat {d}/detect.json; fi\n"
         ),
@@ -6835,6 +6850,79 @@ fn init_new_pushes_a_generated_skeleton_whose_checks_pass() {
         prompts.contains("`zig`") && !prompts.contains("`bash`"),
         "{prompts}"
     );
+}
+
+/// Whether anything reached origin's `main`.
+fn pushed(origin: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(origin)
+        .args(["rev-parse", "--verify", "-q", "refs/heads/main"])
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn init_new_says_so_when_the_skeleton_agent_writes_nothing() {
+    let (_tmp, origin, ok, out) = init_new_generated_with("test -f build.zig", "true");
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("the init agent wrote no files for the zig skeleton")
+            && error.contains("paja init --new"),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
+}
+
+#[test]
+fn init_new_pushes_nothing_when_no_check_is_found_for_a_generated_skeleton() {
+    let (_tmp, origin, ok, out) = init_new_generated("");
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("no check could be found for the generated zig skeleton")
+            && error.contains("nothing was pushed"),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
+}
+
+#[test]
+fn init_new_refuses_a_skeleton_the_agent_committed() {
+    let (tmp, origin, ok, out) = init_new_generated_with(
+        "test -f build.zig",
+        "echo 'const std = @import(\"std\");' > build.zig\n\
+         git add -A && git -c user.name=t -c user.email=t@example.com commit -qm mine",
+    );
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("the init agent committed or switched branches")
+            && error.contains("paja init --new"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&tmp.path().join("work").join("zippy").display().to_string()),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
+}
+
+#[test]
+fn init_new_refuses_a_skeleton_on_another_branch() {
+    let (_tmp, origin, ok, out) = init_new_generated_with(
+        "test -f build.zig",
+        "echo 'const std = @import(\"std\");' > build.zig\ngit checkout -q -b elsewhere",
+    );
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("the init agent committed or switched branches"),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
 }
 
 #[test]
