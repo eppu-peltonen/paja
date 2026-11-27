@@ -17,8 +17,8 @@ use crate::jono::{self, Status, WorkItem};
 pub struct Live {
     /// `running` while a `paja run` holds the item's run lock, `interrupted` when the item is
     /// still active but no run holds it (the run stopped or was killed), `claimed` when the
-    /// item was claimed by hand (`paja work claim`) since its last run, which no `paja run`
-    /// resumes, else the item's status (`queued`, `landed`, `escalated`).
+    /// item was claimed by hand (`paja work claim`, which no `paja run` resumes) since its last
+    /// run and no run holds it, else the item's status (`queued`, `landed`, `escalated`).
     pub state: String,
     /// The run's Ahjo environment, while it exists.
     pub env: Option<LiveEnv>,
@@ -104,10 +104,16 @@ pub fn from_events(
     let mine: Vec<&Event> = jono::item_events(events, &item.repo, item.number).collect();
     let start = mine.iter().rposition(|e| e.kind == EV_STARTED)?;
     // A claim since that run started: by a new `paja run` that hasn't recorded `run.started`
-    // yet, or by hand. Either way the earlier run's steps aren't this one's.
+    // yet, or by hand. Either way the earlier run's steps aren't this one's. While a run holds
+    // the item only a run's claim counts: a hand claim under a live run (the item put back and
+    // claimed by hand) doesn't hide the steps of the run still working on it.
     let claim = mine[start..]
         .iter()
-        .rposition(|e| e.kind == jono::EV_STATUS && e.data["status"] == "active")
+        .rposition(|e| {
+            e.kind == jono::EV_STATUS
+                && e.data["status"] == "active"
+                && (!held || e.data["run"] == true)
+        })
         .map(|at| mine[start + at]);
     let state = match item.status {
         Status::Active if held => "running".to_string(),
@@ -296,6 +302,26 @@ mod tests {
         let live = from_events(&claimed(false), &item(Status::Active), false, |_| None).unwrap();
         assert_eq!(live.state, "claimed");
         assert!(live.steps.is_empty() && live.step.is_none());
+        // Claimed by hand while the run still holds it (put back, then claimed): the run is
+        // still at work, so the view keeps its steps rather than show it running with none.
+        let held = from_events(&claimed(false), &item(Status::Active), true, |_| None).unwrap();
+        let ran = from_events(&run(), &item(Status::Active), true, |_| None).unwrap();
+        assert_eq!(held.state, "running");
+        assert_eq!(held.steps, ran.steps);
+        assert_eq!(held.step, ran.step);
+        assert!(!held.steps.is_empty());
+        // A new `paja run` claimed it, then it was put back and claimed by hand while that run
+        // holds it: the new run's claim still hides the earlier run's steps.
+        let mut events = claimed(true);
+        events.push(event(
+            7,
+            jono::EV_STATUS,
+            json!({"repo": "acme/app", "number": 7, "status": "active"}),
+        ));
+        let live = from_events(&events, &item(Status::Active), true, |_| None).unwrap();
+        assert_eq!(live.state, "running");
+        assert_eq!((live.round, live.steps.len(), live.rounds.len()), (0, 0, 0));
+        assert!(live.step.is_none());
     }
 
     #[test]
