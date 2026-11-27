@@ -7214,6 +7214,23 @@ fn init_recommend_returns_options_best_first_and_paja_decides_the_skeleton() {
         .map(|dir| dir.count())
         .unwrap_or(0);
     assert_eq!(left, 0);
+
+    // The MCP tool returns the same JSON, twice in one server, and leaves nothing behind either.
+    let mut mcp = Mcp::start(&home, tmp.path(), &[("PAJA_CLAUDE", claude.as_path())]);
+    mcp.initialize();
+    for _ in 0..2 {
+        let (ok, via_mcp) = mcp.call(
+            "init_recommend",
+            serde_json::json!({"building": "a reading list web app", "prefer": ["rust", "axum"]}),
+        );
+        assert!(ok, "{via_mcp}");
+        assert_eq!(via_mcp, out);
+    }
+    mcp.finish();
+    let left = std::fs::read_dir(home.join("envs"))
+        .map(|dir| dir.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0);
 }
 
 #[test]
