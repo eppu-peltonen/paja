@@ -181,16 +181,24 @@ fn claude_args(
     tools: &[&str],
     schema: Option<&Value>,
 ) -> Vec<String> {
-    let mut args: Vec<String> = ["-p", "--output-format", "json", "--permission-mode"]
-        .into_iter()
-        .map(String::from)
-        // Auto mode, Anthropic's own safety checks, as an extra layer beside the hook. Never
-        // bypassPermissions (the sandbox image's default) and never a weaker mode.
-        .chain(["auto".to_string()])
-        // No settings files at all, only the deny-list hook: neither the owner's settings nor
-        // a settings file on the branch can loosen or switch it off.
-        .chain(["--setting-sources".to_string(), String::new()])
-        .collect();
+    // stream-json (which needs `--verbose`) carries the `rate_limit_event` messages the usage
+    // window is read from; [`fold_stream`] turns the stream back into the one final result.
+    let mut args: Vec<String> = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+    ]
+    .into_iter()
+    .map(String::from)
+    // Auto mode, Anthropic's own safety checks, as an extra layer beside the hook. Never
+    // bypassPermissions (the sandbox image's default) and never a weaker mode.
+    .chain(["auto".to_string()])
+    // No settings files at all, only the deny-list hook: neither the owner's settings nor
+    // a settings file on the branch can loosen or switch it off.
+    .chain(["--setting-sources".to_string(), String::new()])
+    .collect();
     if let Some(settings) = settings {
         args.extend(["--settings".to_string(), settings]);
     }
@@ -215,6 +223,38 @@ fn claude_args(
         args.extend(["--json-schema".to_string(), schema.to_string()]);
     }
     args
+}
+
+/// The single result JSON of a `claude -p --output-format stream-json` run: the last message of
+/// type `result`, with the latest `rate_limit_event`'s `rate_limit_info` added when the result
+/// has none of its own. Output that is already one JSON value (an older Claude Code, a fake in
+/// tests) is returned as it is, and so is output with no `result` message (a crash), so the
+/// callers' errors still show what Claude Code printed.
+pub(super) fn fold_stream(stdout: &[u8]) -> Vec<u8> {
+    if serde_json::from_slice::<Value>(stdout).is_ok() {
+        return stdout.to_vec();
+    }
+    let mut result: Option<Value> = None;
+    let mut window: Option<Value> = None;
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match message["type"].as_str() {
+            Some("result") => result = Some(message),
+            Some("rate_limit_event") if message["rate_limit_info"].is_object() => {
+                window = Some(message["rate_limit_info"].clone());
+            }
+            _ => {}
+        }
+    }
+    let Some(mut result) = result else {
+        return stdout.to_vec();
+    };
+    if let (Some(info), Some(map)) = (window, result.as_object_mut()) {
+        map.entry("rate_limit_info").or_insert(info);
+    }
+    serde_json::to_vec(&result).unwrap_or_else(|_| stdout.to_vec())
 }
 
 /// A host scratch directory (if any) that is removed when this is dropped.
@@ -324,7 +364,11 @@ pub(super) fn claude(
     let output = crate::platform::output_until_stopped_with_input(
         &mut cmd,
         Some(prompt.as_bytes().to_vec()),
-    );
+    )
+    .map(|mut out| {
+        out.stdout = fold_stream(&out.stdout);
+        out
+    });
     drop(scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
@@ -570,14 +614,23 @@ pub(super) fn hook_settings(
     // Test the very command Claude Code will run, with a throwaway stamp of its own, so a
     // path the shell reads differently fails here and not on every tool call.
     let trial = private.join("self-test");
-    let tested = hook_command(&exe, root, home.root(), &trial, read_only, programs)
-        .and_then(|command| self_test_hook(&command, root, read_only));
+    // The shipped command is built once; the trial differs from it in the stamp word only.
+    let command = hook_command(&exe, root, home.root(), &stamp, read_only, programs)?;
+    let tested = crate::platform::quote_hook_word(&stamp)
+        .and_then(|real| Ok((real, crate::platform::quote_hook_word(&trial)?)))
+        .and_then(|(real, fake)| {
+            let swapped =
+                command.replacen(&format!("--stamp {real}"), &format!("--stamp {fake}"), 1);
+            if swapped == command {
+                bail!("the hook command `{command}` has no stamp word to test with");
+            }
+            self_test_hook(&swapped, root, read_only)
+        });
     let _ = std::fs::remove_file(&trial);
     if let Err(err) = tested {
         let _ = std::fs::remove_dir(&private);
         return Err(err);
     }
-    let command = hook_command(&exe, root, home.root(), &stamp, read_only, programs)?;
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
     let settings = json!({
@@ -1352,6 +1405,30 @@ impl GitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_folds_into_its_result_with_the_latest_window() {
+        let stream = [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","utilization":0.5,"resetsAt":1}}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","utilization":0.9,"resetsAt":2}}"#,
+            r#"{"type":"result","is_error":false,"result":"done","num_turns":3}"#,
+        ]
+        .join("\n");
+        let folded: Value = serde_json::from_slice(&fold_stream(stream.as_bytes())).unwrap();
+        assert_eq!(folded["result"], "done");
+        assert_eq!(folded["rate_limit_info"]["utilization"], 0.9);
+        // A result's own object wins; a single JSON value and a stream with no result stay as is.
+        let own = r#"{"type":"result","rate_limit_info":{"status":"allowed"}}"#;
+        let both = format!(
+            "{}\n{own}",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#
+        );
+        let folded: Value = serde_json::from_slice(&fold_stream(both.as_bytes())).unwrap();
+        assert_eq!(folded["rate_limit_info"]["status"], "allowed");
+        assert_eq!(fold_stream(own.as_bytes()), own.as_bytes());
+        assert_eq!(fold_stream(b"a\nb"), b"a\nb");
+    }
 
     #[test]
     fn agents_always_run_in_auto_mode_and_never_bypass_permissions() {

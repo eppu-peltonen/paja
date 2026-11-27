@@ -187,9 +187,19 @@ pub struct Models {
     pub max_turns: std::collections::BTreeMap<String, u32>,
     /// `window <percent>`: the share of the usage window that counts as nearly used up.
     pub window: Option<u32>,
+    /// The roles of the lines skipped because this Paja doesn't know them, each once, in file
+    /// order, so `paja doctor` can show them where an unattended runner's stderr would not.
+    pub skipped: Vec<String>,
 }
 
 impl Models {
+    /// Note a skipped line's role, once however many lines name it.
+    fn skip(&mut self, role: &str) {
+        if !self.skipped.iter().any(|r| r == role) {
+            self.skipped.push(role.to_string());
+        }
+    }
+
     /// The used share of the usage window, in percent, from which Mestari starts no build.
     pub fn window_percent(&self) -> u32 {
         self.window.unwrap_or(90)
@@ -238,6 +248,7 @@ impl Models {
                 };
                 if !ROLES.contains(named) {
                     unknown_role(&at(), named);
+                    models.skip(named);
                     continue;
                 }
                 if limit == 0 {
@@ -275,6 +286,7 @@ impl Models {
             }
             if !ROLES.contains(&role) {
                 unknown_role(&at(), role);
+                models.skip(role);
                 continue;
             }
             let (model, effort) = match rest {
@@ -477,13 +489,34 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
              {CI_FILE} on the default branch to land on Vasara's checks and the reviewers alone"
         );
     }
+    // A new item starts with a build, which a nearly used window would cut off, so it isn't
+    // claimed at all (no status events) and the pass waits. A resumed item goes on to its round,
+    // which makes the same check for each build.
+    let nearly = window_nearly_used(
+        &home.events().read_all()?,
+        crate::events::now_ms(),
+        config.models.window_percent(),
+    );
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
         lock: _working,
         resumed,
-    }) = jono::claim_for_run_item(home, &name, opts.item)?
+    }) = jono::claim_for_run_item(home, &name, opts.item, nearly.is_none())?
     else {
+        if let Some(resets_at) = nearly {
+            let ready = jono::runnable(home, &name)?
+                .iter()
+                .any(|i| opts.item.is_none_or(|n| n == i.number));
+            if ready {
+                progress(&format!(
+                    "the usage window is nearly used up, so no new item was started; `paja run` \
+                     can run again at {}",
+                    format_utc(resets_at)
+                ));
+                return Ok(RunReport::Paused { resets_at });
+            }
+        }
         if let Some(number) = opts.item {
             bail!(
                 "work item #{number} is not queued (or another run holds it); see \
@@ -495,24 +528,6 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
-    // A new item starts with a build, which a nearly used window would cut off: put it back and
-    // wait. A resumed item goes on to its round, which makes the same check for each build.
-    if !resumed {
-        if let Some(resets_at) = window_nearly_used(
-            &home.events().read_all()?,
-            crate::events::now_ms(),
-            config.models.window_percent(),
-        ) {
-            jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
-            progress(&format!(
-                "the usage window is nearly used up, so #{} wasn't started; `paja run` can run \
-                 again at {}",
-                item.number,
-                format_utc(resets_at)
-            ));
-            return Ok(RunReport::Paused { resets_at });
-        }
-    }
     summary(
         &item,
         &config.target,
@@ -893,7 +908,7 @@ fn run_item(
                     resets_at: Some(resets_at),
                     nearly: true,
                 };
-                return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                return usage_stopped(home, repo, item, round, &limit, steps);
             }
         }
         // An earlier run's session is offered to the first build only.
@@ -923,7 +938,7 @@ fn run_item(
             Some(Err(err)) => {
                 // The window, not the change: keep the worktree and resume after the reset.
                 if let Some(limit) = usage_limit(&err) {
-                    return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                    return usage_stopped(home, repo, item, round, &limit, steps);
                 }
                 let Some(limit) = turn_limit(&err) else {
                     return Err(err);
@@ -1228,7 +1243,7 @@ fn run_item(
                                     result,
                                 ));
                             }
-                            return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                            return usage_stopped(home, repo, item, round, &limit, steps);
                         }
                         return Err(err);
                     }
@@ -1489,7 +1504,6 @@ fn limit_without_reset(events: &[crate::events::Event], repo: &str, number: u64)
 fn usage_stopped(
     home: &Home,
     repo: &Path,
-    env: &Env,
     item: &WorkItem,
     round: u32,
     limit: &UsageLimit,
@@ -1528,7 +1542,19 @@ fn usage_stopped(
                         time was told when the window resets, so it stopped instead of trying \
                         again. Wait until it resets (and check that `claude` is signed in to the \
                         right account), then answer the item to run it again.";
-        return escalated(home, repo, env, item, question, round);
+        // Unlike `escalated`, keep the worktree: the retried round's uncommitted edits are
+        // still in it, and the answer resumes from there.
+        let failed = land::escalate(home, repo, item, question, round)?;
+        progress(&land::parked_line(
+            &format!("#{} needs a decision", item.number),
+            item.number,
+            failed,
+        ));
+        return Ok(RunReport::Escalated {
+            number: item.number,
+            question: question.to_string(),
+            rounds: round,
+        });
     }
     progress(&match limit.resets_at {
         Some(ms) => format!(
@@ -2760,6 +2786,31 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_failed_result_is_a_usage_limit_with_its_reset_time() {
+        // The shape of a failed `claude -p --output-format json` result at the limit.
+        let result = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": true, "api_error_status": 429,
+            "result": "Claude AI usage limit reached|1795804200", "session_id": "s-1",
+            "total_cost_usd": 0.3,
+        });
+        let err = anyhow::Error::new(super::ClaudeFailed(
+            result["result"].as_str().unwrap().to_string(),
+            Some(result),
+        ));
+        let limit = super::usage_limit(&err).expect("a 429 is a usage limit");
+        assert_eq!(limit.resets_at, Some(1_795_804_200_000));
+        // Without a time in the text it is still a limit, with no reset time.
+        let result = serde_json::json!({"is_error": true, "api_error_status": 429,
+                                        "result": "API Error: Rate limit reached"});
+        let err = anyhow::Error::new(super::ClaudeFailed("rate limit".into(), Some(result)));
+        assert_eq!(super::usage_limit(&err).unwrap().resets_at, None);
+        // Other failures are not limits.
+        let result = serde_json::json!({"is_error": true, "api_error_status": 500});
+        let err = anyhow::Error::new(super::ClaudeFailed("boom".into(), Some(result)));
+        assert!(super::usage_limit(&err).is_none());
+    }
+
+    #[test]
     fn sandbox_and_platform_are_high_risk() {
         let text = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.paja/high-risk"),
@@ -2882,6 +2933,11 @@ mod tests {
                 .unwrap();
         assert_eq!(ahead.roles.keys().collect::<Vec<_>>(), ["build"]);
         assert_eq!(ahead.max_turns.keys().collect::<Vec<_>>(), ["fix"]);
+        assert_eq!(ahead.skipped, ["reviewer", "builder"]);
+        // A well-formed `max-turns` line for an unknown role, alone, is skipped too.
+        let alone = Models::parse("max-turns builder 3\n").unwrap();
+        assert!(alone.max_turns.is_empty(), "{alone:?}");
+        assert_eq!(alone.skipped, ["builder"]);
         // Its model and effort are still checked: a skipped line can't hide a flag.
         let err = format!("{:#}", Models::parse("newrole --x").unwrap_err());
         assert!(err.contains("not a plain model or effort name"), "{err}");

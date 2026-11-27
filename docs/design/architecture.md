@@ -259,7 +259,8 @@ the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, t
 planner). Mestari passes `--model` and, when given, `--effort`; a role
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. A line naming a role this Paja
-doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going; an
+doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going, and
+`paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr would not; an
 unknown effort or a malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the
 `fallback` it was given; `fell_back: true` marks a step the fallback model spent something in (its name, or an alias
 such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role didn't run only on its model.
@@ -273,13 +274,15 @@ finished verdict is kept. If it hits the limit again, its worktree is put back a
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
-A step also records the usage window when its result carries a `rate_limit_info` object (`window_status`,
+Agents run with `--output-format stream-json --verbose`; Mestari folds the stream back into its final `result`
+message, with the latest `rate_limit_event`'s `rate_limit_info` added when the result has none of its own. A step
+records the usage window when that object is there (`window_status`,
 `window_used_percent`, `window_resets_at`; all absent for a Claude Code that reports nothing). Before a `build` or
 `fix` session, and before a new item is claimed, Mestari reads the latest recorded state: if it is a warning (or
 rejected) status, or at least `window <percent>` of the window (a line in `.paja/models`, default 90) is used, and its
 reset time is still ahead, the step isn't started. The round is recorded as `usage_limit`, as when Claude Code stops
 at the limit, so the item stays active with its worktree and `paja run` resumes it after the reset, and stderr says
-when. A new item is put back in the queue instead. Reviews still start, so a built change isn't left unreviewed.
+when. A new item isn't claimed at all (no status event) and the pass reports `paused`; an item to resume is let through. Reviews still start, so a built change isn't left unreviewed.
 
 **Usage limit.** When any agent step (a fresh or resumed build, either reviewer) fails on the usage window
 (`api_error_status` 429), nothing needs deciding: the window only has to reset. Mestari records the step's spend from
@@ -289,9 +292,10 @@ reached" text). It keeps the environment, so the builder's uncommitted edits sur
 run reports `usage_limit` and the next `paja run` resumes the item in the round that was cut off, like after Ctrl-C.
 Before a recorded `resets_at` (the window is the account's, so any item's counts) `paja run` claims and resumes
 nothing: it reports `paused` with `resets_at` and says on stderr when it can run again, and `paja run --every` waits
-until then instead of polling the queue. When no reset time is known the next run may try again, but a second stop in
-a row without one parks the item with a question to wait until the window resets, so a broken sign-in or account can't
-loop. A 401 or 403 stays an error that parks the item and asks the person to sign in again.
+until then instead of polling the queue; `paja run --workers` likewise starts no lane and no planner until then. When
+no reset time is known the next run may try again, but a second stop in a row without one parks the item with a
+question to wait until the window resets, so a broken sign-in or account can't loop. The parked item keeps its
+environment, so the builder's uncommitted edits survive the question. A 401 or 403 stays an error that parks the item and asks the person to sign in again.
 
 Before Vasara's checks in every round, Mestari fetches the default branch and merges it into the environment's branch
 when the branch doesn't hold its tip yet, so the checks, the reviewers and CI judge the change as it would land, and a

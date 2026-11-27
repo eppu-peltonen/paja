@@ -471,6 +471,46 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             "check that the repository is intact (`git status`)",
         )),
     }
+    // The model per role: a role this Paja doesn't know is skipped on every pass, which only
+    // stderr would otherwise say.
+    let models_file = crate::mestari::MODELS_FILE;
+    match show(proof.path(), rev, models_file) {
+        Ok(None) => checks.push(ok(
+            "models",
+            format!("no {models_file} on {rev}: every role runs on the account's default model"),
+        )),
+        Ok(Some(text)) => match crate::mestari::Models::parse_on(&text, rev) {
+            Err(err) => checks.push(failed(
+                "models",
+                format!("{err:#}"),
+                format!("fix {models_file} on {rev}"),
+            )),
+            Ok(models) if !models.skipped.is_empty() => checks.push(warning(
+                "models",
+                format!(
+                    "{models_file} on {rev} names role(s) this Paja doesn't know, so their lines \
+                     are skipped and the roles run on the default model or turn cap: {}",
+                    models.skipped.join(", ")
+                ),
+                format!(
+                    "if a role is new, install the newer Paja; if it is a typo, fix it in \
+                     {models_file} on {rev}"
+                ),
+            )),
+            Ok(models) => checks.push(ok(
+                "models",
+                format!(
+                    "{} role(s) set in {models_file} on {rev}",
+                    models.roles.len()
+                ),
+            )),
+        },
+        Err(err) => checks.push(failed(
+            "models",
+            format!("reading {models_file} on {rev}: {err}"),
+            "check that the repository is intact (`git status`)",
+        )),
+    }
     // CI.
     let ci_file = crate::mestari::CI_FILE;
     let mode = show(proof.path(), rev, ci_file).map(|t| lines(&t.unwrap_or_default()));
