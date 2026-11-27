@@ -148,11 +148,11 @@ fn checkout_within(home: &Home, repo: &str, cwd: &Path, asked: usize) -> anyhow:
     // changed would act on another repository's item: it must still be `repo`.
     for path in jono::known_checkouts(home, repo)?.into_iter().take(asked) {
         // A failing `gh` is its own error, not a reason to look elsewhere.
-        if jono::repo_name(home, &path)? == repo {
+        if jono::repo_name(home, &path)?.eq_ignore_ascii_case(repo) {
             return Ok(path);
         }
     }
-    if jono::repo_name(home, cwd).is_ok_and(|name| name == repo) {
+    if jono::repo_name(home, cwd).is_ok_and(|name| name.eq_ignore_ascii_case(repo)) {
         return Ok(cwd.to_path_buf());
     }
     anyhow::bail!(
@@ -912,6 +912,17 @@ mod tests {
         );
         assert_eq!(
             checkout_within(&home, "acme/app", dir.path(), 2).unwrap(),
+            checkout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_name_differing_only_in_case_is_the_same_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        assert_eq!(
+            checkout_within(&home, "Acme/App", dir.path(), 1).unwrap(),
             checkout
         );
     }
