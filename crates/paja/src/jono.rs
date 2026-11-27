@@ -1473,10 +1473,11 @@ fn race_result(claims: &[ClaimComment], me: &str, own: Option<u64>, now: u64) ->
 }
 
 /// Write this runner's claim on issue `number` and check that it won (see `race_result`). On a
-/// loss to another runner's live claim, which comes first, this runner's comment is deleted. The claimed label stays then: it is shared, and the winner's live claim is what it
-/// now marks, so taking it off would make the item look free until the winner's next renewal.
-/// When a step fails the claim is taken back the same way (see `take_back`) and the error says
-/// the item was not taken.
+/// loss to another runner's live claim, which comes first, this runner's comment is deleted.
+/// The claimed label stays then: it is shared, and the winner's live claim is what it now
+/// marks, so taking it off would make the item look free until the winner's next renewal. When
+/// this runner's own comment is gone, or a step fails, the claim is taken back (see
+/// `take_back`); a failure's error says the item was not taken.
 fn claim_on_github(ok: &Untampered, labels: &Labels, number: u64, me: &str) -> Result<Race> {
     let claimed = labels.claimed();
     add_label(
@@ -1631,8 +1632,10 @@ fn remove_label(ok: &Untampered, number: u64, label: &str) -> Result<()> {
 }
 
 /// Renew this runner's claim on `number`: move its live claim comment's times on (a stale one is
-/// posted again, then deleted), and put the claimed label back if it was taken off. A run calls this at each round; the caller reports a failure
-/// and goes on, since the claim only matters to other runners.
+/// posted again, then deleted), and put the claimed label back if it was taken off. A claim that
+/// went stale while another runner claimed the item is not renewed: that runner holds it, and
+/// the error says so. A run calls this at each round; the caller reports a failure and goes on,
+/// since the claim only matters to other runners.
 pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
     let me = runner_id(home)?;
     let ok = crate::ahjo::untampered(home, checkout)?;
@@ -1645,6 +1648,16 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
     // A stale claim is posted again rather than edited: edited, it would keep its old place
     // in comment order and win the race against a claim posted while it was stale.
     let stale = mine.as_ref().filter(|c| c.is_stale(now)).and_then(|c| c.id);
+    let live_mine = mine.as_ref().is_some_and(|c| !c.is_stale(now));
+    let claims = view.claims();
+    if let Some(other) = race_winner(&claims, now).filter(|w| w.runner != me && !live_mine) {
+        bail!(
+            "#{number}'s claim lapsed and runner {} claimed it on GitHub since, so it holds the \
+             item now; this run goes on, and its work may duplicate that runner's. Stop one of \
+             the two runs",
+            other.runner
+        );
+    }
     match mine.filter(|c| !c.is_stale(now)).and_then(|c| c.id) {
         Some(id) => {
             let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
