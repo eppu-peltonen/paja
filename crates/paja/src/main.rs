@@ -681,8 +681,13 @@ fn run(cli: &Cli) -> Result<()> {
                 repo,
             } => {
                 let status = jono::parse_status(status)?;
-                let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+                let checkout = std::path::absolute(repo)?;
+                let name = jono::repo_name(&home, &checkout)?;
                 let item = jono::set_status(&home, &name, *number, status, note.as_deref())?;
+                if status == jono::Status::Queued {
+                    // Queued means any runner may take it: free its claim on GitHub too.
+                    jono::release_claim(&home, &checkout, *number);
+                }
                 emit(cli, serde_json::to_value(&item)?, || describe_item(&item));
             }
             WorkCommand::Answer { number, text, repo } => {
@@ -942,6 +947,12 @@ fn describe_item(item: &jono::WorkItem) -> String {
     );
     if let Some(note) = &item.note {
         line.push_str(&format!("\n  note: {note}"));
+    }
+    if let (Some(claim), true) = (&item.claim, item.status != jono::Status::Landed) {
+        line.push_str(&format!("\n  claimed by runner {}", claim.runner));
+        if let Some(until) = &claim.stale_after {
+            line.push_str(&format!(", stale after {until}"));
+        }
     }
     if item.status == jono::Status::Escalated {
         line.push_str(&format!(

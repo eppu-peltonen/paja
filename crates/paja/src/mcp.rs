@@ -335,14 +335,14 @@ impl PajaMcp {
         let home = self.home.clone();
         call(move || {
             let status = jono::parse_status(&args.status)?;
-            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
-            Ok(serde_json::to_value(jono::set_status(
-                &home,
-                &name,
-                args.number,
-                status,
-                args.note.as_deref(),
-            )?)?)
+            let checkout = checkout(args.repo)?;
+            let name = jono::repo_name(&home, &checkout)?;
+            let item = jono::set_status(&home, &name, args.number, status, args.note.as_deref())?;
+            if status == jono::Status::Queued {
+                // Queued means any runner may take it: free its claim on GitHub too.
+                jono::release_claim(&home, &checkout, args.number);
+            }
+            Ok(serde_json::to_value(item)?)
         })
         .await
     }

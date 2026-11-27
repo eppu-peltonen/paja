@@ -85,6 +85,23 @@ the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.sta
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
 oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
 
+Several runners can share one queue, because a claim is written on GitHub where every runner reads it. The first time
+a home claims anything it records a random runner id (`runner.created`); the id names no host or user, since the
+repository may be public. `paja run` claims an item by adding the label `<work label>-claimed` (`paja-claimed` for
+`paja`; created when the repository lacks it) and posting one comment, `Claimed by runner <id> at <UTC time>; stale
+after <time>`, six hours on. It then reads the issue again: if another runner's live claim comment is ahead of its
+own, that runner won, so the run takes its label and comment back off and tries the next item. When `gh` can't write
+the claim the item is not taken, and the run's error says why. Every sync reads the claimed label with the other
+labels, and for each issue that carries it the latest claim comment, and records what changed as `work.claim`
+(`runner`, `stale_after`; `runner` is null once the label is gone). An item whose label names another runner is
+skipped by `paja run` and by `paja run --workers` until that claim is stale; `paja work list|show` show the holder as
+`claim`, and `paja pool status` gives "claimed by runner <id> on GitHub" as why the item waits. A label with no claim
+comment (put there by hand) holds the item until a person removes it. A run renews its claim at each round by
+editing its claim comment's times (and putting the label back if it was taken off). `paja work set N queued`, and a
+run the person declines at the confirmation, take the label off; an escalated item keeps it, and its claim can't go
+stale while it carries the needs-answer label. `paja work answer` renews the claim, so the runner that escalated the
+item runs it next.
+
 When no work item is ready, Jono takes follow-ups. A sync also imports the open issues with the follow-up label as items
 whose `priority` is `follow-up` (recorded in `work.imported` and `work.changed`; every other item has priority `work`).
 An issue with both labels is a work item. `paja work list`, `work next`, `work claim`, `paja run` and the MCP tools order

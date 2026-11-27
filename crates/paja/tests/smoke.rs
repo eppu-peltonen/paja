@@ -1801,8 +1801,9 @@ impl Factory {
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  echo https://example.com/pull/1 ;;\n\
-                 \"issue comment\") if [ -f {d}/gh-down ]; then exit 1; fi ;;\n\
-                 \"issue edit\") if [ -f {d}/no-label ]; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
+                 \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
+                 \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
+                 \"issue view\") if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -4057,6 +4058,170 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     );
 }
 
+/// A claim comment as `gh issue view --json comments` prints it.
+fn claim_comment(runner: &str, stale_after: &str) -> Value {
+    serde_json::json!({
+        "body": format!("Claimed by runner {runner} at 2020-01-01T00:00:00Z; stale after {stale_after}"),
+        "url": "https://example.com/acme/app/issues/5#issuecomment-77",
+    })
+}
+
+impl Factory {
+    /// Issue 5 as another runner left it on GitHub: the claimed label (when `labelled`) and a
+    /// claim comment that goes stale at `stale_after`.
+    fn claimed_by_other(&self, labelled: bool, stale_after: &str) {
+        let labels = serde_json::json!([{"name": "factory-claimed"}]);
+        let view = serde_json::json!({
+            "labels": if labelled { labels.clone() } else { serde_json::json!([]) },
+            "comments": [claim_comment("abc123", stale_after)],
+        });
+        std::fs::write(self.tmp.path().join("view-5.json"), view.to_string()).unwrap();
+        if labelled {
+            let issues = serde_json::json!([{
+                "number": 5, "title": "Add a feature file", "body": "Please.",
+                "url": "https://example.com/5", "labels": labels,
+            }]);
+            std::fs::write(self.tmp.path().join("issues.json"), issues.to_string()).unwrap();
+        }
+    }
+
+    fn with_gh(&self, args: &[&str]) -> (bool, Value) {
+        paja_with(
+            &self.home,
+            &self.repo,
+            args,
+            &[("PAJA_GH", self.gh.as_path())],
+        )
+    }
+}
+
+#[test]
+fn an_item_another_runner_claimed_is_skipped_and_says_who_holds_it() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.claimed_by_other(true, "2999-01-01T00:00:00Z");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "idle", "{report}");
+    let log = f.gh_log();
+    assert!(
+        !log.contains("issue comment") && !log.contains("pr create"),
+        "{log}"
+    );
+    assert!(
+        !f.tmp.path().join("claude-args.log").exists(),
+        "no agent ran"
+    );
+    let (_, item) = f.with_gh(&["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["claim"]["runner"], "abc123", "{item}");
+    let (_, status) = f.with_gh(&["pool", "status"]);
+    let why = status["waiting"][0]["why"].as_str().unwrap();
+    assert!(why.contains("claimed by runner abc123"), "{status}");
+}
+
+#[test]
+fn a_stale_claim_is_taken_and_the_run_claims_the_item_on_github() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.claimed_by_other(true, "2020-01-02T00:00:00Z");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(
+        log.contains("issue edit 5 --add-label factory-claimed"),
+        "{log}"
+    );
+    let comment = log
+        .lines()
+        .find(|l| l.starts_with("issue comment 5 --body Claimed by runner "))
+        .unwrap_or_else(|| panic!("no claim comment in {log}"));
+    // A random id, never a host or user name, and the times a reader can compare.
+    let id = comment
+        .trim_start_matches("issue comment 5 --body Claimed by runner ")
+        .split(' ')
+        .next()
+        .unwrap();
+    assert!(
+        id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit()),
+        "{comment}"
+    );
+    assert!(comment.contains("; stale after 20"), "{comment}");
+    // The id is recorded once, in the event log.
+    let runners = events_of(&f, "runner.created");
+    assert_eq!(runners.len(), 1, "{runners:?}");
+    assert_eq!(runners[0]["data"]["id"], id);
+}
+
+#[test]
+fn two_claims_racing_resolve_to_the_earlier_one() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    // Nothing is claimed when the run looks, but by the time it re-reads the issue another
+    // runner's live claim comment is there, ahead of its own.
+    f.claimed_by_other(false, "2999-01-01T00:00:00Z");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "idle", "{report}");
+    let log = f.gh_log();
+    assert!(
+        log.contains("issue edit 5 --add-label factory-claimed"),
+        "{log}"
+    );
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "{log}"
+    );
+    assert!(!log.contains("pr create"), "{log}");
+    assert!(
+        !f.tmp.path().join("claude-args.log").exists(),
+        "no agent ran"
+    );
+    let (_, item) = f.with_gh(&["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["claim"]["runner"], "abc123", "{item}");
+}
+
+#[test]
+fn an_item_is_not_taken_when_its_claim_cannot_be_written() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("claim-down"), "").unwrap();
+    let (ok, err) = f.run();
+    assert!(!ok, "{err}");
+    let error = err["error"].as_str().unwrap();
+    assert!(error.contains("claiming #5 on GitHub failed"), "{error}");
+    assert!(error.contains("HTTP 502"), "{error}");
+    let (_, item) = f.with_gh(&["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(
+        !f.tmp.path().join("claude-args.log").exists(),
+        "no agent ran"
+    );
+    assert!(
+        f.gh_log()
+            .contains("issue edit 5 --remove-label factory-claimed"),
+        "the label is taken back off: {}",
+        f.gh_log()
+    );
+}
+
+#[test]
+fn work_set_queued_frees_the_claimed_label() {
+    let f = Factory::new("true\n", "land");
+    let (ok, synced) = f.with_gh(&["work", "sync"]);
+    assert!(ok, "{synced}");
+    f.claimed_by_other(true, "2999-01-01T00:00:00Z");
+    let (ok, item) = f.with_gh(&["work", "set", "5", "queued"]);
+    assert!(ok, "{item}");
+    assert!(
+        f.gh_log()
+            .contains("issue edit 5 --remove-label factory-claimed"),
+        "{}",
+        f.gh_log()
+    );
+    // The label comes off, and the next sync (which finds none) clears the claim in the log.
+    let (_, item) = f.with_gh(&["work", "show", "5"]);
+    assert!(item.get("claim").is_none(), "{item}");
+}
+
 #[test]
 fn a_second_review_judges_only_the_fix() {
     // Round one asks for changes; round two's reviewer sees the earlier blockers and the fix's
@@ -4447,8 +4612,16 @@ fn checks_that_change_git_configuration_stop_the_run() {
     // even to remove the environment.
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "escalated");
-    // Not even gh, which runs git to find the repository.
-    assert!(!f.gh_log().contains("issue comment"), "{}", f.gh_log());
+    // Not even gh, which runs git to find the repository. The only comment is the claim the run
+    // made before it found the tampering.
+    assert!(
+        f.gh_log()
+            .lines()
+            .filter(|l| l.starts_with("issue comment"))
+            .all(|l| l.contains("--body Claimed by runner")),
+        "{}",
+        f.gh_log()
+    );
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
     // Later runs run no git there until a person says the repository was checked.
