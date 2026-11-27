@@ -40,7 +40,8 @@ Follow-up issues go stale: later changes fix them, repeat them or make them moot
 cheapest model; a repository with no line runs it on the account's default) reads the open issues with the follow-up
 label, up to 60, and sorts each into one of the verdicts below. Each issue gets a turn: a pass reads first the issues no
 pass has read (oldest first), then those whose last read (in `triage.ran`) is longest ago, so a list longer than 60 is
-read in full over a few passes. The verdicts:
+read in full over a few passes. The open follow-ups past the 60 are listed too, by number and title only, so an issue of
+the pass can be called a duplicate of one a later pass reads. The verdicts:
 
 - `keep`: still valid. Also what anything Paja can't back up becomes.
 - `duplicate`: the same as another open follow-up issue, which it names.

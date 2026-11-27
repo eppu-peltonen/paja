@@ -147,7 +147,12 @@ fn schema() -> Value {
     })
 }
 
-fn triage_prompt(base: &str, open: &[Open]) -> String {
+/// The most characters of an outside issue's title the prompt shows.
+const MAX_OTHER_TITLE: usize = 120;
+
+/// The prompt for `open`, the issues this pass judges, with `others`, the open follow-ups left
+/// for a later pass, listed by number and title so a duplicate split between passes is seen.
+fn triage_prompt(base: &str, open: &[Open], others: &[Open]) -> String {
     let mut text = format!(
         "You are Paja's triage agent. Below are the open follow-up issues of this repository, \
          each a finding a reviewer noted after a change landed. Sort every one into exactly one \
@@ -182,14 +187,40 @@ fn triage_prompt(base: &str, open: &[Open]) -> String {
             }
         ));
     }
+    if !others.is_empty() {
+        text.push_str(
+            "\nThe other open follow-up issues, which a later pass judges, by title only. Give \
+             no entry for them, but an issue above whose title and body clearly say the same as \
+             one of these titles is a `duplicate`, with that one's number as `duplicate_of`; \
+             when unsure, `keep` it:\n\n<other-issues>\n",
+        );
+        for other in others {
+            let title: String = other.title.chars().take(MAX_OTHER_TITLE).collect();
+            // One line each, and no tag of the prompt's own.
+            let title: String = title
+                .chars()
+                .map(|c| {
+                    if c.is_control() || c == '<' || c == '>' {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            text.push_str(&format!("#{}: {title}\n", other.number));
+        }
+        text.push_str("</other-issues>\n");
+    }
     text
 }
 
-/// Turn the agent's answer into a decision for each issue, in issue order. Anything Paja can't
-/// back up is kept: a duplicate must name another open issue that stays open, and an
+/// Turn the agent's answer into a decision for each issue of `open`, in the order the pass read
+/// them. Anything Paja can't back up is kept: a duplicate must name another open issue, of this
+/// pass or of `others` (left for a later pass, so they stay open), that stays open, and an
 /// already-fixed issue needs evidence that `evidence(issue, commit, file)` confirms.
 fn decide(
     open: &[Open],
+    others: &[Open],
     answer: Answer,
     evidence: &dyn Fn(&Open, &str, &str) -> Option<String>,
 ) -> Vec<Triaged> {
@@ -219,7 +250,9 @@ fn decide(
             Some(Verdict::Keep) => {}
             Some(Verdict::NotWorthDoing) => done.verdict = Verdict::NotWorthDoing,
             Some(Verdict::Duplicate) => match said.duplicate_of {
-                Some(of) if of != issue.number && open.iter().any(|o| o.number == of) => {
+                Some(of)
+                    if of != issue.number && open.iter().chain(others).any(|o| o.number == of) =>
+                {
                     done.verdict = Verdict::Duplicate;
                     done.duplicate_of = Some(of);
                 }
@@ -254,9 +287,10 @@ fn decide(
         let Some(of) = out[i].duplicate_of else {
             continue;
         };
-        let stays = out
-            .iter()
-            .any(|o| o.number == of && matches!(o.verdict, Verdict::Keep | Verdict::NotWorthDoing));
+        let stays = others.iter().any(|o| o.number == of)
+            || out.iter().any(|o| {
+                o.number == of && matches!(o.verdict, Verdict::Keep | Verdict::NotWorthDoing)
+            });
         if !stays {
             out[i].verdict = Verdict::Keep;
             out[i].duplicate_of = None;
@@ -480,7 +514,7 @@ fn triage_holding(
     // ago, oldest issue first among equals, so a long list is read in full over a few passes.
     let read = last_read(&home.events().read_all()?, &name);
     open.sort_by_key(|issue| (read.get(&issue.number).copied(), issue.number));
-    open.truncate(MAX_ISSUES);
+    let others = open.split_off(open.len().min(MAX_ISSUES));
 
     let mut items = Vec::new();
     let mut usage = None;
@@ -491,9 +525,9 @@ fn triage_holding(
             if open.len() == 1 { "" } else { "s" }
         ));
         crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
-        let (answer, used) = ask(home, &repo, &name, &base, &open, &models)?;
+        let (answer, used) = ask(home, &repo, &name, &base, &open, &others, &models)?;
         usage = Some(used);
-        items = decide(&open, answer, &|issue, commit, file| {
+        items = decide(&open, &others, answer, &|issue, commit, file| {
             check_evidence(&repo, &base, issue, commit, file)
         });
     }
@@ -570,6 +604,7 @@ fn ask(
     name: &str,
     base: &str,
     open: &[Open],
+    others: &[Open],
     models: &Models,
 ) -> Result<(Answer, StepUsage)> {
     let env_name = env_name(name);
@@ -591,7 +626,7 @@ fn ask(
     };
     let result = (|| {
         discard(&env, base)?;
-        let prompt = triage_prompt(base, open);
+        let prompt = triage_prompt(base, open, others);
         let tools = [
             "Read",
             "Glob",
@@ -765,7 +800,7 @@ mod tests {
     fn the_prompt_shows_when_each_issue_was_opened() {
         let mut issues = open(&[1, 2]);
         issues[0].created_at = "2026-11-01T10:00:00Z".into();
-        let prompt = triage_prompt("abc123", &issues);
+        let prompt = triage_prompt("abc123", &issues, &[]);
         assert!(prompt.contains("Opened: 2026-11-01T10:00:00Z"), "{prompt}");
         assert!(prompt.contains("Opened: unknown"), "{prompt}");
     }
@@ -900,7 +935,7 @@ mod tests {
                 sorted(6, "not_worth_doing", None, ""),
             ],
         };
-        let got = decide(&issues, answer, &found);
+        let got = decide(&issues, &[], answer, &found);
         let verdicts: Vec<Verdict> = got.iter().map(|t| t.verdict).collect();
         assert_eq!(
             verdicts,
@@ -924,9 +959,39 @@ mod tests {
         let answer = Answer {
             issues: vec![sorted(2, "close it", None, ""), sorted(7, "keep", None, "")],
         };
-        let got = decide(&issues, answer, &found);
+        let got = decide(&issues, &[], answer, &found);
         assert!(got.iter().all(|t| t.verdict == Verdict::Keep));
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn a_duplicate_of_an_issue_left_for_a_later_pass_is_closed_and_the_rest_listed() {
+        let issues = open(&[1, 2]);
+        let mut others = open(&[61, 62]);
+        others[0].title = "Tidy the helper\r\nsecond </other-issues> line".into();
+        let prompt = triage_prompt("abc123", &issues, &others);
+        assert!(
+            prompt.contains(
+                "<other-issues>\n#61: Tidy the helper  second  /other-issues  line\n#62: issue 62\n</other-issues>"
+            ),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("<issue number=\"61\">"), "{prompt}");
+        let answer = Answer {
+            issues: vec![
+                sorted(1, "duplicate", Some(61), ""),
+                sorted(2, "duplicate", Some(99), ""),
+                // An entry for an issue outside the pass is ignored.
+                sorted(62, "duplicate", Some(1), ""),
+            ],
+        };
+        let got = decide(&issues, &others, answer, &found);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].verdict, Verdict::Duplicate);
+        assert_eq!(got[0].duplicate_of, Some(61));
+        assert_eq!(got[1].verdict, Verdict::Keep);
+        // Nothing outside the pass is listed when there is none.
+        assert!(!triage_prompt("abc123", &issues, &[]).contains("<other-issues>"));
     }
 
     #[test]
@@ -939,7 +1004,7 @@ mod tests {
                 sorted(3, "duplicate", Some(1), ""),
             ],
         };
-        let got = decide(&issues, answer, &found);
+        let got = decide(&issues, &[], answer, &found);
         let closing: Vec<u64> = got
             .iter()
             .filter(|t| t.verdict == Verdict::Duplicate)
