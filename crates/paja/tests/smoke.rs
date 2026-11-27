@@ -7363,6 +7363,132 @@ fn a_window_in_a_real_stream_reaches_the_recorded_step() {
 }
 
 #[test]
+fn a_nearly_used_seven_day_window_holds_back_the_next_build_until_it_resets() {
+    // The shape a current Claude Code prints: no top-level utilization, each window's share
+    // under `unifiedWindows`. The five-hour limit binds and is allowed, but the seven-day window
+    // is nearly used, so the next build waits for the seven-day reset.
+    let f = Factory::new("true\n", "changes");
+    let (five, seven) = (epoch_secs_in(3600), epoch_secs_in(5 * 24 * 3600));
+    let stream = [
+        json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
+        json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed", "resetsAt": five, "rateLimitType": "five_hour",
+            "isUsingOverage": false, "unifiedWindows": {
+                "five_hour": {"utilization": 0.2, "resetsAt": five, "status": "allowed"},
+                "seven_day": {"utilization": 0.95, "resetsAt": seven, "status": "allowed"}}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "s-1", "total_cost_usd": 0.25}),
+    ]
+    .iter()
+    .map(|m| format!("{m}\n"))
+    .collect::<String>();
+    std::fs::write(f.tmp.path().join("stream.jsonl"), stream).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    assert_eq!(report["resets_at"], seven * 1000, "{report}");
+    let rounds = round_events(&f);
+    let build = &rounds[0]["data"]["steps"][0];
+    assert_eq!(build["window_status"], "allowed", "{build}");
+    assert_eq!(build["window_resets_at"], seven * 1000, "{build}");
+    let used = build["window_used_percent"].as_f64().unwrap_or_default();
+    assert!((used - 95.0).abs() < 1e-9, "{build}");
+    // The next pass starts nothing until then.
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "paused", "{again}\n{stderr}");
+    assert_eq!(again["resets_at"], seven * 1000, "{again}");
+}
+
+#[test]
+fn doctor_warns_while_no_step_reports_a_usage_window() {
+    let f = Factory::new("true\n", "land");
+    // Doctor's own `claude`: the factory's fake would take `--version` for a build.
+    let auth = f.tmp.path().join("auth.json");
+    let signed_in = |method: &str| {
+        let status = format!(r#"{{"loggedIn": true, "authMethod": "{method}"}}"#);
+        std::fs::write(&auth, status).unwrap();
+    };
+    signed_in("oauth_token");
+    let doctor_claude = program(
+        f.tmp.path(),
+        "doctor-claude",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\"auth status\") cat '{}' ;;\n*) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+            auth.display()
+        ),
+    );
+    let window = |f: &Factory| {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &doctor_claude)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "usage window");
+        check.cloned().unwrap_or_else(|| panic!("{report}"))
+    };
+    // Nothing has run yet: nothing to judge.
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    // The fake's results carry no window, as a Claude Code printing another shape would.
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let check = window(&f);
+    assert_eq!(check["status"], "warning", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reported no usage window"),
+        "{check}"
+    );
+    assert!(
+        check["fix"].as_str().unwrap().contains("rate_limit_event"),
+        "{check}"
+    );
+    // Signed in with an API key there is no window, so nothing to warn of.
+    signed_in("api_key");
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains("API key"),
+        "{check}"
+    );
+    signed_in("oauth_token");
+    // A later step that reports one settles it.
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("reset-at"),
+        epoch_secs_in(3600).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 6, "title": "Another", "body": "Please.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+    paja(&f.home, &f.repo, &["work", "sync"]);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("had allowed_warning, 93% used"),
+        "{check}"
+    );
+}
+
+#[test]
 fn a_nearly_used_window_claims_no_new_item() {
     let f = Factory::new("true\n", "land");
     let resets = epoch_secs_in(3600);
