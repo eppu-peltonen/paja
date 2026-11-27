@@ -5033,13 +5033,57 @@ fn a_duplicate_note_that_fails_is_reported_and_tried_again_next_pass() {
         serde_json::json!([{"number": 12, "on": 11}]),
         "{report}"
     );
-    let ran = events_of(&f, "triage.ran");
+    let notes = events_of(&f, "triage.notes");
     assert_eq!(
-        ran.last().unwrap()["data"]["noted"],
+        notes.last().unwrap()["data"]["noted"],
         serde_json::json!([{"number": 12, "on": 11}]),
-        "{ran:?}"
+        "{notes:?}"
     );
     // A pass after that has nothing left to retry.
+    let (_, report) = triage(&f, &dir);
+    assert!(report.get("retried_notes").is_none(), "{report}");
+}
+
+#[test]
+fn a_duplicate_note_is_retried_before_the_agent_and_given_up_after_three_passes() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let comments = || {
+        std::fs::read_to_string(dir.join("gh.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count()
+    };
+    assert_eq!(comments(), 1);
+    // A pass whose agent gives no answer still tries the note first (and fails again).
+    std::fs::write(dir.join("followups.json"), r#"[{"number": 13, "title": "Add", "body": "x", "createdAt": "2020-01-01T00:00:00Z", "labels": []}]"#).unwrap();
+    std::fs::write(
+        dir.join("answer.json"),
+        r#"{"is_error": false, "num_turns": 1}"#,
+    )
+    .unwrap();
+    let (ok, err) = triage(&f, &dir);
+    assert!(!ok, "{err}");
+    assert_eq!(comments(), 2, "the retry didn't run before the agent");
+    // That pass recorded its retry though it failed after it, so the next is the third and last.
+    let notes = events_of(&f, "triage.notes");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (_, report) = triage(&f, &dir);
+    let error = report["retried_notes"][0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("gave up after 3 tries") && error.contains("by hand"),
+        "{error}"
+    );
     let (_, report) = triage(&f, &dir);
     assert!(report.get("retried_notes").is_none(), "{report}");
 }

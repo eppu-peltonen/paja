@@ -51,7 +51,9 @@ Duplicates and already-fixed issues are closed with a comment that gives the rea
 original also gets a comment naming the closed issue, so if the original is later closed without being done, the
 duplicate's finding can be found and reopened. If that note fails, the item stays closed with the note's failure as its
 `error`, the pass records it in `triage.ran` as `note_failed`, and the next pass tries it again (`retried_notes` in the
-report; a note posted on a retry is recorded as `noted`). "Not worth doing"
+report). Retries run before the agent and are recorded at once as `triage.notes` (`noted`, `note_failed`), so a pass
+whose agent fails still makes them and never posts them twice. After three passes fail the same note, Paja gives up on it, and the last failure's error says to add
+the comment by hand. "Not worth doing"
 is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
 is left out.
 
@@ -67,7 +69,8 @@ a longer or shorter one ending in it at a `/`), and a bare file name with an ext
 paths use `/` whichever way the agent wrote them. Otherwise the issue is kept. Each issue reaches the agent with when
 it was opened. Issue text reaches the agent as data to judge.
 
-`--json` prints `{repo, base, items, closed, not_worth_doing}`; each item has its `verdict`, `reason`, `duplicate_of` or
+`--json` prints `{repo, base, items, closed, not_worth_doing}`, and `retried_notes` when a pass tried earlier notes
+again; each item has its `verdict`, `reason`, `duplicate_of` or
 `evidence` when it has one, and `closed` (or the `error` that stopped a close). Each pass is recorded as `triage.ran`
 with what was closed, kept and left for the person.
 

@@ -494,7 +494,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Triage the open follow-up issues: one cheap agent reading the default branch sorts each into keep, duplicate of #N, already fixed (with the commit or file that shows it) or not worth doing. Duplicates and already-fixed issues are closed with a comment giving the reason and the evidence; not-worth-doing ones are only listed. Returns {repo, base, items: [{number, title, verdict, duplicate_of, evidence, reason, closed, error}], closed, not_worth_doing}."
+        description = "Triage the open follow-up issues: one cheap agent reading the default branch sorts each into keep, duplicate of #N, already fixed (with the commit or file that shows it) or not worth doing. Duplicates and already-fixed issues are closed with a comment giving the reason and the evidence; not-worth-doing ones are only listed. A duplicate's original gets a comment naming it; a note that failed is tried again by later passes. Returns {repo, base, items: [{number, title, verdict, duplicate_of, evidence, reason, closed, error}], closed, not_worth_doing, retried_notes: [{number, on, error}] (left out when empty)}."
     )]
     async fn triage(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
         let home = self.home.clone();
