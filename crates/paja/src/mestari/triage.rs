@@ -543,15 +543,16 @@ fn names_file(issue: &Open, file: &str) -> bool {
         .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
         .filter(|word| !word.is_empty())
         .collect();
-    // A link (`scheme://...`, or a GitHub host written without one) names exactly the file it
-    // links to in this repository, and nothing else; a `:line` or `:line:column` after it, or a
-    // trailing `:`, is left out.
+    // A link (a `scheme://` word, or a GitHub host written without a scheme, also after a `:`
+    // or `@` in the word) names exactly the file it links to in this repository, and nothing
+    // else; a `:line` or `:line:column` after it, or a trailing `:`, is left out.
     let link = |word: &str| -> Option<String> {
-        let link = if let Some(at) = word.find("//") {
+        let whole = if let Some(at) = word.find("//") {
             word[at..].to_string()
         } else {
-            let host = word.split('/').next()?.to_ascii_lowercase();
-            let host = host.rsplit('@').next()?.split(':').next()?;
+            let host = word.split('/').next().unwrap_or(word).to_ascii_lowercase();
+            let host = host.rsplit('@').next().unwrap_or(&host);
+            let host = host.split(':').next().unwrap_or(host);
             if !matches!(
                 host,
                 "github.com" | "www.github.com" | "raw.githubusercontent.com"
@@ -560,20 +561,29 @@ fn names_file(issue: &Open, file: &str) -> bool {
             }
             format!("//{word}")
         };
-        let mut link = link.as_str();
-        while let Some((before, after)) = link.rsplit_once(':') {
+        let mut to = whole.as_str();
+        while let Some((before, after)) = to.rsplit_once(':') {
             if !after.chars().all(|c| c.is_ascii_digit()) {
                 break;
             }
-            link = before;
+            to = before;
         }
-        Some(link.to_string())
+        Some(to.to_string())
     };
+    // The plain part of each word: all of it, or what comes before the link in it
+    // (`Ref:github.com/...`), so no piece of a link is read as a path.
     let mut plain = Vec::new();
     let mut linked = false;
     for word in words {
-        match link(word) {
-            Some(to) => linked |= link_names(&to, &issue.repo, file),
+        let starts = std::iter::once(0).chain(word.match_indices([':', '@']).map(|(at, _)| at + 1));
+        match starts
+            .into_iter()
+            .find_map(|at| link(&word[at..]).map(|to| (at, to)))
+        {
+            Some((at, to)) => {
+                linked |= link_names(&to, &issue.repo, file);
+                plain.push(&word[..at]);
+            }
             None => plain.push(word),
         }
     }
@@ -591,7 +601,7 @@ fn names_file(issue: &Open, file: &str) -> bool {
     plain
         .into_iter()
         .flat_map(|word| word.split([':', '@']))
-        .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
+        .map(|word| word.trim_end_matches(['.', '%']).trim_start_matches("./"))
         .filter(|word| !word.is_empty())
         .any(|word| {
             word == file
@@ -1246,6 +1256,8 @@ mod tests {
             "In C:\\Projects\\paja\\crates\\paja\\src\\hook.rs it fails.",
             "Read @crates/paja/src/hook.rs first.",
             "See hook.rs: the check.",
+            "Read @./crates/paja/src/hook.rs first.",
+            "Up 50% in crates/paja/src/hook.rs%",
         ] {
             let issue = Open {
                 number: 1,
@@ -1258,6 +1270,16 @@ mod tests {
             assert!(names_file(&issue, "crates/paja/src/hook.rs"), "{body}");
             assert!(!names_file(&issue, "crates/paja/src/mcp.rs"), "{body}");
         }
+        // An encoded name is another file.
+        let issue = Open {
+            number: 2,
+            title: "Fix the hook".into(),
+            body: "See crates/paja/src/hook.rs%20old".into(),
+            labels: Vec::new(),
+            created_at: String::new(),
+            repo: "acme/app".into(),
+        };
+        assert!(!names_file(&issue, "crates/paja/src/hook.rs"));
     }
 
     #[test]
@@ -1332,6 +1354,12 @@ mod tests {
             "https://u@github.com/other/repo/blob/main/crates/paja/src/hook.rs",
             "https://github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
             "see github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "user@github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
+            "Ref:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "https:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "evil.com:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "Ref:github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
         ] {
             assert!(
                 !names_file(&linked(body), "crates/paja/src/hook.rs"),
@@ -1341,6 +1369,10 @@ mod tests {
         for body in [
             "see github.com/acme/app/blob/main/crates/paja/src/hook.rs",
             "https://github.com:443/acme/app/blob/main/crates/paja/src/hook.rs",
+            "github.com:443/acme/app/blob/main/crates/paja/src/hook.rs",
+            "raw.githubusercontent.com/acme/app/main/crates/paja/src/hook.rs",
+            "https://u@github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "Ref:github.com/acme/app/blob/main/crates/paja/src/hook.rs",
         ] {
             assert!(
                 names_file(&linked(body), "crates/paja/src/hook.rs"),
