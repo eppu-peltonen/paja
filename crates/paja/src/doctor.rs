@@ -451,13 +451,27 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
 
     // What `paja run` reads, from the default branch: the same refs, in the same order, as
     // `ahjo::show_on_default_branch`, so a default branch with another name is found too.
-    let Some(rev) = ["origin/HEAD", "origin/main", "main"]
-        .into_iter()
-        .find(|rev| {
-            git(&["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")])
-                .is_ok_and(|out| out.status.success())
-        })
-    else {
+    // Resolved once, by exact ref name: every file below is read from that one commit, and
+    // messages name the branch by its short name.
+    let mut found = None;
+    for (full, short) in crate::ahjo::DEFAULT_REFS {
+        match crate::ahjo::ref_commit(proof.path(), full) {
+            Ok(Some(commit)) => {
+                found = Some((commit, short));
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                checks.push(failed(
+                    "default branch",
+                    format!("looking up {short}: {err:#}"),
+                    "run `git fsck` in this checkout and check that `git` runs",
+                ));
+                return;
+            }
+        }
+    }
+    let Some((commit, rev)) = found else {
         checks.push(failed(
             "default branch",
             "none of origin/HEAD, origin/main or main exists in this checkout",
@@ -467,7 +481,7 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         return;
     };
     // The work label.
-    let labels = match show(proof.path(), rev, jono::LABELS_FILE) {
+    let labels = match show(proof.path(), &commit, jono::LABELS_FILE) {
         Ok(text) => jono::Labels::parse(&text.unwrap_or_default()).map_err(|e| format!("{e:#}")),
         Err(err) => Err(err),
     };
@@ -504,7 +518,7 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         }
     }
     // Vasara's checks.
-    match show(proof.path(), rev, crate::mestari::CHECKS_FILE) {
+    match show(proof.path(), &commit, crate::mestari::CHECKS_FILE) {
         Ok(Some(t)) if !lines(&t).is_empty() => checks.push(ok(
             "checks",
             format!(
@@ -533,7 +547,7 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     // The model per role: a role this Paja doesn't know is skipped on every pass, which only
     // stderr would otherwise say.
     let models_file = crate::mestari::MODELS_FILE;
-    match show(proof.path(), rev, models_file) {
+    match show(proof.path(), &commit, models_file) {
         Ok(None) => checks.push(ok(
             "models",
             format!("no {models_file} on {rev}: every role runs on the account's default model"),
@@ -579,7 +593,7 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     }
     // CI.
     let ci_file = crate::mestari::CI_FILE;
-    let mode = show(proof.path(), rev, ci_file).map(|t| lines(&t.unwrap_or_default()));
+    let mode = show(proof.path(), &commit, ci_file).map(|t| lines(&t.unwrap_or_default()));
     let required = || match gh_in_repo(&["workflow", "list"]) {
         Ok(list) if !list.is_empty() => ok("ci", "a GitHub Actions workflow is set up"),
         Ok(_) => failed(
