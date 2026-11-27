@@ -570,14 +570,23 @@ pub(super) fn hook_settings(
     // Test the very command Claude Code will run, with a throwaway stamp of its own, so a
     // path the shell reads differently fails here and not on every tool call.
     let trial = private.join("self-test");
-    let tested = hook_command(&exe, root, home.root(), &trial, read_only, programs)
-        .and_then(|command| self_test_hook(&command, root, read_only));
+    // The shipped command is built once; the trial differs from it in the stamp word only.
+    let command = hook_command(&exe, root, home.root(), &stamp, read_only, programs)?;
+    let tested = crate::platform::quote_hook_word(&stamp)
+        .and_then(|real| Ok((real, crate::platform::quote_hook_word(&trial)?)))
+        .and_then(|(real, fake)| {
+            let swapped =
+                command.replacen(&format!("--stamp {real}"), &format!("--stamp {fake}"), 1);
+            if swapped == command {
+                bail!("the hook command `{command}` has no stamp word to test with");
+            }
+            self_test_hook(&swapped, root, read_only)
+        });
     let _ = std::fs::remove_file(&trial);
     if let Err(err) = tested {
         let _ = std::fs::remove_dir(&private);
         return Err(err);
     }
-    let command = hook_command(&exe, root, home.root(), &stamp, read_only, programs)?;
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
     let settings = json!({
