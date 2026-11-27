@@ -2248,7 +2248,7 @@ impl Factory {
                  \"issue view\") if [ -f {d}/view-down ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  p=; if [ -f {d}/posted-$3 ]; then p=$(tr '\\n' ',' < {d}/posted-$3 | sed 's/,$//'); fi\n\
                  if [ -f {d}/claim-goes-stale ] && [ -f {d}/race-read ]; then p=$(echo \"$p\" | sed 's/stale after [^\"]*/stale after 2020-01-02T00:00:00Z/')\n\
-                 if [ -f {d}/then-claimed ]; then p=\"$p,{{\\\"body\\\": \\\"Claimed by runner abc123 at 2020-01-01T00:00:00Z; stale after 2999-01-01T00:00:00Z\\\", \\\"url\\\": \\\"https://example.com/acme/app/issues/5#issuecomment-77\\\"}}\"; fi; fi\n\
+                 if [ -f {d}/then-claimed ]; then if [ -n \"$p\" ]; then p=\"$p,\"; fi; p=\"$p{{\\\"body\\\": \\\"Claimed by runner abc123 at 2020-01-01T00:00:00Z; stale after 2999-01-01T00:00:00Z\\\", \\\"url\\\": \\\"https://example.com/acme/app/issues/5#issuecomment-77\\\"}}\"; fi; fi\n\
                  if [ -f {d}/claim-goes-stale ] && [ -n \"$p\" ]; then touch {d}/race-read; fi\n\
                  if [ -f {d}/view-$3.json ] && [ -n \"$p\" ]; then sed -e \"s|\\\"comments\\\":\\[\\]|\\\"comments\\\":[$p]|\" -e t -e \"s|],\\\"labels\\\"|,$p],\\\"labels\\\"|\" {d}/view-$3.json\n\
                  elif [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json\n\
