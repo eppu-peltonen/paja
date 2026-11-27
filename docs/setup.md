@@ -197,11 +197,12 @@ repository so you can finish by hand or delete it. `--json` prints the repositor
 For one with no template, an agent on the `init` role writes the skeleton instead, in the fresh clone:
 
 1. A first session, with no repository and no tools, names the programs the stack's build, formatter, linter and test
-   runner run. Paja keeps plain program names and drops shells, network tools and the like.
+   runner run. Paja keeps plain program names and drops shells, network tools and the like, with or without an
+   extension (`bash.exe` and `cmd.bat` are dropped too).
 2. A second session writes a minimal app, one passing test, the formatter's and linter's configuration and a
    `.gitignore`, and runs the formatter, linter and test until they pass. It runs under the deny-list hook, and the
    only programs it may run besides local git are the ones from step 1. It can't write `.github/` (the hook refuses CI
-   configuration), and it doesn't commit.
+   configuration), and it doesn't commit: if it commits or switches branches anyway, Paja stops and pushes nothing.
 3. Paja detects the stacks and checks of the result with the same `init` agent that `paja init` uses, writes `.paja/`,
    `CLAUDE.md` and the workflow in `.github/workflows/paja.yml` from that, and runs every line of `.paja/checks`
    locally.
@@ -211,7 +212,9 @@ When a check fails, or the detection finds no check, nothing is committed or pus
 the clone stays with the files, the error names the check that failed (with its output) and says so, and you fix it in
 the clone and commit and push by hand, or delete the repository. The three agent sessions each spend usage on the `init`
 model of `.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox
-(`PAJA_SBX`) the agent and the checks run in it, with the clone mounted.
+(`PAJA_SBX`) the agent and the checks run in it, with the clone mounted. Set one for a generated skeleton when you can:
+the stack's own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any code they are
+given, so without a sandbox the hook can't keep the agent from running arbitrary code as you.
 
 ## Check the setup
 
