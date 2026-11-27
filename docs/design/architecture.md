@@ -585,9 +585,15 @@ while it starts.
 - **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
   which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
-  of the real one on `PATH` sets `GIT_DIR` and `GIT_WORK_TREE` for git commands aimed at the worktree (current
-  directory or `-C`, compared by identity, not spelling). Other git commands run unchanged. The `.git` file on the
-  host is never rewritten.
+  of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current
+  directory or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not
+  spelling). They are arguments, never exported, so hooks and nested git don't inherit them. Other git commands, and
+  ones that pass their own `--git-dir`, run unchanged. The `.git` file on the host is never rewritten. Only the git
+  found on `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses
+  it. The unit tests run the shim against a fake git on the host; the check against real `sbx` is manual. On
+  Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status` and
+  `git -c k=v -C <worktree> log -1` must succeed, `command -v git` must name `$HOME/.paja-shim/git`, and
+  `git -C /tmp status` must not be redirected to the worktree.
 - **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
   Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The
   other worktrees under `envs/` are mounted too, so code in one worktree can reach another.

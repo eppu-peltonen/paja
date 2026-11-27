@@ -35,32 +35,41 @@ const WORKTREE_GITDIR_VAR: &str = "PAJA_WT_GITDIR";
 
 /// A `git` that runs in the sandbox ahead of the real one when the worktree's `.git` file holds a
 /// host path (`C:/.../.git/worktrees/x`) the sandbox can't resolve. A git command aimed at the
-/// worktree (the current directory or the `-C` directories are inside it) gets `GIT_DIR` and
-/// `GIT_WORK_TREE` set to the sandbox's spelling; every other git command runs unchanged. Paths
+/// worktree (the current directory or the `-C` directories are inside it, after any other global
+/// options) gets `--git-dir` and `--work-tree` in the sandbox's spelling, as arguments, never
+/// exported, so a hook or nested git aimed elsewhere doesn't inherit them; every other git
+/// command runs unchanged. Paths
 /// are compared by identity (`-ef`: each directory from the target up to `/` against the root),
 /// not by spelling, so separators, case, short names (`RUNNER~1`) and mount spellings don't
 /// matter.
 const GIT_SHIM: &str = r#"#!/bin/sh
 dir=.
 want=0
+skip=0
+own=0
 for a in "$@"; do
   if [ "$want" = 1 ]; then
     dir=$(cd "$dir" 2>/dev/null && cd "$a" 2>/dev/null && pwd -P) || dir=/nonexistent-paja
     want=0
     continue
   fi
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
   case "$a" in
     -C) want=1 ;;
+    -c|--namespace|--super-prefix|--config-env) skip=1 ;;
+    --git-dir|--work-tree) own=1; skip=1 ;;
+    --git-dir=*|--work-tree=*) own=1 ;;
+    -*) ;;
     *) break ;;
   esac
 done
 p=$(cd "$dir" 2>/dev/null && pwd -P)
-while [ -z "${GIT_DIR:-}" ] && [ -n "$p" ]; do
+while [ "$own" = 0 ] && [ -n "$p" ]; do
   if [ "$p" -ef "$PAJA_WT_ROOT" ]; then
-    GIT_DIR="$PAJA_WT_GITDIR"
-    GIT_WORK_TREE="$PAJA_WT_ROOT"
-    export GIT_DIR GIT_WORK_TREE
-    break
+    exec "$PAJA_REAL_GIT" --git-dir="$PAJA_WT_GITDIR" --work-tree="$PAJA_WT_ROOT" "$@"
   fi
   [ "$p" = / ] && break
   p=$(dirname "$p")
@@ -676,7 +685,7 @@ mod tests {
         std::fs::write(&shim, GIT_SHIM).unwrap();
         std::fs::write(
             &real,
-            "#!/bin/sh\necho \"dir=${GIT_DIR:-} tree=${GIT_WORK_TREE:-}\"\n",
+            "#!/bin/sh\ndir=; tree=\nfor a in \"$@\"; do case \"$a\" in --git-dir=*) dir=${a#--git-dir=} ;; --work-tree=*) tree=${a#--work-tree=} ;; esac; done\necho \"dir=$dir tree=$tree env=${GIT_DIR:-}\"\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -713,8 +722,8 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let other = tempfile::tempdir().unwrap();
         let root_s = shell_path(root.path());
-        let hit = |out: String| out == format!("dir=/gitdirs/w tree={root_s}");
-        let miss = |out: String| out == "dir= tree=";
+        let hit = |out: String| out == format!("dir=/gitdirs/w tree={root_s} env=");
+        let miss = |out: String| out == "dir= tree= env=";
 
         assert!(hit(shim_sees(&root_s, root.path(), &["status"])));
         assert!(hit(shim_sees(&root_s, &sub, &["status"])));
@@ -732,6 +741,35 @@ mod tests {
             root.path(),
             &["-C", &other_s, "status"]
         )));
+        // Other global options before `-C` don't stop the scan.
+        assert!(hit(shim_sees(
+            &root_s,
+            other.path(),
+            &["-c", "k=v", "--no-pager", "-C", &sub_s, "status"]
+        )));
+        assert!(miss(shim_sees(
+            &root_s,
+            root.path(),
+            &["--no-pager", "-c", "k=v", "-C", &other_s, "status"]
+        )));
+        // A `-C` after the subcommand belongs to the subcommand.
+        assert!(miss(shim_sees(
+            &root_s,
+            other.path(),
+            &["log", "-C", &sub_s]
+        )));
+        // A git directory the caller chose is left alone.
+        assert!(miss(shim_sees(
+            &root_s,
+            root.path(),
+            &["--git-dir", "/x", "status"]
+        )));
+    }
+
+    #[test]
+    fn the_git_shim_does_not_export_the_git_directory() {
+        let script = GIT_SHIM;
+        assert!(!script.contains("export GIT_DIR"));
     }
 
     #[test]
