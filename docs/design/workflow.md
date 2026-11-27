@@ -72,16 +72,19 @@ so each repository has its own and an environment a person made is never reused 
 only when it was made from the same clone, and otherwise stops and names it. One pass runs per repository at a time: a
 pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is held and says to wait,
 and `paja run --every` and an idle pool skip their pass then. Once they hold the lock, they check again that no pass
-ran that day, and a failed pass is recorded before the lock is let go. Its word is not enough to close anything: Paja closes a duplicate only when the
-original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
-named commit must be on the default branch, committed after the issue was opened, and change a file the issue names
-(a merge against its first parent; a commit with no parent there counts as a root only when its own object names none,
-so a shallow clone's boundary or a grafted commit is not taken), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
-a longer or shorter one ending in it at a `/`), and a bare file name with an extension names any file of that name;
-paths use `/` whichever way the agent wrote them. A link to one of the repository's own files on GitHub
-(`github.com/<owner>/<name>/{blob,tree,blame,raw}/<ref>/<path>` or `raw.githubusercontent.com/<owner>/<name>/<ref>/<path>`)
-names exactly that path, with the ref read as one part; any other link names nothing. Otherwise the issue is kept. Each issue reaches the agent with when
-it was opened. Issue text reaches the agent as data to judge.
+ran that day, and a failed pass is recorded before the lock is let go. Its word is not enough to close anything: Paja
+closes a duplicate only when the original is another open issue that stays open, and an already-fixed issue only when
+the evidence has to do with it: a named commit must be on the default branch, committed after the issue was opened,
+and change a file the issue names (a merge against its first parent; a commit with no parent there counts as a root
+only outside a shallow clone, and Paja's git ignores grafts and replace objects), and a named file must exist there
+and be named in the issue's title or body. A path the issue gives names that path (or a longer or shorter one ending
+in it at a `/`), and a bare file name with an extension names any file of that name; paths use `/` whichever way the
+agent wrote them. A link to one of the repository's own files on GitHub
+(`github.com/<owner>/<name>/{blob,tree,blame,raw}/<ref>/<path>` or
+`raw.githubusercontent.com/<owner>/<name>/<ref>/<path>`) names exactly that path, with the ref read as one part (or
+after `refs/heads/` or `refs/tags/`), and a link to another repository, host or page, or with an empty ref, names
+nothing. Otherwise the issue is kept. Each issue reaches the agent with when it was opened. Issue text reaches the
+agent as data to judge.
 
 `--json` prints `{repo, base, items, closed, not_worth_doing}`, and `retried_notes` when a pass tried earlier notes
 again; each item has its `verdict`, `reason`, `duplicate_of` or
