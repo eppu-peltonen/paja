@@ -35,14 +35,14 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   finding is not fixed here, since one concern goes in each pull request: it is recorded (`not filed: outside the
   change`) and listed in the pull request the same way. Each re-reviewer sees the earlier `outside` findings and
   repeats the ones that still apply.
-- **The follow-up label stays.** Jono still takes the follow-up issues that are already open, oldest first, and
-  `paja triage` still closes duplicates and already-fixed ones. New ones are made only by people.
-  The pull request's description is public, so reviewers never copy secrets, environment details or run output into
-  findings, and Mestari checks for itself too: before it writes them, it replaces values that start like a known credential (GitHub,
-  GitLab, Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI, JSON Web Tokens) or follow `Bearer`, `token`,
-  `password`, `secret` or `api_key` (past quotes, backticks, `:`, `=` or `,`, and past a code fence's info string,
-  so the value on the fence's next line goes; an info string that isn't a plain language name goes too) with `<redacted>`, the whole value including any `.`, `+`, `/` or `=`,
-  and the factory home, the repository and the user's home directory (also as
+- **The follow-up label stays.** Jono still takes the follow-up issues that are already open, oldest first, and `paja
+  triage` still closes duplicates and already-fixed ones. New ones are made only by people. The pull request's
+  description is public, so reviewers never copy secrets, environment details or run output into findings, and Mestari
+  checks for itself too: before it writes them, it replaces values that start like a known credential (GitHub, GitLab,
+  Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI, JSON Web Tokens) or follow `Bearer`, `token`, `password`,
+  `secret` or `api_key` (past quotes, backticks, `:`, `=` or `,`, and past a code fence's info string, so the value on
+  the fence's next line goes; an info string that isn't a plain language name goes too) with `<redacted>`, the whole
+  value including any `.`, `+`, `/` or `=`, and the factory home, the repository and the user's home directory (also as
   `~/...`) with `<factory home>`, `<repository>` and `<home>`, where no letter or digit follows the path. Windows paths
   match in any letter case.
 - **A re-review judges the fix.** After a round of changes, the next reviewer gets the earlier blockers and reads only
