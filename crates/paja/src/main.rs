@@ -608,7 +608,8 @@ fn run(cli: &Cli) -> Result<()> {
                         Err(err) => {
                             if mestari::is_fatal(&err) {
                                 paja::posti::stopped(&home, repo);
-                            } else {
+                            } else if !mestari::is_mistake(&err) {
+                                // A mistake in the command is in front of the person already.
                                 paja::posti::pass_failed(&home, repo, false);
                             }
                             return Err(err);
@@ -782,12 +783,7 @@ fn run(cli: &Cli) -> Result<()> {
             } => {
                 let status = jono::parse_status(status)?;
                 let checkout = std::path::absolute(repo)?;
-                let name = jono::repo_name(&home, &checkout)?;
-                let item = jono::set_status(&home, &name, *number, status, note.as_deref())?;
-                if status == jono::Status::Queued {
-                    // Queued means any runner may take it: free its claim on GitHub too.
-                    jono::release_claim(&home, &checkout, *number);
-                }
+                let item = mestari::set_status(&home, &checkout, *number, status, note.as_deref())?;
                 emit(cli, serde_json::to_value(&item)?, || describe_item(&item));
             }
             WorkCommand::Answer { number, text, repo } => {

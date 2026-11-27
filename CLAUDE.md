@@ -52,8 +52,9 @@ the real repository, to the smoke tests.
   risk too.
 - `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`, `.paja/labels`: Vasara's check commands, the
   high-risk path prefixes, the model per agent role, the programs agents may run besides local git (`review <program>`
-  for reviewers too; `cargo` when missing) and the repository's `work` and `follow-up` issue labels (`factory` and
-  `factory-follow-up` when missing). `paja run` reads them from `main`, never from the branch under review.
+  for reviewers too; `cargo` when missing) and the repository's `work`, `follow-up` and `needs-answer` issue labels
+  (`factory`, `factory-follow-up` and `factory-needs-answer` when missing). `paja run` reads them from `main`, never
+  from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It allows local
   git and the programs Mestari passes from `.paja/commands`, and it fails closed.
 - `crates/paja/src/posti.rs`: Posti, the notices that tell the person a run needs them (desktop, `PAJA_NOTIFIER`,
