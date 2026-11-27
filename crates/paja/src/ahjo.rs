@@ -881,7 +881,7 @@ pub(crate) fn default_branch(ok: &Untampered) -> Result<Option<(String, String)>
 /// Errors when `origin/HEAD` exists but can't be trusted to name the default branch: when it
 /// isn't a symbolic ref (one written with `git update-ref`), or points outside
 /// `refs/remotes/origin/` or at one of Paja's own branches.
-fn trusted_origin_head(ok: &Untampered) -> Result<()> {
+pub(crate) fn trusted_origin_head(ok: &Untampered) -> Result<()> {
     let git = |args: &[&str]| {
         git_command()
             .arg("-C")
@@ -943,36 +943,79 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
         .success();
     if has_origin {
         bail!(
-            "{} has an origin remote but none of origin/HEAD, origin/main or main, and GitHub's \
-             default branch isn't fetched, so the default branch is unknown; run `git fetch \
-             origin` and `git remote set-head origin -a` there",
+            "{} has an origin remote but no default branch Paja can read: GitHub's isn't fetched \
+             (or gh can't say), and there is no origin/main or main and no origin/HEAD Paja \
+             uses; run `git fetch origin` and `git remote set-head origin -a` there",
             ok.path().display()
         );
     }
     Ok(None)
 }
 
+/// How long a default branch name from `gh` is reused, so a `work sync`, which reads two
+/// files from the default branch, asks once.
+const NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests run without `gh`, whatever the machine has (`GH_REPO`, a signed-in `gh`).
+    static NO_GH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 /// The default branch's name as `gh repo view` reports it, or None when gh can't say within 15
-/// seconds. A name that couldn't be a branch (`..`, a space, a leading `-`) counts as none.
+/// seconds or names something that can't be a branch Paja would trust. A name is reused for a
+/// few minutes per checkout.
 fn github_default_branch(ok: &Untampered) -> Option<String> {
-    let out = crate::jono::gh_within(
+    #[cfg(test)]
+    if NO_GH.with(|off| off.get()) {
+        return None;
+    }
+    type Names = BTreeMap<PathBuf, (std::time::Instant, Option<String>)>;
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<Names>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(Default::default);
+    if let Some((at, name)) = names.lock().ok()?.get(ok.path()) {
+        if at.elapsed() < NAME_REUSE {
+            return name.clone();
+        }
+    }
+    let name = crate::jono::gh_within(
         ok,
         &["repo", "view", "--json", "defaultBranchRef"],
         Some(std::time::Duration::from_secs(15)),
     )
-    .ok()?;
-    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-    let name = v["defaultBranchRef"]["name"].as_str()?.trim();
-    let branch_like = !name.is_empty()
+    .ok()
+    .and_then(|out| serde_json::from_str::<serde_json::Value>(&out).ok())
+    .and_then(|v| {
+        v["defaultBranchRef"]["name"]
+            .as_str()
+            .map(|n| n.trim().to_string())
+    })
+    .filter(|name| branch_like(name));
+    if let Ok(mut names) = names.lock() {
+        names.insert(
+            ok.path().to_path_buf(),
+            (std::time::Instant::now(), name.clone()),
+        );
+    }
+    name
+}
+
+/// Whether `name` could be a branch's name (git's rules, roughly) that isn't one of Paja's own.
+fn branch_like(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        && !name.starts_with(BRANCH_PREFIX)
         && !name.starts_with(['-', '/', '.'])
         && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
         && !name.contains("..")
         && !name.contains("//")
+        && !name.contains("/.")
+        && !name.contains(".lock/")
         && !name.contains("@{")
         && !name
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c));
-    branch_like.then(|| name.to_string())
+            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
 }
 
 /// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
@@ -1368,6 +1411,40 @@ mod tests {
             .to_string();
         assert!(err.contains("is not a symbolic ref"), "{err}");
         assert!(err.contains("git remote set-head origin -a"), "{err}");
+    }
+
+    #[test]
+    fn a_default_branch_name_from_gh_must_look_like_a_branch() {
+        for good in ["main", "trunk", "release/1.0", "dev-x"] {
+            assert!(branch_like(good), "{good}");
+        }
+        for bad in [
+            "",
+            "@",
+            "paja/app-1",
+            "-x",
+            "/x",
+            ".x",
+            "x/",
+            "x.",
+            "x.lock",
+            "a..b",
+            "a//b",
+            "a/.b",
+            "a.lock/b",
+            "a@{1}",
+            "a b",
+            "a\tb",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?",
+            "a*",
+            "a[",
+            "a\\b",
+        ] {
+            assert!(!branch_like(bad), "{bad:?}");
+        }
     }
 
     #[test]

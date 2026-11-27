@@ -433,14 +433,15 @@ passes that read them. The default branch is the one `gh repo view` names, read 
 skipped then, since code in a worktree can point it at the pushed review branch. When `gh` can't say within 15 seconds
 it is `origin/HEAD`, else `origin/main`, else `main`, and an `origin/HEAD` that isn't a symbolic ref, or points outside
 `refs/remotes/origin/` or at one of Paja's own `paja/` branches, is refused with the fix,
-`git remote set-head origin -a`. `paja doctor` finds it the same way.
+`git remote set-head origin -a`. A name from `gh` is reused for five minutes per checkout, so a `work sync` asks once.
+`paja doctor` finds the branch the same way, and warns when it skipped an `origin/HEAD` it wouldn't trust.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `left_findings`,
 `pass_failed`, `stopped` or `skipped_role`, `channel`, the `error`, and for `skipped_role` the roles it named as
 `subject`), so Paja Desk can show the same inbox. A notice that can't be delivered never stops the run: it says so on
 stderr once per channel, and every notifier is stopped after 15 seconds. The other waits are 15 seconds too: the
-repository name Jono asks `gh` for (the notice goes without it after that), the default branch's name it asks `gh` for
-when it reads `.paja/notify`, and the home lock its record waits for (the record is skipped after that), and a `gh`
+repository name Jono asks `gh` for (the notice goes without it after that), the default branch's name Posti asks `gh`
+for when it reads `.paja/notify`, and the home lock its record waits for (the record is skipped after that), and a `gh`
 stopped while it runs takes what it started with it. With every channel on, one notice holds up the run for about a
 minute and three quarters at most, and a skipped-role notice up to 15 seconds more for Posti's lock; only the local git
 calls that read `.paja/notify` from the default branch have no limit of their own.

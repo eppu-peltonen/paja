@@ -466,12 +466,22 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     let Some((commit, rev)) = found else {
         checks.push(failed(
             "default branch",
-            "none of origin/HEAD, origin/main or main exists in this checkout",
-            "push the default branch (`git push -u origin main`), then run \
-             `git remote set-head origin -a` so Paja knows its name",
+            "no default branch Paja can read in this checkout: GitHub's isn't fetched (or gh \
+             can't say), and there is no origin/main or main and no origin/HEAD Paja uses",
+            "run `git fetch origin`; if the default branch isn't pushed yet, push it \
+             (`git push -u origin main`), then run `git remote set-head origin -a`",
         ));
         return;
     };
+    // GitHub named the branch, so origin/HEAD went unread: still say when it was moved, since
+    // something in this checkout moved it.
+    if let Err(err) = crate::ahjo::trusted_origin_head(&proof) {
+        checks.push(warning(
+            "origin/HEAD",
+            format!("{err:#}; Paja reads {rev} instead"),
+            "run `git remote set-head origin -a`",
+        ));
+    }
     // The work label.
     let labels = match show(proof.path(), &commit, jono::LABELS_FILE) {
         Ok(text) => jono::Labels::parse(&text.unwrap_or_default()).map_err(|e| format!("{e:#}")),

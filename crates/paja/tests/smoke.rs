@@ -2805,6 +2805,16 @@ fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_br
         label["detail"].as_str().unwrap().contains("`game`"),
         "{report}"
     );
+    // Doctor still says origin/HEAD was moved, and what it read instead.
+    let head = named(&report, "origin/HEAD").unwrap();
+    assert_eq!(head["status"], "warning", "{report}");
+    assert!(
+        head["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Paja reads origin/trunk instead"),
+        "{report}"
+    );
     // GitHub can't say: origin/HEAD pointing at one of Paja's own branches is refused.
     let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
     let branch = named(&report, "default branch").unwrap();
@@ -2837,6 +2847,24 @@ fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_br
             .as_str()
             .unwrap()
             .contains("is not a symbolic ref"),
+        "{report}"
+    );
+    assert_eq!(branch["status"], "failed", "{report}");
+    // GitHub names a branch that isn't fetched: origin/HEAD stays unread, and a local main is
+    // the default branch.
+    git(&repo, &["branch", "main", "trunk"]);
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "gone"}}"#);
+    assert!(named(&report, "default branch").is_none(), "{report}");
+    assert_eq!(
+        named(&report, "work label").unwrap()["status"],
+        "ok",
+        "{report}"
+    );
+    assert!(
+        named(&report, "origin/HEAD").unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Paja reads main instead"),
         "{report}"
     );
 }
