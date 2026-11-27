@@ -4703,6 +4703,46 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     );
 }
 
+#[test]
+fn an_error_after_a_round_ended_with_a_verdict_adds_an_error_round() {
+    // The review lands, so round 1 is recorded with its verdict; opening the pull request then
+    // fails, and the error is recorded as a second `run.round` for the same round.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("gh-down"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let rounds = events_of(&f, "run.round");
+    let seen: Vec<(u64, &str)> = rounds
+        .iter()
+        .map(|e| {
+            (
+                e["data"]["round"].as_u64().unwrap(),
+                e["data"]["verdict"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(seen, vec![(1, "land"), (1, "error")], "{rounds:?}");
+    // The steps were spent once, in the round that ran them; the error round adds none.
+    assert_ne!(
+        rounds[0]["data"]["steps"],
+        serde_json::json!([]),
+        "{rounds:?}"
+    );
+    assert_eq!(
+        rounds[1]["data"]["steps"],
+        serde_json::json!([]),
+        "{rounds:?}"
+    );
+    // The last verdict decides the outcome: the item failed, after one round.
+    let (ok, usage) = paja(&f.home, &f.repo, &["usage"]);
+    assert!(ok, "{usage}");
+    let items = usage["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{usage}");
+    assert_eq!(items[0]["outcome"], "failed", "{usage}");
+    assert_eq!(items[0]["rounds"], 1, "{usage}");
+}
+
 /// A claim comment as `gh issue view --json comments` prints it.
 fn claim_comment(runner: &str, stale_after: &str) -> Value {
     serde_json::json!({
