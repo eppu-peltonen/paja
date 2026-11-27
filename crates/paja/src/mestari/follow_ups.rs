@@ -344,30 +344,21 @@ fn is_jwt(value: &str) -> bool {
         && value.split('.').all(|p| !p.is_empty())
 }
 
-/// Whether `gap`, the text between a lead and the next word, ends the lead: an empty quoted
-/// value (`"password": "", "user"`), a blank line, or a line break with no `:` or `=` before it
-/// (a lead at the end of a sentence). `password:` and its value on the next line still go.
+/// Whether `gap`, the text between a lead and the next word, ends the lead for a short value:
+/// an empty quoted value (`"password": "", "user"`) or a blank line (a new paragraph). A long
+/// value after the lead is redacted all the same. A pair of quotes counts only as a whole value:
+/// not part of a longer run (`"""`), and followed in the gap by a space, `,` or `;`. Backticks
+/// never count, since ``` `` x `` ``` opens a Markdown code span.
 fn ends_lead(gap: &str) -> bool {
-    // A pair of quotes counts only as a whole value: not part of a longer run (`"""`, a
-    // Markdown ``` `` ```), and followed in the gap by a space, `,` or `;`.
     let chars: Vec<char> = gap.chars().collect();
     let empty_value = (0..chars.len().saturating_sub(2)).any(|i| {
         let q = chars[i];
-        matches!(q, '"' | '\'' | '`')
+        matches!(q, '"' | '\'')
             && chars[i + 1] == q
             && (i == 0 || chars[i - 1] != q)
             && (chars[i + 2].is_whitespace() || matches!(chars[i + 2], ',' | ';'))
     });
-    if empty_value {
-        return true;
-    }
-    let lines: Vec<&str> = gap.split('\n').collect();
-    match lines.len() {
-        1 => false,
-        2 => !lines[0].contains([':', '=']),
-        // Two line breaks or more: a blank line, a new paragraph.
-        _ => true,
-    }
+    empty_value || gap.split('\n').count() > 2
 }
 
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
@@ -385,6 +376,8 @@ fn redact_tokens(text: &str) -> String {
     let mut led: Option<bool> = None;
     // Whether a `:`, `=` or quote came between the lead and now.
     let mut delimited = false;
+    // Whether an empty value or a blank line came since the lead: then only a long value counts.
+    let mut ended = false;
     while !rest.is_empty() {
         let start = if led.is_some() {
             rest.find(|c: char| !gap_char(c))
@@ -395,7 +388,7 @@ fn redact_tokens(text: &str) -> String {
         let gap = &rest[..start];
         out.push_str(gap);
         if led.is_some() && ends_lead(gap) {
-            led = None;
+            ended = true;
         }
         delimited |= gap
             .chars()
@@ -415,7 +408,8 @@ fn redact_tokens(text: &str) -> String {
             // With nothing between, a strong lead's short value counts only when it isn't a
             // plain lowercase word: "password hunter2" is a secret, "password field" is prose.
             let wordlike = value.chars().all(|c| c.is_ascii_lowercase());
-            if value.len() >= 16 || (starts_plain && (delimited || (strong && !wordlike))) {
+            let short_counts = !ended && starts_plain && (delimited || (strong && !wordlike));
+            if value.len() >= 16 || short_counts {
                 out.push_str("<redacted>");
                 rest = &rest[value.len()..];
                 led = None;
@@ -447,6 +441,7 @@ fn redact_tokens(text: &str) -> String {
         out.push_str(word);
         led = lead_strength(word);
         delimited = false;
+        ended = false;
         rest = &rest[end..];
     }
     out
@@ -622,11 +617,26 @@ mod tests {
              \"bob\"; a secret\nmanager; the password.\n\nNext paragraph; password: <redacted>; \
              secret <redacted>; api_key:\n  <redacted>; password:\n  <redacted>; secret\n\nFinally"
         );
-        // A value that opens with a run of quotes or backticks is still a value, not an empty one.
-        let text = format!("password = \"\"\"{short}\"\"\" and password: ``{short}``");
+        // A value that opens with a run of quotes or backticks is still a value, not an empty
+        // one, padded Markdown code spans included.
+        let text = format!(
+            "password = \"\"\"{short}\"\"\" and password: ``{short}`` and password: `` {short} `` x"
+        );
         assert_eq!(
             redact_tokens(&text),
-            "password = \"\"\"<redacted>\"\"\" and password: ``<redacted>``"
+            "password = \"\"\"<redacted>\"\"\" and password: ``<redacted>`` and password: `` \
+             <redacted> `` x"
+        );
+        // A line break alone doesn't end a lead: a shell line continuation, or a value on the
+        // next line, still goes. After an empty value or a blank line a long value still goes.
+        let text = format!(
+            "login --password \\\n  {short} then token\n{long} then password: \"\", {long} and \
+             secret\n\n{long}"
+        );
+        assert_eq!(
+            redact_tokens(&text),
+            "login --password \\\n  <redacted> then token\n<redacted> then password: \"\", \
+             <redacted> and secret\n\n<redacted>"
         );
         // Known gap, taken on purpose: a short all-lowercase word right after a lead, with
         // nothing between, reads as prose ("the password field"), so it stays.
