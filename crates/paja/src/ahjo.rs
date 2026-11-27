@@ -508,6 +508,9 @@ pub(crate) fn git_command() -> Command {
     cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_GRAFT_FILE", "/dev/null");
     cmd.args([
+        // The graft file above is turned off on purpose: no hint about it in error messages.
+        "-c",
+        "advice.graftFileDeprecated=false",
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
@@ -544,12 +547,22 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
         ));
     }
     let commit = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+    if path.contains('\0') {
+        bail!("reading {spec}: the path holds a NUL character");
+    }
     let mut path = path.to_string();
     // A symbolic link inside the tree (a CLAUDE.md that links to AGENTS.md, say) is followed
-    // to the file it names in the same commit, a few links deep at most.
-    for _ in 0..5 {
+    // to the file it names in the same commit, five links deep at most. A link in the middle
+    // of the path (a `.paja` that is itself a link) isn't: git lists nothing under it, so the
+    // file reads as missing, as it would on a checkout without links.
+    for links in 0..=5 {
         match blob_at(repo, &commit, &path, &spec)? {
-            Entry::Missing => return Ok(None),
+            Entry::Missing if links == 0 => return Ok(None),
+            // A link to nothing is never an empty settings file.
+            Entry::Missing => bail!(
+                "reading {spec}: it is a symbolic link to {path}, which that commit doesn't have; \
+                 commit the file itself in its place"
+            ),
             Entry::File(bytes) => {
                 return String::from_utf8(bytes).map(Some).map_err(|_| {
                     anyhow::anyhow!("reading {spec}: it is not UTF-8 text; save it as UTF-8")
@@ -638,30 +651,42 @@ fn blob_at(repo: &Path, commit: &str, path: &str, spec: &str) -> Result<Entry> {
 }
 
 /// The path, from the top of the tree, that a symbolic link at `link` pointing to `target`
-/// names: relative to the link's folder, and never outside the tree.
+/// names: relative to the link's folder, never outside the tree, and written plainly. A target
+/// a checkout could read differently from this text (a `\\`, an empty, `.` or trailing `/`
+/// part, a `..` after a name) is refused, not guessed at.
 fn link_target(link: &str, target: &str, spec: &str) -> Result<String> {
-    let outside = || {
+    let refuse = |why: &str| {
         anyhow::anyhow!(
-            "reading {spec}: {link} is a symbolic link to {target:?}, outside the repository; \
-             commit the file itself in its place"
+            "reading {spec}: {link} is a symbolic link to {target:?}, {why}; commit the file \
+             itself in its place"
         )
     };
-    if target.starts_with('/') || target.starts_with('\\') || target.contains(':') {
-        return Err(outside());
+    if target.starts_with('/') || target.as_bytes().get(1) == Some(&b':') {
+        return Err(refuse("outside the repository"));
+    }
+    if target.contains(['\\', '\0']) {
+        return Err(refuse("which names a file differently on Windows and Unix"));
     }
     let mut parts: Vec<&str> = link.split('/').collect();
     parts.pop();
-    for part in target.split(['/', '\\']) {
+    let mut named = false;
+    for part in target.split('/') {
         match part {
-            "" | "." => {}
+            "" | "." => return Err(refuse("which isn't a plain path to a file")),
+            ".." if named => return Err(refuse("which isn't a plain path to a file")),
             ".." => {
-                parts.pop().ok_or_else(outside)?;
+                parts
+                    .pop()
+                    .ok_or_else(|| refuse("outside the repository"))?;
             }
-            name => parts.push(name),
+            name => {
+                named = true;
+                parts.push(name);
+            }
         }
     }
-    if parts.is_empty() {
-        return Err(outside());
+    if !named {
+        return Err(refuse("a folder, not a file"));
     }
     Ok(parts.join("/"))
 }
@@ -679,7 +704,8 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
 /// The error for a git command that failed while reading `spec`.
 fn git_failed(spec: &str, repo: &Path, what: &str, output: &std::process::Output) -> anyhow::Error {
     anyhow::anyhow!(
-        "reading {spec}: {what} failed in {}: {}",
+        "reading {spec}: {what} failed in {}: {}; check that the revision exists there (`git \
+         fetch`) and that the repository isn't damaged (`git fsck`)",
         repo.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     )
@@ -892,7 +918,11 @@ mod tests {
         let add = |mode: &str, name: &str, content: &[u8]| {
             let file = dir.path().join("content");
             std::fs::write(&file, content).unwrap();
-            let oid = git_unchecked(repo, &["hash-object", "-w", &file.to_string_lossy()]).unwrap();
+            let oid = git_unchecked(
+                repo,
+                &["hash-object", "--no-filters", "-w", &file.to_string_lossy()],
+            )
+            .unwrap();
             git_unchecked(
                 repo,
                 &[
@@ -910,6 +940,19 @@ mod tests {
         add("120000", ".paja/link", b"../link");
         add("120000", "outside", b"../kept.txt");
         add("120000", "loop", b"loop");
+        add("120000", "dangling", b"gone.txt");
+        add("120000", "absolute", b"/etc/passwd");
+        add("120000", "drive", b"C:/x");
+        add("120000", "backslash", b"d\\x");
+        add("120000", "dot", b".");
+        add("120000", "climb", b"a/../kept.txt");
+        // A chain of five links to a file is followed; a sixth is one too many.
+        add("120000", "l1", b"l2");
+        add("120000", "l2", b"l3");
+        add("120000", "l3", b"l4");
+        add("120000", "l4", b"l5");
+        add("120000", "l5", b"kept.txt");
+        add("120000", "l0", b"l1");
         add("100644", "latin1", b"caf\xe9\n");
         git_unchecked(
             repo,
@@ -940,7 +983,21 @@ mod tests {
             show_at(repo, "HEAD", ".paja/link").unwrap().as_deref(),
             Some("kept\n")
         );
-        for name in ["outside", "loop"] {
+        assert_eq!(
+            show_at(repo, "HEAD", "l1").unwrap().as_deref(),
+            Some("kept\n")
+        );
+        for name in [
+            "outside",
+            "loop",
+            "dangling",
+            "absolute",
+            "drive",
+            "backslash",
+            "dot",
+            "climb",
+            "l0",
+        ] {
             let err = show_at(repo, "HEAD", name).unwrap_err().to_string();
             assert!(err.contains("commit the file itself"), "{err}");
         }
@@ -1006,6 +1063,23 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("work x\n")
+        );
+        // An error reading it names the default branch it came from.
+        std::fs::remove_file(repo.join(".paja/labels")).unwrap();
+        std::fs::create_dir_all(repo.join(".paja/labels")).unwrap();
+        std::fs::write(repo.join(".paja/labels/x"), "").unwrap();
+        git_unchecked(repo, &["add", "-A"]).unwrap();
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "d"]);
+        git_unchecked(repo, &args).unwrap();
+        git_unchecked(repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]).unwrap();
+        let err = format!(
+            "{:#}",
+            show_on_default_branch(&ok, ".paja/labels").unwrap_err()
+        );
+        assert!(
+            err.contains("from origin/HEAD, the default branch"),
+            "{err}"
         );
     }
 
