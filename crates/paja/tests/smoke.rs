@@ -3544,7 +3544,7 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _guard = EndOnPanic(run.id());
+    let guard = EndOnPanic(run.id());
     wait_for_the_builder(&run, dir);
     let mut stdin = run.stdin.take().unwrap();
     writeln!(stdin, "hello").unwrap();
@@ -3558,6 +3558,8 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
         "paja ended before its step did"
     );
     std::fs::remove_file(dir.join("slow")).unwrap();
+    // Reaped there: past this point the pid may be another process's.
+    std::mem::forget(guard);
     let output = output_within(run, std::time::Duration::from_secs(120));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3589,12 +3591,14 @@ fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _guard = EndOnPanic(run.id());
+    let guard = EndOnPanic(run.id());
     wait_for_the_builder(&run, dir);
     let mut stdin = run.stdin.take().unwrap();
     writeln!(stdin, "stop now").unwrap();
     stdin.flush().unwrap();
     let stopping = std::time::Instant::now();
+    // Reaped there: past this point the pid may be another process's.
+    std::mem::forget(guard);
     let output = output_within(run, std::time::Duration::from_secs(120));
     assert!(
         stopping.elapsed().as_secs() < 30,
