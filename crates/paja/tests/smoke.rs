@@ -2512,6 +2512,29 @@ fn slow_run(f: &Factory) -> std::process::Child {
     child
 }
 
+/// `child`'s output, failing the test instead of hanging when it hasn't ended within `limit`:
+/// a watchdog ends it then, so a broken stop shows as a failure.
+#[cfg(unix)]
+fn output_within(child: std::process::Child, limit: std::time::Duration) -> std::process::Output {
+    let pid = child.id().to_string();
+    let (ended, wait) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        let late = wait.recv_timeout(limit).is_err();
+        if late {
+            let _ = Command::new("kill").args(["-9", &pid]).status();
+        }
+        late
+    });
+    let output = child.wait_with_output().unwrap();
+    let _ = ended.send(());
+    assert!(
+        !watchdog.join().unwrap(),
+        "paja didn't end within {limit:?}, so it was ended: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 /// A `stop` line on stdin, as Paja Desk sends it, stops the run after its step, like the first
 /// Ctrl-C; the run's own lock and log are the CLI's.
 #[cfg(unix)]
@@ -2552,7 +2575,7 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
         "paja ended before its step did"
     );
     std::fs::remove_file(dir.join("slow")).unwrap();
-    let output = run.wait_with_output().unwrap();
+    let output = output_within(run, std::time::Duration::from_secs(120));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
@@ -2592,7 +2615,7 @@ fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
     writeln!(stdin, "stop now").unwrap();
     stdin.flush().unwrap();
     let stopping = std::time::Instant::now();
-    let output = run.wait_with_output().unwrap();
+    let output = output_within(run, std::time::Duration::from_secs(120));
     assert!(
         stopping.elapsed().as_secs() < 30,
         "paja didn't stop at once"
