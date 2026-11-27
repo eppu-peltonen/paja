@@ -205,6 +205,9 @@ pub const EV_REOPENED: &str = "work.reopened";
 /// because `.paja/queue` says `follow-ups = off`, so a landed one stays landed when they come
 /// back on.
 const FOLLOW_UPS_OFF: &str = "follow_ups_off";
+/// The mark on a `work.reopened` of a follow-up hidden by `follow-ups = off` that GitHub
+/// reopened while it was hidden (a revert, say): it is a real reopen, so a landed one is queued.
+const REOPENED_ON_GITHUB: &str = "reopened_on_github";
 pub const EV_STATUS: &str = "work.status";
 /// A person answered an escalated item's question.
 pub const EV_ANSWERED: &str = "work.answered";
@@ -757,7 +760,7 @@ fn replay_with_hidden(
                     // A landed issue opened again (say after a revert) needs work again, but
                     // not a follow-up that only comes back because follow-ups are on again.
                     let back_from_rules = if item.open {
-                        hidden.remove(&key(n.number))
+                        hidden.remove(&key(n.number)) && event.data[REOPENED_ON_GITHUB] != true
                     } else {
                         if event.data[FOLLOW_UPS_OFF] == true {
                             hidden.insert(key(n.number));
@@ -1876,7 +1879,18 @@ pub fn sync_with(
             }
         }
     }
-    let report = apply_listed(home, &name, &issues, &open_outside, &hidden)?;
+    // With follow-ups on again, a landed follow-up that the rule hid is asked about once: if
+    // GitHub reopened it while it was hidden (it may have closed and reopened in between), it
+    // needs work again.
+    let mut reopened = BTreeSet::new();
+    if rules.follow_ups {
+        for (number, hidden_at) in landed_hidden(&home.events().read_all()?, &name)? {
+            if queued.contains(&number) && reopened_since(&ok, number, hidden_at)? {
+                reopened.insert(number);
+            }
+        }
+    }
+    let report = apply_listed(home, &name, &issues, &open_outside, &hidden, &reopened)?;
     apply_claims(home, &name, &seen, &held)?;
     record_checkout(home, &name, &checkout_top(repo)?)?;
     Ok(report)
@@ -1948,18 +1962,76 @@ pub fn apply_with(
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
-    apply_listed(home, repo, open, open_outside, &BTreeSet::new())
+    apply_listed(
+        home,
+        repo,
+        open,
+        open_outside,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+}
+
+/// The landed follow-ups of `repo` whose last close came from `follow-ups = off`, each with
+/// when (milliseconds since the epoch) that close was written.
+fn landed_hidden(events: &[Event], repo: &str) -> Result<BTreeMap<u64, u64>> {
+    let (items, hidden) = replay_with_hidden(events, repo)?;
+    let legacy = legacy_repo(events, repo);
+    let mut found = BTreeMap::new();
+    for (r, number) in hidden {
+        let landed = items
+            .get(&(r.clone(), number))
+            .is_some_and(|item| item.status == Status::Landed);
+        if r != repo || !landed {
+            continue;
+        }
+        let closed = events.iter().rev().find(|event| {
+            event.kind == EV_CLOSED
+                && event.data["number"] == number
+                && event_repo(event, legacy) == repo
+        });
+        if let Some(closed) = closed {
+            found.insert(number, closed.ts_ms);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether GitHub reopened issue `number` at or after `since` (milliseconds since the epoch),
+/// read from the issue's events. A listing gh can't give counts as no reopen: the item stays
+/// as the log has it.
+fn reopened_since(ok: &Untampered, number: u64, since: u64) -> Result<bool> {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/events");
+    let output = gh_output(
+        ok,
+        &[
+            "api",
+            &path,
+            "--paginate",
+            "--jq",
+            ".[] | select(.event == \"reopened\") | .created_at",
+        ],
+    )?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_utc)
+        .any(|at| at.saturating_mul(1000) >= since))
 }
 
 /// [`apply_with`], where `hidden` are the follow-ups the sync didn't list only because
 /// `follow-ups = off` (their issues are still open on GitHub). Each that closes is recorded as
-/// closed by that rule, so a landed one isn't queued again when follow-ups come back on.
+/// closed by that rule, so a landed one isn't queued again when follow-ups come back on, unless
+/// it is in `reopened`: GitHub reopened it while it was hidden.
 fn apply_listed(
     home: &Home,
     repo: &str,
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
     hidden: &BTreeSet<u64>,
+    reopened: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
@@ -1972,7 +2044,7 @@ fn apply_listed(
         .collect();
     let back_from_rules: BTreeSet<u64> = closed_by_rule
         .into_iter()
-        .filter(|(r, _)| r == repo)
+        .filter(|(r, number)| r == repo && !reopened.contains(number))
         .map(|(_, number)| number)
         .collect();
     let recorded: BTreeSet<u64> = waiting_recorded(&events, legacy_repo(&events, repo))
@@ -1998,11 +2070,11 @@ fn apply_listed(
             }
             Some(item) => {
                 if !item.open {
-                    log.append(
-                        &lock,
-                        EV_REOPENED,
-                        json!({ "repo": repo, "number": issue.number }),
-                    )?;
+                    let mut data = json!({ "repo": repo, "number": issue.number });
+                    if reopened.contains(&issue.number) {
+                        data[REOPENED_ON_GITHUB] = json!(true);
+                    }
+                    log.append(&lock, EV_REOPENED, data)?;
                     report.reopened.push(issue.number);
                 }
                 if (&item.title, &item.body, &item.url, item.priority)
@@ -3016,7 +3088,15 @@ mod tests {
         }
         // Follow-ups off: the sync lists only the work item.
         let hidden = BTreeSet::from([2, 3]);
-        let off = super::apply_listed(&home, R, &both[..1], &BTreeSet::new(), &hidden).unwrap();
+        let off = super::apply_listed(
+            &home,
+            R,
+            &both[..1],
+            &BTreeSet::new(),
+            &hidden,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(off.closed, vec![2, 3]);
         // A work item that depends on #2 doesn't wait on it once follow-ups are back on.
         let mut dependent = issue(4, "d");
@@ -3036,16 +3116,52 @@ mod tests {
         apply(&home, &on).unwrap();
         set_status(&home, 1, Status::Landed, None).unwrap();
         let hidden = BTreeSet::from([1, 2, 3]);
-        super::apply_listed(&home, R, &[], &BTreeSet::new(), &hidden).unwrap();
+        super::apply_listed(&home, R, &[], &BTreeSet::new(), &hidden, &BTreeSet::new()).unwrap();
         apply(&home, &on).unwrap();
         assert_eq!(get(&home, 1).unwrap().status, Status::Queued);
         // A landed follow-up whose issue GitHub closed while follow-ups were off isn't hidden
         // by the rule, so when GitHub reopens it (a revert, say) it is queued again.
         set_status(&home, 2, Status::Landed, None).unwrap();
         let only_3 = BTreeSet::from([3]);
-        super::apply_listed(&home, R, &on[..1], &BTreeSet::new(), &only_3).unwrap();
+        super::apply_listed(
+            &home,
+            R,
+            &on[..1],
+            &BTreeSet::new(),
+            &only_3,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         apply(&home, &on).unwrap();
         assert_eq!(get(&home, 2).unwrap().status, Status::Queued);
+        // A landed follow-up the rule hid, which GitHub reopened meanwhile, is queued when
+        // follow-ups come back on; the reopen is marked, so replay agrees.
+        set_status(&home, 2, Status::Landed, None).unwrap();
+        let hidden = BTreeSet::from([2, 3]);
+        super::apply_listed(
+            &home,
+            R,
+            &on[..1],
+            &BTreeSet::new(),
+            &hidden,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let events = home.events().read_all().unwrap();
+        let hidden_at = super::landed_hidden(&events, R).unwrap();
+        assert_eq!(hidden_at.keys().copied().collect::<Vec<_>>(), vec![2]);
+        let reopened = BTreeSet::from([2]);
+        let back =
+            super::apply_listed(&home, R, &on, &BTreeSet::new(), &BTreeSet::new(), &reopened)
+                .unwrap();
+        assert!(back.reopened.contains(&2));
+        assert_eq!(get(&home, 2).unwrap().status, Status::Queued);
+        let last = home.events().read_all().unwrap();
+        let mark = last
+            .iter()
+            .rev()
+            .find(|e| e.kind == EV_REOPENED && e.data["number"] == 2);
+        assert_eq!(mark.unwrap().data[super::REOPENED_ON_GITHUB], true);
     }
 
     #[test]
