@@ -405,11 +405,20 @@ fn fingerprint(path: &Path) -> Option<(u64, std::time::SystemTime)> {
 }
 
 /// Tell the window each time the event log changes. The log is append-only, so a poll of its
-/// size and time is enough, and works the same on every platform.
+/// size and time is enough, and works the same on every platform. A home that can't be opened
+/// yet (its folder can't be made, say) is tried again, so the window doesn't stop refreshing
+/// for good.
 fn watch(app: tauri::AppHandle) {
-    let Ok(home) = Home::from_env() else { return };
-    let path = home.root().join("events.jsonl");
     std::thread::spawn(move || {
+        let home = loop {
+            match Home::from_env() {
+                Ok(home) => break home,
+                Err(_) => std::thread::sleep(Duration::from_secs(5)),
+            }
+        };
+        let path = home.root().join("events.jsonl");
+        // The window may have missed changes while the home couldn't be opened.
+        let _ = app.emit(CHANGED, ());
         let mut seen = fingerprint(&path);
         loop {
             std::thread::sleep(Duration::from_millis(750));

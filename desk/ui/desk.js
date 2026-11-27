@@ -301,6 +301,15 @@ function showFiling(step) {
   byId("file-confirm").hidden = step !== "confirm";
 }
 
+// A middle click on a link would make the webview try to open it itself: send it to the
+// opener, as a left click does, and let it decide what may open.
+document.addEventListener("auxclick", (event) => {
+  const link = event.target.closest?.("a[href]");
+  if (!link) return;
+  event.preventDefault();
+  if (event.button === 1) window.__TAURI__.opener.openUrl(link.href).catch(showError);
+});
+
 byId("new-work").addEventListener("click", () => {
   const select = byId("file-repo");
   const chosen = select.value;
