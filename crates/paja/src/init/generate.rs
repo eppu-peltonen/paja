@@ -126,8 +126,10 @@ pub fn parse_programs(answer: Value, stack: &str) -> Result<Vec<String>> {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "_-.+".contains(c));
+        // Compared without any extension, so `bash.exe` or `cmd.bat` is still a shell.
         let lower = name.to_ascii_lowercase();
-        if plain && !NEVER.contains(&lower.as_str()) && !programs.contains(&name) {
+        let stem = lower.split('.').next().unwrap_or_default();
+        if plain && !NEVER.contains(&stem) && !programs.contains(&name) {
             programs.push(name);
         }
     }
@@ -186,7 +188,8 @@ mod tests {
     #[test]
     fn only_plain_program_names_the_agent_may_not_misuse_are_allowed() {
         let answer = json!({"programs": [
-            "go", "gofmt", " go ", "bash", "curl", "../go", "-x", "", "a b", "GIT", "staticcheck"
+            "go", "gofmt", " go ", "bash", "curl", "../go", "-x", "", "a b", "GIT", "staticcheck",
+            "bash.exe", "CMD.EXE", "powershell.exe", "sh.exe", "cmd.bat", "pwsh.cmd", "git.exe"
         ]});
         assert_eq!(
             parse_programs(answer, "go").unwrap(),

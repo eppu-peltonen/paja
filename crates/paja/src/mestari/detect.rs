@@ -142,7 +142,21 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
         )
     };
     crate::sandbox::activate(None);
-    result.map(|_| ())
+    result?;
+    // The agent may run local git, but the skeleton must stay uncommitted on the clone's branch:
+    // a commit would hide its files from the next step, and another branch would push nothing.
+    let branch = git(dir, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_default();
+    let unborn = git(dir, &["rev-parse", "--verify", "-q", "HEAD"]).is_err();
+    if branch != env.branch || !unborn {
+        bail!(
+            "the init agent committed or switched branches in {} (it must leave the skeleton \
+             uncommitted on `{}`), so nothing was pushed; remove that folder and run `paja init \
+             --new` again, or use a stack with a built-in skeleton (rust, node, python)",
+            dir.display(),
+            env.branch
+        );
+    }
+    Ok(())
 }
 
 /// Run `checks` in `dir` the way Vasara runs them, and return the first failure's command and
