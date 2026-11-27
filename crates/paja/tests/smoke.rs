@@ -5003,6 +5003,62 @@ fn triage_closes_a_duplicate_of_a_follow_up_a_later_pass_reads() {
 }
 
 #[test]
+fn triage_lists_at_most_two_hundred_later_follow_ups_and_keeps_a_duplicate_of_one_past_them() {
+    let (f, dir) = triage_factory(r#"{"issues": []}"#);
+    let issues: Vec<String> = (1..=262)
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "title": "Issue {n}", "body": "details of {n}.", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issues.join(", ")),
+    )
+    .unwrap();
+    // #1 names #260, the last one listed; #2 names #261, which the prompt doesn't show.
+    let mut entries = vec![
+        r#"{"number": 1, "verdict": "duplicate", "duplicate_of": 260, "reason": "Same."}"#
+            .to_string(),
+        r#"{"number": 2, "verdict": "duplicate", "duplicate_of": 261, "reason": "Same."}"#
+            .to_string(),
+    ];
+    entries.extend(
+        (3..=60).map(|n| format!(r#"{{"number": {n}, "verdict": "keep", "reason": "open"}}"#)),
+    );
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(
+            r#"{{"is_error": false, "num_turns": 1, "structured_output": {{"issues": [{}]}}}}"#,
+            entries.join(", ")
+        ),
+    )
+    .unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([1]), "{report}");
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    assert!(
+        prompt.contains("#260: Issue 260\n</other-issues>"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("#261:"), "{prompt}");
+    // The pass's record keeps only issues it judged: none it merely listed.
+    let ran = events_of(&f, "triage.ran");
+    let kept: Vec<u64> = ran[0]["data"]["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_u64().unwrap())
+        .collect();
+    assert_eq!(kept, (2..=60).collect::<Vec<u64>>(), "{ran:?}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issue close 1 --comment"), "{log}");
+    assert!(!log.contains("issue close 2 "), "{log}");
+}
+
+#[test]
 fn triage_gives_every_follow_up_a_turn_past_the_first_sixty() {
     let (f, dir) = triage_factory(r#"{"issues": []}"#);
     let issues: Vec<String> = (1..=62)
