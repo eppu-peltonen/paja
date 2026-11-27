@@ -479,8 +479,8 @@ pub(super) fn claude_with(
     if !output.status.success() {
         // A Claude Code without headless auto mode rejects the flag: stop, never fall back to
         // another permission mode.
-        let text = tail(&output);
-        if text.contains("--permission-mode") {
+        if rejects_auto_mode(&output.stderr) {
+            let text = tail(&output);
             bail!(
                 "`{program} -p` does not accept `--permission-mode auto`; Paja always runs agents \
                  in auto mode and never falls back to another mode, so update Claude Code to a \
@@ -507,6 +507,26 @@ pub(super) fn claude_with(
         .into());
     }
     Ok(value)
+}
+
+/// Whether a failed run is Claude Code's command line rejecting `--permission-mode`. Only stderr
+/// counts, and only a line that names the flag and says it is unknown or invalid: a session's
+/// own JSON on stdout may mention the flag without the CLI having rejected it.
+fn rejects_auto_mode(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::to_lowercase)
+        .any(|line| {
+            line.contains("--permission-mode")
+                && [
+                    "unknown option",
+                    "invalid",
+                    "allowed choices",
+                    "unrecognized",
+                ]
+                .iter()
+                .any(|word| line.contains(word))
+        })
 }
 
 /// The owner's commit name and email, and their global ignore file, which agents' git uses
@@ -1444,6 +1464,20 @@ impl GitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_clis_own_rejection_of_the_flag_counts() {
+        let rejection = "error: option '--permission-mode <mode>' argument 'auto' is invalid.";
+        assert!(rejects_auto_mode(rejection.as_bytes()));
+        assert!(rejects_auto_mode(
+            b"error: unknown option '--permission-mode'"
+        ));
+        // Stderr that merely mentions the flag, or has no stderr at all (the session's JSON is
+        // on stdout, which is never looked at), is no rejection.
+        assert!(!rejects_auto_mode(b"using --permission-mode auto"));
+        assert!(!rejects_auto_mode(b"boom"));
+        assert!(!rejects_auto_mode(b""));
+    }
 
     #[test]
     fn git_data_under_the_environments_gets_no_mount_of_its_own() {
