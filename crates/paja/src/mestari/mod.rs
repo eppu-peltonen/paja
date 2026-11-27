@@ -905,7 +905,7 @@ fn run_item(
                     resets_at: Some(resets_at),
                     nearly: true,
                 };
-                return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                return usage_stopped(home, repo, item, round, &limit, steps);
             }
         }
         // An earlier run's session is offered to the first build only.
@@ -935,7 +935,7 @@ fn run_item(
             Some(Err(err)) => {
                 // The window, not the change: keep the worktree and resume after the reset.
                 if let Some(limit) = usage_limit(&err) {
-                    return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                    return usage_stopped(home, repo, item, round, &limit, steps);
                 }
                 let Some(limit) = turn_limit(&err) else {
                     return Err(err);
@@ -1240,7 +1240,7 @@ fn run_item(
                                     result,
                                 ));
                             }
-                            return usage_stopped(home, repo, &env, item, round, &limit, steps);
+                            return usage_stopped(home, repo, item, round, &limit, steps);
                         }
                         return Err(err);
                     }
@@ -1501,7 +1501,6 @@ fn limit_without_reset(events: &[crate::events::Event], repo: &str, number: u64)
 fn usage_stopped(
     home: &Home,
     repo: &Path,
-    env: &Env,
     item: &WorkItem,
     round: u32,
     limit: &UsageLimit,
@@ -1540,7 +1539,19 @@ fn usage_stopped(
                         time was told when the window resets, so it stopped instead of trying \
                         again. Wait until it resets (and check that `claude` is signed in to the \
                         right account), then answer the item to run it again.";
-        return escalated(home, repo, env, item, question, round);
+        // Unlike `escalated`, keep the worktree: the retried round's uncommitted edits are
+        // still in it, and the answer resumes from there.
+        let failed = land::escalate(home, repo, item, question, round)?;
+        progress(&land::parked_line(
+            &format!("#{} needs a decision", item.number),
+            item.number,
+            failed,
+        ));
+        return Ok(RunReport::Escalated {
+            number: item.number,
+            question: question.to_string(),
+            rounds: round,
+        });
     }
     progress(&match limit.resets_at {
         Some(ms) => format!(
@@ -2769,6 +2780,31 @@ mod tests {
         // No time, or a stray number that is no epoch: unknown.
         assert_eq!(super::reset_time(None, "limit reached|42"), None);
         assert_eq!(super::reset_time(None, "limit reached"), None);
+    }
+
+    #[test]
+    fn a_whole_failed_result_is_a_usage_limit_with_its_reset_time() {
+        // The shape of a failed `claude -p --output-format json` result at the limit.
+        let result = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": true, "api_error_status": 429,
+            "result": "Claude AI usage limit reached|1795804200", "session_id": "s-1",
+            "total_cost_usd": 0.3,
+        });
+        let err = anyhow::Error::new(super::ClaudeFailed(
+            result["result"].as_str().unwrap().to_string(),
+            Some(result),
+        ));
+        let limit = super::usage_limit(&err).expect("a 429 is a usage limit");
+        assert_eq!(limit.resets_at, Some(1_795_804_200_000));
+        // Without a time in the text it is still a limit, with no reset time.
+        let result = serde_json::json!({"is_error": true, "api_error_status": 429,
+                                        "result": "API Error: Rate limit reached"});
+        let err = anyhow::Error::new(super::ClaudeFailed("rate limit".into(), Some(result)));
+        assert_eq!(super::usage_limit(&err).unwrap().resets_at, None);
+        // Other failures are not limits.
+        let result = serde_json::json!({"is_error": true, "api_error_status": 500});
+        let err = anyhow::Error::new(super::ClaudeFailed("boom".into(), Some(result)));
+        assert!(super::usage_limit(&err).is_none());
     }
 
     #[test]
