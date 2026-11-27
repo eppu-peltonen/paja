@@ -306,15 +306,20 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         )),
     }
 
-    // What `paja run` reads, from the default branch.
-    let Some(rev) = ["origin/main", "main"].into_iter().find(|rev| {
-        git(&["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")])
-            .is_ok_and(|out| out.status.success())
-    }) else {
+    // What `paja run` reads, from the default branch: the same refs, in the same order, as
+    // `ahjo::show_on_default_branch`, so a default branch with another name is found too.
+    let Some(rev) = ["origin/HEAD", "origin/main", "main"]
+        .into_iter()
+        .find(|rev| {
+            git(&["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")])
+                .is_ok_and(|out| out.status.success())
+        })
+    else {
         checks.push(failed(
             "default branch",
-            "neither origin/main nor main exists in this checkout",
-            "commit on `main` and push it: `git push -u origin main`",
+            "none of origin/HEAD, origin/main or main exists in this checkout",
+            "push the default branch (`git push -u origin main`), then run \
+             `git remote set-head origin -a` so Paja knows its name",
         ));
         return;
     };

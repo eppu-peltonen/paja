@@ -2167,6 +2167,58 @@ fn make_private(dir: &Path) {
 }
 
 #[test]
+fn doctor_reads_a_default_branch_that_is_not_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    git(&repo, &["remote", "set-head", "origin", "trunk"]);
+    let gh = program(
+        tmp.path(),
+        "gh",
+        "#!/bin/sh\ncase \"$1 $2\" in\n\
+         \"repo view\") echo '{\"viewerPermission\": \"ADMIN\"}' ;;\n\
+         \"label list\") echo '[{\"name\": \"game\"}]' ;;\n\
+         \"workflow list\") echo 'CI\tactive\t1' ;;\nesac\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        !checks.iter().any(|c| c["name"] == "default branch"),
+        "{report}"
+    );
+    // The labels came from `trunk`: its work label is `game`, which the repository has.
+    let label = checks.iter().find(|c| c["name"] == "work label").unwrap();
+    assert_eq!(label["status"], "ok", "{report}");
+    assert!(
+        label["detail"].as_str().unwrap().contains("`game`"),
+        "{report}"
+    );
+}
+
+#[test]
 fn doctor_reports_each_check_and_the_fix_for_a_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home, d) = (
