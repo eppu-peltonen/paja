@@ -63,8 +63,8 @@ events appends a `work.synced` event naming it, so a later command from another 
 
 Jono's items are GitHub issues with the work label (`.paja/labels`, `paja` in this repository), each belonging to a
 repository. `.paja/labels`, read from the default branch like `.paja/checks` and never from the branch under review,
-has up to three lines: `work <label>`, which Jono imports, `follow-up <label>`, which Mestari files non-blocking
-findings with, and `needs-answer <label>`, which marks an escalated item's issue until `paja work answer` requeues it.
+has up to three lines: `work <label>`, which Jono imports, `follow-up <label>`, which Jono imports after the
+work label (people file these; Mestari files none), and `needs-answer <label>`, which marks an escalated item's issue until `paja work answer` requeues it.
 Without the file they are `factory`, `factory-follow-up` and `factory-needs-answer`; this repository keeps `paja` and
 `paja-follow-up`. The three must differ. A file that doesn't read stops a sync with an error that names the line;
 `paja work answer` still records and posts the answer, removes the default `factory-needs-answer` and says on stderr
@@ -223,7 +223,7 @@ runs started apart. A run whose reviewers say `land` first takes the repository'
 request, CI and the merge, and lets go when the change lands or goes back to its builder. With the turn it merges the
 latest default branch in again: when that branch moved on while it waited, Vasara's checks run again on the merge
 commit, and only that commit lands. A conflict, or checks that fail on it, sends the item back to its builder for
-another round (`conflict` or `checks_failed`) within the three rounds, and the next review reads the whole change.
+another round (`conflict` or `checks_failed`) within the five rounds, and the next review reads the whole change.
 A pool admits an item to a lane only when the files it will touch don't overlap a running item's
 (`crates/paja/src/mestari/plan.rs`). Before a lane starts it, the pool plans the item in a `paja pool plan <number>` of
 its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; recorded as `pool.planning`):
@@ -245,7 +245,7 @@ waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning whic
 `paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
 from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
 
-Then, for at most three rounds:
+Then, for at most five rounds:
 
 1. A headless `claude -p` builder implements the issue and commits. It may use only file tools, local git and the programs `.paja/commands` lists (`cargo` by default).
    A fix round (after failed checks, a `changes` verdict or a round with no commits) resumes the builder's own
@@ -280,8 +280,8 @@ Then, for at most three rounds:
    run that changes those flags changed the index.
 3. A fresh reviewer agent reads `git diff <default branch>...HEAD` cold against the issue and `CLAUDE.md` as it is
    on the default branch, and
-   answers `land`, `changes` (blockers only) or `escalate`, plus non-blocking follow-ups that Mestari files as
-   follow-up issues (the `follow-up` label of `.paja/labels`) once the change lands. A later round's reviewer judges only the fix for the earlier
+   answers `land`, `changes` (blockers) or `escalate`, plus other findings that Mestari sends back to the builder as the
+   next round's feedback (no follow-up issue is filed; see `landing.md`). A later round's reviewer judges only the fix for the earlier
    blockers, except on high-risk changes. It may read, run cargo and use read-only git, and changes nothing. Its
    prompt names the commit Vasara's checks passed at, which the run loop passes in and the review refuses to judge
    if `HEAD` has moved from it, and tells it not to re-run formatting, lints or the full test suite; to probe a
@@ -355,11 +355,11 @@ round, like a failed check, with the failing checks and the end of the first fai
 default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
 otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
-setting to change. On `escalate`, three failed rounds or
+setting to change. On `escalate`, five failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
-`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. Before an escalation Mestari's arbiter
+`run.escalated`, plus a `run.follow_up` (`error` `not filed: ...`, never an issue) for each review finding the change landed without. Before an escalation Mestari's arbiter
 agent looks at it: `run.arbitrated` (`number`, `verdict` `answer` or `escalate`, the `answer` or the `question`,
 `model`, `overruled`, `steps`) follows, and for an answer a `work.answered` with `by: arbiter` and a status event that
 queues the item again, with no `run.escalated`. `run.step` (`round`, `role`, `model`,
