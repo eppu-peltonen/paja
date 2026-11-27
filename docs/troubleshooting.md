@@ -51,8 +51,8 @@ agent will start; rebuild paja from main, and check that every path in the comma
 ```
 
 Before each agent, Mestari checks that the deny-list hook blocks `git push` (`git commit` for a read-only agent)
-and allows `git status`. Run `cargo install --path crates/paja` again from an up-to-date checkout of `main`, and make
-sure nothing moved or deleted the hook's copy of the binary in `$PAJA_HOME/hook`. If Claude Code never called the hook, the message begins
+and allows `git status`. Install the newer release, or run `cargo install --path crates/paja` again from an
+up-to-date checkout of `main`, and make sure nothing moved or deleted the hook's copy of the binary in `$PAJA_HOME/hook`. If Claude Code never called the hook, the message begins
 `Claude Code never called Paja's deny-list hook during the agent's run`; look for settings that disable hooks, such as
 `disableAllHooks` in managed settings.
 
