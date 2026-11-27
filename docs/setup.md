@@ -40,9 +40,12 @@ v=$(curl -fsSL https://api.github.com/repos/eppu-peltonen/paja/releases/latest |
 name="paja-${v#v}-aarch64-apple-darwin"   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu
 curl -fsSLO "https://github.com/eppu-peltonen/paja/releases/download/$v/$name.tar.gz"
 curl -fsSLO "https://github.com/eppu-peltonen/paja/releases/download/$v/SHA256SUMS"
-grep " $name.tar.gz\$" SHA256SUMS | shasum -a 256 -c -
-tar -xzf "$name.tar.gz" && mkdir -p ~/.local/bin && cp "$name/paja" ~/.local/bin/
+grep " $name.tar.gz\$" SHA256SUMS | shasum -a 256 -c - \
+  && tar -xzf "$name.tar.gz" && mkdir -p ~/.local/bin && cp "$name/paja" ~/.local/bin/
 ```
+
+The last command installs `paja` only when its checksum matches. Where `shasum` is missing (some minimal Linux
+installs), use `sha256sum -c -` in its place.
 
 `~/.local/bin` must be on your `PATH`. Open a new terminal (on Windows, a new PowerShell window), sign in with
 `gh auth login` and `claude`, and check with `paja --version`, which names the version and the commit it was built
