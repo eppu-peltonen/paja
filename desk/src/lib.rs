@@ -31,10 +31,48 @@ async fn work_list() -> Value {
 /// [`work_list`] for `home`. `checkout` is only asked for its repository when the log still
 /// holds events from before items carried one.
 pub fn work_list_in(home: &Home, checkout: &Path) -> Value {
-    match jono::list_all_from(home, checkout).and_then(|items| Ok(serde_json::to_value(items)?)) {
+    match list_items(home, checkout).and_then(|items| Ok(serde_json::to_value(items)?)) {
         Ok(items) => items,
         Err(err) => error(err),
     }
+}
+
+/// [`jono::list_all_from`] in `cwd`; when that fails (Desk started from a shortcut, so `cwd` is
+/// `/` or `System32` and a log from before items carried a repository can't ask `gh` there), in
+/// each checkout Paja remembers, and the first error when none of them helps.
+fn list_items(home: &Home, cwd: &Path) -> anyhow::Result<Vec<jono::WorkItem>> {
+    let first = match jono::list_all_from(home, cwd) {
+        Ok(items) => return Ok(items),
+        Err(err) => err,
+    };
+    // Only a log with items from before they carried a repository, and no `work.*` event naming
+    // one, asks `gh` in the directory, and such a log has no `work.checkout` event: the folders
+    // Paja made environments from (`env.created`) are the checkouts it has. A log that can't be
+    // read fails the same way in every directory, so reading it again for them is harmless: the
+    // first error is the one returned, whatever goes wrong below.
+    let events = home.events().read_all().unwrap_or_default();
+    let mut tried: Vec<PathBuf> = Vec::new();
+    for event in events.iter().rev() {
+        if event.kind != paja::ahjo::EV_CREATED {
+            continue;
+        }
+        let Some(path) = event.data["repo"].as_str().map(PathBuf::from) else {
+            continue;
+        };
+        if tried.contains(&path) || !path.is_dir() {
+            continue;
+        }
+        // Each try is a `gh repo view`, and the window refreshes often: ask about only the
+        // newest few, as `checkout_of` does.
+        if tried.len() >= CHECKOUTS_ASKED {
+            break;
+        }
+        if let Ok(items) = jono::list_all_from(home, &path) {
+            return Ok(items);
+        }
+        tried.push(path);
+    }
+    Err(first)
 }
 
 /// Where an item's latest run is, for the run view: [`paja::mestari::live::live`], or null when
@@ -135,7 +173,7 @@ async fn repos(runner: tauri::State<'_, Runner>) -> Result<Value, String> {
 /// [`repos`] for `home`.
 pub fn repos_in(home: &Home, runner: &Runner, cwd: &Path) -> Value {
     let listed = (|| -> anyhow::Result<Value> {
-        let mut names: Vec<String> = jono::list_all_from(home, cwd)?
+        let mut names: Vec<String> = list_items(home, cwd)?
             .into_iter()
             .map(|item| item.repo)
             .filter(|repo| !repo.is_empty())
@@ -581,8 +619,21 @@ mod tests {
                 .unwrap();
         }
         let listed = work_list_in(&home, dir.path());
-        // The CLI's `--json work list --all` prints exactly this value.
-        let cli = serde_json::to_value(jono::list_all_from(&home, dir.path()).unwrap()).unwrap();
+        // The binary's `--json work list --all` prints exactly this value.
+        let out = std::process::Command::new(std::env::var("CARGO").unwrap_or("cargo".into()))
+            .args(["run", "-q", "--manifest-path"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml"))
+            .args(["-p", "paja", "--", "--json", "work", "list", "--all"])
+            .env("PAJA_HOME", home.root())
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let cli: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(listed, cli);
         let items = listed.as_array().unwrap();
         assert_eq!(items.len(), 2, "{listed}");
@@ -667,6 +718,56 @@ mod tests {
         )
         .unwrap();
         (home, checkout)
+    }
+
+    /// A log from before items carried a repository: item 3 imported without one, and an
+    /// environment made from the git checkout `app` (which the fake `gh` names `acme/app`).
+    /// Returns the home and a `cwd` where `gh` fails, like `/` or `System32` for a shortcut.
+    #[cfg(unix)]
+    fn legacy_log(dir: &Path, with_checkout: bool) -> (Home, PathBuf) {
+        let (home, checkout) = escalated_with_checkout(dir);
+        let kept: Vec<String> = std::fs::read_to_string(home.root().join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| with_checkout || !line.contains(paja::ahjo::EV_CREATED))
+            .map(|line| {
+                let mut event: Value = serde_json::from_str(line).unwrap();
+                if event["kind"] == jono::EV_IMPORTED || event["kind"] == jono::EV_STATUS {
+                    event["data"].as_object_mut().unwrap().remove("repo");
+                }
+                event.to_string()
+            })
+            .collect();
+        std::fs::write(home.root().join("events.jsonl"), kept.join("\n") + "\n").unwrap();
+        assert!(checkout.is_dir());
+        let cwd = dir.join("elsewhere");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("gh-down"), "").unwrap();
+        (home, cwd)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_log_lists_from_the_checkout_paja_made_environments_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, cwd) = legacy_log(dir.path(), true);
+        let listed = work_list_in(&home, &cwd);
+        let items = listed.as_array().unwrap_or_else(|| panic!("{listed}"));
+        assert_eq!(items.len(), 1, "{listed}");
+        assert_eq!(items[0]["repo"], "acme/app");
+        assert_eq!(items[0]["status"], "escalated");
+        let repos = repos_in(&home, &Runner::new(dir.path().join("no-paja")), &cwd);
+        assert!(repos.get("error").is_none(), "{repos}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_log_with_no_checkout_to_ask_returns_the_first_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, cwd) = legacy_log(dir.path(), false);
+        let listed = work_list_in(&home, &cwd);
+        let cli = jono::list_all_from(&home, &cwd).unwrap_err();
+        assert_eq!(listed, json!({ "error": format!("{cli:#}") }));
     }
 
     #[cfg(unix)]

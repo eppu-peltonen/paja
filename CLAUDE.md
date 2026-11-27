@@ -15,6 +15,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+These cover the core only. A change to the core's public API also has to build Paja Desk, which CI's `desk` job
+does: where WebKitGTK (Linux) or WebView2 (Windows) is available, run `cargo clippy -p paja-desk --all-targets -- -D
+warnings` and `cargo test -p paja-desk` too.
+
 Try the CLI against a throwaway home so you never touch real state:
 
 ```sh
