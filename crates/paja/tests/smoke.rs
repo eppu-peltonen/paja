@@ -986,6 +986,68 @@ fn work_waits_on_open_dependencies_until_they_close() {
 }
 
 #[test]
+fn work_answer_says_when_it_cannot_read_the_labels_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let d = slash(tmp.path());
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        r#"[{"number": 3, "title": "Add a plugin", "body": "", "url": "https://example.com/3"}]"#,
+    )
+    .unwrap();
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"issue list\") cat {d}/issues.json ;;\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, synced) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{synced}");
+    paja(
+        &home,
+        &repo,
+        &["work", "set", "3", "escalated", "--note", "Which API?"],
+    );
+    // The default branch's `.paja/labels` breaks after the item escalated.
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/labels"), "needs-answer\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    let answered = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .args(["--json", "work", "answer", "3", "Use v2"])
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&answered.stdout);
+    let stderr = String::from_utf8_lossy(&answered.stderr);
+    // The answer still goes through, and the fallback to the default label is said.
+    assert!(answered.status.success(), "{stdout}\n{stderr}");
+    let item: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(
+        stderr.contains(".paja/labels on the default branch, line 1"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("removing the default `factory-needs-answer` label from #3 instead"),
+        "{stderr}"
+    );
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("issue edit 3 --remove-label factory-needs-answer"),
+        "{log}"
+    );
+}
+
+#[test]
 fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
