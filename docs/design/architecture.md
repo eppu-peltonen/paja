@@ -596,5 +596,5 @@ Windows, a dmg per Mac architecture, an AppImage and a deb on Linux, unsigned fo
 `paja` built from the same commit as a Tauri sidecar (`desk/tauri.bundle.json`, which only the release build merges
 in, names `desk/binaries/paja-<target>`), next to `paja-desk`: in the install folder on Windows, which the NSIS hooks in
 `desk/installer.nsh` put on the user's `PATH`, inside the app on macOS and in `/usr/bin` from the deb. Desk's footer
-runs that `paja` (next to its own executable, else on `PATH`) with `--json --version` and warns when its version
-differs from Desk's; a test keeps `desk/tauri.conf.json`, Desk's crate and the core's crate at one version.
+runs that `paja` (next to its own executable, else on `PATH`) with `--json --version`, shows its full path (a bare name
+is looked up on `PATH`), and warns when its version differs from Desk's; a test keeps `desk/tauri.conf.json`, Desk's crate and the core's crate at one version.
