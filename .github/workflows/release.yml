@@ -50,7 +50,8 @@ jobs:
             (cd dist && 7z a -tzip "${name}.zip" "${name}" >/dev/null)
           else
             cp "target/${{ matrix.target }}/release/paja" "dist/${name}/"
-            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            # BSD tar on macOS would add AppleDouble `._*` entries for extended attributes.
+            COPYFILE_DISABLE=1 tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           fi
           rm -r "dist/${name}"
       - name: Smoke-test the binary
@@ -152,8 +153,14 @@ jobs:
           merge-multiple: true
       - name: Checksums and release notes
         run: |
-          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/paja/Cargo.toml | head -n 1)
+          # The build jobs check this too; checked here as well, so publishing never depends on
+          # which jobs `needs` lists.
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} doesn't match the crate version ${version} in crates/paja/Cargo.toml" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           # The notes are CHANGELOG.md's section for this version; a dry run without one uses
           # Unreleased, so it checks the rest before the version's section is written.
           section="$version"
