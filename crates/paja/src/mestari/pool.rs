@@ -56,6 +56,10 @@ const TICK: Duration = Duration::from_millis(500);
 /// ended.
 const STOP_GRACE: Duration = Duration::from_secs(30);
 
+/// How long a `pool plan` may take before the pool ends it and counts the plan as failed, so a
+/// hung planner can't hold up planning and admission.
+const PLAN_LIMIT: Duration = Duration::from_secs(10 * 60);
+
 pub struct PoolOptions<'a> {
     /// Any path inside the repository's main checkout.
     pub repo: &'a Path,
@@ -164,8 +168,8 @@ struct Pool<'a> {
     key: &'a str,
     opts: &'a PoolOptions<'a>,
     lanes: BTreeMap<u32, Lane>,
-    /// The `pool plan` runs going, by item, with the seq they started after.
-    planners: BTreeMap<u64, (Child, u64)>,
+    /// The `pool plan` runs going, by item, with the seq they started after and when.
+    planners: BTreeMap<u64, (Child, u64, Instant)>,
     /// The seq of this pool's `pool.started`: plans before it are an earlier pool's.
     since: u64,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
@@ -353,7 +357,7 @@ impl Pool<'_> {
         progress(&format!("planning which files #{number} touches"));
         match spawn_planner(self.repo, number) {
             Ok(child) => {
-                self.planners.insert(number, (child, at));
+                self.planners.insert(number, (child, at, Instant::now()));
             }
             Err(err) => self.plan_failed(number, &format!("{err:#}"))?,
         }
@@ -362,13 +366,21 @@ impl Pool<'_> {
 
     /// Free the plans that ended; one that ended without recording a plan failed.
     fn reap_planners(&mut self) -> Result<()> {
+        for number in end_overdue(&mut self.planners, PLAN_LIMIT) {
+            self.planners.remove(&number);
+            let why = format!(
+                "the plan of #{number} took longer than {} minutes",
+                PLAN_LIMIT.as_secs() / 60
+            );
+            self.plan_failed(number, &why)?;
+        }
         let done: Vec<u64> = self
             .planners
             .iter_mut()
-            .filter_map(|(&n, (child, _))| (!matches!(child.try_wait(), Ok(None))).then_some(n))
+            .filter_map(|(&n, (child, _, _))| (!matches!(child.try_wait(), Ok(None))).then_some(n))
             .collect();
         for number in done {
-            let Some((_, at)) = self.planners.remove(&number) else {
+            let Some((_, at, _)) = self.planners.remove(&number) else {
                 continue;
             };
             // The plan may have been recorded after this tick read the log.
@@ -405,7 +417,7 @@ impl Pool<'_> {
 
     /// End the plans going: they are read-only, and an item left unplanned is planned again.
     fn stop_planners(&mut self) {
-        for (child, _) in self.planners.values_mut() {
+        for (child, _, _) in self.planners.values_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -530,6 +542,20 @@ fn stop_children<'c>(children: impl Iterator<Item = &'c mut Child>, grace: Durat
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// End the planners in `planners` that have run longer than `limit`, and return their items.
+/// They stay in the map: the caller records why and removes them.
+fn end_overdue(planners: &mut BTreeMap<u64, (Child, u64, Instant)>, limit: Duration) -> Vec<u64> {
+    let mut overdue = Vec::new();
+    for (&number, (child, _, started)) in planners.iter_mut() {
+        if started.elapsed() > limit && matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            overdue.push(number);
+        }
+    }
+    overdue
 }
 
 /// Record each step lane `n`'s run started after the last one read, in order, as the lane's
@@ -1181,6 +1207,29 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(stuck.try_wait().unwrap().is_some());
         assert!(quick.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planner_past_its_limit_is_ended() {
+        let mut planners = BTreeMap::new();
+        let long_ago = Instant::now() - Duration::from_secs(5);
+        let hung = Command::new("sleep").arg("60").spawn().unwrap();
+        let fresh = Command::new("sleep").arg("60").spawn().unwrap();
+        planners.insert(3, (hung, 0, long_ago));
+        planners.insert(4, (fresh, 0, Instant::now()));
+        assert_eq!(end_overdue(&mut planners, Duration::from_secs(1)), [3]);
+        assert!(planners
+            .get_mut(&3)
+            .unwrap()
+            .0
+            .try_wait()
+            .unwrap()
+            .is_some());
+        let young = &mut planners.get_mut(&4).unwrap().0;
+        assert!(young.try_wait().unwrap().is_none());
+        let _ = young.kill();
+        let _ = young.wait();
     }
 
     fn event(seq: u64, kind: &str, data: Value) -> Event {
