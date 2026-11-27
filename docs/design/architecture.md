@@ -259,7 +259,8 @@ the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, t
 planner). Mestari passes `--model` and, when given, `--effort`; a role
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. A line naming a role this Paja
-doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going; an
+doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going, and
+`paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr would not; an
 unknown effort or a malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the
 `fallback` it was given; `fell_back: true` marks a step the fallback model spent something in (its name, or an alias
 such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role didn't run only on its model.

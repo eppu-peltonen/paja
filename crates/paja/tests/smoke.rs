@@ -2396,6 +2396,12 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     std::fs::create_dir_all(repo.join(".paja")).unwrap();
     std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
     std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    // A typo in a role, which a pass only mentions on stderr.
+    std::fs::write(
+        repo.join(".paja/models"),
+        "build sonnet\nreveiw opus\nmax-turns reveiw 5\n",
+    )
+    .unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "checks"]);
     git(
@@ -2426,6 +2432,14 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     let checks = report["checks"].as_array().unwrap();
     assert!(
         !checks.iter().any(|c| c["name"] == "default branch"),
+        "{report}"
+    );
+    // Doctor names the skipped role, once, as a warning with the fix.
+    let models = checks.iter().find(|c| c["name"] == "models").unwrap();
+    assert_eq!(models["status"], "warning", "{report}");
+    let detail = models["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(": reveiw") && detail.matches("reveiw").count() == 1,
         "{report}"
     );
     // The labels came from `trunk`: its work label is `game`, which the repository has.
