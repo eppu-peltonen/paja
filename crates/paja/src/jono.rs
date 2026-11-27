@@ -2055,7 +2055,13 @@ fn record_checkout(home: &Home, repo: &str, path: &Path) -> Result<()> {
         .into_iter()
         .rev()
         .find(|e| e.kind == EV_CHECKOUT && e.data["repo"] == repo);
-    if last.is_some_and(|e| e.data["path"].as_str().map(Path::new) == Some(path.as_path())) {
+    // The same directory spelled another way (through a symlink, a Windows short name) is
+    // not news either.
+    if last.is_some_and(|e| {
+        e.data["path"]
+            .as_str()
+            .is_some_and(|recorded| same_dir(Path::new(recorded), &path))
+    }) {
         return Ok(());
     }
     log.append(&lock, EV_CHECKOUT, json!({ "repo": repo, "path": text }))?;
@@ -2499,13 +2505,37 @@ pub fn known_checkouts(home: &Home, repo: &str) -> Result<Vec<std::path::PathBuf
             _ => None,
         })
         .map(std::path::PathBuf::from)
-        .filter(|path| path.is_dir())
-        .fold(Vec::new(), |mut paths, path| {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-            paths
-        }))
+        .fold(
+            Vec::new(),
+            |mut kept: Vec<(std::path::PathBuf, std::path::PathBuf)>, path| {
+                // Each directory once, however it was spelled: the newest spelling is kept. Each
+                // spelling is resolved once; one that can't be is no directory now.
+                if !kept.iter().any(|(known, _)| *known == path) {
+                    if let Ok(resolved) = std::fs::canonicalize(&path) {
+                        if resolved.is_dir() && !kept.iter().any(|(_, r)| *r == resolved) {
+                            kept.push((path, resolved));
+                        }
+                    }
+                }
+                kept
+            },
+        )
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect())
+}
+
+/// Whether `a` and `b` name the same directory: as resolved by the file system (symlinks,
+/// Windows short names and letter case where it is ignored), or spelled alike when either
+/// can't be resolved.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// A GitHub issue filed for Jono.
@@ -2877,10 +2907,15 @@ mod tests {
         std::fs::create_dir_all(linked.join("deep")).unwrap();
         std::fs::write(linked.join(".git"), "gitdir: elsewhere\n").unwrap();
         assert_eq!(checkout_top(&linked.join("deep")).unwrap(), linked);
-        // No `.git` above it: the path itself.
+        // No `.git` above it: the path itself. A temporary directory that is itself inside
+        // some checkout finds that one instead, and the fallback isn't exercised then.
         let bare = root.join("bare").join("x");
         std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(checkout_top(&bare.join("..").join("x")).unwrap(), bare);
+        let above = root
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .map_or_else(|| bare.clone(), Path::to_path_buf);
+        assert_eq!(checkout_top(&bare.join("..").join("x")).unwrap(), above);
     }
 
     #[test]
@@ -2959,6 +2994,59 @@ mod tests {
             known_checkouts(&home, R).unwrap(),
             vec![dir.path().join(old), dir.path().join(new)]
         );
+    }
+
+    /// A checkout reached through a symlink is the same checkout: recorded once, named once.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_spelled_through_a_symlink_is_recorded_and_named_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        record_checkout(&home, R, &real).unwrap();
+        record_checkout(&home, R, &link).unwrap();
+        let recorded = |home: &Home| {
+            home.events()
+                .read_all()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == EV_CHECKOUT)
+                .count()
+        };
+        assert_eq!(recorded(&home), 1);
+        // Both spellings in the log, as an older Paja recorded them: named once, the newest.
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(&lock, EV_CHECKOUT, json!({ "repo": R, "path": link }))
+            .unwrap();
+        drop(lock);
+        assert_eq!(known_checkouts(&home, R).unwrap(), vec![link]);
+    }
+
+    /// On Windows a checkout spelled in other letter case is the same checkout.
+    #[cfg(windows)]
+    #[test]
+    fn a_checkout_spelled_in_other_letter_case_is_recorded_and_named_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let real = std::path::absolute(dir.path()).unwrap().join("Real");
+        std::fs::create_dir_all(&real).unwrap();
+        let other = std::path::PathBuf::from(real.to_str().unwrap().to_uppercase());
+        assert_ne!(other, real);
+        record_checkout(&home, R, &real).unwrap();
+        record_checkout(&home, R, &other).unwrap();
+        let recorded = home
+            .events()
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EV_CHECKOUT)
+            .count();
+        assert_eq!(recorded, 1);
+        assert_eq!(known_checkouts(&home, R).unwrap(), vec![real]);
     }
 
     #[test]

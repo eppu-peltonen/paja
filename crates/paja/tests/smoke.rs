@@ -1020,6 +1020,37 @@ fn a_closed_stdout_ends_paja_with_its_exit_code_not_a_panic() {
     }
 }
 
+/// A sync through a symlink to a checkout already recorded records nothing new.
+#[cfg(unix)]
+#[test]
+fn a_sync_through_a_symlink_to_a_recorded_checkout_records_no_new_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&repo, &link).unwrap();
+    let gh = fake_gh(tmp.path(), "[]");
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    // Spelled with `--repo`: a process started in the symlink would see the resolved folder.
+    for at in [&repo, &link] {
+        let (ok, report) = paja_with(
+            &home,
+            tmp.path(),
+            &["work", "sync", "--repo", at.to_str().unwrap()],
+            &with_gh,
+        );
+        assert!(ok, "{report}");
+    }
+    let (_, log) = paja(&home, &repo, &["log"]);
+    let recorded: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .collect();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+}
+
 #[test]
 fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     let tmp = tempfile::tempdir().unwrap();
