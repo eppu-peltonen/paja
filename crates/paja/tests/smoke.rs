@@ -549,8 +549,61 @@ impl Mcp {
     }
 }
 
-/// Every tool a plugin skill tells the agent to call (`Call `name``) is one `paja mcp` provides,
-/// and every skill has a description that says when to use it.
+/// The tools `text` names: each word in backticks after the word "call" (`Call `name``) or
+/// before the word "tool" (`the `name` tool`), and each backticked `family_name` whose family
+/// (the part before `_`) is one of `tools`' families, so a misspelt `work_lst` is caught
+/// however the sentence is put.
+fn named_tools(text: &str, tools: &[String]) -> Vec<String> {
+    let families: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.split_once('_'))
+        .map(|(f, _)| f)
+        .collect();
+    let mut named = Vec::new();
+    // Backticked spans alternate with the text between them.
+    let parts: Vec<&str> = text.split('`').collect();
+    for i in (1..parts.len()).step_by(2) {
+        let (before, word, after) = (
+            parts[i - 1],
+            parts[i],
+            parts.get(i + 1).copied().unwrap_or(""),
+        );
+        let called = before
+            .trim_end()
+            .rsplit(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("call"));
+        let tool_after = after
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .find(|w| !w.is_empty())
+            .is_some_and(|w| w == "tool")
+            && after.trim_start().starts_with("tool");
+        let family = word
+            .split_once('_')
+            .is_some_and(|(f, rest)| !rest.is_empty() && families.contains(&f));
+        if called || tool_after || family {
+            named.push(word.to_string());
+        }
+    }
+    named
+}
+
+#[test]
+fn named_tools_finds_every_way_a_skill_names_a_tool() {
+    let tools: Vec<String> = ["work_list", "work_sync", "doctor"]
+        .map(String::from)
+        .to_vec();
+    let text = "1. Call `work_list`. Then call `doktor`. Use the `status` tool. \
+                Read `work_lst` again. A small `note` and the `paja` MCP tools are no tools; \
+                nor is `pull_request` or `ok`.";
+    assert_eq!(
+        named_tools(text, &tools),
+        ["work_list", "doktor", "status", "work_lst"]
+    );
+}
+
+/// Every tool a plugin skill names (see [`named_tools`]) is one `paja mcp` provides, and every
+/// skill has a description that says when to use it.
 #[test]
 fn plugin_skills_name_only_tools_the_mcp_server_provides() {
     let tmp = tempfile::tempdir().unwrap();
@@ -578,11 +631,10 @@ fn plugin_skills_name_only_tools_the_mcp_server_provides() {
             "{} needs a description that says when to use it",
             file.display()
         );
-        for part in text.split("all `").skip(1) {
-            let name = part.split('`').next().unwrap();
+        for name in named_tools(&text, &names) {
             assert!(
-                names.iter().any(|n| n == name),
-                "{} calls `{name}`, which paja mcp doesn't provide: {names:?}",
+                names.iter().any(|n| n == &name),
+                "{} names the tool `{name}`, which paja mcp doesn't provide: {names:?}",
                 file.display()
             );
         }
@@ -2265,6 +2317,60 @@ fn doctor_checks_that_the_sandbox_program_works() {
 }
 
 #[test]
+fn doctor_warns_when_claude_code_is_out_of_date() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let claude = program(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\ncase \"$1 $2\" in\n\
+         \"auth status\") echo '{\"loggedIn\": true}' ;;\n\
+         *) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+    );
+    let latest = tmp.path().join("latest.json");
+    std::fs::write(&latest, "{\"version\": \"2.1.4\"}").unwrap();
+    let missing = tmp.path().join("no-such-file");
+    let current = tmp.path().join("current.txt");
+    std::fs::write(&current, "2.0.0\n").unwrap();
+    let claude_check = |source: &Path| -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(tmp.path())
+            .env("PAJA_HOME", &home)
+            .env("PAJA_CLAUDE", &claude)
+            .env("PAJA_CLAUDE_LATEST", source)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "claude")
+            .unwrap_or_else(|| panic!("no claude check in {report}"))
+            .clone()
+    };
+    let old = claude_check(&latest);
+    assert_eq!(old["status"], "warning", "{old}");
+    assert!(old["detail"].as_str().unwrap().contains("2.1.4"), "{old}");
+    assert!(old["fix"].as_str().unwrap().contains("update"), "{old}");
+    // A lookup that fails never fails doctor.
+    let unknown = claude_check(&missing);
+    assert_eq!(unknown["status"], "ok", "{unknown}");
+    assert!(
+        unknown["detail"]
+            .as_str()
+            .unwrap()
+            .contains("could not check"),
+        "{unknown}"
+    );
+    let same = claude_check(&current);
+    assert_eq!(same["status"], "ok", "{same}");
+}
+
+#[test]
 fn doctor_reports_each_check_and_the_fix_for_a_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home, d) = (
@@ -2313,12 +2419,16 @@ fn doctor_reports_each_check_and_the_fix_for_a_failure() {
          \"auth status\") echo '{\"loggedIn\": true}' ;;\n\
          *) echo '2.0.0 (Claude Code)' ;;\nesac\n",
     );
+    let latest = tmp.path().join("latest.txt");
+    std::fs::write(&latest, "2.0.0\n").unwrap();
     let doctor = || {
         let output = Command::new(env!("CARGO_BIN_EXE_paja"))
             .current_dir(&repo)
             .env("PAJA_HOME", &home)
             .env("PAJA_GH", &gh)
             .env("PAJA_CLAUDE", &claude)
+            // Not the network: a file that says the installed version is the latest.
+            .env("PAJA_CLAUDE_LATEST", &latest)
             .env_remove("PAJA_SBX")
             .args(["--json", "doctor"])
             .output()
