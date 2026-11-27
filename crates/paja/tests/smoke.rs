@@ -2850,21 +2850,14 @@ fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_br
         "{report}"
     );
     assert_eq!(branch["status"], "failed", "{report}");
-    // GitHub names a branch that isn't fetched: origin/HEAD stays unread, and a local main is
-    // the default branch.
+    // GitHub names a branch that isn't fetched: neither origin/HEAD nor a local main, which
+    // code in a worktree can make, stands in for it.
     git(&repo, &["branch", "main", "trunk"]);
     let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "gone"}}"#);
-    assert!(named(&report, "default branch").is_none(), "{report}");
-    assert_eq!(
-        named(&report, "work label").unwrap()["status"],
-        "ok",
-        "{report}"
-    );
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
     assert!(
-        named(&report, "origin/HEAD").unwrap()["detail"]
-            .as_str()
-            .unwrap()
-            .contains("Paja reads main instead"),
+        branch["fix"].as_str().unwrap().contains("git fetch origin"),
         "{report}"
     );
 }
@@ -2917,6 +2910,15 @@ fn the_default_branch_github_names_is_read_without_origin_head_or_main() {
         calls
             .lines()
             .any(|l| l.starts_with("issue list") && l.contains("game")),
+        "{calls}"
+    );
+    // It read two files from the default branch, and asked GitHub for its name once.
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.contains("defaultBranchRef"))
+            .count(),
+        1,
         "{calls}"
     );
 }

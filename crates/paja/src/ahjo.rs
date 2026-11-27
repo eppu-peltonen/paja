@@ -850,27 +850,25 @@ const BRANCH_PREFIX: &str = "paja/";
 /// change under review.
 ///
 /// GitHub's name for it decides when `gh repo view` can say (within 15 seconds): Paja reads
-/// `origin/<name>`. `origin/HEAD` is local state that code in a worktree can move (`git remote
+/// `origin/<name>`, and nothing else, so an unfetched one is none. `origin/HEAD` is local state that code in a worktree can move (`git remote
 /// set-head`, `git update-ref`), and once the branch under review is pushed it would point
 /// inside `refs/remotes/origin/`, so it is skipped then. Otherwise `origin/HEAD` (the remote's
 /// default branch, whatever its name), else `origin/main`, else a local `main`; `origin/HEAD`
 /// must then be a symbolic ref to a remote-tracking branch that isn't one of Paja's own
 /// (`paja/...`), or this errors.
 pub(crate) fn default_branch(ok: &Untampered) -> Result<Option<(String, String)>> {
-    let named = github_default_branch(ok);
-    if let Some(name) = &named {
-        if let Some(commit) = ref_commit(ok.path(), &format!("refs/remotes/origin/{name}"))? {
-            return Ok(Some((commit, format!("origin/{name}"))));
-        }
-    } else {
-        trusted_origin_head(ok)?;
+    if let Some(name) = github_default_branch(ok) {
+        // GitHub's branch, or none: a local `main` or `origin/main` may be something else, and
+        // code in a worktree can make one.
+        return Ok(
+            ref_commit(ok.path(), &format!("refs/remotes/origin/{name}"))?
+                .map(|commit| (commit, format!("origin/{name}"))),
+        );
     }
+    trusted_origin_head(ok)?;
     // Full ref names: a short one such as `origin/main` would let a tag or branch of that name
     // (`refs/tags/origin/main`) stand in for the default branch.
     for (full, rev) in DEFAULT_REFS {
-        if named.is_some() && full == "refs/remotes/origin/HEAD" {
-            continue;
-        }
         if let Some(commit) = ref_commit(ok.path(), full)? {
             return Ok(Some((commit, rev.to_string())));
         }
@@ -953,28 +951,35 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
 }
 
 /// How long a default branch name from `gh` is reused, so a `work sync`, which reads two
-/// files from the default branch, asks once.
+/// files from the default branch, asks once; and how long gh's failure to say is, so a gh
+/// that hangs costs one wait, not two, while the next pass asks again.
 const NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-#[cfg(test)]
-thread_local! {
-    /// Unit tests run without `gh`, whatever the machine has (`GH_REPO`, a signed-in `gh`).
-    static NO_GH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
+const NO_NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The default branch's name as `gh repo view` reports it, or None when gh can't say within 15
-/// seconds or names something that can't be a branch Paja would trust. A name is reused for a
-/// few minutes per checkout.
+/// seconds or names something that can't be a branch Paja would trust. The answer is reused
+/// per repository: a name for a few minutes, a None for half a minute.
 fn github_default_branch(ok: &Untampered) -> Option<String> {
-    #[cfg(test)]
-    if NO_GH.with(|off| off.get()) {
+    // Unit tests run without `gh`, whatever the machine has (`GH_REPO`, a signed-in `gh`).
+    if cfg!(test) {
         return None;
     }
-    type Names = BTreeMap<PathBuf, (std::time::Instant, Option<String>)>;
+    type Names = BTreeMap<String, (std::time::Instant, Option<String>)>;
     static NAMES: std::sync::OnceLock<std::sync::Mutex<Names>> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(Default::default);
-    if let Some((at, name)) = names.lock().ok()?.get(ok.path()) {
-        if at.elapsed() < NAME_REUSE {
+    // A panic elsewhere while the lock was held leaves the map as it was, which is still right.
+    let lock = || {
+        names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some((at, name)) = lock().get(&ok.key) {
+        let reuse = if name.is_some() {
+            NAME_REUSE
+        } else {
+            NO_NAME_REUSE
+        };
+        if at.elapsed() < reuse {
             return name.clone();
         }
     }
@@ -991,12 +996,7 @@ fn github_default_branch(ok: &Untampered) -> Option<String> {
             .map(|n| n.trim().to_string())
     })
     .filter(|name| branch_like(name));
-    if let Ok(mut names) = names.lock() {
-        names.insert(
-            ok.path().to_path_buf(),
-            (std::time::Instant::now(), name.clone()),
-        );
-    }
+    lock().insert(ok.key.clone(), (std::time::Instant::now(), name.clone()));
     name
 }
 
