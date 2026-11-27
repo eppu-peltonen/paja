@@ -3745,6 +3745,37 @@ fn the_second_high_risk_reviewer_runs_as_review_2() {
 }
 
 #[test]
+fn both_high_risk_reviewers_get_the_same_diff_first() {
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let calls = f.claude_calls();
+    let prefixes: Vec<&str> = calls
+        .iter()
+        .filter(|c| c.contains("--json-schema"))
+        .map(|c| {
+            // What every reviewer of a round shares (issue, answers, diff) comes before the
+            // reviewer's own instructions.
+            let end = c
+                .find("You are an independent reviewer")
+                .unwrap_or_else(|| panic!("no reviewer instructions in {c}"));
+            &c[..end]
+        })
+        .collect();
+    assert_eq!(prefixes.len(), 2, "{calls:?}");
+    assert!(
+        prefixes[0].contains("Issue #5: Add a feature file"),
+        "{}",
+        prefixes[0]
+    );
+    assert!(prefixes[0].contains("Diff stat for `"), "{}", prefixes[0]);
+    assert!(prefixes[0].contains("+++ b/feature.txt"), "{}", prefixes[0]);
+    assert_eq!(prefixes[0], prefixes[1]);
+}
+
+#[test]
 fn a_bad_models_file_says_which_line_to_fix() {
     let f = Factory::new("true\n", "land");
     f.on_main(".paja/models", "build sonnet\nreview opus loud\n");
