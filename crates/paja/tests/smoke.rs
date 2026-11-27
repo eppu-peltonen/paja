@@ -9556,7 +9556,7 @@ fn init_with_agent(
         tmp.path(),
         "claude",
         &format!(
-            "#!/bin/sh\ncat > {d}/prompt.txt\necho x >> {d}/claude-calls\ncat {d}/answer.json\n"
+            "#!/bin/sh\ncat > {d}/prompt.txt\necho x >> {d}/claude-calls\nprintf '%s\\n' \"$@\" > {d}/claude-args\ncat {d}/answer.json\n"
         ),
     );
     let mut all = vec!["init"];
@@ -9854,6 +9854,87 @@ fn init_falls_back_to_the_table_and_says_so_when_the_agent_answers_badly() {
         "{out}"
     );
     assert!(show(&repo, "paja/init", ".paja/checks").contains("go test ./...\n"));
+}
+
+#[test]
+fn init_falls_back_to_the_table_without_the_agents_environment() {
+    // No proposed stack is backed by a file, but its toolchain is: the table's stacks are used,
+    // and the environment is theirs alone, not the agent's toolchains beside them.
+    let answer = serde_json::json!({
+        "stacks": [{"name": "ghost", "dir": ".", "file": "ghost.toml",
+            "checks": [{"command": "ghost test", "file": "ghost.toml"}], "commands": ["ghost"]}],
+        "toolchains": [{"name": "go", "version": "1.22", "file": "go.mod"}],
+        "services": [{"name": "postgres", "file": "go.mod"}]
+    });
+    let (_tmp, _repo, ok, out) = init_with_agent(&[("go.mod", "module x\n")], &answer, &[]);
+    assert!(ok, "{out}");
+    let detected = &out["detected"];
+    assert!(
+        detected["fallback"]
+            .as_str()
+            .unwrap()
+            .contains("proposed no stack"),
+        "{out}"
+    );
+    assert_eq!(detected["checks"][0]["source"], "table", "{out}");
+    assert_eq!(
+        detected["environment"]["toolchains"],
+        serde_json::json!([]),
+        "{out}"
+    );
+    assert_eq!(
+        detected["environment"]["services"],
+        serde_json::json!([]),
+        "{out}"
+    );
+}
+
+#[test]
+fn the_init_agent_gets_read_only_tools_and_hook() {
+    let answer = serde_json::json!({"stacks": [{"name": "go", "dir": ".", "file": "go.mod",
+        "checks": [{"command": "go test ./...", "file": "go.mod"}], "commands": ["go"]}]});
+    let (tmp, _repo, ok, out) = init_with_agent(&[("go.mod", "module x\n")], &answer, &[]);
+    assert!(ok, "{out}");
+    let args = std::fs::read_to_string(tmp.path().join("claude-args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let after = |flag: &str| {
+        let at = args.iter().position(|a| *a == flag);
+        at.and_then(|at| args.get(at + 1))
+            .copied()
+            .unwrap_or_else(|| panic!("no {flag}: {args:?}"))
+    };
+    // Only reading tools are defined at all, and only reading ones are allowed.
+    assert_eq!(after("--tools"), "Read,Glob,Grep,Bash", "{args:?}");
+    let allowed = &args[args.iter().position(|a| *a == "--allowedTools").unwrap() + 1..];
+    let allowed: Vec<&str> = allowed
+        .iter()
+        .take_while(|a| !a.starts_with("--"))
+        .copied()
+        .collect();
+    assert!(allowed.contains(&"Read"), "{allowed:?}");
+    for write in ["Edit", "Write", "NotebookEdit"] {
+        assert!(!allowed.iter().any(|a| a.starts_with(write)), "{allowed:?}");
+    }
+    assert!(
+        allowed.iter().all(|a| !a.starts_with("Bash(")
+            || a.starts_with("Bash(git ")
+            || [
+                "Bash(tail *)",
+                "Bash(head *)",
+                "Bash(grep *)",
+                "Bash(wc *)",
+                "Bash(pwd)"
+            ]
+            .contains(a)),
+        "{allowed:?}"
+    );
+    // The deny-list hook runs in its read-only mode.
+    let settings = after("--settings");
+    assert!(
+        settings.contains("hook") && settings.contains("--read-only"),
+        "{settings}"
+    );
+    assert_eq!(after("--permission-mode"), "auto", "{args:?}");
 }
 
 #[test]

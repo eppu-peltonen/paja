@@ -137,7 +137,8 @@ A repository with no `init` line in `.paja/models` runs the agent on the account
 skips the agent and uses a small built-in table instead (`Cargo.toml`; `package.json` with its `test` and `lint`
 scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`; `go.mod`).
 The table is also the fallback when `claude` is missing or not signed in, or when the agent's answer is malformed or
-holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`).
+holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`),
+and none of the agent's toolchains or services are kept.
 
 `paja init` writes, in one pull request from the branch `paja/init`:
 

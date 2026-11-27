@@ -637,8 +637,12 @@ fn find_stacks(
             .collect()
     };
     let mut d = detected(&stacks);
-    d.environment.toolchains = accepted.toolchains;
-    d.environment.services = accepted.services;
+    // The agent's toolchains and services go with its stacks: on fallback the table's stacks
+    // are used alone, so the environment isn't half the agent's.
+    if why.is_none() {
+        d.environment.toolchains = accepted.toolchains;
+        d.environment.services = accepted.services;
+    }
     d.dropped = accepted.dropped;
     d.fallback = why.map(|why| {
         format!(
