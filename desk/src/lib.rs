@@ -366,12 +366,26 @@ pub fn about_with(candidates: &[PathBuf]) -> Value {
                 "desk": desk,
                 "paja": version,
                 "paja_commit": reply["commit"],
-                "paja_path": program,
+                "paja_path": shown_path(program, std::env::var_os("PATH").as_deref()).to_string_lossy(),
                 "matches": version == desk,
             });
         }
     }
     json!({ "desk": desk, "paja": null, "paja_path": null, "matches": false })
+}
+
+/// Where `program` is: itself when it names a folder, else the first match in `path` (the
+/// value of `PATH`), so the window shows which `paja` answered rather than its bare name.
+fn shown_path(program: &Path, path: Option<&std::ffi::OsStr>) -> PathBuf {
+    if program.components().count() != 1 {
+        return program.to_path_buf();
+    }
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| program.to_path_buf())
 }
 
 /// The directory Desk was started in: the checkout, when started from one.
@@ -910,6 +924,23 @@ mod tests {
         assert_eq!(differs["matches"], false, "{differs}");
         let none = about_with(&[missing]);
         assert_eq!(none["paja"], Value::Null, "{none}");
+    }
+
+    #[test]
+    fn a_bare_program_name_is_shown_where_path_finds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("paja"), "").unwrap();
+        let path = std::env::join_paths([dir.path().join("empty"), bin.clone()]).unwrap();
+        assert_eq!(shown_path(Path::new("paja"), Some(&path)), bin.join("paja"));
+        // Not on PATH: the name as given. A path with a folder is kept as it is.
+        assert_eq!(
+            shown_path(Path::new("other"), Some(&path)),
+            PathBuf::from("other")
+        );
+        let full = dir.path().join("x").join("paja");
+        assert_eq!(shown_path(&full, None), full);
     }
 
     #[test]
