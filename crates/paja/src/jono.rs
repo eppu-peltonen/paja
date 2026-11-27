@@ -1487,22 +1487,40 @@ fn add_label(
             &["issue", "edit", &number.to_string(), "--add-label", label],
         )
     };
-    if add(ok).is_err() {
-        gh(
-            ok,
-            &[
-                "label",
-                "create",
-                label,
-                "--color",
-                color,
-                "--description",
-                description,
-            ],
-        )?;
-        add(ok)?;
+    match add(ok) {
+        Ok(_) => Ok(()),
+        // Only a label the repository lacks is created; any other failure (the network, a
+        // deleted issue, no permission) is the error, not a reason to make a label.
+        Err(err) if label_missing(&err) => {
+            gh(
+                ok,
+                &[
+                    "label",
+                    "create",
+                    label,
+                    "--color",
+                    color,
+                    "--description",
+                    description,
+                ],
+            )?;
+            add(ok).map(drop)
+        }
+        Err(err) => Err(err),
     }
-    Ok(())
+}
+
+/// Whether `gh issue edit --add-label` failed because the repository has no such label: gh
+/// says `could not add label: '<label>' not found`. Matched by that phrase, not by the words
+/// alone, so a checkout path or another error that happens to say "label" or "not found"
+/// isn't taken for it.
+fn label_missing(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_lowercase();
+    text.split("could not add label: ").skip(1).any(|rest| {
+        rest.lines()
+            .next()
+            .is_some_and(|l| l.contains("' not found"))
+    })
 }
 
 fn remove_label(ok: &Untampered, number: u64, label: &str) -> Result<()> {
@@ -2231,27 +2249,13 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
 pub fn mark_needs_answer(home: &Home, repo: &Path, number: u64) -> Result<String> {
     let ok = crate::ahjo::untampered(home, repo)?;
     let label = Labels::of_default_branch(&ok)?.needs_answer;
-    let add = |ok: &Untampered| {
-        gh(
-            ok,
-            &["issue", "edit", &number.to_string(), "--add-label", &label],
-        )
-    };
-    if add(&ok).is_err() {
-        gh(
-            &ok,
-            &[
-                "label",
-                "create",
-                &label,
-                "--color",
-                "d93f0b",
-                "--description",
-                "Paja is waiting for an answer: paja work answer <number> \"<answer>\"",
-            ],
-        )?;
-        add(&ok)?;
-    }
+    add_label(
+        &ok,
+        number,
+        &label,
+        "d93f0b",
+        "Paja is waiting for an answer: paja work answer <number> \"<answer>\"",
+    )?;
     Ok(label)
 }
 
@@ -2471,6 +2475,21 @@ mod tests {
         let (delete, stays) = to_free(&live, Some("dddd"));
         assert!(delete.is_empty());
         assert_eq!(stays.unwrap().runner, "cccc");
+    }
+
+    #[test]
+    fn only_a_missing_label_is_taken_for_one() {
+        let missing = anyhow::anyhow!("`gh issue edit` failed: could not add label: 'x' not found");
+        assert!(label_missing(&missing));
+        let down = anyhow::anyhow!("`gh issue edit` failed: HTTP 502: Bad Gateway");
+        assert!(!label_missing(&down));
+        let elsewhere =
+            anyhow::anyhow!("`gh issue edit` failed in /src/labeler: HTTP 404: Not Found");
+        assert!(!label_missing(&elsewhere));
+        let gone = anyhow::anyhow!(
+            "`gh issue edit` failed: GraphQL: Could not resolve to an issue or pull request"
+        );
+        assert!(!label_missing(&gone));
     }
 
     #[test]
