@@ -112,6 +112,12 @@ impl Home {
         self.try_runs_lock(repo, "land")
     }
 
+    /// Take the lock a `paja triage` pass holds for `repo` while it runs, without waiting. None
+    /// when another live pass holds it, so two passes never share the triage checkout.
+    pub fn try_triage_lock(&self, repo: &str) -> Result<Option<RunLock>> {
+        self.try_runs_lock(repo, "triage")
+    }
+
     /// Whether a live run holds item `number` of `repo`'s run lock, found without writing: a
     /// lock file that isn't there yet is held by no one, so a probe never creates one.
     pub fn run_held(&self, repo: &str, number: u64) -> Result<bool> {
