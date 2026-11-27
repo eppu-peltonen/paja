@@ -2022,7 +2022,7 @@ fn work_show_tells_where_an_active_items_run_is_and_that_it_stopped() {
     assert!(!home.join("runs").exists());
     assert_eq!(
         (&run["round"], &run["max_rounds"]),
-        (&1.into(), &3.into()),
+        (&1.into(), &5.into()),
         "{run}"
     );
     assert_eq!(run["step"]["role"], "build", "{run}");
@@ -2155,7 +2155,6 @@ impl Factory {
         std::fs::write(dir.join("verdict.txt"), verdict).unwrap();
         let script = |name: &str, body: String| program(dir, name, &body);
         let d = slash(dir);
-        let token = fake_token();
         let gh = script(
             "gh",
             format!(
@@ -2200,8 +2199,9 @@ impl Factory {
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
-                 v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [{{\\\"kind\\\": \\\"risk\\\", \\\"finding\\\": \\\"Tidy the helper, which logs {token}\\\"}}, {{\\\"kind\\\": \\\"nit\\\", \\\"finding\\\": \\\"Rename the variable\\\"}}]}}}}\" ;;\n\
+                 v=$(cat {d}/verdict.txt); f='[]'\n\
+                 if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
@@ -2247,6 +2247,15 @@ impl Factory {
                 ("PAJA_CLAUDE", self.claude.as_path()),
             ],
         )
+    }
+
+    /// Have the fake reviewer report `findings` (a JSON array) with its verdict: on every
+    /// review, or with `once` on the first only.
+    fn reviewer_finds(&self, findings: Value, once: bool) {
+        std::fs::write(self.tmp.path().join("findings.json"), findings.to_string()).unwrap();
+        if once {
+            std::fs::write(self.tmp.path().join("findings-once"), "").unwrap();
+        }
     }
 
     /// `run`, with the progress lines it wrote on stderr.
@@ -2320,10 +2329,6 @@ fn a_run_uses_the_labels_main_names() {
     let log = f.gh_log();
     assert!(
         log.contains("issue list --label game --state open"),
-        "{log}"
-    );
-    assert!(
-        log.contains("issue create --label game-ideas --title Tidy the helper"),
         "{log}"
     );
     assert!(!log.contains("factory"), "{log}");
@@ -2464,31 +2469,10 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]));
-    // A finding that didn't block landing becomes an issue for a person to queue, not queued
-    // work.
-    assert!(
-        log.contains("issue create --label factory-follow-up --title Tidy the helper"),
-        "{log}"
-    );
-    // The reviewer's risk and nit make one issue that holds only the risk: nits are not filed.
-    assert_eq!(
-        log.matches("issue create --label factory-follow-up")
-            .count(),
-        1,
-        "{log}"
-    );
-    assert!(!log.contains("Rename the variable"), "{log}");
-    assert!(
-        log.contains("Reviewers found these while reviewing #5"),
-        "{log}"
-    );
+    // A clean review files no issue.
+    assert!(!log.contains("issue create"), "{log}");
     // The prompt reaches `claude` on stdin, not on its command line.
     assert!(f.tmp.path().join("prompt-on-stdin").exists());
-    // A token in a finding never reaches the public issue.
-    assert!(
-        !log.contains(&fake_token()) && log.contains("logs <redacted>"),
-        "{log}"
-    );
     // Every agent runs under the deny-list hook, bounded to its environment, and with no
     // settings files that could switch the hook off.
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
@@ -3237,7 +3221,7 @@ fn a_run_stopped_twice_in_a_fix_keeps_its_round_and_its_blockers() {
     let (report, stderr) = f.run_with_stderr();
     assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
     assert!(stderr.contains("resuming #5 in round 2"), "{stderr}");
-    assert!(!stderr.contains("round 1 of 3"), "{stderr}");
+    assert!(!stderr.contains("round 1 of 5"), "{stderr}");
     let calls = f.claude_calls();
     let fix = calls
         .iter()
@@ -3875,9 +3859,16 @@ fn run_records_what_each_agent_step_spent() {
 }
 
 #[test]
-fn a_fix_round_hands_the_builder_the_nits() {
-    // Round one asks for changes, so the nit goes to the fix round instead of an issue.
+fn a_fix_round_hands_the_builder_the_findings() {
+    // Round one asks for changes, so the findings go to the fix round, never to an issue.
     let f = Factory::new("true\n", "changes");
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": "Tidy the helper"},
+            {"kind": "nit", "finding": "Rename the variable"}
+        ]),
+        true,
+    );
     std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
@@ -3889,18 +3880,93 @@ fn a_fix_round_hands_the_builder_the_nits() {
     assert_eq!(builds.len(), 2, "{calls:?}");
     assert!(!builds[0].contains("Rename the variable"), "{}", builds[0]);
     assert!(
-        builds[1].contains("also noted these nits") && builds[1].contains("Rename the variable"),
+        builds[1].contains("also noted these findings")
+            && builds[1].contains("Rename the variable")
+            && builds[1].contains("Tidy the helper"),
+        "{}",
+        builds[1]
+    );
+    assert!(!f.gh_log().contains("issue create"), "{}", f.gh_log());
+}
+
+#[test]
+fn a_land_verdict_with_findings_sends_them_back_and_lands_when_the_re_review_is_clean() {
+    let f = Factory::new("true\n", "land");
+    let token = fake_token();
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": format!("Tidy the helper, which logs {token}")},
+            {"kind": "nit", "finding": "Rename the variable"}
+        ]),
+        true,
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(
+        builds[1].contains("Tidy the helper") && builds[1].contains("Rename the variable"),
         "{}",
         builds[1]
     );
     let log = f.gh_log();
-    assert_eq!(
-        log.matches("issue create --label factory-follow-up")
-            .count(),
-        1,
+    assert!(!log.contains("issue create"), "{log}");
+    assert!(!log.contains("Reviewers left these findings"), "{log}");
+}
+
+#[test]
+fn a_change_holding_a_finding_at_the_round_limit_lands_and_lists_it_without_an_issue() {
+    let f = Factory::new("true\n", "land");
+    let token = fake_token();
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": format!("Tidy the helper, which logs {token}")},
+            {"kind": "outside", "finding": "The parser drops a line"}
+        ]),
+        false,
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 5, "{report}");
+    let log = f.gh_log();
+    assert!(!log.contains("issue create"), "{log}");
+    // The pull request lists what was left, with the token redacted.
+    assert!(
+        log.contains("Reviewers left these findings")
+            && log.contains("The parser drops a line")
+            && log.contains("logs <redacted>")
+            && !log.contains(&fake_token()),
         "{log}"
     );
-    assert!(!log.contains("Rename the variable"), "{log}");
+    let (_, events) = paja(&f.home, &f.repo, &["log"]);
+    let left: Vec<&str> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.follow_up")
+        .filter_map(|e| e["data"]["error"].as_str())
+        .collect();
+    assert!(
+        left.contains(&"not filed: round limit") && left.contains(&"not filed: outside the change"),
+        "{left:?}"
+    );
+}
+
+#[test]
+fn a_change_holding_a_blocker_at_the_round_limit_escalates() {
+    let f = Factory::new("true\n", "changes");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert_eq!(report["rounds"], 5, "{report}");
+    assert!(!f.gh_log().contains("issue create"), "{}", f.gh_log());
 }
 
 #[test]
@@ -4253,7 +4319,7 @@ fn run_says_what_it_is_doing_on_stderr() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     for step in [
         "picked #5: Add a feature file",
-        "round 1 of 3: Claude is building the change",
+        "round 1 of 5: Claude is building the change",
         "running Vasara's checks",
         "reviewer 1 of 1 is reading the change",
         "review verdict: land",
@@ -4776,12 +4842,12 @@ fn the_next_run_gets_the_persons_answer() {
 }
 
 #[test]
-fn run_gives_up_after_three_failed_rounds_and_asks() {
+fn run_gives_up_after_five_failed_rounds_and_asks() {
     let f = Factory::new("test -f never.txt\n", "land");
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "escalated");
-    assert_eq!(report["rounds"], 3);
+    assert_eq!(report["rounds"], 5);
     assert!(
         report["question"].as_str().unwrap().contains("never.txt"),
         "{report}"
@@ -4793,7 +4859,7 @@ fn run_gives_up_after_three_failed_rounds_and_asks() {
         .iter()
         .filter(|e| e["kind"] == "run.round")
         .count();
-    assert_eq!(rounds, 3);
+    assert_eq!(rounds, 5);
 }
 
 /// A repository, a fake `gh` listing three open follow-up issues (#11, #12, #13) and no work
@@ -5272,6 +5338,10 @@ fn run_checks_come_from_main_not_the_branch() {
 #[test]
 fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "Tidy the helper"}]),
+        false,
+    );
     std::fs::write(f.tmp.path().join("gh-down"), "").unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
@@ -5574,7 +5644,7 @@ fn a_second_review_judges_only_the_fix() {
     assert!(first.contains("...HEAD`"), "{args}");
     assert!(first.contains("+++ b/feature.txt"), "{args}");
     let rereview = reviews.get(1).copied().unwrap_or_default();
-    assert!(rereview.contains("found these blockers"), "{args}");
+    assert!(rereview.contains("asked for these fixes"), "{args}");
     assert!(rereview.contains("add more"), "{args}");
     assert!(
         rereview.contains("Judge only the fix, the diff above (`git diff "),
@@ -6086,6 +6156,10 @@ fn a_fix_round_without_commits_is_not_reviewed() {
     // After a review asks for changes, a round that commits nothing goes back to the builder
     // instead of letting the reviewer land the unchanged branch.
     let f = Factory::new("true\n", "changes");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "Tidy the helper"}]),
+        false,
+    );
     std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
     std::fs::write(f.tmp.path().join("lazy"), "").unwrap();
     let (ok, report) = f.run();

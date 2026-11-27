@@ -12,7 +12,7 @@ flowchart TB
     approve -- yes --> plan["Plan and review plan"]
     plan --> build["Build in its own environment"]
     build --> checks{"Vasara: checks pass?"}
-    checks -- "no: fix loop, max 3 rounds" --> build
+    checks -- "no: fix loop, max 5 rounds" --> build
     checks -- yes --> review{"Reviewer agent(s) agree?"}
     review -- "changes asked" --> build
     review -- "can't decide" --> posti["Escalate to Posti"]
@@ -29,7 +29,7 @@ flowchart TB
 ```
 
 The issue is usually one with the work label. When no such item is ready, `paja run` takes the oldest open issue with
-the follow-up label instead (the non-blocking findings reviewers leave behind), and it goes through the same loop,
+the follow-up label instead (issues people filed; Mestari files none), and it goes through the same loop,
 risk tier and `Depends on` rules. Work items always come first: a work item that becomes ready is picked before any
 follow-up at the next pick. `follow-ups = off` in `.paja/queue` on the default branch turns this off.
 

@@ -47,7 +47,7 @@ use progress::*;
 pub use usage::{ModelUsage, StepUsage};
 
 /// Most build rounds before a run escalates instead of trying again.
-pub const MAX_ROUNDS: u32 = 3;
+pub const MAX_ROUNDS: u32 = 5;
 /// Vasara's checks: one shell command per line, read from the base commit.
 pub const CHECKS_FILE: &str = ".paja/checks";
 /// Path prefixes that make a change high risk (two reviewers), read from the base commit.
@@ -102,7 +102,8 @@ pub const EV_ESCALATED: &str = "run.escalated";
 /// recorded) or the `question` (verdict `escalate`: the person is asked it), and `overruled`
 /// when Mestari turned an `answer` into `escalate`.
 pub const EV_ARBITRATED: &str = "run.arbitrated";
-/// A non-blocking review finding filed as a follow-up issue (the `follow-up` label) after landing.
+/// A review finding the change landed without (`not filed: ...`). No issue is filed for it; older
+/// logs hold ones that were.
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// The tamper lock lives in Ahjo, next to the git every command runs.
 pub use crate::ahjo::{Tampered, EV_TAMPERED, EV_TAMPER_CHECKED};
@@ -178,9 +179,9 @@ pub struct Review {
     /// The intent question for a person, when the verdict is `escalate`.
     #[serde(default)]
     pub question: String,
-    /// Findings that don't block landing, each marked `bug`, `risk` or `nit`. Once the change
-    /// lands, Mestari files its bugs and risks together as one follow-up issue, for a person to
-    /// queue, instead of holding this change up; nits are never filed.
+    /// Findings that aren't blockers, each marked `bug`, `risk`, `nit` or `outside`. Mestari
+    /// sends all but `outside` back to the builder as the next round's feedback; `outside` ones
+    /// and any still open at the round limit are listed in the pull request. No issue is filed.
     #[serde(default)]
     pub follow_ups: Vec<Finding>,
 }
@@ -557,7 +558,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     } else {
         jono::repo_name(home, &repo)?
     };
-    let config = read_config(&repo, &base, labels, target)?;
+    let config = read_config(&repo, &base, target)?;
     // A new item starts with a build, which a nearly used window would cut off, so it isn't
     // claimed at all (no status events) and the pass waits. A resumed item goes on to its round,
     // which makes the same check for each build.
@@ -850,19 +851,13 @@ struct Config {
     high_risk: Vec<String>,
     models: Models,
     commands: crate::hook::Commands,
-    labels: jono::Labels,
     target: RepoSettings,
 }
 
 /// Read and check the default branch's configuration once, before an item is claimed: a
 /// mistake there is one fix on that branch, so it stops the pass instead of parking every item
 /// in turn.
-fn read_config(
-    repo: &Path,
-    base: &str,
-    labels: jono::Labels,
-    target: RepoSettings,
-) -> Result<Config> {
+fn read_config(repo: &Path, base: &str, target: RepoSettings) -> Result<Config> {
     let branch = target.branch.as_str();
     let checks = read_from_base(repo, base, CHECKS_FILE)?.with_context(|| {
         format!("{CHECKS_FILE} is missing on {branch}; add the check commands there")
@@ -887,7 +882,6 @@ fn read_config(
         high_risk,
         models,
         commands,
-        labels,
         target,
     })
 }
@@ -907,7 +901,6 @@ fn run_item(
         high_risk,
         models,
         commands,
-        labels,
         target,
     } = config;
     let (env, kept) = environment(home, repo, base, item)?;
@@ -1398,8 +1391,8 @@ fn run_item(
             record_round_next(home, item, round, "turn_limit", &note, steps, Some(next))?;
             continue;
         }
-        // Only the round that lands files its follow-ups: an earlier round's may be about code
-        // the fix has since changed.
+        // Only the latest review's findings count: an earlier round's may be about code the fix
+        // has since changed.
         follow_ups.clear();
         for review in &reviews {
             for finding in &review.follow_ups {
@@ -1410,10 +1403,48 @@ fn run_item(
         }
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
         progress(&format!("review verdict: {}", verdicts.join(", ")));
+        // Every finding in the change is fixed in it: a clean `land` with some still open goes
+        // back to the builder, until the last round, which lands with them listed.
+        let all_land = verdicts.iter().all(|v| *v == "land");
+        let fixes = to_fix(&follow_ups);
+        if all_land && !fixes.is_empty() && round < MAX_ROUNDS {
+            let list = fixes
+                .iter()
+                .map(|f| f.shown())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            progress("review left findings; sending them back to the builder");
+            feedback = format!(
+                "The reviewers would land this once these findings are fixed. Fix each one, or \
+                 leave one only when it is plainly wrong, and commit:\n\n{list}"
+            );
+            prior = Some(Prior {
+                reviewed: checked,
+                blockers: list,
+                follow_ups: follow_ups
+                    .iter()
+                    .filter(|f| f.kind == FindingKind::Outside)
+                    .cloned()
+                    .collect(),
+            });
+            let next = Next {
+                feedback: &feedback,
+                prior: prior.as_ref(),
+            };
+            record_round_next(
+                home,
+                item,
+                round,
+                &verdicts.join(","),
+                &summaries(&reviews),
+                steps,
+                Some(next),
+            )?;
+            continue;
+        }
         // A round that goes on is recorded below, with what the next one starts from.
-        let ends = verdicts.iter().all(|v| *v == "land")
-            || verdicts.contains(&"escalate")
-            || (risky && verdicts.contains(&"land"));
+        let ends =
+            all_land || verdicts.contains(&"escalate") || (risky && verdicts.contains(&"land"));
         if ends {
             record_round(
                 home,
@@ -1494,7 +1525,11 @@ fn run_item(
                     continue;
                 }
             }
-            let landed = land(home, repo, &env, item, round, &judged, ci, &target);
+            // What the change lands without: findings outside it, and at the round limit the
+            // ones still open. No issue is filed; the pull request lists them.
+            let left = unsettled(home, repo, &follow_ups);
+            let notes: Vec<String> = left.iter().map(|(text, _)| text.clone()).collect();
+            let landed = land(home, repo, &env, item, round, &judged, ci, &target, &notes);
             drop(landing);
             let report = match landed {
                 Ok(Landing::Retry(why)) => {
@@ -1516,16 +1551,18 @@ fn run_item(
                 Err(err) => Err(err),
             };
             match &report {
-                Ok(RunReport::Landed { pr, .. }) => {
-                    file_follow_ups(home, repo, item, pr, &follow_ups, &labels)
+                Ok(RunReport::Landed { .. }) => {
+                    for (text, why) in &left {
+                        record_follow_up(home, item, text, None, why);
+                    }
                 }
                 // Not landed after all: keep the findings in the log, for later.
                 _ => {
-                    for finding in &follow_ups {
+                    for (text, _) in &left {
                         record_follow_up(
                             home,
                             item,
-                            &finding.shown(),
+                            text,
                             None,
                             "not filed: the change did not land",
                         );
@@ -1565,18 +1602,14 @@ fn run_item(
             .collect::<Vec<_>>()
             .join("\n\n");
         feedback = format!("A reviewer asked for changes:\n\n{blockers}");
-        // Another round runs anyway, so a nit that takes a line or two is fixed now rather
-        // than filed; a nit not fixed is simply dropped.
-        let nits: Vec<&str> = follow_ups
-            .iter()
-            .filter(|f| f.kind == FindingKind::Nit)
-            .map(|f| f.text.as_str())
-            .collect();
-        if !nits.is_empty() {
+        // Every other finding in the change is fixed in it too. A nit that needs more than a
+        // rename or a comment may be left.
+        let others: Vec<String> = to_fix(&follow_ups).iter().map(|f| f.shown()).collect();
+        if !others.is_empty() {
             feedback.push_str(&format!(
-                "\n\nThe reviewers also noted these nits. Fix one only if it takes a line or \
-                 two; otherwise leave it:\n\n{}",
-                nits.join("\n\n")
+                "\n\nThe reviewers also noted these findings. Fix each one; a nit that needs \
+                 more than a rename or a comment may be left:\n\n{}",
+                others.join("\n\n")
             ));
         }
         // Without named blockers there is nothing to narrow the next review to.
@@ -2202,11 +2235,11 @@ fn review_prompt(
              issue."
         ),
         Some(prior) => format!(
-            "An earlier review of this change (at {reviewed}) found these blockers:\n\n{blockers}\n\n\
-             Judge only the fix, the diff above (`git diff {reviewed}..HEAD`). Land it if it resolves those \
-             blockers and adds none. That review read the whole change and named every blocker it \
-             found, so don't reopen the rest. It also noted these \
-             follow-ups; repeat in your `follow_ups` the ones that still apply:\n\n{follow_ups}\n",
+            "An earlier review of this change (at {reviewed}) asked for these fixes:\n\n{blockers}\n\n\
+             Judge only the fix, the diff above (`git diff {reviewed}..HEAD`). Check that each of \
+             those is settled and that the fix adds no problem. That review read the whole change \
+             and named every finding it had, so don't reopen the rest. It also noted these \
+             findings outside the change; repeat in your `follow_ups` the ones that still apply:\n\n{follow_ups}\n",
             reviewed = prior.reviewed,
             blockers = prior.blockers,
             follow_ups = if prior.follow_ups.is_empty() {
@@ -2229,19 +2262,22 @@ fn review_prompt(
          whether it lands.\n\n{scope} You already have the diff, so read only the surrounding \
          code you need. Judge it by the rules in CLAUDE.md as they are on the default branch: the CLAUDE.md in \
          your system prompt is the default branch's copy, not the branch's, so don't read it again.\n\n\
-         Verdicts: `land` if it does what the issue asks and has no blocker; `changes` only for \
-         blockers, naming every blocker in the whole diff in `comments` (a later review reads \
-         only the fix); `escalate` with a question only when the issue's \
+         Judge the change against its issue. Verdicts: `land` if it does what the issue asks and \
+         has no blocker; `changes` only for blockers, naming every blocker in the whole diff in \
+         `comments` (a later review reads only the fix); `escalate` with a question only when the issue's \
          intent is unclear or the change would weaken a check (a person must decide). A blocker \
          is a bug in what the issue asks for, a security hole the change opens, a broken \
          CLAUDE.md rule, or missing tests for the new behaviour. Anything else goes in \
          `follow_ups`, one finding each, starting with a short title line, at most five, each \
-         marked with its `kind`: `bug` for a wrong result outside what the issue asks, `risk` \
-         for a security or data-loss risk or a missing test for behaviour that could break, \
-         `nit` for style, naming, comment wording or a small refactor. Leave out ideas that are \
-         neither. Paja files the bugs and risks together as one public issue after landing \
-         (so never copy secrets, environment details or run output into them) and never files \
-         nits. They never hold the change up.\n\n\
+         marked with its `kind`: `bug` for a wrong result in the change, `risk` for a security \
+         or data-loss risk or a missing test for behaviour that could break, `nit` for style, \
+         naming, comment wording or a small refactor, `outside` for a real bug in code the \
+         change doesn't touch. Paja sends every finding except `outside` back to the builder, \
+         who fixes it in this change (so a `land` verdict with such findings runs another \
+         round), and no issue is filed for any. Leave out ideas that are none of these, and a \
+         nit that isn't worth a round. `outside` findings and any still open at the round \
+         limit are listed in the public pull request, so never copy secrets, environment \
+         details or run output into them.\n\n\
          Vasara's checks (every command in `.paja/checks` on the default branch: {checks}) already passed at \
          {checked}, the commit you are judging, so don't run them again. {probe}Read-only git \
          is fine; you can't change files.\n",
@@ -2418,7 +2454,7 @@ fn review(
                 "items": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string", "enum": ["bug", "risk", "nit"]},
+                        "kind": {"type": "string", "enum": ["bug", "risk", "nit", "outside"]},
                         "finding": {"type": "string"}
                     },
                     "required": ["kind", "finding"]

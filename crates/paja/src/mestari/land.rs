@@ -57,6 +57,7 @@ pub(super) fn land(
     judged: &str,
     ci: CiMode,
     target: &RepoSettings,
+    unsettled: &[String],
 ) -> Result<Landing> {
     let gh = jono::gh_program();
     let branch = env.branch.as_str();
@@ -82,6 +83,15 @@ pub(super) fn land(
          reviewer agent approved it.",
         item.number
     );
+    if !unsettled.is_empty() {
+        body.push_str(
+            "\n\nReviewers left these findings: ones outside this change, or still open at the \
+             round limit. No issue was filed for them.\n",
+        );
+        for finding in unsettled {
+            body.push_str(&format!("\n- {}", finding.replace('\n', "\n  ")));
+        }
+    }
     if ci == CiMode::None {
         body.push_str(&format!(
             "\n\nThis repository has no CI (`{CI_FILE}` is `none`), so Paja landed it on \
