@@ -124,8 +124,10 @@ enum Command {
         /// takes a number or a stack name. With --json or no terminal, --stack is required.
         #[arg(long, value_name = "NAME", conflicts_with = "recommend")]
         new: Option<String>,
-        /// The skeleton's stack, with --new. For a stack to choose, see --recommend.
-        #[arg(long, value_parser = paja::init::STACKS, requires = "new")]
+        /// The skeleton's stack, with --new: any language or framework. rust, node and python
+        /// have a built-in skeleton; an agent generates one for any other, and nothing is pushed
+        /// unless its checks pass. For a stack to choose, see --recommend.
+        #[arg(long, requires = "new")]
         stack: Option<String>,
         /// Recommend stacks for a project that doesn't exist yet instead of setting one up: an
         /// agent reads this description (and any --prefer) and answers with one to three options,
@@ -433,7 +435,8 @@ fn run(cli: &Cli) -> Result<()> {
                     let stdin = std::io::stdin();
                     if cli.json || !std::io::IsTerminal::is_terminal(&stdin) {
                         anyhow::bail!(
-                            "`paja init --new {name}` needs --stack rust, node or python here; run \
+                            "`paja init --new {name}` needs --stack (a language or framework, such as \
+                             rust, node, python or go) here; run \
                              `paja init --recommend \"<what you are building>\"` first to get \
                              options, then pass the one you pick as --stack"
                         );
@@ -998,12 +1001,13 @@ fn describe_recommendations(found: &paja::init::Recommendations) -> String {
 
 fn describe_new(report: &paja::init::NewReport) -> String {
     let mut text = format!(
-        "created {} ({}): {}\ncloned to {}\nstack: {}\nchecks: {}\nwrote: {}\npushed the first commit to {}\n\nNext:\n",
+        "created {} ({}): {}\ncloned to {}\nstack: {} ({} skeleton)\nchecks: {}\nwrote: {}\npushed the first commit to {}\n\nNext:\n",
         report.repo,
         if report.private { "private" } else { "public" },
         report.url,
         report.directory,
         report.stack,
+        report.skeleton,
         report.checks.join("; "),
         report.files.join(", "),
         report.default_branch

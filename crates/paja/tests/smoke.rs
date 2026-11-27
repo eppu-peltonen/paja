@@ -6011,6 +6011,7 @@ fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its
         assert_eq!(out["repo"], format!("acme/{name}"));
         assert_eq!(out["directory"], dir.display().to_string());
         assert_eq!(out["default_branch"], "main");
+        assert_eq!(out["skeleton"], "built-in");
         assert_eq!(out["private"], extra == "--private");
         let files: Vec<&str> = out["files"]
             .as_array()
@@ -6106,6 +6107,169 @@ fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(!log.contains("bad name"), "{log}");
     assert!(!log.contains("app.git"), "{log}");
+}
+
+/// `paja init --new zippy --stack zig`, a stack with no built-in skeleton, against a fake `gh` and
+/// a fake `claude` that answers the three sessions (the programs, the skeleton, the detection)
+/// by what the prompt says. The detection names `check` as the one check. Returns the temp dir, the
+/// bare origin, and the command's result.
+fn init_new_generated(check: &str) -> (tempfile::TempDir, std::path::PathBuf, bool, Value) {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo create\") echo \"https://github.com/acme/$3\" ;;\n\
+             \"repo clone\") git clone -q {d}/origin-$(basename \"$3\").git \"$4\" ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let reply = |name: &str, value: Value| {
+        std::fs::write(
+            tmp.path().join(name),
+            serde_json::json!({"is_error": false, "num_turns": 1, "structured_output": value})
+                .to_string(),
+        )
+        .unwrap();
+    };
+    reply(
+        "programs.json",
+        serde_json::json!({"programs": ["zig", "bash"]}),
+    );
+    reply(
+        "detect.json",
+        serde_json::json!({"stacks": [{
+            "name": "zig", "dir": ".", "file": "build.zig",
+            "checks": [{"command": check, "file": "build.zig"}],
+            "commands": ["test"]
+        }]}),
+    );
+    std::fs::write(
+        tmp.path().join("skeleton.json"),
+        r#"{"is_error": false, "num_turns": 3, "result": "done"}"#,
+    )
+    .unwrap();
+    let claude = program(
+        tmp.path(),
+        "claude",
+        &format!(
+            "#!/bin/sh\ncat > {d}/prompt.txt\ncat {d}/prompt.txt >> {d}/prompts.txt\n\
+             echo x >> {d}/claude-calls\n\
+             stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
+             if [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
+             if grep -q 'Name the bare program names' {d}/prompt.txt; then cat {d}/programs.json\n\
+             elif grep -q 'Write its walking skeleton here' {d}/prompt.txt; then\n\
+               echo 'const std = @import(\"std\");' > build.zig\n\
+               echo 'zig-out/' > .gitignore\n\
+               cat {d}/skeleton.json\n\
+             else cat {d}/detect.json; fi\n"
+        ),
+    );
+    let origin = tmp.path().join("origin-zippy.git");
+    git(
+        tmp.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+        ],
+    );
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let (ok, out) = paja_with(
+        &tmp.path().join("home"),
+        &work,
+        &["init", "--new", "zippy", "--stack", "zig"],
+        &[
+            ("GIT_AUTHOR_NAME", Path::new("test")),
+            ("GIT_AUTHOR_EMAIL", Path::new("test@example.com")),
+            ("GIT_COMMITTER_NAME", Path::new("test")),
+            ("GIT_COMMITTER_EMAIL", Path::new("test@example.com")),
+            ("PAJA_GH", gh.as_path()),
+            ("PAJA_CLAUDE", claude.as_path()),
+        ],
+    );
+    (tmp, origin, ok, out)
+}
+
+#[test]
+fn init_new_pushes_a_generated_skeleton_whose_checks_pass() {
+    let (tmp, origin, ok, out) = init_new_generated("test -f build.zig");
+    assert!(ok, "{out}");
+    assert_eq!(out["skeleton"], "generated");
+    assert_eq!(out["stack"], "zig");
+    let files: Vec<&str> = out["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    for file in [
+        "build.zig",
+        ".gitignore",
+        ".paja/checks",
+        ".paja/commands",
+        "CLAUDE.md",
+        ".github/workflows/paja.yml",
+    ] {
+        assert!(files.contains(&file), "{file} missing from {files:?}");
+    }
+    // The agent's files and Paja's reached origin in one commit, written from the detection.
+    assert!(show(&origin, "main", "build.zig").contains("std"));
+    assert!(show(&origin, "main", ".paja/checks").contains("test -f build.zig\n"));
+    assert!(show(&origin, "main", ".paja/commands").contains("test\nreview test\n"));
+    assert!(show(&origin, "main", "CLAUDE.md").contains("## Working with Paja"));
+    assert!(show(&origin, "main", ".github/workflows/paja.yml").contains("run: test -f build.zig"));
+    let count = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args(["rev-list", "--count", "main"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    // Three sessions; the skeleton's agent was told only the stack's tools, never a shell.
+    let calls = std::fs::read_to_string(tmp.path().join("claude-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 3);
+    let prompts = std::fs::read_to_string(tmp.path().join("prompts.txt")).unwrap();
+    assert!(
+        prompts.contains("`zig`") && !prompts.contains("`bash`"),
+        "{prompts}"
+    );
+}
+
+#[test]
+fn init_new_pushes_nothing_when_a_generated_skeletons_check_fails() {
+    let (tmp, origin, ok, out) = init_new_generated("test -f nothing-here.txt");
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("fails its own check") && error.contains("test -f nothing-here.txt"),
+        "{error}"
+    );
+    assert!(error.contains("Nothing was committed or pushed"), "{error}");
+    // The clone stays, with the files and no commit; origin has no branch.
+    let dir = tmp.path().join("work").join("zippy");
+    assert!(dir.join("build.zig").is_file() && dir.join(".paja/checks").is_file());
+    assert!(error.contains(&dir.display().to_string()), "{error}");
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .status()
+        .unwrap();
+    assert!(!head.success());
+    let pushed = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args(["rev-parse", "--verify", "-q", "main"])
+        .status()
+        .unwrap();
+    assert!(!pushed.success());
 }
 
 #[test]

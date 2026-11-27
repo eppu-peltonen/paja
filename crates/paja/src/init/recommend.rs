@@ -3,8 +3,8 @@
 //! One agent on the `init` role, with no repository to read, is told what the person is building
 //! and which languages or frameworks they prefer, and answers with one to three options, best
 //! first. Paja decides which options have a built-in skeleton (`rust`, `node`, `python`); the rest
-//! are `generated`. `paja init --new` without `--stack` asks the person on a terminal, shows the
-//! options and takes a number or a stack name.
+//! are `generated` (an agent writes the skeleton). `paja init --new` without `--stack` asks the
+//! person on a terminal, shows the options and takes a number or a stack name.
 
 use std::io::{BufRead, Write};
 
@@ -211,8 +211,7 @@ fn pick(answer: &str, options: &[Recommendation]) -> Result<String> {
 
 /// The prompt flow of `paja init --new` without `--stack`: ask what is being built and the
 /// preferences on `input`, get options from `ask_agent`, show them on `out`, and take a number or a
-/// stack name. Returns the built-in stack to scaffold; a `generated` skeleton stops with an error
-/// until Paja can write one.
+/// stack name. Returns the stack to scaffold, built-in or generated.
 pub fn choose_stack(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
@@ -240,11 +239,7 @@ pub fn choose_stack(
     let answer = ask(input, out, "\nPick a number or type a stack name: ")?;
     let stack = pick(&answer, &found.recommendations)?;
     if skeleton_of(&stack) == "generated" {
-        bail!(
-            "{stack} needs a generated skeleton, which Paja can't write yet; pick a built-in stack \
-             ({}), for example `paja init --new NAME --stack rust`",
-            STACKS.join(", ")
-        );
+        return Ok(stack.trim().to_string());
     }
     Ok(stack.trim().to_ascii_lowercase())
 }
@@ -307,11 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn a_generated_skeleton_or_a_bad_answer_stops_with_the_fix() {
+    fn a_generated_skeleton_is_picked_as_it_is_and_a_bad_answer_stops_with_the_fix() {
         let (result, _) = run("a reading list\nrust, axum\n2\n", "rust");
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("go needs a generated skeleton"), "{error}");
-        assert!(error.contains("rust, node, python"), "{error}");
+        assert_eq!(result.unwrap(), "go");
+        let (result, _) = run("a reading list\nrust, axum\n Ruby on Rails \n", "rust");
+        assert_eq!(result.unwrap(), "Ruby on Rails");
         let (result, _) = run("a reading list\nrust, axum\n9\n", "rust");
         assert!(format!("{:#}", result.unwrap_err()).contains("1 to 2"));
         let (result, _) = run("a reading list\n", "rust");

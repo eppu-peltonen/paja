@@ -144,7 +144,7 @@ pub struct InitArgs {
     /// signed-in account. Needs `stack` (call `init_recommend` first to choose one); `repo`, `ci`,
     /// `force` and `no_agent` are not used.
     new: Option<String>,
-    /// With `new`: rust, node or python.
+    /// With `new`: any language or framework; rust, node and python have a built-in skeleton.
     stack: Option<String>,
     /// With `new`: make the repository public (default: private).
     #[serde(default)]
@@ -422,7 +422,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Set an existing repository up for Paja in one pull request: an agent on the init role detects the stacks (any language, each with its directory), checks, commands, toolchains and services, and Paja keeps only what files on the default branch back up (detected.dropped lists the rest; no_agent, or an agent that can't run, uses the built-in table for Rust, Node, Python and Go and says why in detected.fallback). Writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true. With new (a repository name) and stack (rust, node or python) it instead creates that GitHub repository, clones it (to dir, or the name) and pushes a walking skeleton as the first commit on the default branch, returning {repo, url, directory, files, next_steps}."
+        description = "Set an existing repository up for Paja in one pull request: an agent on the init role detects the stacks (any language, each with its directory), checks, commands, toolchains and services, and Paja keeps only what files on the default branch back up (detected.dropped lists the rest; no_agent, or an agent that can't run, uses the built-in table for Rust, Node, Python and Go and says why in detected.fallback). Writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true. With new (a repository name) and stack (any language or framework) it instead creates that GitHub repository, clones it (to dir, or the name) and pushes a walking skeleton as the first commit on the default branch, returning {repo, url, directory, stack, skeleton, files, next_steps}; skeleton is built-in for rust, node and python, and generated otherwise: an agent writes it, and nothing is committed or pushed unless every check passes."
     )]
     async fn init(&self, Parameters(args): Parameters<InitArgs>) -> Result<String, String> {
         let home = self.home.clone();
@@ -430,7 +430,8 @@ impl PajaMcp {
             if let Some(name) = args.new {
                 let Some(stack) = args.stack else {
                     anyhow::bail!(
-                        "`new` needs `stack`: rust, node or python; call `init_recommend` first \
+                        "`new` needs `stack` (a language or framework, such as rust, node, python \
+                         or go); call `init_recommend` first \
                          to get options"
                     );
                 };
