@@ -1304,16 +1304,20 @@ pub fn claim_for_run_on(
         let Some(run_lock) = run_lock else {
             continue;
         };
-        let lost = claim_on_github(&ok, &labels, item.number, &me)?;
+        let race = claim_on_github(&ok, &labels, item.number, &me)?;
         let lock = home.lock()?;
         let log = home.events();
-        if let Some(winner) = lost {
-            log.append(
-                &lock,
-                EV_CLAIM,
-                claim_event(repo, item.number, Some(&winner)),
-            )?;
-            continue;
+        match race {
+            Race::Won => {}
+            Race::LostTo(winner) => {
+                log.append(
+                    &lock,
+                    EV_CLAIM,
+                    claim_event(repo, item.number, Some(&winner)),
+                )?;
+                continue;
+            }
+            Race::Gone => continue,
         }
         let mine = Claim {
             runner: me.clone(),
@@ -1414,18 +1418,10 @@ fn holder(view: &View, labels: &Labels) -> Option<Claim> {
         return None;
     }
     let escalated = view.has_label(&labels.needs_answer);
-    let now = now_secs();
-    let mut claims = view.claims();
-    let first_live = claims.iter().position(|c| !c.is_stale(now));
-    let chosen = match first_live {
-        Some(i) => Some(claims.swap_remove(i)),
-        None => claims.pop(),
-    };
+    let claims = view.claims();
+    let chosen = race_winner(&claims, now_secs()).or(claims.last());
     Some(match chosen {
-        Some(c) => Claim {
-            runner: c.runner,
-            stale_after: (!escalated).then_some(c.stale_after),
-        },
+        Some(c) => held(c, escalated),
         None => Claim {
             runner: "unknown".into(),
             stale_after: None,
@@ -1433,18 +1429,55 @@ fn holder(view: &View, labels: &Labels) -> Option<Claim> {
     })
 }
 
-/// Write this runner's claim on issue `number` and check that it won. None when it did; the
-/// holder when another runner's live claim comment came first, after deleting this runner's
-/// comment. The claimed label stays then: it is shared, and the winner's live claim is what it
+/// The claim that won the race for an issue: its first live claim comment. Every reader of a
+/// race (the claim check, `holder`, freeing) goes by this one rule.
+fn race_winner(claims: &[ClaimComment], now: u64) -> Option<&ClaimComment> {
+    claims.iter().find(|c| !c.is_stale(now))
+}
+
+/// The claim a comment records: its runner and stale time, with no stale time for an escalated
+/// item, which waits on a person and so can't go stale.
+fn held(c: &ClaimComment, escalated: bool) -> Claim {
+    Claim {
+        runner: c.runner.clone(),
+        stale_after: (!escalated).then(|| c.stale_after.clone()),
+    }
+}
+
+/// How a claim race on GitHub came out.
+#[derive(Debug, PartialEq, Eq)]
+enum Race {
+    Won,
+    /// Another runner's live claim came first: the holder, recorded as such.
+    LostTo(Claim),
+    /// This runner's own comment was gone when it read the issue back: a runner giving the
+    /// item back deleted it as a later claim. Nobody holds the item by this runner's reckoning.
+    Gone,
+}
+
+/// Read a race back: `own` is the id of the comment this runner just posted, when `gh` printed
+/// it. The runner won only when its own live comment is still there and is the race's winner.
+fn race_result(claims: &[ClaimComment], me: &str, own: Option<u64>, now: u64) -> Race {
+    if let Some(w) = race_winner(claims, now).filter(|w| w.runner != me) {
+        return Race::LostTo(held(w, false));
+    }
+    let is_own = |c: &ClaimComment| match own {
+        Some(own) => c.id == Some(own),
+        None => c.runner == me,
+    };
+    if claims.iter().any(|c| is_own(c) && !c.is_stale(now)) {
+        Race::Won
+    } else {
+        Race::Gone
+    }
+}
+
+/// Write this runner's claim on issue `number` and check that it won (see `race_result`). On a
+/// loss to another runner's live claim, which comes first, this runner's comment is deleted. The claimed label stays then: it is shared, and the winner's live claim is what it
 /// now marks, so taking it off would make the item look free until the winner's next renewal.
 /// When a step fails the claim is taken back the same way (see `take_back`) and the error says
 /// the item was not taken.
-fn claim_on_github(
-    ok: &Untampered,
-    labels: &Labels,
-    number: u64,
-    me: &str,
-) -> Result<Option<Claim>> {
+fn claim_on_github(ok: &Untampered, labels: &Labels, number: u64, me: &str) -> Result<Race> {
     let claimed = labels.claimed();
     add_label(
         ok,
@@ -1489,17 +1522,17 @@ fn claim_on_github(
             return Err(not_taken(err));
         }
     };
-    let first = view.claims().into_iter().find(|c| !c.is_stale(now));
-    let Some(first) = first.filter(|c| c.runner != me) else {
-        return Ok(None);
-    };
-    if let Some(id) = own {
-        let _ = delete_comment(ok, id);
+    let race = race_result(&view.claims(), me, own, now);
+    match (&race, own) {
+        (Race::LostTo(_), Some(id)) => {
+            let _ = delete_comment(ok, id);
+        }
+        // The runner that deleted this one's comment also took the label off when nobody
+        // else held the item; make sure, so the item isn't left labelled with no claim.
+        (Race::Gone, _) => take_back(ok, &claimed, number, me, None),
+        _ => {}
     }
-    Ok(Some(Claim {
-        runner: first.runner,
-        stale_after: Some(first.stale_after),
-    }))
+    Ok(race)
 }
 
 fn delete_comment(ok: &Untampered, id: u64) -> Result<()> {
@@ -1597,8 +1630,8 @@ fn remove_label(ok: &Untampered, number: u64, label: &str) -> Result<()> {
     .map(drop)
 }
 
-/// Renew this runner's claim on `number`: move its claim comment's times on, and put the claimed
-/// label back if it was taken off. A run calls this at each round; the caller reports a failure
+/// Renew this runner's claim on `number`: move its live claim comment's times on (a stale one is
+/// posted again, then deleted), and put the claimed label back if it was taken off. A run calls this at each round; the caller reports a failure
 /// and goes on, since the claim only matters to other runners.
 pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
     let me = runner_id(home)?;
@@ -1609,7 +1642,10 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
     let now = now_secs();
     let text = claim_text(&me, now);
     let mine = view.claims().into_iter().rev().find(|c| c.runner == me);
-    match mine.and_then(|c| c.id) {
+    // A stale claim is posted again rather than edited: edited, it would keep its old place
+    // in comment order and win the race against a claim posted while it was stale.
+    let stale = mine.as_ref().filter(|c| c.is_stale(now)).and_then(|c| c.id);
+    match mine.filter(|c| !c.is_stale(now)).and_then(|c| c.id) {
         Some(id) => {
             let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
             gh(
@@ -1622,6 +1658,10 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
                 &ok,
                 &["issue", "comment", &number.to_string(), "--body", &text],
             )?;
+            // The stale one goes once the new one is up; left, it is only noise.
+            if let Some(id) = stale {
+                let _ = delete_comment(&ok, id);
+            }
         }
     }
     if !view.has_label(&claimed) {
@@ -1676,7 +1716,7 @@ pub fn release_own_claim(home: &Home, checkout: &Path, number: u64) {
 /// behind would win every later runner's race check while nobody builds the item. A claim
 /// posted before this runner's first stays; the first of those (the race's winner) holds the
 /// item.
-fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>) {
+fn to_free(live: &[ClaimComment], me: Option<&str>, escalated: bool) -> (Vec<u64>, Option<Claim>) {
     let first_mine = match me {
         None => 0,
         Some(me) => live
@@ -1686,10 +1726,8 @@ fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>)
     };
     let (ahead, rest) = live.split_at(first_mine);
     let delete = rest.iter().filter_map(|c| c.id).collect();
-    let stays = ahead.first().map(|c| Claim {
-        runner: c.runner.clone(),
-        stale_after: Some(c.stale_after.clone()),
-    });
+    // `live` holds live claims only, so the first ahead is the race's winner.
+    let stays = ahead.first().map(|c| held(c, escalated));
     (delete, stays)
 }
 
@@ -1714,7 +1752,8 @@ fn free_claim(home: &Home, checkout: &Path, number: u64, freeing: Freeing) {
             .into_iter()
             .filter(|c| !c.is_stale(now))
             .collect();
-        let (delete, stays) = to_free(&live, me.as_deref());
+        let escalated = view.has_label(&labels.needs_answer);
+        let (delete, stays) = to_free(&live, me.as_deref(), escalated);
         for id in delete {
             let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
             // Carry on past a delete that fails (another account's comment answers 403), so
@@ -1724,9 +1763,12 @@ fn free_claim(home: &Home, checkout: &Path, number: u64, freeing: Freeing) {
             }
         }
         let name = name_of(&ok, None)?;
-        if stays.is_none() && view.has_label(&labels.claimed()) {
+        let labelled = view.has_label(&labels.claimed());
+        if stays.is_none() && labelled {
             remove_label(&ok, number, &labels.claimed())?;
         }
+        // Recorded as a sync would read it: an issue without the label holds nothing.
+        let stays = stays.filter(|_| labelled);
         let lock = home.lock()?;
         home.events()
             .append(&lock, EV_CLAIM, claim_event(&name, number, stays.as_ref()))?;
@@ -2655,25 +2697,57 @@ mod tests {
         };
         let live = [comment("bbbb", 1), comment("aaaa", 2), comment("cccc", 3)];
         // The person put the item back: every claim goes, and nothing stays.
-        assert_eq!(to_free(&live, None), (vec![1, 2, 3], None));
+        assert_eq!(to_free(&live, None, false), (vec![1, 2, 3], None));
         // A run gives back its own: runner bbbb's earlier claim stays, and with it the label;
         // cccc's later one lost the race to aaaa and goes with it.
-        let (delete, stays) = to_free(&live, Some("aaaa"));
+        let (delete, stays) = to_free(&live, Some("aaaa"), false);
         assert_eq!(delete, vec![2, 3]);
         assert_eq!(stays.unwrap().runner, "bbbb");
         // With no earlier claim, nothing stays and the label comes off too.
-        let (delete, stays) = to_free(&live[1..], Some("aaaa"));
+        let (delete, stays) = to_free(&live[1..], Some("aaaa"), false);
         assert_eq!((delete, stays), (vec![2, 3], None));
         // A runner with no live claim of its own deletes nothing; the race's winner holds.
-        let (delete, stays) = to_free(&live, Some("dddd"));
+        let (delete, stays) = to_free(&live, Some("dddd"), false);
         assert!(delete.is_empty());
         assert_eq!(stays.unwrap().runner, "bbbb");
         // Two claims ahead of this runner's (cccc lost to bbbb, its comment left behind): the
         // earlier one holds the item.
         let raced = [comment("bbbb", 1), comment("cccc", 2), comment("aaaa", 3)];
-        let (delete, stays) = to_free(&raced, Some("aaaa"));
+        let (delete, stays) = to_free(&raced, Some("aaaa"), false);
         assert_eq!(delete, vec![3]);
         assert_eq!(stays.unwrap().runner, "bbbb");
+        // An escalated item's claim stays with no stale time, as a sync records it.
+        let (_, stays) = to_free(&raced, Some("aaaa"), true);
+        assert_eq!(stays.unwrap().stale_after, None);
+    }
+
+    #[test]
+    fn a_race_is_won_only_by_a_live_own_comment_that_comes_first() {
+        let comment = |runner: &str, id: u64| {
+            let url = format!("https://github.com/a/b/issues/5#issuecomment-{id}");
+            parse_claim_comment(&claim_text(runner, 1_785_000_000), &url).unwrap()
+        };
+        let now = 1_785_000_001;
+        let mine = [comment("aaaa", 2)];
+        assert_eq!(race_result(&mine, "aaaa", Some(2), now), Race::Won);
+        // Without the comment's id (gh printed no URL) it is found by runner.
+        assert_eq!(race_result(&mine, "aaaa", None, now), Race::Won);
+        let lost = [comment("bbbb", 1), comment("aaaa", 2)];
+        match race_result(&lost, "aaaa", Some(2), now) {
+            Race::LostTo(c) => assert_eq!(c.runner, "bbbb"),
+            other => panic!("{other:?}"),
+        }
+        // A runner giving the item back deleted this one's comment as a later claim: no win.
+        assert_eq!(race_result(&[], "aaaa", Some(2), now), Race::Gone);
+        assert_eq!(
+            race_result(&[comment("aaaa", 1)], "aaaa", Some(2), now),
+            Race::Gone
+        );
+        // This runner's own comment, gone stale, wins nothing.
+        assert_eq!(
+            race_result(&mine, "aaaa", Some(2), now + CLAIM_SECS),
+            Race::Gone
+        );
     }
 
     #[test]

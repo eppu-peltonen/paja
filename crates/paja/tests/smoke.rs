@@ -2238,12 +2238,20 @@ impl Factory {
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
-                 if [ -f {d}/view-down-after-claim ]; then touch {d}/view-down; fi; echo https://example.com/acme/app/issues/$3#issuecomment-88 ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
+                 if [ -f {d}/view-down-after-claim ]; then touch {d}/view-down; fi\n\
+                 printf '{{\"body\": \"%s\", \"url\": \"https://example.com/acme/app/issues/%s#issuecomment-88\"}}' \"$5\" \"$3\" > {d}/posted-$3\n\
+                 echo https://example.com/acme/app/issues/$3#issuecomment-88 ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi\n\
                  if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi ;;\n\
-                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; rm -f {d}/view-5.json; fi ;;\n\
+                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; rm -f {d}/view-5.json {d}/posted-5; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-down ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
-                 if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
+                 p=; if [ -f {d}/posted-$3 ]; then p=$(cat {d}/posted-$3); fi\n\
+                 if [ -f {d}/claim-goes-stale ] && [ -f {d}/race-read ]; then p=$(echo \"$p\" | sed 's/stale after [^\"]*/stale after 2020-01-02T00:00:00Z/'); fi\n\
+                 if [ -f {d}/claim-goes-stale ] && [ -n \"$p\" ]; then touch {d}/race-read; fi\n\
+                 if [ -f {d}/view-$3.json ] && [ -n \"$p\" ]; then sed \"s|],\\\"labels\\\"|,$p],\\\"labels\\\"|\" {d}/view-$3.json\n\
+                 elif [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json\n\
+                 elif [ -n \"$p\" ]; then echo \"{{\\\"labels\\\": [], \\\"comments\\\": [$p]}}\"\n\
+                 else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -6062,6 +6070,30 @@ fn a_failed_claim_keeps_another_runners_label() {
         "{log}"
     );
     assert!(!log.contains("api -X DELETE"), "{log}");
+}
+
+#[test]
+fn a_claim_renewed_after_going_stale_is_posted_again() {
+    // The run wins its race, then its claim goes stale before round two renews it (another
+    // runner may have claimed the item meanwhile, after it in comment order).
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    std::fs::write(f.tmp.path().join("claim-goes-stale"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let log = f.gh_log();
+    // Edited in place, the stale comment would keep its early place and win that race back.
+    assert!(!log.contains("PATCH"), "{log}");
+    let posts: Vec<usize> = log
+        .match_indices("issue comment 5 --body Claimed by runner ")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(posts.len(), 2, "{log}");
+    let deleted = log
+        .find("/issues/comments/88")
+        .unwrap_or_else(|| panic!("the stale comment is deleted: {log}"));
+    assert!(deleted > posts[1], "deleted after the new one is up: {log}");
 }
 
 #[test]

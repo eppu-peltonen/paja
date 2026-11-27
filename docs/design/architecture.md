@@ -89,24 +89,29 @@ Several runners can share one queue, because a claim is written on GitHub where 
 home claims anything it records a random runner id (`runner.created`); the id names no host or user, since the
 repository may be public. `paja run` claims an item by adding the label `<work label>-claimed` (`paja-claimed` for
 `paja`; created when the repository lacks it) and posting one comment, `Claimed by runner <id> at <UTC time>; stale
-after <time>`, six hours on. It then reads the issue again: if another runner's live claim comment is ahead of its own,
-that runner won, so the run deletes its own comment and tries the next item. The label stays: it is shared, and it now
-marks the winner's claim (taking it off would make the item look free until the winner's next renewal). When `gh` can't
-write the claim the item is not taken, and the run's error says why. The run deletes its comment if posted, and takes
-the label off unless another runner's live claim is on the issue (or the issue can't be read). Every sync reads the
-claimed label with the other labels, and for each issue that carries it the first live claim comment (the race's winner;
-else the latest), and records what changed as `work.claim` (`runner`, `stale_after`; `runner` is null once the label is
-gone). An item whose label names another runner is skipped by `paja run` and by `paja run --workers` until that claim is
-stale; `paja work list|show` show the holder as `claim`, and `paja pool status` gives "claimed by runner <id> on GitHub"
-as why the item waits. A label with no claim comment (put there by hand) holds the item until a person removes it. A run
-renews its claim at each round by editing its claim comment's times (and putting the label back if it was taken off).
-`paja work set N queued` deletes every live claim comment, whichever runner wrote it, and takes the label off: the
-person put the item back, which overrides the holder. A run that gives back an item it claimed (the person declined at
-the confirmation, or a gate put it back) deletes its own runner's live claim comments and the later ones that lost the
-race to it, and takes the label off unless an earlier runner's live claim remains. Either way a claim comment GitHub
-refuses to delete (another account wrote it) doesn't stop the rest: the label still comes off (or stays, as above), and
-stderr names the comment to delete by hand. An escalated item keeps its claim, which can't go stale while it carries the
-needs-answer label. `paja work answer` renews the claim, so the runner that escalated the item runs it next.
+after <time>`, six hours on. It then reads the issue again. Every reader of a race goes by one rule: the first live
+claim comment wins. If another runner's live claim comment is ahead of its own, that runner won, so the run deletes its
+own comment and tries the next item. If its own comment is gone (a runner giving the item back deleted it as a later
+claim) it lost too, and leaves the item. The label stays: it is shared, and it now marks the winner's claim (taking it
+off would make the item look free until the winner's next renewal). When `gh` can't write the claim the item is not
+taken, and the run's error says why. The run deletes its comment if posted, and takes the label off unless another
+runner's live claim is on the issue (or the issue can't be read). Every sync reads the claimed label with the other
+labels, and for each issue that carries it the first live claim comment (the race's winner; else the latest), and
+records what changed as `work.claim` (`runner`, `stale_after`; `runner` is null once the label is gone). An item whose
+label names another runner is skipped by `paja run` and by `paja run --workers` until that claim is stale; `paja work
+list|show` show the holder as `claim`, and `paja pool status` gives "claimed by runner <id> on GitHub" as why the item
+waits. A label with no claim comment (put there by hand) holds the item until a person removes it. A run renews its
+claim at each round by editing its claim comment's times (and putting the label back if it was taken off). A claim that
+went stale is posted again and the old comment deleted: edited, it would keep its early place in comment order and win
+the race back from a claim posted while it was stale. `paja work set N queued` deletes every live claim comment,
+whichever runner wrote it, and takes the label off: the person put the item back, which overrides the holder. A run that
+gives back an item it claimed (the person declined at the confirmation, or a gate put it back) deletes its own runner's
+live claim comments and the later ones that lost the race to it, and takes the label off unless an earlier runner's live
+claim remains. Either way a claim comment GitHub refuses to delete (another account wrote it) doesn't stop the rest: the
+label still comes off (or stays, as above), and stderr names the comment to delete by hand. Until it is deleted, or goes
+stale, that comment wins every race; runners that lose to it leave the label on, so `paja work list` names its runner as
+the holder. An escalated item keeps its claim, which can't go stale while it carries the needs-answer label. `paja work
+answer` renews the claim, so the runner that escalated the item runs it next.
 
 When no work item is ready, Jono takes follow-ups. A sync also imports the open issues with the follow-up label as items
 whose `priority` is `follow-up` (recorded in `work.imported` and `work.changed`; every other item has priority `work`).
