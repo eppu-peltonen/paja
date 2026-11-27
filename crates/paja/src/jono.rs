@@ -1345,7 +1345,12 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
             &needs_answer,
         ],
     ) {
-        eprintln!("paja: couldn't remove the `{needs_answer}` label from #{number}: {err:#}");
+        // Not `eprintln!`: a closed stderr (Paja Desk, `paja mcp`) must not abort the answer.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "paja: couldn't remove the `{needs_answer}` label from #{number}: {err:#}"
+        );
     }
     gh(
         &ok,
