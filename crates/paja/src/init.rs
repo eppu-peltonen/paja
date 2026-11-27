@@ -408,10 +408,15 @@ fn workflow_file(stacks: &[Stack], d: &Detected) -> String {
     text
 }
 
-/// A plain YAML scalar when it is safe, else a single-quoted one. A leading `~` would read as
-/// null.
+/// A plain YAML scalar when it is safe, else a single-quoted one. A leading `~`, `-`, `?` or `,`
+/// would be read as something else, and so would a word YAML reads as a bool or null, or a number.
 fn yaml_scalar(text: &str) -> String {
-    if text.starts_with('~')
+    let reserved = ["true", "false", "yes", "no", "on", "off", "null", "y", "n"];
+    if text.is_empty()
+        || text.starts_with(['~', '-', '?', ',', ' '])
+        || text.ends_with(' ')
+        || reserved.contains(&text.to_ascii_lowercase().as_str())
+        || text.parse::<f64>().is_ok()
         || text.contains([
             ':', '#', '\'', '"', '{', '}', '[', ']', '&', '*', '!', '|', '>', '%', '@', '`',
         ])
@@ -905,6 +910,10 @@ mod tests {
         assert!(at("apps/web").contains("working-directory: apps/web\n"));
         assert_eq!(yaml_scalar("~x"), "'~x'");
         assert_eq!(yaml_scalar("a~b"), "a~b");
+        for misread in ["-x", "?x", ",x", "true", "Null", "off", "2024", "1.5", ""] {
+            assert_eq!(yaml_scalar(misread), format!("'{misread}'"), "{misread}");
+        }
+        assert_eq!(yaml_scalar("npm ci"), "npm ci");
     }
 
     #[test]
