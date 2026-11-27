@@ -690,6 +690,79 @@ pub fn desktop_notification(title: &str, text: &str) -> Command {
     }
 }
 
+/// What `cmd` printed and how it ended, like [`Command::output`], but stopped once it has run
+/// for `limit`, which is then an error that says so. Its stdin is empty. Start `cmd` in its own
+/// process group ([`own_process_group`]) so that stopping it while it runs stops what it
+/// started too. Once it has exited, Windows can't find what it left behind, which then runs on.
+pub fn output_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let drain = |pipe: Option<Box<dyn Read + Send>>, err: bool| {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = tx.send((err, bytes));
+        });
+    };
+    drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        false,
+    );
+    drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        true,
+    );
+    let stopped = |child: &mut std::process::Child| {
+        kill_tree(child);
+        let _ = child.wait();
+        std::io::Error::other(format!(
+            "it was still running after {limit:?}, so Paja stopped it"
+        ))
+    };
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() > limit {
+            return Err(stopped(&mut child));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    // A process it started can hold a pipe open after it exits: the limit covers that too.
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        match rx.recv_timeout(limit.saturating_sub(start.elapsed())) {
+            Ok((true, bytes)) => stderr = bytes,
+            Ok((false, bytes)) => stdout = bytes,
+            Err(_) => return Err(stopped(&mut child)),
+        }
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Run `cmd` with no input or output, and wait at most `limit` for it: a notifier that hangs
 /// must not hold up the run. An error names what went wrong.
 pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<()> {
@@ -723,6 +796,37 @@ pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_within_gives_the_output_or_stops_the_program_at_the_limit() {
+        let out = output_within(
+            Command::new("git").arg("--version"),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("git version"));
+        #[cfg(unix)]
+        {
+            let started = std::time::Instant::now();
+            let err = output_within(
+                own_process_group(Command::new("sh").args(["-c", "sleep 5; echo late"])),
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Paja stopped it"), "{err}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            // A process it left behind holding the pipe open is stopped at the limit too.
+            let started = std::time::Instant::now();
+            let err = output_within(
+                own_process_group(Command::new("sh").args(["-c", "sleep 5 & echo early"])),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Paja stopped it"), "{err}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        }
+    }
 
     #[test]
     fn open_plain_file_opens_only_plain_files() {
