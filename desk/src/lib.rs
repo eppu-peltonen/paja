@@ -928,19 +928,27 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn about_names_the_paja_it_found_and_whether_it_matches() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        // A program that prints what `paja --json --version` does: a shell script on Unix, a
+        // batch file on Windows.
         let fake = |name: &str, version: &str| {
-            let path = dir.path().join(name);
-            std::fs::write(
-                &path,
-                format!("#!/bin/sh\necho '{{\"version\": \"{version}\", \"commit\": \"abc\"}}'\n"),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let reply = format!("{{\"version\": \"{version}\", \"commit\": \"abc\"}}");
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::fs::PermissionsExt;
+                let path = dir.path().join(name);
+                std::fs::write(&path, format!("#!/bin/sh\necho '{reply}'\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            };
+            #[cfg(windows)]
+            let path = {
+                let path = dir.path().join(format!("{name}.cmd"));
+                std::fs::write(&path, format!("@echo {reply}\r\n")).unwrap();
+                path
+            };
             path
         };
         let same = fake("same", env!("CARGO_PKG_VERSION"));
