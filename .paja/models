@@ -3,8 +3,9 @@
 # Roles: build (first build round), fix (later build rounds), review (first full review),
 # re-review (normal-risk fix-only review), review-2 (second high-risk reviewer), triage
 # (`paja triage`), plan (the pool's planner) and init (`paja init`'s detection of the project's
-# stacks, checks and environment). A line naming another role is skipped, and `paja doctor` warns
-# about it.
+# stacks, checks and environment) and arbiter (the agent that settles an escalation before it
+# reaches the person; with no line it runs on the review model). A line naming another role is
+# skipped, and `paja doctor` warns about it.
 # A `fallback <model>` line names a model to use when the chosen one is busy.
 # A role with no line runs on the account's default model.
 build sonnet
@@ -19,6 +20,8 @@ plan haiku
 # init (`paja init`'s agent, which reads a repository to find its stacks and checks) needs a
 # capable model; with no line it runs on the account's default.
 init sonnet
+# arbiter (settles an escalation an agent can decide) reads the issue, the escalation and the diff.
+arbiter opus
 # The most turns one session of a role may take: `max-turns <role> <turns>`. A role with no
 # line gets 80 (build, fix) or 30 (the reviews); no session runs uncapped.
 max-turns build 80

@@ -11,7 +11,7 @@ Measured on 2026-11-27 with `paja usage` on Paja's own event log (a Rust project
 | --- | --- | --- |
 | Review rounds | 1 | 2 |
 | Tokens (input, output, cache read and cache write) | 781,385 | 3,523,605 |
-| Wall time | 4 min 34 s | not reported |
+| Wall time | 4 min 34 s | not measured yet |
 
 These are Paja's own numbers. Other projects, with other sizes and slower checks, will differ; run `paja usage` after a
 few items to get yours. Most of the tokens are cache reads, which a session pays each turn it re-reads its context.
