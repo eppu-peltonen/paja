@@ -839,6 +839,19 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
         serde_json::json!(repo),
         "{events}"
     );
+    // A sync from a subdirectory is the same checkout.
+    let sub = repo.join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    let (ok, again) = paja_with(&home, &sub, &["work", "sync"], &with_gh);
+    assert!(ok, "{again}");
+    let (_, events) = paja(&home, &repo, &["log"]);
+    let checkouts = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .count();
+    assert_eq!(checkouts, 1, "{events}");
 
     let (ok, next) = paja(&home, &repo, &["work", "next"]);
     assert!(ok);

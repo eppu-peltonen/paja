@@ -1128,13 +1128,29 @@ pub fn sync_with(
         }
     }
     let report = apply_with(home, &name, &issues, &open_outside)?;
-    record_checkout(home, &name, repo)?;
+    record_checkout(home, &name, &checkout_top(repo)?)?;
     Ok(report)
 }
 
-/// Record that `path` is a checkout of `repo`, unless it is already the last one recorded.
+/// The top level of the checkout `path` is in (the nearest folder holding `.git`), so a sync
+/// from a subdirectory names the same checkout as one from its root. Found from the path's own
+/// spelling, not from git, so it compares equal to the path an environment records.
+fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
+    let path = std::path::absolute(path)?;
+    Ok(path
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map_or_else(|| path.clone(), Path::to_path_buf))
+}
+
+/// Record that `path` is a checkout of `repo`, unless it is already the last one recorded. A
+/// path that isn't UTF-8 can't be written to the log as text, so it isn't recorded: Paja Desk
+/// then finds the checkout only by starting there.
 fn record_checkout(home: &Home, repo: &str, path: &Path) -> Result<()> {
     let path = std::path::absolute(path)?;
+    let Some(text) = path.to_str() else {
+        return Ok(());
+    };
     let lock = home.lock()?;
     let log = home.events();
     let last = log
@@ -1145,7 +1161,7 @@ fn record_checkout(home: &Home, repo: &str, path: &Path) -> Result<()> {
     if last.is_some_and(|e| e.data["path"].as_str().map(Path::new) == Some(path.as_path())) {
         return Ok(());
     }
-    log.append(&lock, EV_CHECKOUT, json!({ "repo": repo, "path": path }))?;
+    log.append(&lock, EV_CHECKOUT, json!({ "repo": repo, "path": text }))?;
     Ok(())
 }
 
@@ -1557,6 +1573,17 @@ mod tests {
         assert_eq!(Labels::default().needs_answer, "factory-needs-answer");
         let waiting = Labels::parse("needs-answer waiting on you\n").unwrap();
         assert_eq!(waiting.needs_answer, "waiting on you");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_path_that_is_not_utf8_is_not_recorded() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"app\xff"));
+        record_checkout(&home, R, &odd).unwrap();
+        assert!(home.events().read_all().unwrap().is_empty());
     }
 
     #[test]

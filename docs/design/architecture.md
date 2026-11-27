@@ -557,7 +557,8 @@ answer on the issue), and "New work" takes a repository, a title and a body, sho
 `jono::file` (as `paja work file`: an issue with the work label). Both run where `gh` finds the repository: the
 newest checkout Paja synced in or made an environment from for it that `gh` still names as that repository
 (`jono::known_checkouts`, newest first, from the log's `work.checkout` and `env.created`
-events; each sync records `work.checkout` with its path when it differs from the last one), else the directory Desk
+events; each sync records `work.checkout` with its checkout's top level, the nearest folder holding `.git`, when it
+differs from the last one, and skips a path that isn't UTF-8), else the directory Desk
 started in when it is a checkout of that repository, else an error that says where to start. The
 person's text stays in the window across refreshes and errors. Desk's Tauri permissions
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
