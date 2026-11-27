@@ -30,8 +30,11 @@ pub struct Notice {
     pub repo: Option<String>,
     /// The work item, when the notice is about one.
     pub number: Option<u64>,
-    /// `escalated`, `pass_failed` or `stopped`.
+    /// `escalated`, `pass_failed`, `stopped` or `skipped_role`.
     pub kind: &'static str,
+    /// What the notice is about beyond the item, recorded with it: the role of a
+    /// `skipped_role` notice, so each role is told once.
+    pub subject: Option<String>,
     pub title: String,
     pub text: String,
 }
@@ -43,6 +46,7 @@ impl Notice {
             repo: Some(repo.to_string()),
             number: Some(number),
             kind: "escalated",
+            subject: None,
             title: format!("Paja: {repo}#{number} needs a decision"),
             text: format!(
                 "{title}. The question is on the issue; answer with \
@@ -63,6 +67,7 @@ impl Notice {
             repo,
             number: None,
             kind: "pass_failed",
+            subject: None,
             title: format!("Paja: a pass failed in {place}"),
             text: text.to_string(),
         }
@@ -75,10 +80,59 @@ impl Notice {
             repo,
             number: None,
             kind: "stopped",
+            subject: None,
             title: format!("Paja stopped in {place}"),
             text: "paja run stopped and needs you; the reason is in the terminal.".to_string(),
         }
     }
+}
+
+impl Notice {
+    /// `.paja/models` on `branch` names a role this Paja doesn't know, so its line is skipped.
+    /// The role is shown quoted and escaped, as the run's warning shows it, so a control
+    /// character in the file never reaches a terminal or a phone.
+    pub fn skipped_role(repo: &str, branch: &str, role: &str) -> Self {
+        Self {
+            repo: Some(repo.to_string()),
+            number: None,
+            kind: "skipped_role",
+            subject: Some(role.to_string()),
+            title: format!("Paja: {repo} names a role this Paja doesn't know"),
+            text: format!(
+                ".paja/models on {branch} has a line for role {role:?}, which this Paja skips, \
+                 so the role runs on the default model or turn cap. If the role is new, install \
+                 the newer Paja; if it is a typo, fix the line."
+            ),
+        }
+    }
+}
+
+/// Tell the person once about each role in `skipped` (the `.paja/models` roles this Paja
+/// doesn't know) that no earlier notice for `repo` named, so a runner left unattended hears of
+/// it without anyone running `paja doctor`. A notice that was tried counts, delivered or not, so
+/// a channel that is down doesn't bring the same notice back at every pass.
+pub fn skipped_roles(home: &Home, checkout: &Path, repo: &str, branch: &str, skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let told = told_roles(home, repo);
+    for role in skipped.iter().filter(|r| !told.contains(*r)) {
+        send(home, checkout, &Notice::skipped_role(repo, branch, role));
+    }
+}
+
+/// The roles earlier `skipped_role` notices for `repo` named, from the log. A log that can't be
+/// read tells nothing, so the notice goes (again, at worst).
+fn told_roles(home: &Home, repo: &str) -> Vec<String> {
+    let Ok(events) = home.events().read_all() else {
+        return Vec::new();
+    };
+    events
+        .iter()
+        .filter(|e| e.kind == EV_SENT || e.kind == EV_FAILED)
+        .filter(|e| e.data["kind"] == "skipped_role" && e.data["repo"] == repo)
+        .filter_map(|e| e.data["subject"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// Which failed passes of `paja run --every` Posti tells of: the first in a row only, so an
@@ -267,6 +321,9 @@ fn outcome(
         "kind": notice.kind,
         "channel": channel,
     });
+    if let Some(subject) = &notice.subject {
+        data["subject"] = json!(subject);
+    }
     let kind = match &result {
         Ok(()) => EV_SENT,
         Err(err) => {
@@ -320,6 +377,16 @@ mod tests {
         ] {
             assert!(!loopback(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_skipped_role_is_named_escaped() {
+        let n = Notice::skipped_role("acme/app", "main", "rev\u{1b}[2Jiewer");
+        assert_eq!(n.kind, "skipped_role");
+        assert_eq!(n.subject.as_deref(), Some("rev\u{1b}[2Jiewer"));
+        assert!(!n.text.contains('\u{1b}'), "{}", n.text);
+        assert!(n.text.contains(r#""rev\u{1b}[2Jiewer""#), "{}", n.text);
+        assert!(n.text.contains(".paja/models on main"), "{}", n.text);
     }
 
     #[test]

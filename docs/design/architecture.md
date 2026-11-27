@@ -313,7 +313,9 @@ otherwise runs on the account's default). Mestari passes `--model` and, when giv
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. A line naming a role this Paja
 doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going, and
-`paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr would not; an
+`paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr would not. Posti
+tells of each skipped role once per repository (a `skipped_role` notice, the role quoted and escaped), so an
+unattended runner's person hears of it without running doctor; a notice that was tried counts, delivered or not. An
 unknown effort or a malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the
 `fallback` it was given; `fell_back: true` marks a step the fallback model spent something in (its name, or an alias
 such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role didn't run only on its model.
@@ -420,8 +422,8 @@ Unlike the settings `paja run` reads from the default branch's tip as fetched, `
 worktree could move. That could send the notice's text to a URL it picks, or change the work and follow-up labels and
 whether Jono takes follow-ups, for the passes that read them.
 
-Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed` or
-`stopped`, `channel`, and the `error`), so Paja Desk can show the same inbox. A notice that can't be delivered never
+Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed`,
+`stopped` or `skipped_role`, `channel`, the `error`, and for `skipped_role` the role as `subject`), so Paja Desk can show the same inbox. A notice that can't be delivered never
 stops the run: it says so on stderr once per channel, and every notifier is stopped after 15 seconds. The other
 waits are 15 seconds too: the repository name Jono asks `gh` for (the notice goes without it after that), and the home
 lock its record waits for (the record is skipped after that), and a `gh` stopped while it runs takes what it started

@@ -4532,6 +4532,53 @@ fn an_escalation_reaches_the_notifier() {
     assert_eq!(sent[0]["data"]["channel"], "PAJA_NOTIFIER");
 }
 
+#[test]
+fn a_skipped_models_role_reaches_the_notifier_once() {
+    // An unattended runner's stderr goes unread, so Posti tells of a role main's `.paja/models`
+    // names that this Paja doesn't know: once per role, not at every pass.
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main(
+        ".paja/models",
+        "build sonnet\nnewrole haiku\nnewrole opus\n",
+    );
+    let (notifier, log) = fake_notifier(&f);
+    let pass = || {
+        paja_with(
+            &f.home,
+            &f.repo,
+            &["run"],
+            &[
+                ("PAJA_GH", f.gh.as_path()),
+                ("PAJA_CLAUDE", f.claude.as_path()),
+                ("PAJA_NOTIFIER", notifier.as_path()),
+            ],
+        )
+    };
+    let (ok, report) = pass();
+    assert!(ok, "{report}");
+    let (ok, report) = pass();
+    assert!(ok, "{report}");
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 1, "{notices}");
+    assert!(
+        notices.starts_with("Paja: acme/app names a role this Paja doesn't know|")
+            && notices.contains("role \"newrole\""),
+        "{notices}"
+    );
+    let sent = events_of(&f, "notify.sent");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["data"]["kind"], "skipped_role");
+    assert_eq!(sent[0]["data"]["subject"], "newrole");
+    // A second unknown role is news, so it gets a notice of its own.
+    f.on_main(".paja/models", "build sonnet\nnewrole haiku\nother haiku\n");
+    let (ok, report) = pass();
+    assert!(ok, "{report}");
+    let notices = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(notices.lines().count(), 2, "{notices}");
+    assert!(notices.contains("role \"other\""), "{notices}");
+}
+
 /// What the fake arbiter says next: its `structured_output`.
 fn arbiter_says(f: &Factory, said: Value) {
     std::fs::write(
