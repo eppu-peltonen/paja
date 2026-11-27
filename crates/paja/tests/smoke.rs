@@ -10264,6 +10264,58 @@ fn init_agent_gets_read_only_tools_and_hook() {
 }
 
 #[test]
+fn init_check_lines_for_a_subdirectory_run_there_and_an_unsafe_dir_is_dropped() {
+    // A monorepo proposal: one stack in `svc`, one in a directory whose name would be a second
+    // command if it reached `cd <dir> && ...` unquoted. The second is dropped, and the line
+    // written for the first runs in its directory when the checks file is run as written.
+    let evil = "evil;touch pwned";
+    let script = "echo ok > ran\n";
+    let answer = serde_json::json!({"stacks": [
+        {"name": "svc", "dir": "svc", "file": "svc/check.sh",
+         "checks": [{"command": "sh check.sh", "file": "svc/check.sh"}], "commands": ["sh"]},
+        {"name": "evil", "dir": evil, "file": format!("{evil}/check.sh"),
+         "checks": [{"command": "sh check.sh", "file": format!("{evil}/check.sh")}],
+         "commands": ["sh"]}
+    ]});
+    let evil_script = format!("{evil}/check.sh");
+    let (_tmp, repo, ok, out) = init_with_agent(
+        &[("svc/check.sh", script), (evil_script.as_str(), script)],
+        &answer,
+        &["--ci"],
+    );
+    assert!(ok, "{out}");
+    let dropped = out["detected"]["dropped"].to_string();
+    assert!(dropped.contains("stack `evil"), "{out}");
+    let checks = show(&repo, "paja/init", ".paja/checks");
+    let lines: Vec<&str> = checks
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(lines, ["cd svc && sh check.sh"], "{checks}");
+    // The CI workflow runs the same line, and nothing of the dropped stack.
+    let workflow = show(&repo, "paja/init", ".github/workflows/paja.yml");
+    assert!(
+        workflow.contains("- run: 'cd svc && sh check.sh'\n") && !workflow.contains("evil"),
+        "{workflow}"
+    );
+    // Run as written, from the repository's root, as Vasara runs each line.
+    git(&repo, &["checkout", "-q", "paja/init"]);
+    for line in &lines {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(line)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{line}");
+    }
+    assert!(repo.join("svc/ran").is_file());
+    assert!(!repo.join("ran").exists() && !repo.join("pwned").exists());
+    assert!(!repo.join(evil).join("ran").exists());
+}
+
+#[test]
 fn init_falls_back_to_the_table_when_claude_is_missing() {
     let (_tmp, repo, home, gh) = init_fixture(&[("go.mod", "module x\n")]);
     let missing = repo.join("no-such-claude");
