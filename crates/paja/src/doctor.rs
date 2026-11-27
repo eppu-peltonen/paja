@@ -241,6 +241,18 @@ fn parse_version(text: &str) -> Option<Vec<u64>> {
         })
 }
 
+/// Whether version `a` comes before `b`, a missing part counting as 0, so `2.0` and `2.0.0` are
+/// the same release.
+fn older(a: &[u64], b: &[u64]) -> bool {
+    let len = a.len().max(b.len());
+    let padded = |v: &[u64]| {
+        (0..len)
+            .map(|i| v.get(i).copied().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    padded(a) < padded(b)
+}
+
 /// The latest released version, or why it couldn't be found. Never waits more than a few seconds.
 fn latest_version() -> std::result::Result<Vec<u64>, String> {
     let source = std::env::var(LATEST_VAR).unwrap_or_else(|_| LATEST_URL.to_string());
@@ -275,7 +287,7 @@ fn claude_version(claude: &str, installed_text: String) -> Check {
         return ok("claude", installed_text);
     };
     match latest_version() {
-        Ok(latest) if installed < latest => {
+        Ok(latest) if older(&installed, &latest) => {
             let latest = latest
                 .iter()
                 .map(u64::to_string)
@@ -522,5 +534,19 @@ fn sandbox(checks: &mut Vec<Check>) {
             format!("{var} is not set, so agents and checks run as this user, with your files and sign-ins"),
             format!("install `sbx` and set {var} to it for a sandbox (see docs/setup.md)"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_of_different_lengths_compare_by_their_numbers() {
+        assert!(!older(&[2, 0], &[2, 0, 0]));
+        assert!(!older(&[2, 0, 0], &[2, 0]));
+        assert!(older(&[2, 0], &[2, 0, 1]));
+        assert!(older(&[1, 9, 9], &[2, 0]));
+        assert!(!older(&[2, 1], &[2, 0, 9]));
     }
 }
