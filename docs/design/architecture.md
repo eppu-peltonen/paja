@@ -189,7 +189,8 @@ the item's `Touches:` line names the paths when it has one (`source: spec`; the 
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
-`error`; a planner still going after 10 minutes is ended and fails) overlaps everything, so its item runs only in an otherwise idle pool. The pool takes items in queue order and
+`error`; a planner still going after 10 minutes is ended and fails) overlaps everything, so its item runs only in an otherwise idle pool,
+unless it is planned again: after the next timed sync, once per pool run. The pool takes items in queue order and
 admits one only once every item before it has a plan, so a plan that finishes first never puts a later item ahead;
 it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording `pool.admitted` (`repo`,
 `number`, `lane`, `paths`, `source`, `high_risk`). Each round records the paths its change touches as `run.changed`;

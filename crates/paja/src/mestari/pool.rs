@@ -145,6 +145,8 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         planners: BTreeMap::new(),
         since,
         held_back: BTreeSet::new(),
+        retry_failed_to: 0,
+        retried: BTreeSet::new(),
     };
     let outcome = pool.run();
     // A pool that ends on an error leaves no lane running unsupervised.
@@ -175,6 +177,12 @@ struct Pool<'a> {
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
     /// `paja run --every` waits after a failed pass.
     held_back: BTreeSet<u64>,
+    /// Failed plans recorded at or before this seq are planned again: set at each timed sync,
+    /// so a planner's passing error doesn't keep its item waiting for an idle pool.
+    retry_failed_to: u64,
+    /// The items planned again that way: once each per pool run, so a plan that keeps failing
+    /// doesn't start a planner every sync.
+    retried: BTreeSet<u64>,
 }
 
 impl Pool<'_> {
@@ -245,6 +253,7 @@ impl Pool<'_> {
                         said_idle = false;
                         if timed {
                             self.held_back.clear();
+                            self.retry_failed_to = events.last().map_or(0, |e| e.seq);
                         }
                         match super::sync_queue(self.home, self.repo) {
                             Ok(_) => {}
@@ -282,7 +291,14 @@ impl Pool<'_> {
             }
         };
         let events = self.home.events().read_all()?;
-        let plans = plans_since(&events, self.name, self.since);
+        let mut plans = plans_since(&events, self.name, self.since);
+        let retry: BTreeSet<u64> = failed_by(&events, self.name, self.since, self.retry_failed_to)
+            .into_iter()
+            .filter(|n| !self.retried.contains(n))
+            .collect();
+        for number in &retry {
+            plans.remove(number);
+        }
         let queue: Vec<u64> = next
             .iter()
             .map(|item| item.number)
@@ -295,6 +311,9 @@ impl Pool<'_> {
         let (chosen, to_plan) = choose(&queue, &plans, &running, &planning, free, room);
         let chosen: Vec<Plan> = chosen.into_iter().cloned().collect();
         for number in to_plan {
+            if retry.contains(&number) {
+                self.retried.insert(number);
+            }
             self.start_planner(number)?;
         }
         let mut started = 0;
@@ -627,6 +646,24 @@ fn plans_since(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, Plan> 
         .filter(|e| e.seq > since && e.kind == EV_POOL_PLANNED && e.data["repo"] == repo)
         .filter_map(|e| serde_json::from_value::<Plan>(e.data.clone()).ok())
         .map(|plan| (plan.number, plan))
+        .collect()
+}
+
+/// The items of `repo` whose latest plan after `since` failed and was recorded at or before
+/// `to`: the ones to plan again.
+fn failed_by(events: &[Event], repo: &str, since: u64, to: u64) -> BTreeSet<u64> {
+    let mut latest: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
+    for e in events {
+        if e.seq > since && e.kind == EV_POOL_PLANNED && e.data["repo"] == repo {
+            if let Some(number) = e.data["number"].as_u64() {
+                latest.insert(number, (e.seq, e.data["source"] == "failed"));
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|(_, (seq, failed))| *failed && *seq <= to)
+        .map(|(number, _)| number)
         .collect()
 }
 
@@ -1193,6 +1230,35 @@ pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_plan_from_before_the_last_timed_sync_is_planned_again() {
+        let planned = |seq: u64, number: u64, source: &str| Event {
+            v: 1,
+            seq,
+            ts_ms: seq,
+            kind: EV_POOL_PLANNED.to_string(),
+            data: json!({"repo": "acme/app", "number": number, "paths": [], "source": source,
+                         "high_risk": false}),
+        };
+        let events = vec![
+            planned(2, 3, "failed"),
+            planned(3, 4, "failed"),
+            planned(4, 4, "spec"),
+            planned(6, 5, "failed"),
+            planned(7, 6, "failed"),
+        ];
+        // #3 failed before the cutoff, #4 has a newer plan, and #5 and #6 failed after it.
+        let again: Vec<u64> = failed_by(&events, "acme/app", 1, 5).into_iter().collect();
+        assert_eq!(again, [3]);
+        assert!(failed_by(&events, "acme/app", 1, 0).is_empty());
+        assert_eq!(
+            failed_by(&events, "acme/app", 2, 7)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [5, 6]
+        );
+    }
 
     #[cfg(unix)]
     #[test]
