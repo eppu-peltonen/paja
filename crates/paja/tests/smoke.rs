@@ -2219,6 +2219,52 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
 }
 
 #[test]
+fn doctor_checks_that_the_sandbox_program_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let working = program(tmp.path(), "sbx", "#!/bin/sh\necho 'sbx 0.9'\n");
+    let broken = program(
+        tmp.path(),
+        "broken-sbx",
+        "#!/bin/sh\necho 'sbx: daemon not running' >&2\nexit 3\n",
+    );
+    let sandbox = |sbx: &Path| -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(tmp.path())
+            .env("PAJA_HOME", &home)
+            .env("PAJA_SBX", sbx)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "sandbox")
+            .unwrap_or_else(|| panic!("no sandbox check in {report}"))
+            .clone()
+    };
+    assert_eq!(sandbox(&working)["status"], "ok");
+    // One that starts but fails is not set up.
+    let failed = sandbox(&broken);
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(
+        failed["detail"]
+            .as_str()
+            .unwrap()
+            .contains("daemon not running"),
+        "{failed}"
+    );
+    assert!(
+        failed["fix"].as_str().unwrap().contains("PAJA_SBX"),
+        "{failed}"
+    );
+}
+
+#[test]
 fn doctor_reports_each_check_and_the_fix_for_a_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home, d) = (

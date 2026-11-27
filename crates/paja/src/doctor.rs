@@ -430,7 +430,15 @@ fn sandbox(checks: &mut Vec<Check>) {
     let var = crate::sandbox::PROGRAM_VAR;
     match crate::sandbox::configured() {
         Some(program) => match run(Command::new(&program).arg("version")) {
-            Ok(_) => checks.push(ok("sandbox", format!("{var} is {program}"))),
+            Ok(out) if out.status.success() => {
+                checks.push(ok("sandbox", format!("{var} is {program}")))
+            }
+            // It started but failed: a broken or wrong `sbx` must not look set up.
+            Ok(out) => checks.push(failed(
+                "sandbox",
+                format!("{var} is {program}, and `{program} version` failed: {}", text(&out)),
+                format!("fix or reinstall `sbx` and point {var} at it, or unset {var} to run without a sandbox"),
+            )),
             Err(err) => checks.push(failed(
                 "sandbox",
                 format!("{var} is {program}, which did not run: {err}"),
