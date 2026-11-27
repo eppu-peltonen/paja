@@ -93,6 +93,10 @@ struct Open {
     /// When the issue was opened, as `gh` writes it (`2026-01-31T09:05:00Z`).
     #[serde(default, rename = "createdAt")]
     created_at: String,
+    /// The repository the issue belongs to (`owner/name`), set after reading: a link to one of
+    /// its files on GitHub names that file.
+    #[serde(skip)]
+    repo: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +374,13 @@ fn touches_named_file(repo: &Path, issue: &Open, commit: &str) -> bool {
     let mut args = vec!["diff-tree", "-r", "--no-commit-id", "--name-only", "-z"];
     match parent.as_deref() {
         Some(parent) => args.extend([parent.trim(), commit]),
+        // In a shallow clone a commit at the boundary has no parent here either, and against
+        // nothing it would change every file, so only a real root counts as one.
+        None if git(repo, &["rev-parse", "--is-shallow-repository"])
+            .map_or(true, |shallow| shallow.trim() != "false") =>
+        {
+            return false;
+        }
         None => args.extend(["--root", commit]),
     }
     git(repo, &args).is_ok_and(|names| {
@@ -398,15 +409,28 @@ fn names_file(issue: &Open, file: &str) -> bool {
     }
     let text = format!("{}\n{}", issue.title, issue.body).replace('\\', "/");
     let name = file.rsplit('/').next().unwrap_or(file);
-    // The words of the text that could be paths, without quotes or trailing punctuation.
+    // The words of the text that could be paths, without quotes or trailing punctuation. A
+    // link to a file of this repository on GitHub (`.../owner/name/blob/<ref>/<path>`) gives
+    // its path; any other link names nothing.
+    let blob = format!("/{}/blob/", issue.repo.to_ascii_lowercase());
     let words = text
         .split(|c: char| !(c.is_alphanumeric() || "/._-".contains(c)))
         .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
+        .filter_map(|word| {
+            if !word.starts_with("//") {
+                return Some(word);
+            }
+            let at = word.to_ascii_lowercase().find(&blob)?;
+            (!issue.repo.is_empty())
+                .then(|| word[at + blob.len()..].split_once('/'))
+                .flatten()
+                .map(|(_, path)| path)
+        })
         .filter(|word| !word.is_empty());
     // A path the issue gives is matched as a path: the same path, or one of the two ending in
     // the other at a `/` (`mestari/mod.rs` names `crates/paja/src/mestari/mod.rs`). A bare file
     // name with an extension (`triage.rs`) names any file of that name, but a path's last part
-    // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`). URLs (`//`) name nothing.
+    // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`).
     let suffix = |long: &str, short: &str| long.ends_with(&format!("/{short}"));
     let named_name = name.contains('.') && name.len() > 3;
     words
@@ -510,6 +534,9 @@ fn triage_holding(
         .context("`gh issue list` printed something that is not a list of issues")?;
     // An issue that is also a work item is queued work, not a stale finding.
     open.retain(|issue| !issue.labels.iter().any(|l| l.name == labels.work));
+    for issue in &mut open {
+        issue.repo = name.clone();
+    }
     // Each issue gets a turn: the ones no pass has read yet first, then the ones read longest
     // ago, oldest issue first among equals, so a long list is read in full over a few passes.
     let read = last_read(&home.events().read_all()?, &name);
@@ -740,6 +767,7 @@ mod tests {
                 body: String::new(),
                 labels: Vec::new(),
                 created_at: String::new(),
+                repo: String::new(),
             })
             .collect()
     }
@@ -752,6 +780,7 @@ mod tests {
             body: "The check in triage.rs, and docs\\design\\workflow.md.".into(),
             labels: Vec::new(),
             created_at: String::new(),
+            repo: String::new(),
         };
         for named in [
             "crates/paja/src/hook.rs",
@@ -783,6 +812,7 @@ mod tests {
             body: "See https://example.com/acme/app/blob/main/LICENSE and lib.rs.".into(),
             labels: Vec::new(),
             created_at: String::new(),
+            repo: String::new(),
         };
         for named in [
             "crates/paja/src/mestari/mod.rs",
@@ -794,6 +824,59 @@ mod tests {
         for unnamed in ["crates/paja/src/init/mod.rs", "mod.rs", "LICENSE"] {
             assert!(!names_file(&issue, unnamed), "{unnamed}");
         }
+    }
+
+    #[test]
+    fn a_link_to_a_file_of_this_repository_names_it_and_other_links_name_nothing() {
+        let issue = Open {
+            number: 3,
+            title: "Broken check".into(),
+            body: "See https://github.com/Acme/App/blob/main/crates/paja/src/hook.rs#L10 and \
+                   https://github.com/other/proj/blob/main/src/lib.rs."
+                .into(),
+            labels: Vec::new(),
+            created_at: String::new(),
+            repo: "acme/app".into(),
+        };
+        assert!(names_file(&issue, "crates/paja/src/hook.rs"));
+        assert!(!names_file(&issue, "src/lib.rs"));
+        assert!(!names_file(&issue, "lib.rs"));
+        // Without a repository, no link names anything.
+        let unknown = Open {
+            repo: String::new(),
+            ..issue
+        };
+        assert!(!names_file(&unknown, "crates/paja/src/hook.rs"));
+    }
+
+    #[test]
+    fn a_shallow_clones_boundary_commit_is_not_taken_as_a_root() {
+        let (tmp, _) = evidence_repo();
+        // `file://` so `--depth` applies; `file:///C:/...` on Windows.
+        let path = tmp.path().display().to_string().replace('\\', "/");
+        let url = if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        };
+        let shallow = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", "--depth", "1", &url])
+            .arg(shallow.path().join("c"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let dir = shallow.path().join("c");
+        let head = git(&dir, &["rev-parse", "HEAD"]).unwrap();
+        // HEAD's own change is b.txt, but with no parent here it would seem to add a.txt too.
+        let old = "2020-01-01T00:00:00Z";
+        let shown = check_evidence(&dir, "HEAD", &issue_naming("Fix a.txt", old), &head, "");
+        assert_eq!(shown, None);
+        let shown = check_evidence(&dir, "HEAD", &issue_naming("Fix b.txt", old), &head, "");
+        assert_eq!(
+            shown, None,
+            "a boundary commit's own change can't be told apart here"
+        );
     }
 
     #[test]
@@ -879,6 +962,7 @@ mod tests {
             body: String::new(),
             labels: Vec::new(),
             created_at: created_at.into(),
+            repo: "acme/app".into(),
         }
     }
 
