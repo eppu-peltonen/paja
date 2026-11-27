@@ -191,13 +191,13 @@ pub(super) fn land(
     ahjo::remove(home, &env.name, true)?;
     if let Err(err) = run_gh(repo, &["pr", "merge", &pr, merge_flag, "--delete-branch"]) {
         let text = format!("{err:#}").to_lowercase();
-        if text.contains("not allowed") || text.contains("permission") {
-            let question = format!(
-                "GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{}",
-                no_merge_method(&item.repo)
-            );
+        // Whether GitHub refused it is asked of GitHub, not read from the error's wording.
+        if let Some(why) = merge_refused(repo, &item.repo, merge_flag) {
+            let question =
+                format!("GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{why}");
             return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
         }
+        // Only a hint on top of the error, for a repository with no CI: the wording is enough.
         if ci == CiMode::None && text.contains("status check") {
             return Err(err).with_context(|| {
                 format!(
@@ -207,7 +207,14 @@ pub(super) fn land(
                 )
             });
         }
-        return Err(err).with_context(|| format!("{gh} pr merge {pr}"));
+        return Err(err).with_context(|| {
+            format!(
+                "{gh} pr merge {pr} failed; unless gh's message says why (a network error, a \
+                 conflict), check that the token `{gh} auth status` shows may write to {}, and \
+                 the default branch's protection rules",
+                item.repo
+            )
+        });
     }
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, &item.repo, item.number, Status::Landed, Some(&pr));
@@ -246,6 +253,55 @@ fn failed_log(repo: &Path, checks: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let tail = lines[lines.len().saturating_sub(LINES)..].join("\n");
     (!tail.trim().is_empty()).then_some(tail)
+}
+
+/// Why GitHub won't let the signed-in `gh` account merge with `flag` in `repo`, asked after a
+/// merge failed: its permission there is below write, or the method is now off. None when
+/// GitHub shows neither, or `gh` can't say, so the failure is an error instead.
+fn merge_refused(checkout: &Path, repo: &str, flag: &str) -> Option<String> {
+    let out = run_gh(
+        checkout,
+        &[
+            "repo",
+            "view",
+            "--json",
+            "viewerPermission,squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed",
+        ],
+    )
+    .ok()?;
+    let v: Value = serde_json::from_str(&out).ok()?;
+    merge_refusal(&v, repo, flag)
+}
+
+/// [`merge_refused`]'s reading of `gh repo view`'s answer `v`. A field it leaves out says
+/// nothing.
+fn merge_refusal(v: &Value, repo: &str, flag: &str) -> Option<String> {
+    if let Some(permission) = v["viewerPermission"].as_str().filter(|p| !p.is_empty()) {
+        if !matches!(permission, "ADMIN" | "MAINTAIN" | "WRITE") {
+            return Some(format!(
+                "The signed-in `gh` account has {permission} permission on {repo}, and merging \
+                 needs write access. Give it write access (or sign `gh` in as an account that \
+                 has it), then answer that it is changed."
+            ));
+        }
+    }
+    let methods = [
+        (SQUASH, "squashMergeAllowed", "squash merging"),
+        (REBASE, "rebaseMergeAllowed", "rebase merging"),
+        (MERGE, "mergeCommitAllowed", "merge commits"),
+    ];
+    let off = |key: &str| v[key].as_bool() == Some(false);
+    let (_, key, name) = methods.iter().find(|(f, ..)| *f == flag)?;
+    if !off(key) {
+        return None;
+    }
+    if methods.iter().all(|(_, key, _)| off(key)) {
+        return Some(no_merge_method(repo));
+    }
+    Some(format!(
+        "{repo} doesn't allow {name} now. Answer to land it with a method {repo} allows; the \
+         next run picks one."
+    ))
 }
 
 /// The question for a repository whose settings leave Paja no way to merge.
@@ -390,6 +446,50 @@ fn cut_short(body: String, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_merge_refusal_is_read_from_github_s_settings() {
+        use serde_json::json;
+        let why = |v: serde_json::Value, flag: &str| super::merge_refusal(&v, "o/r", flag);
+        // Write access and the method allowed: not a refusal, whatever the error said.
+        let fine = json!({"viewerPermission": "WRITE", "squashMergeAllowed": true});
+        assert_eq!(why(fine, super::SQUASH), None);
+        // Fields gh leaves out say nothing.
+        assert_eq!(why(json!({}), super::SQUASH), None);
+        for permission in ["READ", "TRIAGE"] {
+            let v = json!({ "viewerPermission": permission });
+            let text = why(v, super::SQUASH).unwrap();
+            assert!(
+                text.contains(&format!("has {permission} permission on o/r")),
+                "{text}"
+            );
+        }
+        // The method Paja chose was switched off, but another is still on: an answer is enough.
+        for (flag, key, name) in [
+            (super::SQUASH, "squashMergeAllowed", "squash merging"),
+            (super::REBASE, "rebaseMergeAllowed", "rebase merging"),
+            (super::MERGE, "mergeCommitAllowed", "merge commits"),
+        ] {
+            let v = json!({ "viewerPermission": "ADMIN", key: false });
+            let text = why(v, flag).unwrap();
+            assert!(
+                text.contains(&format!("doesn't allow {name} now")),
+                "{text}"
+            );
+            assert!(text.contains("the next run picks one"), "{text}");
+        }
+        // All three off: the setting to change.
+        let none = json!({"squashMergeAllowed": false, "rebaseMergeAllowed": false,
+                          "mergeCommitAllowed": false});
+        assert!(why(none, super::REBASE)
+            .unwrap()
+            .contains("allow squash merging"));
+        // An empty permission says nothing either.
+        assert_eq!(why(json!({"viewerPermission": ""}), super::SQUASH), None);
+        // Another method being off says nothing about this one.
+        let v = json!({"viewerPermission": "ADMIN", "rebaseMergeAllowed": false});
+        assert_eq!(why(v, super::SQUASH), None);
+    }
+
     #[test]
     fn a_body_past_the_limit_is_cut_to_it_by_characters() {
         let body = "ä".repeat(100);
