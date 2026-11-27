@@ -60,7 +60,9 @@ with what was closed, kept and left for the person.
 
 `paja run --every` triages at most once a day, when a pass finds the queue idle. It reads `triage.ran` (and
 `triage.failed`, recorded when a pass fails, so a broken pass isn't retried every few minutes) to know when the last
-one ran, and prints one more JSON line, `{"outcome": "triage", "triage": {...}}`, when it triaged. With follow-ups
+one ran, and prints one more JSON line, `{"outcome": "triage", "triage": {...}}`, when it triaged. An idle
+`paja run --workers` pool does the same, and tags a failed pass's error line as well (`{"outcome": "triage", "error":
+"..."}`), so it can't be read as a lane's. With follow-ups
 taken as work (the default), the queue is idle only once they are done, so a repository that wants stale ones closed
 before they are built sets `follow-ups = off` in `.paja/queue` or runs `paja triage` itself.
 

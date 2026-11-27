@@ -512,6 +512,13 @@ impl Pool<'_> {
             }
             Ok(None) => {}
             Err(err) if super::is_fatal(&err) => return Err(err),
+            // Tagged, so a reader of the pool's lines can tell it from a lane's error.
+            Err(err) if self.opts.json => {
+                println!(
+                    "{}",
+                    json!({ "outcome": "triage", "error": format!("{err:#}") })
+                );
+            }
             Err(err) => self.say_error(&err),
         }
         let minutes = self.opts.every;
