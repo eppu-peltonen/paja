@@ -72,7 +72,8 @@ pub struct StepUsage {
 /// reports. The status is the top-level one, the limit that binds now. The used share is the
 /// top-level `utilization` when there is one. Otherwise it comes from `unifiedWindows`: while the
 /// status is a warning (or rejected), the binding window's (`rateLimitType`), with the top-level
-/// reset time, so the hold lasts until that limit resets; else the fullest window's, with its own
+/// reset time (or, without one, the binding window's own), so the hold lasts until that limit
+/// resets; else the fullest window's, with its own
 /// reset time, so a window that is nearly used holds builds back until it resets. Every window
 /// counts, whichever model it is for, and `isUsingOverage` (extra usage that keeps work going
 /// past a full window) is not read: both err on holding back.
