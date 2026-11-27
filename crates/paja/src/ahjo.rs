@@ -553,10 +553,19 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
     let mut path = path.to_string();
     // A symbolic link inside the tree (a CLAUDE.md that links to AGENTS.md, say) is followed
     // to the file it names in the same commit, five links deep at most. A link in the middle
-    // of the path (a `.paja` that is itself a link) isn't: git lists nothing under it, so the
-    // file reads as missing, as it would on a checkout without links.
+    // of the path (a `.paja` that is itself a link) is an error: git lists nothing under it,
+    // and the file must not read as missing when a checkout would have it.
     for links in 0..=5 {
-        match blob_at(repo, &commit, &path, &spec)? {
+        let entry = blob_at(repo, &commit, &path, &spec)?;
+        if matches!(entry, Entry::Missing) {
+            if let Some(folder) = not_a_folder(repo, &commit, &path, &spec)? {
+                bail!(
+                    "reading {spec}: {folder}, on the way to {path}, is a symbolic link or a file, \
+                     not a folder; commit the folder itself in its place"
+                );
+            }
+        }
+        match entry {
             Entry::Missing if links == 0 => return Ok(None),
             // A link to nothing is never an empty settings file.
             Entry::Missing => bail!(
@@ -572,6 +581,38 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
         }
     }
     bail!("reading {spec}: it is a symbolic link more than five links deep; commit the file itself in its place")
+}
+
+/// The first leading part of `path` (`a` of `a/b/c`, then `a/b`) that the commit has as
+/// something other than a folder, if any.
+fn not_a_folder(repo: &Path, commit: &str, path: &str, spec: &str) -> Result<Option<String>> {
+    let parts: Vec<&str> = path.split('/').collect();
+    for end in 1..parts.len() {
+        let prefix = parts[..end].join("/");
+        let listed = run_git(
+            repo,
+            &[
+                "--literal-pathspecs",
+                "ls-tree",
+                "--full-tree",
+                "-z",
+                commit,
+                "--",
+                &prefix,
+            ],
+        )?;
+        if !listed.status.success() {
+            return Err(git_failed(spec, repo, "git ls-tree", &listed));
+        }
+        let entry = String::from_utf8_lossy(&listed.stdout);
+        match entry.split(' ').nth(1) {
+            // Not there: nothing below it is either.
+            None => return Ok(None),
+            Some("tree") => {}
+            Some(_) => return Ok(Some(prefix)),
+        }
+    }
+    Ok(None)
 }
 
 /// What one path at a commit is.
@@ -953,6 +994,9 @@ mod tests {
         add("120000", "l4", b"l5");
         add("120000", "l5", b"kept.txt");
         add("120000", "l0", b"l1");
+        // A folder that is a link, read through or linked through.
+        add("120000", "via", b".paja");
+        add("120000", "through", b"via/checks");
         add("100644", "latin1", b"caf\xe9\n");
         git_unchecked(
             repo,
@@ -987,6 +1031,12 @@ mod tests {
             show_at(repo, "HEAD", "l1").unwrap().as_deref(),
             Some("kept\n")
         );
+        for name in ["via/checks", "through"] {
+            let err = show_at(repo, "HEAD", name).unwrap_err().to_string();
+            assert!(err.contains("via, on the way"), "{err}");
+        }
+        // A folder that isn't there at all still means the file is missing.
+        assert_eq!(show_at(repo, "HEAD", "nowhere/checks").unwrap(), None);
         for name in [
             "outside",
             "loop",
