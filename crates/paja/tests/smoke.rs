@@ -5006,9 +5006,13 @@ fn triage_leaves_another_clones_triage_environment_alone() {
         std::fs::read_to_string(theirs.join("my-work.txt")).unwrap(),
         "unsaved"
     );
-    // From a worktree of the clone itself, the environment is its own and is reused.
-    let (ok, report) = triage_in(&f, &dir, &theirs);
+    // From the clone that made it, the environment is its own: reused, reset and removed.
+    let (ok, report) = triage_in(&f, &dir, &clone);
     assert!(ok, "{report}");
+    assert!(dir.join("claude-calls").exists(), "the agent didn't run");
+    assert!(!theirs.exists(), "the environment was left behind");
+    let (_, envs) = paja(&f.home, &clone, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]), "{envs}");
 }
 
 #[test]

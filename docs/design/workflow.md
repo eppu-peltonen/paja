@@ -67,8 +67,8 @@ so each repository has its own and an environment a person made is never reused 
 `owner/name`, so two clones of one repository under one home share the name: a pass reuses a left-over environment
 only when it was made from the same clone, and otherwise stops and names it. One pass runs per repository at a time: a
 pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is held and says to wait,
-and `paja run --every` and an idle pool skip their pass then, and check again under the lock that no pass ran that
-day. Its word is not enough to close anything: Paja closes a duplicate only when the
+and `paja run --every` and an idle pool skip their pass then. Once they hold the lock, they check again that no pass
+ran that day, and a failed pass is recorded before the lock is let go. Its word is not enough to close anything: Paja closes a duplicate only when the
 original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
 named commit must be on the default branch, committed after the issue was opened, and change a file the issue names
 (a merge against its first parent; in a shallow clone a commit with no parent there is not taken), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or

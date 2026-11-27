@@ -28,7 +28,7 @@ const MAX_NOTE_TRIES: u32 = 3;
 /// The Ahjo environment the triage agent runs in for `repo` (`owner/name`): a checkout of the
 /// default branch, named like a work item's environment (the repository's name and a hash of
 /// `owner/name`), so each repository has its own and a person's `paja env create triage` is
-/// never reused or removed.
+/// never reused or removed. Two clones of one repository share it; see [`ask`].
 pub fn env_name(repo: &str) -> String {
     jono::env_name_for(repo, "triage")
 }
@@ -546,7 +546,7 @@ pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
              `paja run --every`); wait for it to finish, then run `paja triage` again"
         );
     };
-    triage_holding(home, &repo, &name, lock)
+    triage_holding(home, &repo, &name, &lock)
 }
 
 /// [`triage`], holding `repo`'s triage lock.
@@ -554,7 +554,7 @@ fn triage_holding(
     home: &Home,
     repo: &Path,
     name: &str,
-    _lock: crate::home::RunLock,
+    _lock: &crate::home::RunLock,
 ) -> Result<TriageReport> {
     let repo = repo.to_path_buf();
     let name = name.to_string();
@@ -774,9 +774,10 @@ fn ask(
             // Another clone of the same repository shares the name: leave its checkout alone.
             if !ahjo::belongs_to(home, &env, repo)? {
                 bail!(
-                    "environment {env_name} belongs to the repository at {}, not {}: another \
-                     clone of {name} triaged from this home. Run `paja triage` from that clone, \
-                     or remove the environment with `paja env remove {env_name}` if it is stale",
+                    "environment {env_name} belongs to the repository at {}, not {}: it was \
+                     made by another clone of {name} (or one that has moved). Run `paja triage` \
+                     from that clone, or remove the environment with `paja env remove --force \
+                     {env_name}` if it is stale",
                     env.repo.display(),
                     repo.display()
                 );
@@ -933,7 +934,8 @@ pub fn triage_if_due(home: &Home, repo: &Path) -> Result<Option<TriageReport>> {
     if !due()? {
         return Ok(None);
     }
-    match triage_holding(home, &std::path::absolute(repo)?, &name, lock) {
+    // The lock is held until a failure is recorded too, so no other pass sees the day as due.
+    match triage_holding(home, &std::path::absolute(repo)?, &name, &lock) {
         Ok(report) => Ok(Some(report)),
         Err(err) => {
             if !is_fatal(&err) {
