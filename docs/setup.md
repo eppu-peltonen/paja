@@ -173,6 +173,17 @@ With `--json` it prints `{"checks": [{"name", "status", "detail", "fix"}], "ok":
 check, and `ok` is false when any check failed (a warning doesn't count). The exit code is non-zero when any check
 failed. The MCP tool `doctor` returns the same JSON.
 
+### How the safety layers fit
+
+- **Base layer: Claude Code's auto mode.** Every agent Mestari starts runs under `--permission-mode auto`. Its permission
+  checks, and the improvements Anthropic ships to them, reach Paja's agents through Claude Code updates, so keep Claude
+  Code current.
+- **On top: the deny-list hook** (`paja hook`). A thin extra layer for what only Paja knows: no `git push`, only the
+  programs in `.paja/commands`, and fail closed. It is not a sandbox and does not stand in for auto mode.
+- **Optional: the sandbox** (`PAJA_SBX`, Docker Sandboxes). Recommended when people outside your team can write the
+  repository's issues or code, and for long unattended runs (`paja run --every`, `--workers` pools). Nothing requires
+  Docker; see [`safety.md`](./safety.md).
+
 ## Using Paja from Claude Code
 
 The Claude Code plugin in `plugin/` starts `paja mcp`, so Paja's core shows up as MCP tools, and adds five skills:

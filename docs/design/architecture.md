@@ -347,6 +347,13 @@ Because that also skips `CLAUDE.md`, Mestari passes the default branch's `CLAUDE
 under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read from
 the tool call, because the reported `cwd` moves when the agent runs `cd`.
 
+The hook adds to Claude Code's auto mode (always on, see Permissions below); it never replaces it. Auto mode is the
+base layer, and its safety improvements reach agents through Claude Code updates. The hook is a thin layer for what only
+Paja knows: no `git push`, the programs in `.paja/commands`, and fail closed. A rule goes into the deny-list only when it
+is Paja-specific and auto mode can't know it; broad safety rules belong to Claude Code. For untrusted writers of the
+repository's issues or code, and for long unattended runs (`paja run --every`, pools), the optional sandbox below is
+recommended.
+
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
   tools included, is blocked. Subagents run in the same worktree in the foreground, under the same hook; one with
   `isolation` or `run_in_background` is blocked, since Claude Code would make its worktree without a call to judge.

@@ -5,9 +5,11 @@ Read this before your first `paja run` on a computer that holds anything you car
 
 ## What the agents can and can't do
 
-Every agent Paja starts (builder and reviewers) runs under these limits:
+Every agent Paja starts (builder and reviewers) runs under these limits. Claude Code's auto mode is the base layer: its
+safety improvements arrive with Claude Code updates, so keep Claude Code current. The deny-list hook only adds to it.
 
-- **The deny-list hook.** Each tool call goes to `paja hook`, which allows the file tools, local `git` and the programs
+- **The deny-list hook.** A thin extra layer for what only Paja knows (no `git push`, the programs in `.paja/commands`,
+  fail closed); it is not a sandbox and does not replace auto mode. Each tool call goes to `paja hook`, which allows the file tools, local `git` and the programs
   in `.paja/commands` (`cargo` when the file is missing), in plain shapes, and blocks the rest. It fails closed. Reviewers
   run it read-only. No settings file or MCP server loads, so neither your settings nor a file on the branch can loosen it.
 - **`--tools`.** An agent is given only the built-in tools its role needs. There are no web or subagent tools.
@@ -26,6 +28,9 @@ in your home folder). Paja detects changes to git's configuration and hooks and 
 everything such code does. `paja doctor` warns while no sandbox is set, and `paja run` says so before it starts.
 
 ## The optional sandbox
+
+It stays optional, and nothing requires Docker. Use it when people outside your team can write the repository's issues
+or code, and for long unattended runs (`paja run --every`, pools with `--workers`).
 
 Set `PAJA_SBX` to the [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) program and `paja run` runs every agent
 and every check inside one sandbox named `paja`:
