@@ -921,6 +921,17 @@ mod tests {
     fn a_repository_name_differing_only_in_case_is_the_same_checkout() {
         let dir = tempfile::tempdir().unwrap();
         let (home, checkout) = escalated_with_checkout(dir.path());
+        // An environment's name hashes the repository's exact spelling, so only a remembered
+        // checkout (from a sync) is found under another case.
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                jono::EV_CHECKOUT,
+                json!({ "repo": "acme/app", "path": checkout }),
+            )
+            .unwrap();
+        drop(lock);
         assert_eq!(
             checkout_within(&home, "Acme/App", dir.path(), 1).unwrap(),
             checkout
