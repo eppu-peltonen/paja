@@ -163,7 +163,7 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     let claude = std::env::var("PAJA_CLAUDE").unwrap_or_else(|_| "claude".to_string());
     match run(Command::new(&claude).arg("--version")) {
         Ok(out) if out.status.success() => {
-            checks.push(ok("claude", text(&out)));
+            checks.push(claude_version(&claude, text(&out)));
             match run(Command::new(&claude).args(["auth", "status"])) {
                 Ok(out) if out.status.success() => checks.push(ok("claude sign-in", "signed in")),
                 Ok(out) => checks.push(failed(
@@ -223,6 +223,78 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             };
             checks.push(failed("home folder", why, fix));
         }
+    }
+}
+
+/// Where the latest Claude Code release is looked up: an `http(s)` URL (fetched with `curl`) or a
+/// file path, which holds the answer for tests and offline setups.
+pub const LATEST_VAR: &str = "PAJA_CLAUDE_LATEST";
+const LATEST_URL: &str = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
+
+/// The dotted number at the start of the first word that has one, e.g. `2.0.0` in
+/// `2.0.0 (Claude Code)`.
+fn parse_version(text: &str) -> Option<Vec<u64>> {
+    text.split(|c: char| c.is_whitespace() || c == '"' || c == 'v')
+        .find_map(|word| {
+            let parts: Option<Vec<u64>> = word.split('.').map(|p| p.parse().ok()).collect();
+            parts.filter(|p| p.len() >= 2)
+        })
+}
+
+/// The latest released version, or why it couldn't be found. Never waits more than a few seconds.
+fn latest_version() -> std::result::Result<Vec<u64>, String> {
+    let source = std::env::var(LATEST_VAR).unwrap_or_else(|_| LATEST_URL.to_string());
+    let body = if source.starts_with("http://") || source.starts_with("https://") {
+        let out = run(Command::new("curl").args([
+            "-fsS",
+            "--connect-timeout",
+            "3",
+            "--max-time",
+            "5",
+            &source,
+        ]))?;
+        if !out.status.success() {
+            return Err(text(&out));
+        }
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    } else {
+        std::fs::read_to_string(&source).map_err(|e| format!("reading {source}: {e}"))?
+    };
+    // The registry answers JSON with a `version`; a plain version number works too.
+    let version = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["version"].as_str().map(str::to_string))
+        .unwrap_or(body);
+    parse_version(&version).ok_or_else(|| format!("no version in the answer: {}", version.trim()))
+}
+
+/// The Claude Code check: it runs, and is it current? Agents get Anthropic's safety updates only
+/// through Claude Code updates, so an old one is a warning. A lookup that fails stays ok.
+fn claude_version(claude: &str, installed_text: String) -> Check {
+    let Some(installed) = parse_version(&installed_text) else {
+        return ok("claude", installed_text);
+    };
+    match latest_version() {
+        Ok(latest) if installed < latest => {
+            let latest = latest
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+            warning(
+                "claude",
+                format!("{installed_text}; the latest release is {latest}"),
+                format!(
+                    "run `{claude} update`; agents get Anthropic's safety updates only through \
+                     Claude Code updates"
+                ),
+            )
+        }
+        Ok(_) => ok("claude", format!("{installed_text} (up to date)")),
+        Err(why) => ok(
+            "claude",
+            format!("{installed_text} (could not check for a newer release: {why})"),
+        ),
     }
 }
 
