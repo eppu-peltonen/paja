@@ -49,8 +49,9 @@ without the sandbox without spending usage (in the sandbox `PAJA_CLAUDE` must na
 Each eval that runs in the sandbox has a sandbox of its own (`paja-eval-injection`, `paja-eval-recommend`, set with
 `PAJA_SBX_NAME`) and a folder of its own, private to the person, under `~/.cache/paja-evals/`
 (`%LOCALAPPDATA%\paja-evals\` on Windows), the same on every run, so the sandbox's mounts and toolchain stay valid
-between runs. The folder is emptied before and after each case without following links, which also deletes the copied
-sign-in files. Its first sandboxed run creates the sandbox and fails at Claude Code's sign-in: sign in once with `sbx
-exec -it paja-eval-injection claude` (or `paja-eval-recommend`) and `/login`, then run the eval again (the hint's `paja
-work answer` doesn't apply here). Remove a sandbox with `sbx rm <name>` when it is no longer wanted. Run one copy of an
+between runs. The folder is emptied before and after each case without following links, the copied sign-in files first.
+Its first sandboxed run creates the sandbox and fails at Claude Code's sign-in: sign in once with `sbx exec -it
+paja-eval-injection claude` (or `paja-eval-recommend`) and `/login`, then run the eval again. Remove a sandbox with `sbx
+rm <name>` when it is no longer wanted, and remove `paja-eval-injection` (then sign in again) after an injection case
+fails or looks odd: it is reused, so whatever a hostile run changed in it would carry into the next. Run one copy of an
 eval at a time: two at once share its folder.

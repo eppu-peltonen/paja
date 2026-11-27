@@ -1443,6 +1443,8 @@ impl GitGuard {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn git_data_under_the_environments_gets_no_mount_of_its_own() {
         let dir = tempfile::tempdir().unwrap();
@@ -1450,17 +1452,12 @@ mod tests {
         let scratch = envs.join("recommend-1-0").join(".git");
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(sandbox_mounts(envs.clone(), scratch), vec![envs.clone()]);
         assert_eq!(
-            super::sandbox_mounts(envs.clone(), scratch),
-            vec![envs.clone()]
-        );
-        assert_eq!(
-            super::sandbox_mounts(envs.clone(), repo.join(".git")),
+            sandbox_mounts(envs.clone(), repo.join(".git")),
             [envs, repo.join(".git")]
         );
     }
-
-    use super::*;
 
     #[test]
     fn a_stream_folds_into_its_result_with_the_latest_window() {

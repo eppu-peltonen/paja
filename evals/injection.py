@@ -170,9 +170,11 @@ def built(log):
             event = json.loads(line)
         except ValueError:
             continue
-        if event.get("kind") != "run.round":
+        # A round a usage limit stopped holds the builder's step, but its session never worked.
+        data = event.get("data") or {}
+        if event.get("kind") != "run.round" or data.get("verdict") == "usage_limit":
             continue
-        steps = (event.get("data") or {}).get("steps") or []
+        steps = data.get("steps") or []
         if any(isinstance(step, dict) and step.get("step") == "build" for step in steps):
             return True
     return False
@@ -261,9 +263,21 @@ def _is_link(path, st):
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
+def _retry(func, path, _exc):
+    """`shutil.rmtree`'s error handler: git writes read-only object files, which Windows won't
+    delete until they are writable. Anything else is raised."""
+    if WINDOWS and func in (os.unlink, os.remove, os.rmdir):
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    else:
+        raise
+
+
 def _remove(path):
     """Remove one entry, never following a link: code in the sandbox can write in the mounted
-    folders, and a link there must not lead the cleanup to the person's own files."""
+    folders, and a link there must not lead the cleanup to the person's own files. A directory
+    goes with `shutil.rmtree`, which on Unix walks by file descriptor and so never follows a link
+    swapped in while it runs; on Windows it doesn't enter links or junctions either."""
     st = os.lstat(path)
     if _is_link(path, st):
         try:
@@ -271,25 +285,38 @@ def _remove(path):
         except OSError:
             os.rmdir(path)  # a Windows link or junction to a directory
     elif stat.S_ISDIR(st.st_mode):
-        for entry in os.listdir(path):
-            _remove(os.path.join(path, entry))
-        os.rmdir(path)
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_retry)
+        else:
+            shutil.rmtree(path, onerror=_retry)
     else:
         try:
-            os.remove(path)
+            os.unlink(path)
         except PermissionError:
             if not WINDOWS:
                 raise
-            # git writes read-only object files, which Windows won't delete until writable.
             os.chmod(path, stat.S_IWRITE)
-            os.remove(path)
+            os.unlink(path)
 
 
-def reset(root, keep):
+def reset(root, keep, first=()):
     """Empty `root` but keep the directories in `keep` (emptied) and those on the way to them.
     The eval's sandbox mounts those, so they stay where the sandbox made on the first run sees
-    them; a directory deleted and made again at the same path may not be visible in it."""
+    them; a directory deleted and made again at the same path may not be visible in it. The
+    paths in `first` go before anything else (the copied sign-in), and one entry that can't be
+    removed doesn't stop the rest: the errors are raised together at the end."""
     kept = [os.path.normcase(os.path.abspath(k)) for k in keep]
+    errors = []
+
+    def attempt(p):
+        try:
+            _remove(p)
+        except OSError as err:
+            errors.append(f"{p}: {err}")
+
+    for p in first:
+        if os.path.lexists(p):
+            attempt(p)
 
     def clear(d):
         for entry in os.listdir(d):
@@ -300,11 +327,13 @@ def reset(root, keep):
             if on_the_way and stat.S_ISDIR(st.st_mode) and not _is_link(p, st):
                 clear(p)
             else:
-                _remove(p)
+                attempt(p)
 
     clear(root)
     for k in keep:
         os.makedirs(k, exist_ok=True)
+    if errors:
+        raise OSError("couldn't remove " + "; ".join(errors))
 
 
 def one_case(case, paja, fake_tool, base_env):
@@ -312,7 +341,7 @@ def one_case(case, paja, fake_tool, base_env):
     # What the eval's sandbox mounts: the factory home's environments and the repository's git.
     keep = [os.path.join(scratch, "paja-home", "envs"),
             os.path.join(scratch, "files", "app", ".git")]
-    reset(scratch, keep)
+    reset(scratch, keep, first=[os.path.join(scratch, "home")])
     env = {k: v for k, v in base_env.items() if k != "PAJA_SBX_NAME"}
     if case["sandbox"]:
         env["PAJA_SBX_NAME"] = SANDBOX
@@ -320,7 +349,7 @@ def one_case(case, paja, fake_tool, base_env):
         return _one_case(case, paja, fake_tool, env, scratch)
     finally:
         try:
-            reset(scratch, keep)
+            reset(scratch, keep, first=[os.path.join(scratch, "home")])
         except OSError as err:
             print(f"warning: delete {os.path.join(scratch, 'home')}; it holds a copy of Claude "
                   f"Code's sign-in ({err})", file=sys.stderr)
