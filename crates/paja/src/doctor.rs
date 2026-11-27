@@ -235,6 +235,73 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         }
     }
     checks.push(left_over_environments(home));
+    checks.push(usage_window(home));
+}
+
+/// How many of the latest agent steps the usage window check reads.
+const WINDOW_STEPS: usize = 5;
+
+/// Whether Claude Code's results tell Paja the usage window. The window comes from the
+/// `rate_limit_event` messages of `claude -p --output-format stream-json`, whose shape Paja
+/// assumes; if a Claude Code prints it differently, no step records a window and a nearly used
+/// one never holds a build back, silently. So the latest agent steps the log has are read: none
+/// at all is ok (nothing has run yet), and none of them with a window is a warning.
+fn usage_window(home: &Home) -> Check {
+    let name = "usage window";
+    let steps = home.events().read_all().map(|events| {
+        let mut steps: Vec<crate::mestari::StepUsage> = events
+            .iter()
+            .filter(|e| e.kind == crate::mestari::EV_ROUND)
+            .filter_map(|e| e.data["steps"].as_array())
+            .flatten()
+            .filter_map(|s| serde_json::from_value(s.clone()).ok())
+            // A step that ran a session; one that never started has nothing to report.
+            .filter(|s: &crate::mestari::StepUsage| s.session_id.is_some())
+            .collect();
+        steps.drain(..steps.len().saturating_sub(WINDOW_STEPS));
+        steps
+    });
+    let steps = match steps {
+        Ok(steps) => steps,
+        Err(err) => {
+            return warning(
+                name,
+                format!("couldn't read the event log: {err:#}"),
+                format!("check {}", home.root().display()),
+            );
+        }
+    };
+    let reported = |s: &&crate::mestari::StepUsage| {
+        s.window_status.is_some() || s.window_used_percent.is_some() || s.window_resets_at.is_some()
+    };
+    let Some(latest) = steps.iter().rfind(reported) else {
+        if steps.is_empty() {
+            return ok(name, "no agent step has run yet");
+        }
+        return warning(
+            name,
+            format!(
+                "the latest {} agent step{} reported no usage window, so a nearly used window \
+                 can't hold a build back before Claude Code's limit cuts it off",
+                steps.len(),
+                if steps.len() == 1 { "" } else { "s" }
+            ),
+            "run `claude update`; signed in with an API key there is no window, and this is \
+             expected. If Claude Code is current and signed in to a subscription, its stream-json \
+             output no longer has `rate_limit_event` messages with `rate_limit_info` (`status`, \
+             `utilization`, `resetsAt`) as Paja reads them: file an issue with the \
+             `rate_limit_event` line that `claude -p --output-format stream-json --verbose hi` \
+             prints",
+        );
+    };
+    let mut detail = format!(
+        "the latest step reported {}",
+        latest.window_status.as_deref().unwrap_or("a window")
+    );
+    if let Some(used) = latest.window_used_percent {
+        detail.push_str(&format!(", {used:.0}% used"));
+    }
+    ok(name, detail)
 }
 
 /// Environments whose work item's issue was closed: a parked item keeps its environment (so the

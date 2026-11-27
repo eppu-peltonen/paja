@@ -7,7 +7,8 @@
 //! latest event's `rate_limit_info` to it unless the result has one. Paja records `status`, the used percent and the reset time on the step
 //! (`window_status`, `window_used_percent`, `window_resets_at`). A Claude Code whose result has no
 //! `rate_limit_info` leaves all three `None`, and then nothing is held back: the window is only
-//! ever judged on what was reported.
+//! ever judged on what was reported, and `paja doctor` warns while none of the latest steps has
+//! a window.
 //!
 //! Before a `build` or `fix` session, and before a new item is claimed, Mestari reads the latest
 //! recorded state ([`window_nearly_used`]); `window <percent>` in `.paja/models` on the default

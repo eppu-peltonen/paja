@@ -242,6 +242,10 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
 - No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it
   is answered; if its issue is closed instead, this is a warning that names the environment and the
   `paja env remove <name>` that frees it (the branch is kept).
+- Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
+  `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
+  warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; with
+  an API key there is no window, and the warning is expected. Before any step has run, it is ok.
 - The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
   branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.

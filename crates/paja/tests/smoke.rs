@@ -7283,6 +7283,72 @@ fn a_window_in_a_real_stream_reaches_the_recorded_step() {
 }
 
 #[test]
+fn doctor_warns_while_no_step_reports_a_usage_window() {
+    let f = Factory::new("true\n", "land");
+    let window = |f: &Factory| {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "usage window");
+        check.cloned().unwrap_or_else(|| panic!("{report}"))
+    };
+    // Nothing has run yet: nothing to judge.
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    // The fake's results carry no window, as a Claude Code printing another shape would.
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let check = window(&f);
+    assert_eq!(check["status"], "warning", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reported no usage window"),
+        "{check}"
+    );
+    assert!(
+        check["fix"].as_str().unwrap().contains("rate_limit_event"),
+        "{check}"
+    );
+    // A later step that reports one settles it.
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("reset-at"),
+        epoch_secs_in(3600).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 6, "title": "Another", "body": "Please.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+    paja(&f.home, &f.repo, &["work", "sync"]);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("allowed_warning, 93% used"),
+        "{check}"
+    );
+}
+
+#[test]
 fn a_nearly_used_window_claims_no_new_item() {
     let f = Factory::new("true\n", "land");
     let resets = epoch_secs_in(3600);

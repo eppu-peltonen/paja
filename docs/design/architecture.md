@@ -335,7 +335,8 @@ its limit a second time in a run escalates with a question that says so, instead
 Agents run with `--output-format stream-json --verbose`; Mestari folds the stream back into its final `result`
 message, with the latest `rate_limit_event`'s `rate_limit_info` added when the result has none of its own. A step
 records the usage window when that object is there (`window_status`,
-`window_used_percent`, `window_resets_at`; all absent for a Claude Code that reports nothing). Before a `build` or
+`window_used_percent`, `window_resets_at`; all absent for a Claude Code that reports nothing, and `paja doctor` warns
+when none of the latest five steps has them). Before a `build` or
 `fix` session, and before a new item is claimed, Mestari reads the latest recorded state: if it is a warning (or
 rejected) status, or at least `window <percent>` of the window (a line in `.paja/models`, default 90) is used, and its
 reset time is still ahead, the step isn't started. The round is recorded as `usage_limit`, as when Claude Code stops
