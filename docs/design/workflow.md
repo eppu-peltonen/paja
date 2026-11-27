@@ -49,7 +49,9 @@ read in full over a few passes. The verdicts:
 
 Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. A duplicate's
 original also gets a comment naming the closed issue, so if the original is later closed without being done, the
-duplicate's finding can be found and reopened. "Not worth doing"
+duplicate's finding can be found and reopened. If that note fails, the item stays closed with the note's failure as its
+`error`, the pass records it in `triage.ran` as `note_failed`, and the next pass tries it again (`retried_notes` in the
+report; a note posted on a retry is recorded as `noted`). "Not worth doing"
 is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
 is left out.
 

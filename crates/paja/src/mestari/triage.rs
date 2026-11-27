@@ -79,6 +79,19 @@ pub struct TriageReport {
     pub closed: Vec<u64>,
     /// The issues the agent thinks aren't worth doing: left open, for the person to decide.
     pub not_worth_doing: Vec<u64>,
+    /// Notes on a duplicate's original that an earlier pass failed to post, tried again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retried_notes: Vec<RetriedNote>,
+}
+
+/// A note on duplicate `number`'s original `on` that an earlier pass failed to post.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetriedNote {
+    pub number: u64,
+    pub on: u64,
+    /// Why posting it failed again; None when it was posted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// An open follow-up issue as the agent is shown it.
@@ -478,7 +491,9 @@ fn triage_holding(
     open.retain(|issue| !issue.labels.iter().any(|l| l.name == labels.work));
     // Each issue gets a turn: the ones no pass has read yet first, then the ones read longest
     // ago, oldest issue first among equals, so a long list is read in full over a few passes.
-    let read = last_read(&home.events().read_all()?, &name);
+    let events = home.events().read_all()?;
+    let read = last_read(&events, &name);
+    let pending = pending_notes(&events, &name);
     open.sort_by_key(|issue| (read.get(&issue.number).copied(), issue.number));
     open.truncate(MAX_ISSUES);
 
@@ -527,6 +542,25 @@ fn triage_holding(
             }
         }
     }
+    // Notes an earlier pass failed to post get another try, in a short form, since the
+    // duplicate's reason is in its own closing comment.
+    let mut retried_notes = Vec::new();
+    for (number, on) in pending {
+        let note = follow_ups::redact_for_issue(
+            &format!(
+                "**Paja triage closed #{number} as a duplicate of this issue.**\n\nIf this issue \
+                 is closed without being done, reopen #{number} so its finding isn't lost."
+            ),
+            &repo,
+        );
+        let error = run_gh(
+            &repo,
+            &["issue", "comment", &on.to_string(), "--body", &note],
+        )
+        .err()
+        .map(|err| format!("{err:#}"));
+        retried_notes.push(RetriedNote { number, on, error });
+    }
     let report = TriageReport {
         repo: name,
         base,
@@ -541,7 +575,29 @@ fn triage_holding(
             .map(|i| i.number)
             .collect(),
         items,
+        retried_notes,
     };
+    // A duplicate closed whose note failed, this pass or again on a retry: the next pass tries it.
+    let note_failed: Vec<Value> = report
+        .items
+        .iter()
+        .filter(|i| i.closed && i.error.is_some())
+        .filter_map(|i| i.duplicate_of.map(|on| (i.number, on)))
+        .chain(
+            report
+                .retried_notes
+                .iter()
+                .filter(|n| n.error.is_some())
+                .map(|n| (n.number, n.on)),
+        )
+        .map(|(number, on)| json!({ "number": number, "on": on }))
+        .collect();
+    let noted: Vec<Value> = report
+        .retried_notes
+        .iter()
+        .filter(|n| n.error.is_none())
+        .map(|n| json!({ "number": n.number, "on": n.on }))
+        .collect();
     record(
         home,
         EV_TRIAGE_RAN,
@@ -557,6 +613,8 @@ fn triage_holding(
             "kept": report.items.iter().filter(|i| i.verdict == Verdict::Keep).map(|i| i.number).collect::<Vec<_>>(),
             "not_worth_doing": report.not_worth_doing,
             "failed": report.items.iter().filter(|i| i.error.is_some()).map(|i| i.number).collect::<Vec<_>>(),
+            "note_failed": note_failed,
+            "noted": noted,
             "usage": usage,
         }),
     )?;
@@ -654,6 +712,35 @@ fn last_read(events: &[crate::events::Event], repo: &str) -> BTreeMap<u64, u64> 
         }
     }
     read
+}
+
+/// The notes on a duplicate's original (`(duplicate, original)`) that passes of `repo` failed
+/// to post and no later pass posted: each `triage.ran` lists the ones it failed as
+/// `note_failed` and the ones it posted on a retry as `noted`.
+fn pending_notes(events: &[crate::events::Event], repo: &str) -> Vec<(u64, u64)> {
+    let pairs = |value: &Value| -> Vec<(u64, u64)> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| Some((n["number"].as_u64()?, n["on"].as_u64()?)))
+            .collect()
+    };
+    let mut pending: Vec<(u64, u64)> = Vec::new();
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EV_TRIAGE_RAN && e.data["repo"].as_str() == Some(repo))
+    {
+        let noted = pairs(&event.data["noted"]);
+        let failed = pairs(&event.data["note_failed"]);
+        pending.retain(|p| !noted.contains(p) && !failed.contains(p));
+        for pair in failed {
+            if !pending.contains(&pair) {
+                pending.push(pair);
+            }
+        }
+    }
+    pending
 }
 
 /// Whether `events` hold a triage pass (or a failed attempt) of `repo` less than a day before

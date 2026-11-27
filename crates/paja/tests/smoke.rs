@@ -4718,6 +4718,7 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"workflow list\") echo 'CI	active	1' ;;\n\
              \"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/followups.json ;; *) echo '[]' ;; esac ;;\n\
+             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi ;;\n\
              *) ;;\nesac\n"
         ),
     );
@@ -4980,6 +4981,67 @@ fn triage_gives_every_follow_up_a_turn_past_the_first_sixty() {
     assert_eq!(&numbers[..3], [61, 62, 1], "{report}");
     assert_eq!(numbers.len(), 60, "{report}");
     assert!(prompt().contains("details of 62."), "{}", prompt());
+}
+
+#[test]
+fn a_duplicate_note_that_fails_is_reported_and_tried_again_next_pass() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    // #12 is closed even though the note on #11 failed, and the report says both.
+    assert_eq!(report["closed"], serde_json::json!([12]), "{report}");
+    assert_eq!(report["items"][1]["closed"], true, "{report}");
+    let error = report["items"][1]["error"].as_str().unwrap();
+    assert!(error.contains("noting it on #11 failed"), "{error}");
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran[0]["data"]["note_failed"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{ran:?}"
+    );
+    // The text report doesn't call the closed issue "not closed".
+    let vars = triage_vars(&dir);
+    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .envs(vars.iter().map(|(k, v)| (*k, v.as_path())))
+        .arg("triage")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("(closed; closed, but noting it on #11 failed"),
+        "{text}"
+    );
+    assert!(!text.contains("not closed"), "{text}");
+    assert!(text.contains("failed again"), "{text}");
+    // Once comments work, the next pass posts the note and records it.
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(
+        report["retried_notes"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{report}"
+    );
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran.last().unwrap()["data"]["noted"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{ran:?}"
+    );
+    // A pass after that has nothing left to retry.
+    let (_, report) = triage(&f, &dir);
+    assert!(report.get("retried_notes").is_none(), "{report}");
 }
 
 #[test]
