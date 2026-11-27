@@ -2297,7 +2297,9 @@ impl Factory {
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
                  for w in $(ls {d}/holds 2>/dev/null); do case \"$*\" in *\"$w feature\"*) : > {d}/holding-$w; while [ -f {d}/holds/$w ]; do sleep 0.1; done ;; esac; done\n\
                  if [ -f {d}/main-moves.sh ]; then sh {d}/main-moves.sh; rm {d}/main-moves.sh; fi\n\
-                 case \"$*\" in *\"another round\"*) if [ -f {d}/leave-merge ]; then rm {d}/leave-merge; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
+                 if [ -f {d}/fix-moves-main.sh ] && case \"$*\" in *\"another round\"*) true ;; *) false ;; esac; then sh {d}/fix-moves-main.sh; rm {d}/fix-moves-main.sh; fi\n\
+                 if git rev-parse -q --verify MERGE_HEAD >/dev/null; then case \"$*\" in *\"another round\"*) if [ -f {d}/leave-merge ]; then rm {d}/leave-merge; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi\n\
+                 if [ -f {d}/limit-in-merge ]; then rm {d}/limit-in-merge; stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi ;; esac; fi\n\
                  tag=; file=feature.txt; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) tag=\" $t\"; if [ -f {d}/own-files ]; then file=$t.txt; fi ;; esac; done\n\
                  echo \"built$tag\" >> $file\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
@@ -2372,9 +2374,18 @@ impl Factory {
     /// Have the fake builder's next call push `text` as `path` to origin's main from another
     /// clone first, as a change landing elsewhere while this one is built.
     fn main_moves(&self, path: &str, text: &str) {
+        self.main_moves_in("main-moves.sh", path, text);
+    }
+
+    /// [`Factory::main_moves`], but in the first fix round (a builder call for another round).
+    fn main_moves_in_a_fix(&self, path: &str, text: &str) {
+        self.main_moves_in("fix-moves-main.sh", path, text);
+    }
+
+    fn main_moves_in(&self, script: &str, path: &str, text: &str) {
         let d = slash(self.tmp.path());
         std::fs::write(
-            self.tmp.path().join("main-moves.sh"),
+            self.tmp.path().join(script),
             format!(
                 "git clone -q {d}/origin.git {d}/other && cd {d}/other && printf '{text}\\n' > {path} \
                  && git add {path} && git -c user.name=t -c user.email=t@example.com commit -qm moved \
@@ -8688,6 +8699,81 @@ fn a_merge_the_builder_leaves_unfinished_stays_in_progress_for_the_next_round() 
         .find(|c| c.contains("isn't finished: these files still have conflicts: feature.txt"))
         .unwrap_or_else(|| panic!("{calls:#?}"));
     assert!(fix.contains("finish the merge"), "{fix}");
+}
+
+#[test]
+fn a_turn_limit_in_an_unfinished_merge_names_the_merge_next_round() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.main_moves("feature.txt", "landed elsewhere");
+    std::fs::write(f.tmp.path().join("limit-in-merge"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(stderr.contains("turn limit"), "{stderr}");
+    let calls = f.claude_calls();
+    let after = calls
+        .iter()
+        .find(|c| c.contains("stopped because the builder hit the turn limit"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(
+        after.contains("isn't finished: these files still have conflicts: feature.txt"),
+        "{after}"
+    );
+    assert!(after.contains("Finish smaller"), "{after}");
+}
+
+#[test]
+fn a_merge_left_unfinished_after_a_review_keeps_the_blockers() {
+    let f = Factory::new("test -f feature.txt\n", "changes");
+    // Main moves during round 2's fix, so the branch conflicts after it; round 3 leaves that
+    // merge unfinished.
+    f.main_moves_in_a_fix("feature.txt", "landed elsewhere");
+    std::fs::write(f.tmp.path().join("leave-merge"), "").unwrap();
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let calls = f.claude_calls();
+    let conflict = calls
+        .iter()
+        .find(|c| c.contains("merging it conflicts in: feature.txt"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(
+        conflict.contains("blockers still need fixing"),
+        "{conflict}"
+    );
+    let unfinished = calls
+        .iter()
+        .find(|c| c.contains("isn't finished: these files still have conflicts: feature.txt"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(
+        unfinished.contains("blockers still need fixing"),
+        "{unfinished}"
+    );
+}
+
+#[test]
+fn a_resumed_run_finishes_a_merge_its_kept_environment_left_in_progress() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.main_moves("feature.txt", "landed elsewhere");
+    // Round 2 is handed the merge and stopped in it.
+    std::fs::write(f.tmp.path().join("hang-fix"), "").unwrap();
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(f.tmp.path().join("hang-fix")).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(stderr.contains("resuming #5 in round 2"), "{stderr}");
+    // The resumed round is told about the merge again.
+    let calls = f.claude_calls();
+    let resumed = calls
+        .iter()
+        .filter(|c| c.contains("merging it conflicts in: feature.txt"))
+        .count();
+    assert_eq!(resumed, 2, "{calls:#?}");
+    // The kept merge was finished, not started again: the resumed run hands over no new one.
+    assert!(
+        !stderr.contains("sending the merge to the builder"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("round 3 of"), "{stderr}");
 }
 
 #[test]
