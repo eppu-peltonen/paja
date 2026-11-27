@@ -405,14 +405,15 @@ The comment on the issue is posted with the person's own token, so GitHub doesn'
 `escalated` by hand with `paja work set` or the `work_set` tool), when a pass of `paja run` fails (with or without
 `--every`; of failed passes in a row, only the first; not for a mistake in how a single `paja run` was started, such as
 a `--repo` that isn't a directory or an `--item` that isn't queued, which is in front of the person already), when a
-run stops for a person, and once per repository for each `.paja/models` role this Paja skips. Each notice names the
-repository and, for an item, the issue, its title and the answer command. An escalated item's issue also gets the
-`needs-answer` label (created when the repository lacks it), which `paja work answer` removes, so the person can
-filter or subscribe to it on GitHub. An item set `escalated` by hand gets its own notice: it says so and points to
-`paja work show`, since its note stays on this machine. Setting an item that is already escalated to `escalated` again
-sends no second notice and only tries the label again. The notice goes first, so a slow `gh` doesn't hold it up; a
-label that can't be set is reported on stderr and the run carries on. `paja work list` shows escalated items first,
-each with its answer command. A notice goes to two channels:
+run stops for a person, when a change lands with review findings still open at the round limit, which no issue holds,
+and once per repository for each `.paja/models` role this Paja skips. Each notice names the repository and, for an
+item, the issue, its title and the answer command. An escalated item's issue also gets the `needs-answer` label
+(created when the repository lacks it), which `paja work answer` removes, so the person can filter or subscribe to it
+on GitHub. An item set `escalated` by hand gets its own notice: it says so and points to `paja work show`, since its
+note stays on this machine. Setting an item that is already escalated to `escalated` again sends no second notice and
+only tries the label again. The notice goes first, so a slow `gh` doesn't hold it up; a label that can't be set is
+reported on stderr and the run carries on. `paja work list` shows escalated items first, each with its answer command.
+A notice goes to two channels:
 
 - **Local.** `PAJA_NOTIFIER` names a program, run with the title and the text as its two arguments; `desktop` asks for
   a desktop notification (a Windows toast through Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere,
@@ -430,14 +431,14 @@ Unlike the settings `paja run` reads from the default branch's tip as fetched, `
 worktree could move. That could send the notice's text to a URL it picks, or change the work and follow-up labels and
 whether Jono takes follow-ups, for the passes that read them.
 
-Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed`, `stopped`
-or `skipped_role`, `channel`, the `error`, and for `skipped_role` the roles it named as `subject`), so Paja Desk can
-show the same inbox. A notice that can't be delivered never stops the run: it says so on stderr once per channel, and
-every notifier is stopped after 15 seconds. The other waits are 15 seconds too: the repository name Jono asks `gh` for
-(the notice goes without it after that), and the home lock its record waits for (the record is skipped after that), and
-a `gh` stopped while it runs takes what it started with it. With every channel on, one notice holds up the run for about
-a minute and a half at most, and a skipped-role notice up to 15 seconds more for Posti's lock; only the local git calls
-that read `.paja/notify` from the default branch have no limit of their own.
+Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `left_findings`,
+`pass_failed`, `stopped` or `skipped_role`, `channel`, the `error`, and for `skipped_role` the roles it named as
+`subject`), so Paja Desk can show the same inbox. A notice that can't be delivered never stops the run: it says so on
+stderr once per channel, and every notifier is stopped after 15 seconds. The other waits are 15 seconds too: the
+repository name Jono asks `gh` for (the notice goes without it after that), and the home lock its record waits for (the
+record is skipped after that), and a `gh` stopped while it runs takes what it started with it. With every channel on,
+one notice holds up the run for about a minute and a half at most, and a skipped-role notice up to 15 seconds more for
+Posti's lock; only the local git calls that read `.paja/notify` from the default branch have no limit of their own.
 
 ## The deny-list hook
 
