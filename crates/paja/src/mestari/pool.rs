@@ -267,13 +267,13 @@ impl Pool<'_> {
                         }
                         match super::sync_queue(self.home, self.repo) {
                             Ok(_) => {}
-                            Err(err) if super::is_fatal(&err) => {
-                                fatal = Some(err);
-                                continue;
-                            }
+                            // The next tick tells the lanes and stops, after the usual sleep.
+                            Err(err) if super::is_fatal(&err) => fatal = Some(err),
                             Err(err) => self.say_error(&err),
                         }
                     }
+                }
+                if free > 0 && paused.is_none() && fatal.is_none() {
                     let admitted = self.admit(free)?;
                     if admitted == 0
                         && self.lanes.is_empty()

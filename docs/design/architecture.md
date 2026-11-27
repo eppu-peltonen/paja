@@ -74,7 +74,8 @@ every item it imported with it. `.paja/labels` takes effect only once its change
 new label to the open issues before it lands, keeping the old one, and remove the old label after: every sync in
 between sees them under one label or the other.
 `paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
-events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than the last one recorded (every
+events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than the last one recorded, as the file
+system resolves them (a symlink or a Windows short name to the same folder is the same checkout) (every
 `paja run` syncs first, so runs record it too); it never touches another repository's items, even when their issue
 numbers are the same. `paja work
 list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
@@ -227,7 +228,10 @@ lane is told `stop now`, none starts, and the pool ends with the tamper error, a
 any other error stops its lanes the same way first, and ends a lane's run still going 30 seconds after `stop now`, so
 a stuck run can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
 (`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes;
-`origin/<branch>` is then moved to that tip, as a plain fetch would.
+`origin/<branch>` is then moved to that tip, as a plain fetch would, also back after a force-push. The fetches in a
+checkout take turns (`paja-fetch.lock` in its git directory), so the last to move it is the newest; a fetch that waited a
+minute for the lock goes ahead without it, and then never moves it back onto a commit it holds. A fetch ref a killed
+run left behind is deleted by the first fetch in that checkout once it is over an hour old.
 
 Changes land one at a time per repository, each on the latest default branch, whether from a pool's lanes or from
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
@@ -433,18 +437,26 @@ A notice goes to two channels:
   private topic for a private repository. A repository the tamper lock holds isn't read for the URL.
 
 Unlike the settings `paja run` reads from the default branch's tip as fetched, `.paja/notify`, `.paja/labels` and
-`.paja/queue` are read from the local refs (`origin/HEAD`, `origin/main`, `main`), which an agent with local git in a
-worktree could move. That could send the notice's text to a URL it picks, or change the work and follow-up labels and
-whether Jono takes follow-ups, for the passes that read them.
+`.paja/queue` are read from local refs, which an agent with local git in a worktree could move. That could send the
+notice's text to a URL it picks, or change the work and follow-up labels and whether Jono takes follow-ups, for the
+passes that read them. The default branch is the one `gh repo view` names, read as `origin/<name>` and nothing else
+(when it isn't fetched, Paja says to run `git fetch origin <name>`), since code in a worktree can point `origin/HEAD` at
+the pushed review branch or make a local `main`. When `gh` can't say (it fails, takes over 15 seconds, or names no
+usable branch) it is `origin/HEAD`, else `origin/main`, else `main`, and an `origin/HEAD` that isn't a symbolic ref, or
+points outside `refs/remotes/origin/` or at one of Paja's own `paja/` branches, is refused with the fix,
+`git remote set-head origin -a`. A name from `gh` is reused for five minutes per repository, so a `work sync` asks once,
+and its failure to say for 30 seconds. `paja doctor` finds the branch the same way, and warns when it skipped an
+`origin/HEAD` it wouldn't trust.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `left_findings`,
 `pass_failed`, `stopped` or `skipped_role`, `channel`, the `error`, and for `skipped_role` the roles it named as
 `subject`), so Paja Desk can show the same inbox. A notice that can't be delivered never stops the run: it says so on
 stderr once per channel, and every notifier is stopped after 15 seconds. The other waits are 15 seconds too: the
-repository name Jono asks `gh` for (the notice goes without it after that), and the home lock its record waits for (the
-record is skipped after that), and a `gh` stopped while it runs takes what it started with it. With every channel on,
-one notice holds up the run for about a minute and a half at most, and a skipped-role notice up to 15 seconds more for
-Posti's lock; only the local git calls that read `.paja/notify` from the default branch have no limit of their own.
+repository name Jono asks `gh` for (the notice goes without it after that), the default branch's name Posti asks `gh`
+for when it reads `.paja/notify`, and the home lock its record waits for (the record is skipped after that), and a `gh`
+stopped while it runs takes what it started with it. With every channel on, one notice holds up the run for about a
+minute and three quarters at most, and a skipped-role notice up to 15 seconds more for Posti's lock; only the local git
+calls that read `.paja/notify` from the default branch have no limit of their own.
 
 ## The deny-list hook
 
@@ -703,8 +715,8 @@ answer on the issue), and "New work" takes a repository, a title and a body, sho
 `jono::file` (as `paja work file`: an issue with the work label). Both run where `gh` finds the repository: the
 newest checkout Paja synced in or made an environment from for it that `gh` still names as that repository
 (`jono::known_checkouts`, newest first, from the log's `work.checkout` and `env.created`
-events; each sync records `work.checkout` with its checkout's top level, the nearest folder holding `.git` (its path's `..` parts folded first), when it
-differs from the last one, and skips a path that isn't UTF-8; Desk asks `gh` about the newest three at most), else the directory Desk
+events, each folder once in its newest spelling; each sync records `work.checkout` with its checkout's top level, the nearest folder holding `.git` (its path's `..` parts folded first), when it
+is another folder than the last one, and skips a path that isn't UTF-8; Desk asks `gh` about the newest three at most), else the directory Desk
 started in when it is a checkout of that repository, else an error that says where to start. The
 person's text stays in the window across refreshes and errors. Desk's Tauri permissions
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open

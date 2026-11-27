@@ -888,6 +888,106 @@ fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
     )
 }
 
+/// A run's fetch sweeps the `refs/paja/fetch/*` refs a killed run left over an hour ago, and
+/// moves `origin/main` wherever a force-push put the default branch.
+#[test]
+fn a_fetch_sweeps_stale_fetch_refs_and_follows_a_rewritten_main() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main("one.txt", "one\n");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let stale = "refs/paja/fetch/1-1000-0";
+    let fresh = format!("refs/paja/fetch/1-{now}-0");
+    git(&f.repo, &["update-ref", stale, "HEAD"]);
+    git(&f.repo, &["update-ref", &fresh, "HEAD"]);
+    // main rewritten elsewhere: the same parent, another commit.
+    let before = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["commit", "-q", "--amend", "-m", "rewritten"]);
+    let rewritten = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &before],
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let refs = git_out(
+        &f.repo,
+        &["for-each-ref", "--format=%(refname)", "refs/paja/fetch/"],
+    );
+    assert_eq!(refs, fresh, "{refs}");
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        rewritten
+    );
+    // Rewound to a commit origin/main already holds: followed too, since fetches in the
+    // checkout take turns and a slower one can't come last.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD~1:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &rewritten],
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        git_out(&f.repo, &["rev-parse", "HEAD~1"])
+    );
+}
+
+/// A fetch that waited its time for another holding the fetch lock goes ahead without it, and
+/// then never moves `origin/main` back onto a commit it holds, since a slower fetch looks so.
+#[test]
+fn a_fetch_without_the_lock_follows_main_only_away_from_what_it_holds() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main("one.txt", "one\n");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(f.repo.join(".git").join("paja-fetch.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let run = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_TEST_FETCH_WAIT_MS", "200")
+            .args(["--json", "run"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("fetching without it"), "{stderr}");
+    };
+    let tip = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    // Rewound: origin/main stays where it was.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD~1:main"]);
+    git(&f.repo, &["update-ref", "refs/remotes/origin/main", &tip]);
+    run();
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        tip
+    );
+    // Moved on: followed.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", "HEAD~1"],
+    );
+    run();
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        tip
+    );
+}
+
 #[test]
 fn a_closed_stdout_ends_paja_with_its_exit_code_not_a_panic() {
     // The program that started paja exited without reading or redirecting stdout: the report
@@ -920,6 +1020,37 @@ fn a_closed_stdout_ends_paja_with_its_exit_code_not_a_panic() {
         assert_eq!(output.status.code(), Some(code), "{stderr}");
         assert!(!stderr.contains("panicked"), "{stderr}");
     }
+}
+
+/// A sync through a symlink to a checkout already recorded records nothing new.
+#[cfg(unix)]
+#[test]
+fn a_sync_through_a_symlink_to_a_recorded_checkout_records_no_new_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&repo, &link).unwrap();
+    let gh = fake_gh(tmp.path(), "[]");
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    // Spelled with `--repo`: a process started in the symlink would see the resolved folder.
+    for at in [&repo, &link] {
+        let (ok, report) = paja_with(
+            &home,
+            tmp.path(),
+            &["work", "sync", "--repo", at.to_str().unwrap()],
+            &with_gh,
+        );
+        assert!(ok, "{report}");
+    }
+    let (_, log) = paja(&home, &repo, &["log"]);
+    let recorded: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .collect();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
 }
 
 #[test]
@@ -2772,6 +2903,195 @@ fn make_private(dir: &Path) {
             .unwrap();
         assert!(status.success(), "icacls failed");
     }
+}
+
+#[test]
+fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    // A pushed review branch with labels of its own, and origin/HEAD moved to it, as code in
+    // a worktree could.
+    git(&repo, &["checkout", "-q", "-b", "paja/app-1"]);
+    std::fs::write(repo.join(".paja/labels"), "work evil\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "labels"]);
+    git(&repo, &["push", "-q", "origin", "paja/app-1"]);
+    git(&repo, &["checkout", "-q", "trunk"]);
+    git(&repo, &["remote", "set-head", "origin", "paja/app-1"]);
+    let doctor = |view: &str| {
+        let gh = program(
+            tmp.path(),
+            "gh",
+            &format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n\
+                 \"repo view\") echo '{view}' ;;\n\
+                 \"label list\") echo '[{{\"name\": \"game\"}}]' ;;\n\
+                 \"workflow list\") echo 'CI\tactive\t1' ;;\nesac\n"
+            ),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        report
+    };
+    let named = |report: &Value, name: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .cloned()
+    };
+    // GitHub names trunk: the labels come from origin/trunk, not the review branch.
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "trunk"}}"#);
+    assert!(named(&report, "default branch").is_none(), "{report}");
+    let label = named(&report, "work label").unwrap();
+    assert_eq!(label["status"], "ok", "{report}");
+    assert!(
+        label["detail"].as_str().unwrap().contains("`game`"),
+        "{report}"
+    );
+    // Doctor still says origin/HEAD was moved, and what it read instead.
+    let head = named(&report, "origin/HEAD").unwrap();
+    assert_eq!(head["status"], "warning", "{report}");
+    assert!(
+        head["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Paja reads origin/trunk instead"),
+        "{report}"
+    );
+    // GitHub can't say: origin/HEAD pointing at one of Paja's own branches is refused.
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("one of Paja's own branches"),
+        "{report}"
+    );
+    // Nor is one that isn't a symbolic ref.
+    git(
+        &repo,
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    );
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "--no-deref",
+            "refs/remotes/origin/HEAD",
+            "paja/app-1",
+        ],
+    );
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("is not a symbolic ref"),
+        "{report}"
+    );
+    assert_eq!(branch["status"], "failed", "{report}");
+    // GitHub names a branch that isn't fetched: neither origin/HEAD nor a local main, which
+    // code in a worktree can make, stands in for it.
+    git(&repo, &["branch", "main", "trunk"]);
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "gone"}}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no origin/gone; run `git fetch origin gone`"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_default_branch_github_names_is_read_without_origin_head_or_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    let log = tmp.path().join("gh.log");
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\", \"defaultBranchRef\": {{\"name\": \"trunk\"}}}}' ;;\n\
+             \"issue list\") echo '[]' ;;\nesac\n",
+            slash(tmp.path().join("gh.log").as_path())
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["--json", "work", "sync"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The work label came from origin/trunk.
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.starts_with("issue list") && l.contains("game")),
+        "{calls}"
+    );
+    // It read two files from the default branch, and asked GitHub for its name once.
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.contains("defaultBranchRef"))
+            .count(),
+        1,
+        "{calls}"
+    );
 }
 
 #[test]

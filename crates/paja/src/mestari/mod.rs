@@ -3112,11 +3112,14 @@ fn git_command() -> Command {
 pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = format!(
-        "refs/paja/fetch/{}-{}-{n}",
-        std::process::id(),
-        crate::events::now_ms()
-    );
+    // One fetch at a time in this checkout, through to `origin/<branch>`, so the last fetch to
+    // move it is the latest one, whatever order the lanes' fetches would have ended in. (A
+    // remote that served an older tip than it had, as a lagging replica can, is followed back
+    // until the next fetch.)
+    let held = fetch_lock(repo);
+    let now = crate::events::now_ms();
+    let name = format!("refs/paja/fetch/{}-{now}-{n}", std::process::id());
+    sweep_fetch_refs(repo, now);
     let fetched = git(
         repo,
         &[
@@ -3134,15 +3137,23 @@ pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
         )
     });
     let _ = git(repo, &["update-ref", "-d", &name]);
+    // The fetch also writes FETCH_HEAD, which nothing here reads (`--no-write-fetch-head`, from
+    // git 2.29, would say so, but older gits refuse it).
+    //
     // `origin/<branch>` still follows, as a plain fetch would move it: Jono reads `.paja/labels`
-    // and the queue file from it outside runs. Only forward, and only from the value just read,
-    // so a slower lane never moves it back; one updating it at the same moment wins.
+    // and the queue file from it outside runs. Under the lock it goes to the tip just fetched,
+    // forward, back after a force-push rewound the branch, or onto rewritten history alike.
+    // Without the lock (its file couldn't be opened) a slower fetch can't be told from a
+    // rewind, so it then never goes back onto a commit it already holds. Either way it moves
+    // only from the value just read: a `git fetch` of the person's own at the same moment may
+    // win that compare-and-swap, which is left so on purpose, since the next fetch moves it on.
     if let Ok(tip) = &fetched {
         let tracking = format!("refs/remotes/origin/{branch}");
         match git(repo, &["rev-parse", "--verify", "-q", &tracking]) {
             Ok(old) if old == *tip => {}
             Ok(old) => {
-                if git(repo, &["merge-base", "--is-ancestor", &old, tip]).is_ok() {
+                if held.is_some() || git(repo, &["merge-base", "--is-ancestor", tip, &old]).is_err()
+                {
                     let _ = git(repo, &["update-ref", &tracking, tip, &old]);
                 }
             }
@@ -3151,7 +3162,81 @@ pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
             }
         }
     }
+    drop(held);
     fetched
+}
+
+/// How long a [`fetch_tip`] waits for another one in the checkout before it goes ahead
+/// without the lock, so one fetch stalled on the network doesn't hold up every lane.
+const FETCH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The lock that makes [`fetch_tip`]s in the checkout `repo` take turns: `paja-fetch.lock` in
+/// its git directory, held until the returned file is dropped. None when the file can't be
+/// opened, or another fetch held it for [`FETCH_LOCK_WAIT`] (debug builds:
+/// `PAJA_TEST_FETCH_WAIT_MS`), and the fetch then goes ahead on its own.
+fn fetch_lock(repo: &Path) -> Option<std::fs::File> {
+    let common = git(repo, &["rev-parse", "--git-common-dir"]).ok()?;
+    let path = repo.join(common).join("paja-fetch.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .ok()?;
+    let wait = std::env::var("PAJA_TEST_FETCH_WAIT_MS")
+        .ok()
+        .filter(|_| cfg!(debug_assertions))
+        .and_then(|ms| ms.parse().ok())
+        .map_or(FETCH_LOCK_WAIT, std::time::Duration::from_millis);
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                progress(&format!(
+                    "another fetch held {} for {wait:?}; fetching without it",
+                    path.display()
+                ));
+                return None;
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                progress(&format!(
+                    "couldn't lock {}: {err}; fetching without it",
+                    path.display()
+                ));
+                return None;
+            }
+        }
+    }
+}
+
+/// Delete the `refs/paja/fetch/*` refs a run that was killed between its fetch and deleting
+/// the ref left behind: any made over an hour ago by the wall clock, which a fetch still in
+/// progress is assumed not to be. The sweep runs under the fetch lock when it has it, so no
+/// other locked fetch is in progress then: only a fetch that went ahead without the lock (or
+/// one from an older Paja), over an hour old by a clock set forward, could lose its ref, and
+/// that fetch then fails.
+fn sweep_fetch_refs(repo: &Path, now: u64) {
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+    let Ok(refs) = git(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "refs/paja/fetch/"],
+    ) else {
+        return;
+    };
+    for name in refs.lines() {
+        let made = name
+            .rsplit('/')
+            .next()
+            .and_then(|leaf| leaf.split('-').nth(1))
+            .and_then(|ms| ms.parse::<u64>().ok());
+        if made.is_some_and(|ms| ms.saturating_add(HOUR_MS) < now) {
+            let _ = git(repo, &["update-ref", "-d", name]);
+        }
+    }
 }
 
 /// Whether a long-running loop must stop on `err`: today only a tampered repository.
