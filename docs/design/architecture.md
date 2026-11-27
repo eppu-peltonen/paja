@@ -110,7 +110,9 @@ the queue by priority and then age, so every ready work item goes before any fol
 ready wins at the next pick. A follow-up passes through the same loop, risk tier and `Depends on` rules as any item.
 `.paja/queue`, read from the default branch like `.paja/labels`, turns this off with `follow-ups = off` (`on` is the
 default); a sync with it off doesn't list the follow-up label, so the follow-ups already imported close like any item
-whose label went away. A line Jono can't read is an error naming the line.
+whose label went away. Their `work.closed` events carry `follow_ups_off: true`, so when follow-ups come back on a
+follow-up that had landed stays landed instead of being queued again like a reopened landing. A line Jono can't read is
+an error naming the line.
 
 An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed by
 issue numbers (`Depends on #12, #14`), after optional quote, list or number markers. Lines in fenced code blocks don't

@@ -201,6 +201,10 @@ pub const EV_IMPORTED: &str = "work.imported";
 pub const EV_CHANGED: &str = "work.changed";
 pub const EV_CLOSED: &str = "work.closed";
 pub const EV_REOPENED: &str = "work.reopened";
+/// Set on a `work.closed` event when the item is a follow-up that a sync no longer listed
+/// because `.paja/queue` says `follow-ups = off`, so a landed one stays landed when they come
+/// back on.
+const FOLLOW_UPS_OFF: &str = "follow_ups_off";
 pub const EV_STATUS: &str = "work.status";
 /// A person answered an escalated item's question.
 pub const EV_ANSWERED: &str = "work.answered";
@@ -663,6 +667,8 @@ pub fn replay_repo(events: &[Event], repo: &str) -> Result<BTreeMap<u64, WorkIte
 /// carried a repository belong to [`legacy_repo`] (`fallback` is the checkout's repository).
 pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem>> {
     let mut items: BTreeMap<Key, WorkItem> = BTreeMap::new();
+    // Follow-ups whose last close came from `follow-ups = off`, not from GitHub.
+    let mut hidden: BTreeSet<Key> = BTreeSet::new();
     let bad = |event: &Event| format!("event {} ({}) has unexpected data", event.seq, event.kind);
     let legacy = legacy_repo(events, fallback);
     for event in events {
@@ -717,8 +723,19 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
                 if let Some(item) = items.get_mut(&key(n.number)) {
                     item.open = event.kind == EV_REOPENED;
-                    // A landed issue opened again (say after a revert) needs work again.
-                    if item.open && item.status == Status::Landed {
+                    // A landed issue opened again (say after a revert) needs work again, but
+                    // not a follow-up that only comes back because follow-ups are on again.
+                    let back_from_rules = if item.open {
+                        hidden.remove(&key(n.number))
+                    } else {
+                        if event.data[FOLLOW_UPS_OFF] == true {
+                            hidden.insert(key(n.number));
+                        } else {
+                            hidden.remove(&key(n.number));
+                        }
+                        false
+                    };
+                    if item.open && item.status == Status::Landed && !back_from_rules {
                         item.status = Status::Queued;
                         item.note = None;
                     }
@@ -1733,7 +1750,7 @@ pub fn sync_with(
             open_outside.insert(number);
         }
     }
-    let report = apply_with(home, &name, &issues, &open_outside)?;
+    let report = apply_listed(home, &name, &issues, &open_outside, rules.follow_ups)?;
     apply_claims(home, &name, &seen, &held)?;
     record_checkout(home, &name, &checkout_top(repo)?)?;
     Ok(report)
@@ -1805,11 +1822,25 @@ pub fn apply_with(
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
+    apply_listed(home, repo, open, open_outside, true)
+}
+
+/// [`apply_with`], where `follow_ups` says whether the sync listed the follow-up label. When it
+/// didn't, a follow-up that closes is recorded as closed by that rule, so a landed one isn't
+/// queued again when follow-ups come back on.
+fn apply_listed(
+    home: &Home,
+    repo: &str,
+    open: &[Issue],
+    open_outside: &BTreeSet<u64>,
+    follow_ups: bool,
+) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
     pin_legacy(&lock, &log, repo)?;
     let events = log.read_all()?;
     let items = replay_repo(&events, repo)?;
+    let back_from_rules = closed_by_rules(&events, repo);
     let recorded: BTreeSet<u64> = waiting_recorded(&events, legacy_repo(&events, repo))
         .into_iter()
         .filter(|(r, _)| r == repo)
@@ -1855,8 +1886,9 @@ pub fn apply_with(
             // A dependency Paja has landed counts as done even before GitHub closes it, unless
             // this very sync finds it opened again.
             .filter(|n| {
-                let reopened =
-                    items.get(n).is_some_and(|i| !i.open) && open.iter().any(|i| i.number == *n);
+                let reopened = items.get(n).is_some_and(|i| !i.open)
+                    && !back_from_rules.contains(n)
+                    && open.iter().any(|i| i.number == *n);
                 let landed = items.get(n).is_some_and(|i| i.status == Status::Landed);
                 (!landed || reopened)
                     && (open.iter().any(|i| i.number == *n) || open_outside.contains(n))
@@ -1880,15 +1912,35 @@ pub fn apply_with(
     for item in items.values() {
         let still_open = open.iter().any(|issue| issue.number == item.number);
         if item.open && !still_open {
-            log.append(
-                &lock,
-                EV_CLOSED,
-                json!({ "repo": repo, "number": item.number }),
-            )?;
+            let mut data = json!({ "repo": repo, "number": item.number });
+            if !follow_ups && item.priority == Priority::FollowUp {
+                data[FOLLOW_UPS_OFF] = json!(true);
+            }
+            log.append(&lock, EV_CLOSED, data)?;
             report.closed.push(item.number);
         }
     }
     Ok(report)
+}
+
+/// The items of `repo` whose last close was a follow-up hidden by `follow-ups = off`.
+fn closed_by_rules(events: &[Event], repo: &str) -> BTreeSet<u64> {
+    let legacy = legacy_repo(events, repo);
+    let mut hidden = BTreeSet::new();
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EV_CLOSED && event_repo(e, legacy) == repo)
+    {
+        let Some(number) = event.data["number"].as_u64() else {
+            continue;
+        };
+        if event.data[FOLLOW_UPS_OFF] == true {
+            hidden.insert(number);
+        } else {
+            hidden.remove(&number);
+        }
+    }
+    hidden
 }
 
 /// Whether the log says this runner holds item `number` of `repo`.
@@ -2766,6 +2818,44 @@ mod tests {
             "reverted work is queued"
         );
         assert!(format!("{:#}", get(&home, 9).unwrap_err()).contains("paja work sync"));
+    }
+
+    #[test]
+    fn a_landed_follow_up_hidden_by_follow_ups_off_stays_landed_but_a_real_reopen_requeues() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let follow_up = |number: u64| Issue {
+            priority: Priority::FollowUp,
+            ..issue(number, "tidy")
+        };
+        let both = [issue(1, "a"), follow_up(2), follow_up(3)];
+        apply(&home, &both).unwrap();
+        for n in [1, 2] {
+            set_status(&home, n, Status::Landed, None).unwrap();
+        }
+        // Follow-ups off: the sync lists only the work item.
+        let off = super::apply_listed(&home, R, &both[..1], &BTreeSet::new(), false).unwrap();
+        assert_eq!(off.closed, vec![2, 3]);
+        // A work item that depends on #2 doesn't wait on it once follow-ups are back on.
+        let mut dependent = issue(4, "d");
+        dependent.body = "Depends on #2".into();
+        let mut on = both.to_vec();
+        on.push(dependent);
+        let back = apply(&home, &on).unwrap();
+        assert_eq!(back.reopened, vec![2, 3]);
+        assert_eq!(get(&home, 2).unwrap().status, Status::Landed);
+        assert_eq!(get(&home, 3).unwrap().status, Status::Queued);
+        assert!(get(&home, 4).unwrap().waiting_on.is_empty());
+        // A close GitHub makes (say a revert reopens the issue later) still requeues.
+        apply(&home, &on[..1]).unwrap();
+        apply(&home, &on).unwrap();
+        assert_eq!(get(&home, 2).unwrap().status, Status::Queued);
+        // A work item closed while follow-ups are off isn't marked: it requeues as before.
+        apply(&home, &on).unwrap();
+        set_status(&home, 1, Status::Landed, None).unwrap();
+        super::apply_listed(&home, R, &[], &BTreeSet::new(), false).unwrap();
+        apply(&home, &on).unwrap();
+        assert_eq!(get(&home, 1).unwrap().status, Status::Queued);
     }
 
     #[test]
