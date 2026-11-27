@@ -3704,4 +3704,83 @@ mod tests {
             );
         }
     }
+
+    /// The events of item 7 of `o/r`, numbered in order.
+    fn item_log(events: &[(&str, serde_json::Value)]) -> Vec<crate::events::Event> {
+        events
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, data))| {
+                let mut data = data.clone();
+                data["repo"] = "o/r".into();
+                data["number"] = 7.into();
+                crate::events::Event {
+                    v: 1,
+                    seq: i as u64 + 1,
+                    ts_ms: 0,
+                    kind: kind.to_string(),
+                    data,
+                }
+            })
+            .collect()
+    }
+
+    fn ended(round: u32) -> (&'static str, serde_json::Value) {
+        (
+            EV_ROUND,
+            serde_json::json!({"round": round, "verdict": "changes", "next": {"feedback": "fix it"}}),
+        )
+    }
+
+    #[test]
+    fn resume_point_counts_rounds_since_the_item_was_last_queued() {
+        use serde_json::json;
+        let at = |events: &[(&str, serde_json::Value)]| {
+            let point = super::resume_point(&item_log(events), "o/r", 7);
+            (point.round, point.feedback, point.checked)
+        };
+        // Nothing yet: round 1.
+        assert_eq!(at(&[]), (1, String::new(), None));
+        // A round that ended with a verdict moves on to the next one, with its feedback.
+        assert_eq!(at(&[ended(1)]), (2, "fix it".into(), None));
+        // A round without `next` was cut off: it is run again, not moved past.
+        let cut = (EV_ROUND, json!({"round": 2}));
+        assert_eq!(at(&[ended(1), cut.clone()]).0, 2);
+        assert_eq!(at(&[cut]).0, 2);
+        let checked = |round: u32| {
+            (
+                EV_CHECKED,
+                json!({"round": round, "commit": "c1", "base": "b1"}),
+            )
+        };
+        // Each event that starts the item afresh resets the count, and drops the checks that
+        // round 1 of the next cycle would otherwise take for its own.
+        for kind in [
+            jono::EV_STATUS,
+            jono::EV_ANSWERED,
+            jono::EV_REOPENED,
+            EV_LANDED,
+            EV_ESCALATED,
+        ] {
+            assert_eq!(
+                at(&[ended(1), ended(2), checked(3), (kind, json!({}))]),
+                (1, String::new(), None),
+                "{kind} resets the round count"
+            );
+        }
+        // Another item's rounds don't count.
+        let mut other = item_log(&[ended(1), ended(2)]);
+        for event in &mut other {
+            event.data["number"] = 8.into();
+        }
+        assert_eq!(super::resume_point(&other, "o/r", 7).round, 1);
+        // Checks count only for the round they ran in.
+        assert_eq!(
+            at(&[ended(1), checked(2)]).2,
+            Some(("c1".into(), "b1".into()))
+        );
+        assert_eq!(at(&[ended(1), checked(1)]).2, None);
+        // Checks from a round that later ended don't carry into the next one.
+        assert_eq!(at(&[checked(1), ended(1)]).2, None);
+    }
 }
