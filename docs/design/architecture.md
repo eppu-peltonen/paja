@@ -203,7 +203,9 @@ checks or the review; a change both reviewers passed still lands): the round's s
 loop too. Any error after a Ctrl-C ends the same way rather than parking the item, unless the repository was tampered
 with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. A program that
 starts `paja run` without a terminal (Paja Desk) passes `--stop-on-stdin` and writes a `stop` or `stop now` line to
-its stdin instead, which counts as the first or second Ctrl-C on every platform; stdin closing leaves the run going.
+its stdin instead, which counts as the first or second Ctrl-C on every platform (the first stop's message then names
+`stop now`, not a second Ctrl-C); stdin closing leaves the run going. A stdout nobody reads any more (that program
+exited) loses the report but not the run: Paja doesn't panic on it, and the exit code still says how the run ended.
 
 `paja run --every M --workers N` runs a pool of lanes (`crates/paja/src/mestari/pool.rs`). One process holds
 `runs/<owner>@<name>@pool.lock`, so a repository has one pool, and keeps up to N lanes busy. Each lane is a `paja run
