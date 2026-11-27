@@ -887,6 +887,40 @@ fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn a_closed_stdout_ends_paja_with_its_exit_code_not_a_panic() {
+    // The program that started paja exited without reading or redirecting stdout: the report
+    // can't be written, but paja ends as it would have, without panicking.
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    for (answer, code) in [("echo '[]'", 0), ("echo 'HTTP 502' >&2; exit 1", 1)] {
+        // A slow gh, so stdout is closed before paja writes its report.
+        let gh = program(
+            tmp.path(),
+            &format!("gh-{code}"),
+            &format!(
+                "#!/bin/sh\nsleep 1\ncase \"$*\" in *nameWithOwner*) echo '{{\"nameWithOwner\": \"acme/app\"}}' ;; *) {answer} ;; esac\n"
+            ),
+        );
+        let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .args(["--json", "work", "sync"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(run.stdout.take());
+        let output = output_within(run, std::time::Duration::from_secs(60));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+#[test]
 fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -3412,29 +3446,77 @@ fn slow_run(f: &Factory) -> std::process::Child {
         .process_group(0)
         .spawn()
         .unwrap();
+    wait_for_the_builder(&child, dir);
+    child
+}
+
+/// Ends paja if the test panics before [`output_within`] took it over, so a failed step (a
+/// write to its stdin, a file the test removes) doesn't leave it running.
+struct EndOnPanic(u32);
+
+impl Drop for EndOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            end_process(self.0);
+        }
+    }
+}
+
+/// Wait until the fake builder is held on `slow`; past a minute, end `run` and fail, so a run
+/// that never got there doesn't outlive the test.
+fn wait_for_the_builder(run: &std::process::Child, dir: &Path) {
     let started = std::time::Instant::now();
     while !dir.join("slowing").exists() {
-        assert!(
-            started.elapsed().as_secs() < 60,
-            "the builder never started"
-        );
+        if started.elapsed().as_secs() >= 60 {
+            end_process(run.id());
+            panic!("the builder never started");
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    child
+}
+
+/// End the process `pid` and the processes it started, without waiting for them. Paja starts
+/// each agent and check as the leader of a process group of its own, so on Unix each child's
+/// group is ended too.
+fn end_process(pid: u32) {
+    let pid = pid.to_string();
+    #[cfg(unix)]
+    {
+        let children = Command::new("pgrep")
+            .args(["-P", &pid])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let _ = Command::new("kill").args(["-9", &pid]).status();
+        for child in children.split_whitespace() {
+            let group = format!("-{child}");
+            let _ = Command::new("kill")
+                .args(["-9", "--", &group, child])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// `child`'s output, failing the test instead of hanging when it hasn't ended within `limit`:
 /// a watchdog ends it then, so a broken stop shows as a failure.
-#[cfg(unix)]
 fn output_within(child: std::process::Child, limit: std::time::Duration) -> std::process::Output {
-    let pid = child.id().to_string();
+    let pid = child.id();
     let (ended, wait) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
-        let late = wait.recv_timeout(limit).is_err();
-        if late {
-            let _ = Command::new("kill").args(["-9", &pid]).status();
+        // Only the limit passing counts as late. The sender is dropped unsent only when
+        // `wait_with_output` panicked, with paja not reaped; it is ended then too.
+        let waited = wait.recv_timeout(limit);
+        if waited.is_err() {
+            end_process(pid);
         }
-        late
+        matches!(waited, Err(std::sync::mpsc::RecvTimeoutError::Timeout))
     });
     let output = child.wait_with_output().unwrap();
     let _ = ended.send(());
@@ -3448,7 +3530,6 @@ fn output_within(child: std::process::Child, limit: std::time::Duration) -> std:
 
 /// A `stop` line on stdin, as Paja Desk sends it, stops the run after its step, like the first
 /// Ctrl-C; the run's own lock and log are the CLI's.
-#[cfg(unix)]
 #[test]
 fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
     use std::io::Write as _;
@@ -3466,14 +3547,8 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let started = std::time::Instant::now();
-    while !dir.join("slowing").exists() {
-        assert!(
-            started.elapsed().as_secs() < 60,
-            "the builder never started"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let guard = EndOnPanic(run.id());
+    wait_for_the_builder(&run, dir);
     let mut stdin = run.stdin.take().unwrap();
     writeln!(stdin, "hello").unwrap();
     writeln!(stdin, "stop").unwrap();
@@ -3486,16 +3561,25 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
         "paja ended before its step did"
     );
     std::fs::remove_file(dir.join("slow")).unwrap();
+    // Reaped there: past this point the pid may be another process's.
+    std::mem::forget(guard);
     let output = output_within(run, std::time::Duration::from_secs(120));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
-    assert!(stderr.contains("stopping after this step"), "{stderr}");
+    // Started by a program, the run names the line that stops it now, not a second Ctrl-C.
+    assert!(
+        stderr.contains("stopping after this step; send `stop now` to stop now"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("running Vasara's checks"), "{stderr}");
 }
 
 /// `stop now` on stdin stops at once and ends the agent, like a second Ctrl-C, also in a loop.
+// Unix only for now: on Windows CI paja stopped and exited, but the fake builder's processes
+// (Git Bash's `sh` and its `sleep` loop) outlived `taskkill /T` and kept paja's output pipes
+// open, so the run never read as ended.
 #[cfg(unix)]
 #[test]
 fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
@@ -3514,18 +3598,14 @@ fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let started = std::time::Instant::now();
-    while !dir.join("slowing").exists() {
-        assert!(
-            started.elapsed().as_secs() < 60,
-            "the builder never started"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let guard = EndOnPanic(run.id());
+    wait_for_the_builder(&run, dir);
     let mut stdin = run.stdin.take().unwrap();
     writeln!(stdin, "stop now").unwrap();
     stdin.flush().unwrap();
     let stopping = std::time::Instant::now();
+    // Reaped there: past this point the pid may be another process's.
+    std::mem::forget(guard);
     let output = output_within(run, std::time::Duration::from_secs(120));
     assert!(
         stopping.elapsed().as_secs() < 30,
@@ -9943,6 +10023,43 @@ fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
     assert!(reports.is_empty(), "{reports:?}");
     let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
     assert!(err.contains("starting nothing until"), "{err}");
+}
+
+/// The pool says how to stop it now; its lanes, which read `stop` from the pool, only say they
+/// are stopping, since nobody can write to a lane's stdin.
+#[cfg(unix)]
+#[test]
+fn a_stopping_pools_lanes_leave_the_stop_now_hint_to_the_pool() {
+    use std::io::Write as _;
+    let f = pool_factory(false);
+    let mut pool = start_pool(&f, "1");
+    wait_until(&f, "a lane building", || holding(&f, "Alpha"));
+    let mut stdin = pool.stdin.take().unwrap();
+    writeln!(stdin, "stop").unwrap();
+    stdin.flush().unwrap();
+    let err_path = f.tmp.path().join("pool.err");
+    let lane_stopping = || {
+        std::fs::read_to_string(&err_path)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.starts_with("lane 1 #5: paja: stopping after this step"))
+    };
+    wait_until(&f, "the lane saying it stops", lane_stopping);
+    release(&f, "Alpha");
+    let output = output_within(pool, std::time::Duration::from_secs(120));
+    let err = std::fs::read_to_string(&err_path).unwrap();
+    assert!(output.status.success(), "{err}");
+    assert!(
+        err.lines()
+            .any(|l| l.starts_with("paja: stopping after this step; send `stop now`")),
+        "{err}"
+    );
+    for line in err.lines().filter(|l| l.starts_with("lane ")) {
+        assert!(
+            !line.contains("stop now") && !line.contains("Ctrl-C"),
+            "{line}\n{err}"
+        );
+    }
 }
 
 #[cfg(unix)]
