@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// The environment (and branch, `paja/<name>`) of issue #5 of `acme/app`, the repository the
 /// fake `gh` names: its repository name, a hash of `acme/app`, then `work-5`.
@@ -2317,6 +2317,7 @@ impl Factory {
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add $file\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
+                 if [ -f {d}/stream.jsonl ]; then cat {d}/stream.jsonl; exit 0; fi\n\
                  if [ -f {d}/window-warning ]; then echo \"{{\\\"is_error\\\": false, \\\"result\\\": \\\"done\\\", \\\"session_id\\\": \\\"s-1\\\", \\\"total_cost_usd\\\": 0.25, \\\"rate_limit_info\\\": {{\\\"status\\\": \\\"allowed_warning\\\", \\\"utilization\\\": 0.93, \\\"resetsAt\\\": $(cat {d}/reset-at)}}}}\"; exit 0; fi\n\
                  if [ -f {d}/no-session ]; then echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi\n\
                  echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4, \"duration_ms\": 900, \"session_id\": \"s-1\", \"total_cost_usd\": 0.25, \"usage\": {{\"input_tokens\": 100, \"output_tokens\": 20, \"cache_read_input_tokens\": 3000, \"cache_creation_input_tokens\": 400}}, \"modelUsage\": {{\"claude-test\": {{\"inputTokens\": 100, \"outputTokens\": 20, \"cacheReadInputTokens\": 3000, \"cacheCreationInputTokens\": 400, \"costUSD\": 0.25}}}}}}' ;;\nesac\n"
@@ -7241,6 +7242,44 @@ fn a_nearly_used_window_holds_back_the_next_build_but_not_the_review() {
     assert_eq!(build["window_status"], "allowed_warning", "{build}");
     assert_eq!(build["window_resets_at"], resets * 1000, "{build}");
     assert_eq!(rounds.last().unwrap()["data"]["verdict"], "usage_limit");
+}
+
+#[test]
+fn a_window_in_a_real_stream_reaches_the_recorded_step() {
+    // The build prints a stream-json sequence, as a real Claude Code does with
+    // `--output-format stream-json --verbose`: the window comes in a `rate_limit_event` before
+    // the result, which has none of its own, so it is recorded only if the stream is folded.
+    let f = Factory::new("true\n", "changes");
+    let resets = epoch_secs_in(3600);
+    let stream = [
+        json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
+        json!({"type": "rate_limit_event", "rate_limit_info":
+            {"status": "allowed", "utilization": 0.4, "resetsAt": resets - 60}}),
+        json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}),
+        json!({"type": "rate_limit_event", "rate_limit_info":
+            {"status": "allowed_warning", "utilization": 0.93, "resetsAt": resets}}),
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "s-1", "total_cost_usd": 0.25}),
+    ]
+    .iter()
+    .map(|m| format!("{m}\n"))
+    .collect::<String>();
+    std::fs::write(f.tmp.path().join("stream.jsonl"), stream).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    // The latest event's nearly used window holds back the next build, as a one-value result does.
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    let calls = f.claude_calls();
+    assert!(
+        calls[0].contains("--output-format stream-json") && calls[0].contains("--verbose"),
+        "{calls:?}"
+    );
+    let rounds = round_events(&f);
+    let build = &rounds[0]["data"]["steps"][0];
+    assert_eq!(build["window_status"], "allowed_warning", "{build}");
+    assert_eq!(build["window_resets_at"], resets * 1000, "{build}");
+    let used = build["window_used_percent"].as_f64().unwrap_or_default();
+    assert!((used - 93.0).abs() < 1e-9, "{build}");
+    assert_eq!(build["cost_usd"], 0.25, "{build}");
 }
 
 #[test]
