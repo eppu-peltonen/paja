@@ -2048,7 +2048,7 @@ impl Factory {
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
-                 \"api -X\") if [ \"$3\" = DELETE ]; then rm -f {d}/view-5.json; fi ;;\n\
+                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; rm -f {d}/view-5.json; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
                  *) ;;\nesac\n"
             ),
@@ -5175,6 +5175,36 @@ fn work_set_queued_frees_the_claimed_label() {
     // The label comes off, and the next sync (which finds none) clears the claim in the log.
     let (_, item) = f.with_gh(&["work", "show", "5"]);
     assert!(item.get("claim").is_none(), "{item}");
+}
+
+#[test]
+fn freeing_takes_the_label_off_even_when_a_claim_comment_cannot_be_deleted() {
+    let f = Factory::new("true\n", "land");
+    let (ok, synced) = f.with_gh(&["work", "sync"]);
+    assert!(ok, "{synced}");
+    // Another account wrote the claim comment, so GitHub refuses to delete it.
+    f.claimed_by_other(true, "2999-01-01T00:00:00Z");
+    std::fs::write(f.tmp.path().join("delete-refused"), "").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .args(["--json", "work", "set", "5", "queued"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let log = f.gh_log();
+    assert!(log.contains("api -X DELETE"), "{log}");
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "the label comes off past the failed delete: {log}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deleting claim comment 77") && stderr.contains("HTTP 403"),
+        "{stderr}"
+    );
 }
 
 #[test]
