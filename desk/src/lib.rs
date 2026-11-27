@@ -62,6 +62,11 @@ fn list_items(home: &Home, cwd: &Path) -> anyhow::Result<Vec<jono::WorkItem>> {
         if tried.contains(&path) || !path.is_dir() {
             continue;
         }
+        // Each try is a `gh repo view`, and the window refreshes often: ask about only the
+        // newest few, as `checkout_of` does.
+        if tried.len() >= CHECKOUTS_ASKED {
+            break;
+        }
         if let Ok(items) = jono::list_all_from(home, &path) {
             return Ok(items);
         }
