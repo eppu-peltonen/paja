@@ -5296,7 +5296,14 @@ fn stop_pool(f: &Factory, mut pool: std::process::Child) -> Vec<Value> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|report| report["outcome"] != "triage")
+        // The idle pool's daily triage prints its report, or an error when the fake `claude`'s
+        // answer isn't a triage answer; whether it gets to run first is timing. Neither is a lane's.
+        .filter(|report| {
+            report["outcome"] != "triage"
+                && !report["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("triage agent"))
+        })
         .collect()
 }
 
