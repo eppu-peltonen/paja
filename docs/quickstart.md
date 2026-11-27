@@ -143,8 +143,10 @@ landed, or escalated with a question.
 ## 6. When Paja asks
 
 When a run can't decide something (reviewers disagree, three rounds weren't enough, or the issue needs a decision),
-Paja escalates: it asks on the issue, labels it so it stands out, and tells you with a desktop notification. Answer
-in any of three ways, and the item goes back in the queue with your answer:
+Paja escalates: it asks on the issue, labels it so it stands out, and Posti tells you: a desktop notification by
+default, or a program of your own (`PAJA_NOTIFIER`) or a push URL such as an ntfy topic for your phone (`PAJA_NOTIFY`
+or `.paja/notify`); see [Notifications](./setup.md#notifications). Answer in any of three ways, and the item goes back
+in the queue with your answer:
 
 - In Paja Desk, in the item's answer box under **Waiting on you**.
 - In Claude Code, with `/paja:answer`.
