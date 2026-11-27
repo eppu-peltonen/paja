@@ -6,6 +6,7 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
 ## Unreleased
 
 - `paja usage` gives the 90th percentile of wall time per landed item in its summary line, next to the median.
+- `paja doctor` quotes and escapes the role words it names as skipped in `.paja/models`, so a control character in the file never reaches the terminal.
 
 ## 0.1.0
 
