@@ -193,8 +193,8 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         Err(err) => checks.push(failed(
             "deny-list hook",
             format!("{err:#}"),
-            "rebuild and reinstall Paja (`cargo install --path crates/paja`), and fix what the \
-             detail names",
+            "install the newer release, or rebuild Paja (`cargo install --path crates/paja`), \
+             and fix what the detail names",
         )),
     }
     let dir = home.root();
