@@ -179,7 +179,9 @@ fn render(template: &str, name: &str) -> String {
     if krate.starts_with(|c: char| c.is_ascii_digit()) {
         krate.insert_str(0, "app_");
     }
+    // A Windows checkout may embed the templates with CRLF; Prettier and ESLint want LF.
     template
+        .replace("\r\n", "\n")
         .replace("{{name}}", &slug)
         .replace("{{crate}}", &krate)
 }
@@ -339,7 +341,8 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
     };
     let after_create = |err: anyhow::Error| {
         err.context(format!(
-            "the repository {url} was created; finish by hand in {} or delete it on GitHub",
+            "the repository {url} was created; finish by hand in {} or delete it on GitHub \
+             (`gh repo delete {repo}`) before running `paja init --new` again with the same name",
             dir.display()
         ))
     };
@@ -458,4 +461,16 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
             "run `paja run --once`".into(),
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+
+    #[test]
+    fn render_gives_lf_endings_even_from_a_crlf_template() {
+        let out = render("{\r\n  \"name\": \"{{name}}\"\r\n}\r\n", "My_App");
+        assert_eq!(out, "{\n  \"name\": \"my-app\"\n}\n");
+        assert!(!out.contains('\r'));
+    }
 }
