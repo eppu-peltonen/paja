@@ -18,7 +18,9 @@ use crate::home::Home;
 use crate::jono::{self, Status, WorkItem};
 
 mod agent;
+mod arbiter;
 mod builder;
+mod detect;
 mod follow_ups;
 mod land;
 pub mod live;
@@ -28,11 +30,13 @@ mod progress;
 mod triage;
 mod usage;
 
+pub use detect::{init_agent, recommend_agent, skeleton_agent, skeleton_checks};
 pub use triage::{
     triage, triage_if_due, TriageReport, Triaged, Verdict, EV_TRIAGE_FAILED, EV_TRIAGE_RAN,
 };
 
 use agent::*;
+use arbiter::*;
 use builder::*;
 use follow_ups::*;
 use land::*;
@@ -50,9 +54,17 @@ pub const CHECKS_FILE: &str = ".paja/checks";
 pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
 /// The model and effort for each agent role, read from the base commit.
 pub const MODELS_FILE: &str = ".paja/models";
+/// Whether the repository has CI Paja waits for before landing (`required` or `none`), read from
+/// the base commit.
 pub const CI_FILE: &str = ".paja/ci";
+/// The default branch when `gh` names none.
+const FALLBACK_BRANCH: &str = "main";
+/// The `gh pr merge` flags landing uses, and the summary names the same ones.
+const SQUASH: &str = "--squash";
+const REBASE: &str = "--rebase";
+const MERGE: &str = "--merge";
 /// The roles `.paja/models` may name, besides `fallback`.
-pub const ROLES: [&str; 7] = [
+pub const ROLES: [&str; 9] = [
     "build",
     "fix",
     "review",
@@ -60,6 +72,8 @@ pub const ROLES: [&str; 7] = [
     "review-2",
     "triage",
     "plan",
+    "init",
+    "arbiter",
 ];
 /// The effort levels Claude Code takes.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -83,6 +97,11 @@ pub const EV_LANDED: &str = "run.landed";
 /// `{repo, number, round, paths}`.
 pub const EV_CHANGED: &str = "run.changed";
 pub const EV_ESCALATED: &str = "run.escalated";
+/// The arbiter agent looked at an escalation before it reached the person: `{repo, number,
+/// round, verdict, model}` with the `answer` (verdict `answer`: the item is queued again with it
+/// recorded) or the `question` (verdict `escalate`: the person is asked it), and `overruled`
+/// when Mestari turned an `answer` into `escalate`.
+pub const EV_ARBITRATED: &str = "run.arbitrated";
 /// A non-blocking review finding filed as a follow-up issue (the `follow-up` label) after landing.
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// The tamper lock lives in Ahjo, next to the git every command runs.
@@ -102,6 +121,13 @@ pub enum RunReport {
     Escalated {
         number: u64,
         question: String,
+        rounds: u32,
+    },
+    /// The arbiter agent settled an escalation: its answer is recorded and the item is queued
+    /// again, so the next run goes on with it. Nobody was asked.
+    Arbitrated {
+        number: u64,
+        answer: String,
         rounds: u32,
     },
     /// The person pressed Ctrl-C. The item stays active, and the next `paja run` resumes it in
@@ -328,11 +354,21 @@ impl Models {
             })
     }
 
+    /// The model line a role runs on: its own, or for `arbiter` with no line of its own, the
+    /// `review` line.
+    pub fn chosen(&self, role: &str) -> Option<&RoleModel> {
+        self.roles.get(role).or_else(|| {
+            (role == "arbiter")
+                .then(|| self.roles.get("review"))
+                .flatten()
+        })
+    }
+
     /// The flags `claude -p` gets for a role. The model flags are left out when the file
     /// doesn't name the role.
     fn args(&self, role: &str) -> Vec<String> {
         let mut args = vec!["--max-turns".to_string(), self.max_turns(role).to_string()];
-        let Some(chosen) = self.roles.get(role) else {
+        let Some(chosen) = self.chosen(role) else {
             return args;
         };
         args.extend(["--model".to_string(), chosen.model.clone()]);
@@ -349,7 +385,7 @@ impl Models {
     /// account's default), and none for a role already on the fallback model, which Claude Code
     /// refuses.
     pub fn fallback_for(&self, role: &str) -> Option<&str> {
-        let chosen = self.roles.get(role)?;
+        let chosen = self.chosen(role)?;
         self.fallback.as_deref().filter(|f| *f != chosen.model)
     }
 }
@@ -396,8 +432,8 @@ fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bo
     progress(&format!("repository: {}", item.repo));
     progress(&format!("item: #{} {}", item.number, item.title));
     let method = match target.merge_flag() {
-        Some("--squash") => "by squash",
-        Some("--rebase") => "by rebase",
+        Some(SQUASH) => "by squash",
+        Some(REBASE) => "by rebase",
         Some(_) => "by a merge commit",
         None => "no merge method allowed, so landing escalates",
     };
@@ -421,12 +457,52 @@ fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bo
     }
 }
 
-/// Ask on stderr and read a yes or no from stdin.
+/// Ask on stderr and read a yes or no from stdin. `PAJA_TEST_ANSWER` stands in for the person
+/// in tests (the smoke harness has no terminal).
 fn confirmed() -> Result<bool> {
     eprint!("Go ahead? [y/N] ");
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    match std::env::var("PAJA_TEST_ANSWER") {
+        Ok(forced) if cfg!(debug_assertions) => answer = forced,
+        _ => {
+            std::io::stdin().read_line(&mut answer)?;
+        }
+    }
     Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Give an item claimed for this pass back, so stopping before the build leaves the queue as it
+/// was. A resumed item was active already and stays so.
+fn unclaim(home: &Home, repo: &Path, item: &WorkItem, resumed: bool) -> Result<()> {
+    if !resumed {
+        jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
+        // And off GitHub too, where other runners look.
+        jono::release_claim(home, repo, item.number);
+    }
+    Ok(())
+}
+
+/// With required CI the repository must have an active GitHub Actions workflow, or Paja would
+/// wait for checks that never come. It checks that one exists, not that it runs on pull
+/// requests: a repository whose workflows only run on push or on a schedule passes here and
+/// then waits for CI that never reports.
+fn require_workflow(repo: &Path) -> Result<()> {
+    let list = run_gh(repo, &["workflow", "list"]).with_context(|| {
+        format!(
+            "listing the repository's workflows failed (a token without the `workflow` or \
+             `repo` scope does this); fix the sign-in, or put `none` in {CI_FILE} on the default \
+             branch to land on Vasara's checks and the reviewers alone"
+        )
+    })?;
+    if list.is_empty() {
+        bail!(
+            "this repository has no active GitHub Actions workflow, so Paja would wait for CI \
+             that never comes; add a workflow that runs the checks on pull requests, or put \
+             `none` in {CI_FILE} on the default branch to land on Vasara's checks and the \
+             reviewers alone"
+        );
+    }
+    Ok(())
 }
 
 /// Take the next work item and run it to an outcome.
@@ -481,14 +557,6 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         jono::repo_name(home, &repo)?
     };
     let config = read_config(&repo, &base, labels, target)?;
-    // Before an item is claimed: waiting for CI that will never run fails after the whole build.
-    if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
-        bail!(
-            "this repository has no GitHub Actions workflow, so Paja would wait for CI that never \
-             comes; add a workflow that runs the checks on pull requests, or put `none` in \
-             {CI_FILE} on the default branch to land on Vasara's checks and the reviewers alone"
-        );
-    }
     // A new item starts with a build, which a nearly used window would cut off, so it isn't
     // claimed at all (no status events) and the pass waits. A resumed item goes on to its round,
     // which makes the same check for each build.
@@ -497,6 +565,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         crate::events::now_ms(),
         config.models.window_percent(),
     );
+    // Before the claim, so a repository without a workflow never has an item claimed and given
+    // back on GitHub at every pass; only when something could be taken, so an idle pass never
+    // calls GitHub for it; and before the build, because waiting for CI that will never run
+    // fails after the whole build.
+    if config.ci == CiMode::Required
+        && jono::runnable(home, &name)?
+            .iter()
+            .any(|i| opts.item.is_none_or(|n| n == i.number))
+    {
+        require_workflow(&repo)?;
+    }
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
@@ -528,20 +607,26 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
+    if let Some(number) = opts.item {
+        if let Some(other) = jono::left_active(home, &name)?
+            .into_iter()
+            .find(|&n| n != number)
+        {
+            progress(&format!(
+                "#{other} was left active by an earlier run and is not resumed with --item; \
+                 `paja run` without --item resumes it"
+            ));
+        }
+    }
     summary(
         &item,
         &config.target,
         config.ci,
         crate::sandbox::active().is_some(),
     );
-    if opts.confirm && !confirmed()? {
-        // Put the item back, so declining leaves the queue as it was. A resumed item was
-        // active already and stays so.
-        if !resumed {
-            jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
-            // And off GitHub too, where other runners look.
-            jono::release_claim(home, &repo, item.number);
-        }
+    let go = if opts.confirm { confirmed()? } else { true };
+    if !go {
+        unclaim(home, &repo, &item, resumed)?;
         return Err(Declined.into());
     }
     if resumed {
@@ -730,7 +815,7 @@ impl RepoSettings {
         let v: Value = serde_json::from_str(json).ok()?;
         let branch = match v["defaultBranchRef"]["name"].as_str() {
             Some(name) if !name.is_empty() => name.to_string(),
-            _ if v.get("defaultBranchRef").is_none() => "main".to_string(),
+            _ if v.get("defaultBranchRef").is_none() => FALLBACK_BRANCH.to_string(),
             _ => return None,
         };
         let flag = |key: &str, default: bool| v[key].as_bool().unwrap_or(default);
@@ -745,11 +830,11 @@ impl RepoSettings {
     /// The `gh pr merge` flag to land with: squash, else rebase, else a merge commit.
     fn merge_flag(&self) -> Option<&'static str> {
         if self.squash {
-            Some("--squash")
+            Some(SQUASH)
         } else if self.rebase {
-            Some("--rebase")
+            Some(REBASE)
         } else if self.merge_commit {
-            Some("--merge")
+            Some(MERGE)
         } else {
             None
         }
@@ -941,6 +1026,7 @@ fn run_item(
                 earlier.as_ref(),
                 steps,
                 &commands.builder,
+                &checks,
             )
         });
         let built = match built {
@@ -976,7 +1062,15 @@ fn run_item(
                 steps.push(step);
                 if builder_limits > 1 {
                     record_round(home, item, round, "turn_limit", &note, steps)?;
-                    return turn_limit_twice(home, repo, &env, item, &note, round);
+                    let scene = Scene {
+                        home,
+                        repo,
+                        env: &env,
+                        base: &base,
+                        item,
+                        models: &models,
+                    };
+                    return turn_limit_twice(&scene, &note, round);
                 }
                 progress(&format!("{note}; asking it to finish smaller"));
                 feedback = format!(
@@ -1007,7 +1101,15 @@ fn run_item(
                 record_round(home, item, round, "question", &asked, steps)?;
                 let question =
                     format!("Paja's builder needs a decision before it can go on:\n\n{asked}");
-                return escalated(home, repo, &env, item, &question, round);
+                let scene = Scene {
+                    home,
+                    repo,
+                    env: &env,
+                    base: &base,
+                    item,
+                    models: &models,
+                };
+                return settle(&scene, &question, "", round);
             }
         }
         // A merge Paja handed over must be finished, not committed with its conflicts. It stays
@@ -1265,7 +1367,15 @@ fn run_item(
             review_limits += 1;
             if review_limits > 1 {
                 record_round(home, item, round, "turn_limit", &note, steps)?;
-                return turn_limit_twice(home, repo, &env, item, &note, round);
+                let scene = Scene {
+                    home,
+                    repo,
+                    env: &env,
+                    base: &base,
+                    item,
+                    models: &models,
+                };
+                return turn_limit_twice(&scene, &note, round);
             }
             progress(&format!(
                 "{note}; asking the builder to make the change easier to review"
@@ -1315,7 +1425,15 @@ fn run_item(
         }
 
         if let Some(esc) = reviews.iter().find(|r| r.verdict == "escalate") {
-            return escalated(home, repo, &env, item, &esc.question, round);
+            let scene = Scene {
+                home,
+                repo,
+                env: &env,
+                base: &base,
+                item,
+                models: &models,
+            };
+            return settle(&scene, &esc.question, &summaries(&reviews), round);
         }
         if verdicts.iter().all(|v| *v == "land") {
             // One change lands at a time per repository, each on the latest default branch: a
@@ -1421,7 +1539,15 @@ fn run_item(
                 "The two reviewers disagree on this high-risk change.\n\n{}",
                 summaries(&reviews)
             );
-            return escalated(home, repo, &env, item, &question, round);
+            let scene = Scene {
+                home,
+                repo,
+                env: &env,
+                base: &base,
+                item,
+                models: &models,
+            };
+            return settle(&scene, &question, "", round);
         }
         // A `changes` verdict without comments still names something: its summary.
         let blockers = reviews
@@ -1476,7 +1602,15 @@ fn run_item(
         "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
          Answer with what should change, or what is out of scope."
     );
-    escalated(home, repo, &env, item, &question, MAX_ROUNDS)
+    let scene = Scene {
+        home,
+        repo,
+        env: &env,
+        base: &base,
+        item,
+        models: &models,
+    };
+    settle(&scene, &question, "", MAX_ROUNDS)
 }
 
 /// The latest reset time any usage-limit stop recorded, in milliseconds since the epoch, when it
@@ -1608,20 +1742,13 @@ pub fn format_utc(ms: u64) -> String {
 
 /// The same kind of step hit its turn limit a second time in this run: ask a person rather
 /// than spend another round.
-fn turn_limit_twice(
-    home: &Home,
-    repo: &Path,
-    env: &Env,
-    item: &WorkItem,
-    note: &str,
-    round: u32,
-) -> Result<RunReport> {
+fn turn_limit_twice(scene: &Scene, note: &str, round: u32) -> Result<RunReport> {
     let question = format!(
         "In this run {note}, the second time that step stopped at its turn limit. The issue may \
          be too big for one change: split it into smaller issues, or raise the limit with a \
          `max-turns` line in `{MODELS_FILE}` on the default branch, then answer with what you changed."
     );
-    escalated(home, repo, env, item, &question, round)
+    settle(scene, &question, "", round)
 }
 
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
@@ -1774,9 +1901,7 @@ fn record_step(
     models: Option<&Models>,
     reviewer: Option<u32>,
 ) -> Result<()> {
-    let model = models
-        .and_then(|m| m.roles.get(role))
-        .map(|c| c.model.clone());
+    let model = models.and_then(|m| m.chosen(role)).map(|c| c.model.clone());
     record(
         home,
         EV_STEP,
@@ -1859,10 +1984,16 @@ fn program_tools(programs: &[String]) -> Vec<String> {
 }
 
 /// What the builder is asked. `programs` are the ones `.paja/commands` lets it run.
-fn builder_prompt(item: &WorkItem, programs: &[String]) -> String {
+fn builder_prompt(item: &WorkItem, programs: &[String], checks: &[String]) -> String {
+    let checks = checks
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
-         CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
+         CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists \
+         (Vasara's checks, every command in `.paja/checks` on the default branch: {checks}), \
          and commit your work on the current branch (never push, never switch branches). Commit \
          with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
          that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
@@ -1899,8 +2030,9 @@ fn build(
     carried: Option<&Carried>,
     spent: &mut Vec<StepUsage>,
     programs: &[String],
+    checks: &[String],
 ) -> Result<Built> {
-    let mut prompt = builder_prompt(item, programs);
+    let mut prompt = builder_prompt(item, programs, checks);
     let again = format!(
         "This is another round on the same branch (based on {base}). Address this first:\n\n{feedback}\n"
     );
@@ -2080,16 +2212,22 @@ fn review_prompt(
          (so never copy secrets, environment details or run output into them) and never files \
          nits. They never hold the change up.\n\n\
          Vasara's checks (every command in `.paja/checks` on the default branch: {checks}) already passed at \
-         {checked}, the commit you are judging, so don't run them again. To probe a behaviour, \
-         run one named test or the project itself, with Bash limited to {programs} and long \
-         output piped through `tail -n 80` or `grep`. Read-only git is fine; you can't change \
-         files.\n",
+         {checked}, the commit you are judging, so don't run them again. {probe}Read-only git \
+         is fine; you can't change files.\n",
+        probe = if programs.is_empty() {
+            "Bash is limited to local git, so read the code to judge a behaviour. ".to_string()
+        } else {
+            format!(
+                "To probe a behaviour, run one named test or the project itself, with Bash \
+                 limited to {} and long output piped through `tail -n 80` or `grep`. ",
+                programs_prose(programs)
+            )
+        },
         checks = checks
             .iter()
             .map(|c| format!("`{c}`"))
             .collect::<Vec<_>>()
             .join(", "),
-        programs = programs_prose(programs),
         number = item.number,
         title = item.title,
         body = item.body,
@@ -2118,8 +2256,14 @@ fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
         text.push_str(&format!("The diff:\n\n{full}"));
         return Ok(text);
     }
+    // The names come from git itself (`-z`: no quoting, any character in a path), in the order
+    // the diff lists its files.
+    let names = run(&["--name-only", "-z"])?;
+    let names: Vec<&str> = names.split('\0').filter(|n| !n.is_empty()).collect();
     let mut shown = String::new();
+    let mut used = 0usize;
     let mut skipped = Vec::new();
+    let mut cut = None;
     let mut files: Vec<String> = Vec::new();
     for line in full.lines() {
         if line.starts_with("diff --git ") || files.is_empty() {
@@ -2130,26 +2274,35 @@ fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
         last.push('\n');
     }
     let mut full_so_far = false;
-    for file in files {
-        let name = file
-            .lines()
-            .next()
-            .and_then(|l| l.rsplit_once(" b/"))
-            .map_or("(unknown file)", |(_, n)| n)
-            .to_string();
-        if !full_so_far && shown.chars().count() + file.chars().count() <= cap {
-            shown.push_str(&file);
+    for (index, file) in files.iter().enumerate() {
+        let name = names.get(index).copied().unwrap_or("(unknown file)");
+        let size = file.chars().count();
+        if !full_so_far && used + size <= cap {
+            shown.push_str(file);
+            used += size;
         } else {
             // Once one file doesn't fit, the later ones are left out too, so the diff shown
             // is a prefix of the whole.
+            if !full_so_far && shown.is_empty() {
+                // The first file alone is over the cap: show its head, cut at the cap.
+                shown = file.chars().take(cap).collect();
+                cut = Some(name);
+            }
             full_so_far = true;
-            skipped.push(name);
+            skipped.push(format!("{name} ({} lines)", file.lines().count()));
         }
     }
+    let note = match cut {
+        Some(name) => format!(
+            "The first file, {name}, is over the cap by itself, so only its first {cap} \
+             characters are here. "
+        ),
+        None => String::new(),
+    };
     text.push_str(&format!(
-        "The diff is over {cap} characters, so only its first files are here:\n\n{shown}\n\
-         Not shown, because of the size cap; you must read these files yourself (`git diff \
-         {range} -- <file>`): {}\n",
+        "The diff is over {cap} characters, so only its first files are here. {note}\n\n{shown}\n\
+         Not shown (or cut), because of the size cap; you must read these files yourself (`git \
+         diff {range} -- <file>`): {}\n",
         skipped.join(", ")
     ));
     Ok(text)
@@ -3026,7 +3179,14 @@ mod tests {
             prompt.contains("Bash limited to local git and `cargo`"),
             "{prompt}"
         );
-        assert!(super::builder_prompt(&item, &cargo).contains("only for local git and `cargo`"));
+        let builder = super::builder_prompt(&item, &cargo, &checks);
+        assert!(builder.contains("only for local git and `cargo`"));
+        assert!(builder.contains("`cargo fmt --all --check`, `cargo test`"));
+        // No review programs: the reviewer is not told to run anything.
+        let bare = super::review_prompt(&item, "base1", "abc123", None, "D", &checks, &[]);
+        assert!(!bare.contains("run one named test"), "{bare}");
+        assert!(bare.contains("limited to local git"), "{bare}");
+        assert!(bare.contains("Read-only git is fine"), "{bare}");
 
         // Another project: neither prompt mentions cargo or Paja as the project.
         let npm = vec!["npm".to_string(), "node".to_string()];
@@ -3039,7 +3199,7 @@ mod tests {
             &["npm test".to_string()],
             &npm,
         );
-        let build = super::builder_prompt(&item, &npm);
+        let build = super::builder_prompt(&item, &npm, &["npm test".to_string()]);
         for text in [&js, &build] {
             assert!(!text.contains("cargo"), "{text}");
             assert!(!text.contains("reviewer for Paja"), "{text}");
@@ -3110,5 +3270,218 @@ mod tests {
             "{capped}"
         );
         assert!(capped.contains("b.txt"), "{capped}");
+        assert!(capped.contains("b.txt ("), "{capped}");
+    }
+
+    #[test]
+    fn the_review_diff_shows_the_head_of_a_first_file_over_the_cap_and_reads_names_from_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("keep.txt"), "one\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["tag", "base"]);
+        // A first file (in path order) far over the cap, then one whose path has ` b/` in it.
+        std::fs::create_dir(dir.join("x b")).unwrap();
+        std::fs::write(dir.join("a.txt"), "y".repeat(900)).unwrap();
+        std::fs::write(dir.join("x b").join("z.txt"), "later\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "change"]);
+        let capped = super::review_diff(dir, "base...HEAD", 300).unwrap();
+        assert!(
+            capped.contains("The first file, a.txt, is over the cap"),
+            "{capped}"
+        );
+        assert!(capped.contains("yyyyyyyy"), "{capped}");
+        assert!(!capped.contains(&"y".repeat(400)), "{capped}");
+        assert!(capped.contains("x b/z.txt ("), "{capped}");
+        assert!(!capped.contains("(unknown file)"), "{capped}");
+    }
+
+    #[test]
+    fn the_review_diff_names_renamed_mode_only_and_binary_files_past_the_cap() {
+        // The skipped files' names come from `git diff --name-only` and their sections from
+        // splitting the diff, matched by position: a rename, a mode-only change and a binary file
+        // each make one section, so every name keeps its own line count.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("m.sh"), "echo hi\n").unwrap();
+        std::fs::write(dir.join("old.txt"), "rename me\n".repeat(20)).unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["tag", "base"]);
+        std::fs::write(dir.join("a.txt"), "y".repeat(900)).unwrap();
+        std::fs::write(dir.join("c.bin"), [0u8, 1, 2, 0, 255, 0]).unwrap();
+        std::fs::write(dir.join("z.txt"), "one\ntwo\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["update-index", "--chmod=+x", "m.sh"]);
+        run(&["mv", "old.txt", "new.txt"]);
+        run(&["commit", "-q", "-m", "change"]);
+        let capped = super::review_diff(dir, "base...HEAD", 300).unwrap();
+        assert!(
+            capped.contains("The first file, a.txt, is over the cap"),
+            "{capped}"
+        );
+        // Header, mode and index lines plus `Binary files ... differ`; old and new mode; the
+        // similarity and rename lines; a new file's five header lines and its two added lines.
+        for skipped in [
+            "c.bin (4 lines)",
+            "m.sh (3 lines)",
+            "new.txt (4 lines)",
+            "z.txt (8 lines)",
+        ] {
+            assert!(capped.contains(skipped), "{skipped}: {capped}");
+        }
+        assert!(!capped.contains("(unknown file)"), "{capped}");
+    }
+
+    #[test]
+    fn the_prompts_fit_this_repositorys_own_checks_and_commands() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let checks = super::lines(&std::fs::read_to_string(root.join(".paja/checks")).unwrap());
+        let commands = crate::hook::Commands::parse(
+            std::fs::read_to_string(root.join(".paja/commands"))
+                .ok()
+                .as_deref(),
+        )
+        .unwrap();
+        assert!(!checks.is_empty());
+        let item = crate::jono::WorkItem {
+            repo: "acme/app".into(),
+            number: 9,
+            title: "T".into(),
+            body: "B".into(),
+            url: String::new(),
+            open: true,
+            status: crate::jono::Status::Active,
+            note: None,
+            usage: None,
+            answers: Vec::new(),
+            waiting_on: Vec::new(),
+            priority: Default::default(),
+            claim: None,
+        };
+        let review = super::review_prompt(
+            &item,
+            "base1",
+            "abc123",
+            None,
+            "D",
+            &checks,
+            &commands.reviewer,
+        );
+        let build = super::builder_prompt(&item, &commands.builder, &checks);
+        for check in &checks {
+            assert!(review.contains(&format!("`{check}`")), "{check}: {review}");
+            assert!(build.contains(&format!("`{check}`")), "{check}: {build}");
+        }
+        for program in &commands.builder {
+            assert!(
+                build.contains(&format!("`{program}`")),
+                "{program}: {build}"
+            );
+        }
+        for program in &commands.reviewer {
+            assert!(
+                review.contains(&format!("`{program}`")),
+                "{program}: {review}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_source_file_is_high_risk_or_reviewed_as_standard_risk_on_purpose() {
+        // A new module has to be placed in `.paja/high-risk` or in this list, so it can't land
+        // at standard risk by being forgotten.
+        // Paths are relative to `crates/paja/src`, and every directory under it is read.
+        const STANDARD: &[&str] = &[
+            "doctor.rs",
+            "home.rs",
+            "init.rs",
+            "init/detect.rs",
+            "init/generate.rs",
+            "init/recommend.rs",
+            "init/scaffold.rs",
+            "jono.rs",
+            "mcp.rs",
+            "mestari/builder.rs",
+            "mestari/detect.rs",
+            "mestari/follow_ups.rs",
+            "mestari/live.rs",
+            "mestari/plan.rs",
+            "mestari/pool.rs",
+            "mestari/progress.rs",
+            "mestari/usage.rs",
+            "posti.rs",
+            "usage.rs",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let prefixes =
+            super::lines(&std::fs::read_to_string(root.join(".paja/high-risk")).unwrap());
+        let src = root.join("crates/paja/src");
+        let mut dirs = vec![src.clone()];
+        let mut seen = 0;
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // Always `/`, as `.paja/high-risk` writes paths, on Windows too.
+                let relative = path
+                    .strip_prefix(&src)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let full = format!("crates/paja/src/{relative}");
+                assert!(
+                    super::is_high_risk(&full, &prefixes) || STANDARD.contains(&relative.as_str()),
+                    "{full} is neither in .paja/high-risk nor in this test's standard-risk list; \
+                     decide which it is"
+                );
+                seen += 1;
+            }
+        }
+        // The walk reached the subdirectories, where most of Mestari's code is.
+        assert!(
+            seen > 25,
+            "only {seen} source files found under {}",
+            src.display()
+        );
+        // Each listed file still exists, so the list can't hide a rename.
+        for name in STANDARD {
+            assert!(
+                src.join(name).is_file(),
+                "{name} is listed as standard risk but is gone"
+            );
+        }
     }
 }

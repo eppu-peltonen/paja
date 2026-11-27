@@ -118,6 +118,15 @@ pub struct FileArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct RecommendArgs {
+    /// What the person is building, in their words.
+    building: String,
+    /// Languages or frameworks the person prefers, if any. They win unless one is a poor fit.
+    #[serde(default)]
+    prefer: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct InitArgs {
     /// Any path inside the repository. Defaults to the directory the server runs in.
     repo: Option<String>,
@@ -127,10 +136,15 @@ pub struct InitArgs {
     /// Write the files again on the branch although .paja/checks is on the default branch.
     #[serde(default)]
     force: bool,
+    /// Don't run the detection agent: use the built-in table of known files (Rust, Node, Python,
+    /// Go).
+    #[serde(default)]
+    no_agent: bool,
     /// Start a new project instead: the name of a GitHub repository to create under the
-    /// signed-in account. Needs `stack`; `repo`, `ci` and `force` are not used.
+    /// signed-in account. Needs `stack` (call `init_recommend` first to choose one); `repo`, `ci`,
+    /// `force` and `no_agent` are not used.
     new: Option<String>,
-    /// With `new`: rust, node or python.
+    /// With `new`: any language or framework; rust, node and python have a built-in skeleton.
     stack: Option<String>,
     /// With `new`: make the repository public (default: private).
     #[serde(default)]
@@ -408,14 +422,18 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Set an existing repository up for Paja in one pull request: detects the stack, writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true. With new (a repository name) and stack (rust, node or python) it instead creates that GitHub repository, clones it (to dir, or the name) and pushes a walking skeleton as the first commit on the default branch, returning {repo, url, directory, files, next_steps}."
+        description = "Set an existing repository up for Paja in one pull request: an agent on the init role detects the stacks (any language, each with its directory), checks, commands, toolchains and services, and Paja keeps only what files on the default branch back up (detected.dropped lists the rest; no_agent, or an agent that can't run, uses the built-in table for Rust, Node, Python and Go and says why in detected.fallback). Writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true. With new (a repository name) and stack (any language or framework) it instead creates that GitHub repository, clones it (to dir, or the name) and pushes a walking skeleton as the first commit on the default branch, returning {repo, url, directory, stack, skeleton, files, next_steps}; skeleton is built-in for rust, node and python, and generated otherwise: an agent writes it, and nothing is committed or pushed unless every check passes."
     )]
     async fn init(&self, Parameters(args): Parameters<InitArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
             if let Some(name) = args.new {
                 let Some(stack) = args.stack else {
-                    anyhow::bail!("`new` needs `stack`: rust, node or python");
+                    anyhow::bail!(
+                        "`new` needs `stack` (a language or framework, such as rust, node, python \
+                         or go); call `init_recommend` first \
+                         to get options"
+                    );
                 };
                 let report = crate::init::run_new(
                     &home,
@@ -435,9 +453,28 @@ impl PajaMcp {
                 crate::init::Options {
                     ci: args.ci,
                     force: args.force,
+                    no_agent: args.no_agent,
                 },
             )?;
             Ok(serde_json::to_value(report)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Recommend stacks for a project that doesn't exist yet (paja init --recommend): an agent on the init role, with no repository to read, takes what the person is building and the languages or frameworks they prefer (preferences win unless one is a poor fit, and then why says so) and returns {recommendations: [{stack, why, tradeoffs, skeleton}], questions}: one to three options, best first. skeleton is built-in for rust, node and python, and generated otherwise. Changes nothing; pass the chosen stack to init with new."
+    )]
+    async fn init_recommend(
+        &self,
+        Parameters(args): Parameters<RecommendArgs>,
+    ) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            Ok(serde_json::to_value(crate::init::recommend(
+                &home,
+                &args.building,
+                &args.prefer,
+            )?)?)
         })
         .await
     }

@@ -58,8 +58,8 @@ enum Command {
         /// Take this item instead of the oldest queued one.
         #[arg(long, value_name = "NUMBER", conflicts_with = "every")]
         item: Option<u64>,
-        /// Don't ask for confirmation, even on a terminal.
-        #[arg(long)]
+        /// Don't ask for confirmation, even on a terminal. Not with --every, which never asks.
+        #[arg(long, conflicts_with = "every")]
         yes: bool,
         /// After Paja stopped because git's configuration changed during a run: you have
         /// checked and restored the files it named, and Paja may run git in this repository
@@ -96,8 +96,9 @@ enum Command {
     },
     /// Set an existing repository up for Paja in one pull request.
     ///
-    /// Detects the stack, writes `.paja/checks`, `.paja/commands`, `.paja/models` and
-    /// `.paja/high-risk`, adds a `CLAUDE.md` (or a "Working with Paja" section to the existing
+    /// An agent detects the stacks, checks and environment (any language); Paja keeps what the
+    /// files on the default branch back up. Writes `.paja/checks`, `.paja/commands`,
+    /// `.paja/models` and `.paja/high-risk`, adds a `CLAUDE.md` (or a "Working with Paja" section to the existing
     /// one), creates the work label, and opens a pull request from `paja/init`. Never pushes to
     /// the default branch; Paja starts working once the pull request is merged.
     Init {
@@ -111,15 +112,37 @@ enum Command {
         /// Write the files again on the branch although `.paja/checks` is on the default branch.
         #[arg(long, conflicts_with = "new")]
         force: bool,
+        /// Don't run the detection agent: use the built-in table of known files (Rust, Node,
+        /// Python, Go). The agent also steps aside when `claude` is missing or not signed in.
+        #[arg(long, conflicts_with = "new")]
+        no_agent: bool,
         /// Start a new project instead: create this GitHub repository under the signed-in
         /// account, clone it, and push a walking skeleton (a minimal app with a passing test, a
         /// formatter, a linter, a CI workflow, and the `.paja/` files and `CLAUDE.md`) as the
-        /// first commit on the default branch. Needs --stack.
-        #[arg(long, value_name = "NAME", requires = "stack")]
+        /// first commit on the default branch. Without --stack, on a terminal, it asks what you
+        /// are building and which language or framework you prefer, shows recommended stacks, and
+        /// takes a number or a stack name. With --json or no terminal, --stack is required.
+        #[arg(long, value_name = "NAME", conflicts_with = "recommend")]
         new: Option<String>,
-        /// The skeleton's stack, with --new.
-        #[arg(long, value_parser = paja::init::STACKS, requires = "new")]
+        /// The skeleton's stack, with --new: any language or framework. rust, node and python
+        /// have a built-in skeleton; an agent generates one for any other, and nothing is pushed
+        /// unless its checks pass. For a stack to choose, see --recommend.
+        #[arg(long, requires = "new")]
         stack: Option<String>,
+        /// Recommend stacks for a project that doesn't exist yet instead of setting one up: an
+        /// agent reads this description (and any --prefer) and answers with one to three options,
+        /// best first, each with why, trade-offs and whether its skeleton is `built-in` (rust,
+        /// node, python) or `generated`. Changes nothing.
+        #[arg(
+            long,
+            value_name = "WHAT YOU ARE BUILDING",
+            conflicts_with_all = ["ci", "force", "no_agent"]
+        )]
+        recommend: Option<String>,
+        /// With --recommend: a language or framework you prefer; repeat it for several. It wins
+        /// unless it is a poor fit for what you are building.
+        #[arg(long, requires = "recommend")]
+        prefer: Vec<String>,
         /// With --new: make the repository public (the default is private).
         #[arg(long, requires = "new", conflicts_with = "private")]
         public: bool,
@@ -390,18 +413,47 @@ fn run(cli: &Cli) -> Result<()> {
             }
         }
         Command::Init {
+            recommend: Some(building),
+            prefer,
+            ..
+        } => {
+            let found = paja::init::recommend(&home, building, prefer)?;
+            emit(cli, serde_json::to_value(&found)?, || {
+                describe_recommendations(&found)
+            });
+        }
+        Command::Init {
             new: Some(name),
             stack,
             public,
             dir,
             ..
         } => {
+            let stack = match stack {
+                Some(stack) => stack.clone(),
+                None => {
+                    let stdin = std::io::stdin();
+                    if cli.json || !std::io::IsTerminal::is_terminal(&stdin) {
+                        anyhow::bail!(
+                            "`paja init --new {name}` needs --stack (a language or framework, such as \
+                             rust, node, python or go) here; run \
+                             `paja init --recommend \"<what you are building>\"` first to get \
+                             options, then pass the one you pick as --stack"
+                        );
+                    }
+                    paja::init::choose_stack(
+                        &mut stdin.lock(),
+                        &mut std::io::stderr(),
+                        &mut |building, prefer| paja::init::recommend(&home, building, prefer),
+                    )?
+                }
+            };
             let report = paja::init::run_new(
                 &home,
                 &std::env::current_dir()?,
                 paja::init::NewOptions {
                     name: name.clone(),
-                    stack: stack.clone().unwrap_or_default(),
+                    stack,
                     private: !*public,
                     dir: dir.clone(),
                 },
@@ -411,7 +463,11 @@ fn run(cli: &Cli) -> Result<()> {
             });
         }
         Command::Init {
-            repo, ci, force, ..
+            repo,
+            ci,
+            force,
+            no_agent,
+            ..
         } => {
             let report = paja::init::run(
                 &home,
@@ -419,6 +475,7 @@ fn run(cli: &Cli) -> Result<()> {
                 paja::init::Options {
                     ci: *ci,
                     force: *force,
+                    no_agent: *no_agent,
                 },
             )?;
             emit(cli, serde_json::to_value(&report)?, || {
@@ -505,7 +562,9 @@ fn run(cli: &Cli) -> Result<()> {
             let confirm = every.is_none()
                 && !*yes
                 && !*stop_on_stdin
-                && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                && (std::io::IsTerminal::is_terminal(&std::io::stdin())
+                    // Debug builds only: lets tests answer the question with no terminal.
+                    || (cfg!(debug_assertions) && std::env::var_os("PAJA_TEST_ANSWER").is_some()));
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
@@ -901,6 +960,10 @@ fn describe_run(report: &mestari::RunReport) -> String {
         } => format!(
             "#{number} escalated:\n{question}\n  answer: paja work answer {number} \"<your answer>\""
         ),
+        mestari::RunReport::Arbitrated { number, answer, .. } => format!(
+            "#{number} answered by the arbiter and queued again: {answer}\n  override: paja work \
+             answer {number} \"<your answer>\""
+        ),
         mestari::RunReport::Stopped { number, .. } => {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
         }
@@ -920,14 +983,37 @@ fn describe_run(report: &mestari::RunReport) -> String {
     }
 }
 
+fn describe_recommendations(found: &paja::init::Recommendations) -> String {
+    let mut text = String::from("Recommended stacks, best first:\n");
+    for (i, o) in found.recommendations.iter().enumerate() {
+        text.push_str(&format!(
+            "\n{}. {} ({} skeleton)\n   Why: {}\n   Trade-offs: {}\n",
+            i + 1,
+            o.stack,
+            o.skeleton,
+            o.why,
+            o.tradeoffs
+        ));
+    }
+    if !found.questions.is_empty() {
+        text.push_str("\nQuestions that could change this:\n");
+        for q in &found.questions {
+            text.push_str(&format!("  {q}\n"));
+        }
+    }
+    text.push_str("\nThen: paja init --new NAME --stack <rust|node|python>");
+    text
+}
+
 fn describe_new(report: &paja::init::NewReport) -> String {
     let mut text = format!(
-        "created {} ({}): {}\ncloned to {}\nstack: {}\nchecks: {}\nwrote: {}\npushed the first commit to {}\n\nNext:\n",
+        "created {} ({}): {}\ncloned to {}\nstack: {} ({} skeleton)\nchecks: {}\nwrote: {}\npushed the first commit to {}\n\nNext:\n",
         report.repo,
         if report.private { "private" } else { "public" },
         report.url,
         report.directory,
         report.stack,
+        report.skeleton,
         report.checks.join("; "),
         report.files.join(", "),
         report.default_branch
@@ -942,18 +1028,40 @@ fn describe_init(report: &paja::init::Report) -> String {
     let found = if report.detected.stacks.is_empty() {
         "no stack Paja knows".to_string()
     } else {
-        report.detected.stacks.join(", ")
+        report
+            .detected
+            .environment
+            .stacks
+            .iter()
+            .map(|s| {
+                if s.dir == "." {
+                    s.name.clone()
+                } else {
+                    format!("{} ({})", s.name, s.dir)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let mut text = format!(
         "detected: {found}\nchecks: {}\nwrote: {}\nci: {}\n",
         if report.detected.checks.is_empty() {
             "none".to_string()
         } else {
-            report.detected.checks.join("; ")
+            report
+                .detected
+                .checks
+                .iter()
+                .map(|c| c.command.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         },
         report.files.join(", "),
         report.ci
     );
+    for item in &report.detected.dropped {
+        text.push_str(&format!("dropped: {}: {}\n", item.item, item.reason));
+    }
     if report.ci == "none" {
         text.push_str(
             "  the repository has no CI; `.paja/ci` says `none` (use --ci to add a workflow)\n",
@@ -1013,6 +1121,15 @@ fn describe_item(item: &jono::WorkItem) -> String {
         line.push_str(&format!("\n  claimed by runner {}", claim.runner));
         if let Some(until) = &claim.stale_after {
             line.push_str(&format!(", stale after {until}"));
+        }
+    }
+    if let Some(last) = item.answers.last().filter(|a| a.by_arbiter()) {
+        line.push_str(&format!("\n  answered by arbiter: {}", last.answer));
+        if item.status == jono::Status::Queued {
+            line.push_str(&format!(
+                "\n  override: paja work answer {} \"<your answer>\"",
+                item.number
+            ));
         }
     }
     if item.status == jono::Status::Escalated {

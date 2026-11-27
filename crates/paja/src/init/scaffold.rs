@@ -2,9 +2,10 @@
 //!
 //! The skeleton is a minimal app with one passing test, a formatter and a linter, a workflow that
 //! runs the checks on pull requests, and the `.paja/` files and `CLAUDE.md` that `paja init` writes
-//! for the stack. The templates are in the binary, so only GitHub needs the network. The first
-//! commit goes straight to the default branch: the repository is empty and new, the one place Paja
-//! pushes there.
+//! for the stack. For rust, node and python the templates are in the binary, so only GitHub needs
+//! the network; any other stack gets a skeleton an agent writes (see `generate`), and the first
+//! commit waits until its checks pass here. The first commit goes straight to the default branch:
+//! the repository is empty and new, the one place Paja pushes there.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,6 +39,8 @@ pub struct NewReport {
     /// The clone, an absolute path.
     pub directory: String,
     pub stack: String,
+    /// `built-in` (Paja's template for rust, node or python) or `generated` (an agent wrote it).
+    pub skeleton: String,
     pub default_branch: String,
     /// The files of the first commit, relative to the directory.
     pub files: Vec<String>,
@@ -129,7 +132,7 @@ fn skeleton(stack: &str) -> Result<&'static [Template]> {
         "rust" => Ok(RUST),
         "node" => Ok(NODE),
         "python" => Ok(PYTHON),
-        _ => bail!("no skeleton for the stack {stack:?}; use --stack rust, node or python"),
+        _ => bail!("no built-in skeleton for the stack {stack:?}; Paja generates one instead"),
     }
 }
 
@@ -212,6 +215,64 @@ fn write_new(target: &Path, text: &str) -> Result<()> {
     std::fs::write(target, text).with_context(|| format!("writing {}", target.display()))
 }
 
+/// Have the init agent write the skeleton in the fresh clone `dir`, then detect its stacks and
+/// checks the way `paja init` does. The files are staged and a commit object made for the
+/// detection to read; no branch points at it, so nothing is committed.
+fn generated(
+    home: &Home,
+    dir: &Path,
+    name: &str,
+    stack: &str,
+    programs: &[String],
+    default_branch: &str,
+) -> Result<(Vec<Stack>, Detected)> {
+    crate::mestari::progress(&format!(
+        "init: asking the init agent to write a {stack} skeleton"
+    ));
+    crate::mestari::skeleton_agent(
+        home,
+        dir,
+        programs,
+        &generate::skeleton_prompt(name, stack, programs),
+    )?;
+    if git(dir, &["status", "--porcelain"])?.is_empty() {
+        bail!(
+            "the init agent wrote no files for the {stack} skeleton; run `paja init --new` again, \
+             or use a stack with a built-in skeleton (rust, node, python)"
+        );
+    }
+    // Paja writes these from what it finds; the agent's own copies would only disagree.
+    let paja_dir = dir.join(".paja");
+    if paja_dir.exists() {
+        std::fs::remove_dir_all(&paja_dir)
+            .with_context(|| format!("removing {}", paja_dir.display()))?;
+    }
+    git(dir, &["add", "-A"])?;
+    let tree = git(dir, &["write-tree"])?;
+    let base = git(
+        dir,
+        &[
+            "-c",
+            "user.name=paja",
+            "-c",
+            "user.email=paja@localhost",
+            "commit-tree",
+            &tree,
+            "-m",
+            "skeleton",
+        ],
+    )?;
+    let (stacks, d) = find_stacks(home, dir, dir, &base, default_branch, Options::default())?;
+    if d.checks.is_empty() {
+        bail!(
+            "no check could be found for the generated {stack} skeleton (a formatter, a linter and \
+             a test command that files in it back up), so nothing was verified and nothing was \
+             pushed; write `.paja/checks` by hand in the clone, then commit and push"
+        );
+    }
+    Ok((stacks, d))
+}
+
 /// Create the repository on GitHub, clone it, write the skeleton, and push the first commit.
 pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport> {
     let NewOptions {
@@ -221,7 +282,13 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
         dir,
     } = options;
     check_name(&name)?;
-    let templates = skeleton(&stack)?;
+    let builtin = recommend::skeleton_of(&stack) == "built-in";
+    let stack = if builtin {
+        stack.trim().to_ascii_lowercase()
+    } else {
+        generate::check_stack(&stack)?
+    };
+    let templates: &[Template] = if builtin { skeleton(&stack)? } else { &[] };
     let dir = match dir {
         Some(dir) => std::path::absolute(cwd.join(dir))?,
         None => cwd.join(&name),
@@ -236,6 +303,21 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+
+    // Before anything is created: no programs to allow means no skeleton, and nothing to clean up.
+    let programs = if builtin {
+        Vec::new()
+    } else {
+        crate::mestari::progress(&format!(
+            "init: asking the init agent which programs a {stack} skeleton needs"
+        ));
+        let answer = crate::mestari::recommend_agent(
+            home,
+            &generate::programs_prompt(&stack),
+            &generate::programs_schema(),
+        )?;
+        generate::parse_programs(answer, &stack)?
+    };
 
     let visibility = if private { "--private" } else { "--public" };
     let created = gh(cwd, &["repo", "create", &name, visibility])?;
@@ -263,14 +345,24 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
     gh(cwd, &["repo", "clone", &url, &dir.display().to_string()]).map_err(after_create)?;
 
     let ok = ahjo::untampered(home, &dir).map_err(after_create)?;
+    let default_branch = git(&dir, &["symbolic-ref", "--short", "HEAD"]).map_err(after_create)?;
     for (path, template) in templates {
         write_new(&dir.join(path), &render(template, &name)).map_err(after_create)?;
     }
-    let stacks = detect_stacks(&dir);
-    let mut d = detected(&stacks);
-    if stack == "python" {
-        d.checks.push("ruff format --check .".into());
-    }
+    let (stacks, d) = if builtin {
+        let stacks = detect_stacks(&dir);
+        let mut d = detected(&stacks);
+        if stack == "python" {
+            d.checks.push(Check {
+                command: "ruff format --check .".into(),
+                source: Source::Table,
+                file: Some("pyproject.toml".into()),
+            });
+        }
+        (stacks, d)
+    } else {
+        generated(home, &dir, &name, &stack, &programs, &default_branch).map_err(after_create)?
+    };
     let labels = Labels::parse(LABELS)?;
 
     let mut files: Vec<(String, String)> = vec![
@@ -285,9 +377,35 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
     for (path, text) in &files {
         write_new(&dir.join(path), text).map_err(after_create)?;
     }
-    let mut names: Vec<String> = templates.iter().map(|(p, _)| p.to_string()).collect();
-    names.extend(files.drain(..).map(|(p, _)| p));
-    names.sort();
+    git(&dir, &["add", "-A"]).map_err(after_create)?;
+    let names: Vec<String> = if builtin {
+        let mut names: Vec<String> = templates.iter().map(|(p, _)| p.to_string()).collect();
+        names.extend(files.drain(..).map(|(p, _)| p));
+        names.sort();
+        names
+    } else {
+        let mut names: Vec<String> = git(&dir, &["ls-files"])
+            .map_err(after_create)?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    };
+
+    // The commit takes what is staged now, so what the checks write is never committed.
+    if !builtin {
+        let commands: Vec<String> = d.checks.iter().map(|c| c.command.clone()).collect();
+        crate::mestari::progress("init: running the checks on the generated skeleton");
+        let failed =
+            crate::mestari::skeleton_checks(home, &dir, &commands).map_err(after_create)?;
+        if let Some(failure) = failed {
+            return Err(after_create(anyhow::anyhow!(
+                "the generated {stack} skeleton fails its own check: {failure}\n\nNothing was \
+                 committed or pushed; fix it in the clone, then commit and push by hand"
+            )));
+        }
+    }
 
     let mut labels_created = Vec::new();
     for (label, description) in [
@@ -308,7 +426,6 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
         }
     }
 
-    git(&dir, &["add", "-A"]).map_err(after_create)?;
     git(
         &dir,
         &["commit", "-q", "-m", "Start the project from a walking skeleton"],
@@ -318,7 +435,6 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
             "committing the skeleton; set `user.name` and `user.email` in git, then commit and push by hand",
         ))
     })?;
-    let default_branch = git(&dir, &["symbolic-ref", "--short", "HEAD"]).map_err(after_create)?;
     git(&dir, &["push", "-q", "-u", "origin", &default_branch]).map_err(after_create)?;
 
     Ok(NewReport {
@@ -327,9 +443,10 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
         private,
         directory: dir.display().to_string(),
         stack,
+        skeleton: if builtin { "built-in" } else { "generated" }.to_string(),
         default_branch,
         files: names,
-        checks: d.checks,
+        checks: d.checks.into_iter().map(|c| c.command).collect(),
         labels_created,
         next_steps: vec![
             format!(

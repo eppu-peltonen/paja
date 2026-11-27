@@ -107,11 +107,32 @@ In a checkout of an existing repository, with `gh` signed in and the default bra
 paja init          # --ci also writes a GitHub Actions workflow when the repository has none
 ```
 
-`paja init` finds the stack from the files on the default branch (`Cargo.toml`; `package.json` with its `test` and
-`lint` scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`;
-`go.mod`) and writes, in one pull request from the branch `paja/init`:
+### Detection
 
-- `.paja/checks` and `.paja/commands` for what it found. When it finds nothing it knows, both hold commented templates
+`paja init` runs one agent, on the `init` role in `.paja/models`, to detect the project, whatever its languages. The
+agent reads the default branch in a temporary worktree, under the same deny-list hook and read-only tools as
+`paja triage`, and treats the repository's text (READMEs, scripts, workflows) as data to judge, never as instructions.
+It returns each stack with its directory (so monorepos and workspaces work), its checks, the programs they need, the CI
+setup steps, the high-risk paths, the toolchain versions it finds in files such as `rust-toolchain.toml`, `.nvmrc`,
+`.python-version`, `.tool-versions` and `global.json`, and the services in compose files. When `.github/workflows/`
+already runs test, lint or format commands, it proposes those first, since the project already trusts them. Every item
+names the file that backs it.
+
+Paja keeps only what it can back up: the named file must exist on the default branch, and each check's program must be
+one of the proposal's commands (a check is also one plain command, with no `;`, `|`, `&`, redirects or `$`). Everything
+else is dropped. A stack in a subdirectory gets `cd <dir> && ` in front of its checks. The pull request body lists what
+the agent found, each check with the file it comes from, the environment, and what was dropped, so you review it there
+before merging.
+
+A repository with no `init` line in `.paja/models` runs the agent on the account's default model. `paja init --no-agent`
+skips the agent and uses a small built-in table instead (`Cargo.toml`; `package.json` with its `test` and `lint`
+scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`; `go.mod`).
+The table is also the fallback when `claude` is missing or not signed in, or when the agent's answer is malformed or
+holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`).
+
+`paja init` writes, in one pull request from the branch `paja/init`:
+
+- `.paja/checks` and `.paja/commands` for what it found. When it finds nothing, both hold commented templates
   and `paja init` says to fill in the checks in the pull request.
 - `.paja/models` with Paja's defaults, and `.paja/high-risk` listing `.paja/`, `CLAUDE.md`, `.github/`, `.claude/` and
   the stack's build configuration.
@@ -126,17 +147,34 @@ never the default branch. Read the pull request, change what is wrong, and merge
 merged, on issues with the work label.
 
 If `.paja/checks` is already on the default branch, `paja init` refuses; `--force` writes the files again on the branch.
-`--json` prints what it detected, the files it wrote and the pull request, and the MCP tool `init` returns the same.
+`--json` prints what it detected, the files it wrote and the pull request, and the MCP tool `init` (which takes
+`no_agent`) returns the same. `detected` holds `stacks`, `checks` (each `{command, source, file}`, `source` being
+`agent` or `table`), `commands`, `environment` (`stacks` with each one's `dir`, `toolchains`, `services`), `dropped` (each
+`{item, reason}`) and `fallback`.
 
 ## Starting a new project
 
 For a project that doesn't exist yet, with `gh` signed in:
 
 ```sh
-paja init --new my-app --stack rust     # or node, python; --public for a public repository (default --private)
+paja init --new my-app --stack rust     # or node, python, or any other stack; --public for a public repository (default --private)
 ```
 
-It creates the repository `my-app` under your account with `gh repo create`, clones it to `my-app` in the current
+Without `--stack`, on a terminal, `paja init --new my-app` asks on stdin what you are building and whether you prefer a
+language or framework, shows the recommendations (why, trade-offs and the kind of skeleton) and takes a number or a
+stack name. With `--json`, or with no terminal, `--stack` is required and the error says to run
+`paja init --recommend` first:
+
+```sh
+paja init --recommend "a reading list web app" [--prefer rust]...
+```
+
+An agent on the `init` role, with no repository to read, answers `{recommendations: [{stack, why, tradeoffs,
+skeleton}], questions}`: one to three options, best first. Stated preferences win unless one is a poor fit for what you
+are building, and then `why` says so. `skeleton` is `built-in` for `rust`, `node` and `python`, and `generated`
+otherwise (see below). The MCP tool `init_recommend` (`building`, `prefer`) returns the same JSON.
+
+`--new` creates the repository `my-app` under your account with `gh repo create`, clones it to `my-app` in the current
 directory (`--dir <path>` to clone elsewhere), and pushes one first commit holding a walking skeleton:
 
 - a minimal app with one passing test, with a formatter and a linter configured (Rust: `rustfmt` and `clippy`; Node:
@@ -145,12 +183,35 @@ directory (`--dir <path>` to clone elsewhere), and pushes one first commit holdi
 - the `.paja/` files and `CLAUDE.md` that `paja init` writes for the stack, and `.paja/labels` naming the work label
   `paja` and the follow-up label `paja-follow-up`, which it creates in the repository.
 
-This is the one place Paja pushes to a default branch: the repository is empty and new. The skeletons are templates in
-the binary (`crates/paja/templates/`), so the command needs the network only for GitHub (and for installing the
-stack's tools in CI). When it succeeds it prints the next steps: file an issue with `/paja:spec`, then `paja run --once`.
-If it fails after creating the repository, the error names the repository so you can finish by hand or delete it.
-`--json` prints the repository, the directory, the files, the checks and the next steps; the MCP tool `init` takes
-`new`, `stack`, `public` and `dir` for the same.
+This is the one place Paja pushes to a default branch: the repository is empty and new. The rust, node and python
+skeletons are templates in the binary (`crates/paja/templates/`), the fast path, so for them the command needs the
+network only for GitHub (and for installing the stack's tools in CI). When it succeeds it prints the next steps: file an
+issue with `/paja:spec`, then `paja run --once`. If it fails after creating the repository, the error names the
+repository so you can finish by hand or delete it. `--json` prints the repository, the directory, the stack, the
+`skeleton` kind (`built-in` or `generated`), the files, the checks and the next steps; the MCP tool `init` takes `new`,
+`stack`, `public` and `dir` for the same.
+
+### Generated skeletons
+
+`--stack` takes any language or framework (`go`, `ruby`, `elixir`, `C#`, ...; letters, digits, spaces and `-_.+#/`).
+For one with no template, an agent on the `init` role writes the skeleton instead, in the fresh clone:
+
+1. A first session, with no repository and no tools, names the programs the stack's build, formatter, linter and test
+   runner run. Paja keeps plain program names and drops shells, network tools and the like.
+2. A second session writes a minimal app, one passing test, the formatter's and linter's configuration and a
+   `.gitignore`, and runs the formatter, linter and test until they pass. It runs under the deny-list hook, and the
+   only programs it may run besides local git are the ones from step 1. It can't write `.github/` (the hook refuses CI
+   configuration), and it doesn't commit.
+3. Paja detects the stacks and checks of the result with the same `init` agent that `paja init` uses, writes `.paja/`,
+   `CLAUDE.md` and the workflow in `.github/workflows/paja.yml` from that, and runs every line of `.paja/checks`
+   locally.
+4. Only when every check passes does it make the first commit and push, as it does for a built-in skeleton.
+
+When a check fails, or the detection finds no check, nothing is committed or pushed: the repository exists on GitHub and
+the clone stays with the files, the error names the check that failed (with its output) and says so, and you fix it in
+the clone and commit and push by hand, or delete the repository. The three agent sessions each spend usage on the `init`
+model of `.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox
+(`PAJA_SBX`) the agent and the checks run in it, with the clone mounted.
 
 ## Check the setup
 
@@ -210,9 +271,13 @@ the repository's checkout, because the MCP tools work on the checkout they run i
 
 Paja waits for the pull request's CI before it lands. `.paja/ci`, read from the default branch next to `.paja/checks`,
 says whether the repository has any: `required` (the default when the file is missing) or `none`. With `required`, a
-repository with no GitHub Actions workflow (`gh workflow list` is empty) stops the pass before an item is claimed, with an
-error that names the two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the
-default branch. With `none`, Paja lands on Vasara's checks and the reviewers alone, and says so in the pull request body.
+repository with no active GitHub Actions workflow (`gh workflow list` is empty) stops the run before it claims anything,
+once an item is ready to take (a pass with nothing to take doesn't call GitHub for this), and gives an error that names the
+two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the default branch. The
+check only sees that a workflow exists, not that it runs on pull requests: a repository whose workflows run only on push
+or on a schedule passes it and then waits five minutes for checks that never appear. With `none`, Paja lands on Vasara's
+checks and the reviewers alone, and says so in the pull request body. If the default branch's protection still requires
+status checks, GitHub refuses the merge and the error says so.
 
 ## Paja Desk
 

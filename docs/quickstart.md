@@ -74,7 +74,16 @@ paja init --new my-app --stack node
 cd my-app
 ```
 
-The stacks are `rust`, `node` and `python`, and the repository is private unless you pass `--public`.
+`rust`, `node` and `python` start from a ready-made skeleton; any other stack (`--stack go`) gets one an agent writes,
+and nothing is pushed unless its checks pass. The repository is private unless you pass `--public`. Not sure which
+stack? Leave `--stack` out on a terminal and Paja asks what you are building and which language or framework you
+prefer, shows one to three recommended stacks with their trade-offs, and takes a number or a stack name:
+
+```sh
+paja init --new my-app
+```
+
+`paja init --recommend "a reading list web app" --prefer rust` prints the same recommendations and creates nothing.
 
 Either way the repository gets these files:
 

@@ -168,6 +168,15 @@ pub(super) fn land(
             );
             return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
         }
+        if ci == CiMode::None && text.contains("status check") {
+            return Err(err).with_context(|| {
+                format!(
+                    "{gh} pr merge {pr}: {CI_FILE} is `none`, but the default branch's protection \
+                     still requires status checks; remove that requirement, or put `required` in \
+                     {CI_FILE} and add a workflow"
+                )
+            });
+        }
         return Err(err).with_context(|| format!("{gh} pr merge {pr}"));
     }
     // Merged: from here nothing may turn this into an escalation.

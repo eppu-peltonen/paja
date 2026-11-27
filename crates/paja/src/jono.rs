@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::ahjo::Untampered;
 use crate::events::Event;
 use crate::home::{Home, RunLock};
-use crate::mestari::{StepUsage, EV_ROUND};
+use crate::mestari::{StepUsage, EV_ARBITRATED, EV_ROUND};
 
 /// Most issues one sync reads. A sync that hits it refuses to close anything.
 pub const FETCH_LIMIT: usize = 1000;
@@ -201,6 +201,10 @@ pub const EV_IMPORTED: &str = "work.imported";
 pub const EV_CHANGED: &str = "work.changed";
 pub const EV_CLOSED: &str = "work.closed";
 pub const EV_REOPENED: &str = "work.reopened";
+/// Set on a `work.closed` event when the item is a follow-up that a sync no longer listed
+/// because `.paja/queue` says `follow-ups = off`, so a landed one stays landed when they come
+/// back on.
+const FOLLOW_UPS_OFF: &str = "follow_ups_off";
 pub const EV_STATUS: &str = "work.status";
 /// A person answered an escalated item's question.
 pub const EV_ANSWERED: &str = "work.answered";
@@ -474,6 +478,20 @@ pub struct Answer {
     #[serde(default)]
     pub question: Option<String>,
     pub answer: String,
+    /// Who answered when it wasn't a person: `arbiter` for Mestari's arbiter agent. Absent for
+    /// a person's answer, and in older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+}
+
+/// The `by` of an answer Mestari's arbiter agent gave.
+pub const BY_ARBITER: &str = "arbiter";
+
+impl Answer {
+    /// Whether the arbiter agent gave this answer, not a person.
+    pub fn by_arbiter(&self) -> bool {
+        self.by.as_deref() == Some(BY_ARBITER)
+    }
 }
 
 /// An item's agent usage, totalled over every recorded step. A step whose result lacked a token
@@ -663,6 +681,8 @@ pub fn replay_repo(events: &[Event], repo: &str) -> Result<BTreeMap<u64, WorkIte
 /// carried a repository belong to [`legacy_repo`] (`fallback` is the checkout's repository).
 pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem>> {
     let mut items: BTreeMap<Key, WorkItem> = BTreeMap::new();
+    // Follow-ups whose last close came from `follow-ups = off`, not from GitHub.
+    let mut hidden: BTreeSet<Key> = BTreeSet::new();
     let bad = |event: &Event| format!("event {} ({}) has unexpected data", event.seq, event.kind);
     let legacy = legacy_repo(events, fallback);
     for event in events {
@@ -717,8 +737,19 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
                 if let Some(item) = items.get_mut(&key(n.number)) {
                     item.open = event.kind == EV_REOPENED;
-                    // A landed issue opened again (say after a revert) needs work again.
-                    if item.open && item.status == Status::Landed {
+                    // A landed issue opened again (say after a revert) needs work again, but
+                    // not a follow-up that only comes back because follow-ups are on again.
+                    let back_from_rules = if item.open {
+                        hidden.remove(&key(n.number))
+                    } else {
+                        if event.data[FOLLOW_UPS_OFF] == true {
+                            hidden.insert(key(n.number));
+                        } else {
+                            hidden.remove(&key(n.number));
+                        }
+                        false
+                    };
+                    if item.open && item.status == Status::Landed && !back_from_rules {
                         item.status = Status::Queued;
                         item.note = None;
                     }
@@ -746,7 +777,7 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                     item.answers.push(answered.answer);
                 }
             }
-            EV_ROUND => {
+            EV_ROUND | EV_ARBITRATED => {
                 let round: Round =
                     serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
                 // Steps that aren't a list count as one step whose usage is unknown.
@@ -1573,6 +1604,22 @@ pub fn runnable(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
     Ok(free)
 }
 
+/// The numbers of the items an earlier `paja run` left active in `repo` and no live run holds:
+/// the ones a run without `--item` resumes first.
+pub fn left_active(home: &Home, repo: &str) -> Result<Vec<u64>> {
+    let lock = home.lock()?;
+    let log = home.events();
+    pin_legacy(&lock, &log, repo)?;
+    let (left, _) = run_candidates(&log.read_all()?, repo)?;
+    let mut free = Vec::new();
+    for item in left {
+        if home.try_run_lock(repo, item.number)?.is_some() {
+            free.push(item.number);
+        }
+    }
+    Ok(free)
+}
+
 /// The items of `repo` a run may take, before their run locks are looked at: those an earlier
 /// `paja run` left active (its latest status change was a run's claim), and the ready ones in
 /// priority order. Items a person or another worker claimed with `paja work claim` are in
@@ -1717,7 +1764,7 @@ pub fn sync_with(
             open_outside.insert(number);
         }
     }
-    let report = apply_with(home, &name, &issues, &open_outside)?;
+    let report = apply_listed(home, &name, &issues, &open_outside, rules.follow_ups)?;
     apply_claims(home, &name, &seen, &held)?;
     record_checkout(home, &name, &checkout_top(repo)?)?;
     Ok(report)
@@ -1789,11 +1836,25 @@ pub fn apply_with(
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
+    apply_listed(home, repo, open, open_outside, true)
+}
+
+/// [`apply_with`], where `follow_ups` says whether the sync listed the follow-up label. When it
+/// didn't, a follow-up that closes is recorded as closed by that rule, so a landed one isn't
+/// queued again when follow-ups come back on.
+fn apply_listed(
+    home: &Home,
+    repo: &str,
+    open: &[Issue],
+    open_outside: &BTreeSet<u64>,
+    follow_ups: bool,
+) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
     pin_legacy(&lock, &log, repo)?;
     let events = log.read_all()?;
     let items = replay_repo(&events, repo)?;
+    let back_from_rules = closed_by_rules(&events, repo);
     let recorded: BTreeSet<u64> = waiting_recorded(&events, legacy_repo(&events, repo))
         .into_iter()
         .filter(|(r, _)| r == repo)
@@ -1839,8 +1900,9 @@ pub fn apply_with(
             // A dependency Paja has landed counts as done even before GitHub closes it, unless
             // this very sync finds it opened again.
             .filter(|n| {
-                let reopened =
-                    items.get(n).is_some_and(|i| !i.open) && open.iter().any(|i| i.number == *n);
+                let reopened = items.get(n).is_some_and(|i| !i.open)
+                    && !back_from_rules.contains(n)
+                    && open.iter().any(|i| i.number == *n);
                 let landed = items.get(n).is_some_and(|i| i.status == Status::Landed);
                 (!landed || reopened)
                     && (open.iter().any(|i| i.number == *n) || open_outside.contains(n))
@@ -1864,15 +1926,35 @@ pub fn apply_with(
     for item in items.values() {
         let still_open = open.iter().any(|issue| issue.number == item.number);
         if item.open && !still_open {
-            log.append(
-                &lock,
-                EV_CLOSED,
-                json!({ "repo": repo, "number": item.number }),
-            )?;
+            let mut data = json!({ "repo": repo, "number": item.number });
+            if !follow_ups && item.priority == Priority::FollowUp {
+                data[FOLLOW_UPS_OFF] = json!(true);
+            }
+            log.append(&lock, EV_CLOSED, data)?;
             report.closed.push(item.number);
         }
     }
     Ok(report)
+}
+
+/// The items of `repo` whose last close was a follow-up hidden by `follow-ups = off`.
+fn closed_by_rules(events: &[Event], repo: &str) -> BTreeSet<u64> {
+    let legacy = legacy_repo(events, repo);
+    let mut hidden = BTreeSet::new();
+    for event in events
+        .iter()
+        .filter(|e| e.kind == EV_CLOSED && event_repo(e, legacy) == repo)
+    {
+        let Some(number) = event.data["number"].as_u64() else {
+            continue;
+        };
+        if event.data[FOLLOW_UPS_OFF] == true {
+            hidden.insert(number);
+        } else {
+            hidden.remove(&number);
+        }
+    }
+    hidden
 }
 
 /// Whether the log says this runner holds item `number` of `repo`.
@@ -1915,6 +1997,35 @@ fn apply_claims(
     Ok(())
 }
 
+/// Record the arbiter agent's answer to an escalation Mestari didn't take to the person, and
+/// queue the item again, in one step under the home lock. Like [`answer`] it only touches the
+/// event log; the caller comments on the issue.
+pub fn answer_by_arbiter(
+    home: &Home,
+    repo: &str,
+    number: u64,
+    question: &str,
+    text: &str,
+) -> Result<()> {
+    let lock = home.lock()?;
+    let log = home.events();
+    pin_legacy(&lock, &log, repo)?;
+    log.append(
+        &lock,
+        EV_ANSWERED,
+        json!({
+            "repo": repo, "number": number, "question": question, "answer": text,
+            "by": BY_ARBITER
+        }),
+    )?;
+    log.append(
+        &lock,
+        EV_STATUS,
+        json!({ "repo": repo, "number": number, "status": Status::Queued, "note": null }),
+    )?;
+    Ok(())
+}
+
 /// Answer an escalated item: record the person's answer in the event log and queue the item
 /// again, in one step under the home lock, then post the answer on the issue so it is visible
 /// there too. The next run passes every recorded answer to its agents.
@@ -1932,7 +2043,11 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
         let mut item = replay_repo(&log.read_all()?, &name)?
             .remove(&number)
             .with_context(|| no_item(&name, number))?;
-        if item.status != Status::Escalated {
+        // A queued item whose last answer is the arbiter's hasn't run since: a person may
+        // override that answer, which then comes last in the prompts.
+        let overriding =
+            item.status == Status::Queued && item.answers.last().is_some_and(Answer::by_arbiter);
+        if item.status != Status::Escalated && !overriding {
             bail!(
                 "work item #{number} is {}, not escalated, so there is no question to answer; \
                  check `paja work show {number}`",
@@ -1940,8 +2055,13 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
             );
         }
         let answer = Answer {
-            question: item.note.clone(),
+            question: if overriding {
+                item.answers.last().and_then(|a| a.question.clone())
+            } else {
+                item.note.clone()
+            },
             answer: text.to_string(),
+            by: None,
         };
         log.append(
             &lock,
@@ -2753,6 +2873,44 @@ mod tests {
     }
 
     #[test]
+    fn a_landed_follow_up_hidden_by_follow_ups_off_stays_landed_but_a_real_reopen_requeues() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let follow_up = |number: u64| Issue {
+            priority: Priority::FollowUp,
+            ..issue(number, "tidy")
+        };
+        let both = [issue(1, "a"), follow_up(2), follow_up(3)];
+        apply(&home, &both).unwrap();
+        for n in [1, 2] {
+            set_status(&home, n, Status::Landed, None).unwrap();
+        }
+        // Follow-ups off: the sync lists only the work item.
+        let off = super::apply_listed(&home, R, &both[..1], &BTreeSet::new(), false).unwrap();
+        assert_eq!(off.closed, vec![2, 3]);
+        // A work item that depends on #2 doesn't wait on it once follow-ups are back on.
+        let mut dependent = issue(4, "d");
+        dependent.body = "Depends on #2".into();
+        let mut on = both.to_vec();
+        on.push(dependent);
+        let back = apply(&home, &on).unwrap();
+        assert_eq!(back.reopened, vec![2, 3]);
+        assert_eq!(get(&home, 2).unwrap().status, Status::Landed);
+        assert_eq!(get(&home, 3).unwrap().status, Status::Queued);
+        assert!(get(&home, 4).unwrap().waiting_on.is_empty());
+        // A close GitHub makes (say a revert reopens the issue later) still requeues.
+        apply(&home, &on[..1]).unwrap();
+        apply(&home, &on).unwrap();
+        assert_eq!(get(&home, 2).unwrap().status, Status::Queued);
+        // A work item closed while follow-ups are off isn't marked: it requeues as before.
+        apply(&home, &on).unwrap();
+        set_status(&home, 1, Status::Landed, None).unwrap();
+        super::apply_listed(&home, R, &[], &BTreeSet::new(), false).unwrap();
+        apply(&home, &on).unwrap();
+        assert_eq!(get(&home, 1).unwrap().status, Status::Queued);
+    }
+
+    #[test]
     fn an_escalated_item_is_queued_again_only_by_an_answer() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path()).unwrap();
@@ -2897,11 +3055,13 @@ mod tests {
             [
                 Answer {
                     question: Some("Which API?".into()),
-                    answer: "v2".into()
+                    answer: "v2".into(),
+                    by: None
                 },
                 Answer {
                     question: None,
-                    answer: "Keep it small".into()
+                    answer: "Keep it small".into(),
+                    by: None
                 },
             ]
         );
