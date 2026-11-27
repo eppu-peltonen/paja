@@ -5,8 +5,8 @@ and only `Bash(pwd)` among its tools, still answers with structured output.
 The smoke tests drive this path with a fake `claude` that prints a canned answer, so they can't
 show that a real agent, under the deny-list hook (and, with the sandbox, inside it), returns an
 answer of the right shape. This eval runs `paja --json init --recommend` twice: with the sandbox
-(`PAJA_SBX`, the `sbx` program; a sandbox of the eval's own, removed before and after, so the
-person's `paja` sandbox is never touched) and without. The verdict never rests on the model's report. It
+(`PAJA_SBX`, the `sbx` program, with a sandbox of the eval's own, `paja-eval-recommend`, that the
+person signs Claude Code in to once; their `paja` sandbox is never touched) and without. The verdict never rests on the model's report. It
 comes from evidence:
 
 - `paja` exits 0 and prints one JSON value;
@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,10 @@ STEP_TIMEOUT = 15 * 60
 WINDOWS = os.name == "nt"
 BUILDING = "a small web app where a family keeps its reading list"
 BUILT_IN = {"rust", "node", "python"}
+# The eval's own sandbox and folder, the same every run: the person signs Claude Code in to the
+# sandbox once, and its mounts and toolchain stay valid. The person's `paja` sandbox is never used.
+SANDBOX = "paja-eval-recommend"
+SCRATCH = os.path.join(tempfile.gettempdir(), "paja-eval-recommend")
 
 
 def kill_tree(proc):
@@ -67,26 +72,33 @@ def run(cmd, cwd=None, env=None, timeout=STEP_TIMEOUT):
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
-def sandbox_listed(sbx, name):
-    """Whether `sbx ls` lists the sandbox by name (its first column); None when it can't say."""
-    done = run([sbx, "ls"], timeout=120)
-    if done.returncode != 0:
-        return None
-    return any(line.split()[:1] == [name] for line in done.stdout.splitlines())
+def _force_remove(func, path, _exc):
+    """git writes read-only object files, which Windows won't delete until they are writable."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
 
-def remove_sandbox(sbx, name):
-    """Try the ways `sbx rm` is spelled (some ask for confirmation) until the sandbox is gone."""
-    for args in (["rm", "--force", name], ["rm", "-f", name], ["rm", name]):
-        if sandbox_listed(sbx, name) is False:
-            return True
-        proc = subprocess.Popen([sbx, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
-        try:
-            proc.communicate("y\n", timeout=300)
-        except subprocess.TimeoutExpired:
-            kill_tree(proc)
-    return sandbox_listed(sbx, name) is False
+def reset(root, keep):
+    """Empty `root` but keep the directories in `keep` (emptied) and those on the way to them.
+    The eval's sandbox mounts those, so they stay where the sandbox made on the first run sees
+    them; a directory deleted and made again at the same path may not be visible in it."""
+    kept = [os.path.normcase(os.path.abspath(k)) for k in keep]
+    for k in keep:
+        os.makedirs(k, exist_ok=True)
+
+    def clear(d):
+        for entry in os.listdir(d):
+            p = os.path.join(d, entry)
+            n = os.path.normcase(os.path.abspath(p))
+            if any(k == n or k.startswith(n + os.sep) for k in kept):
+                clear(p)
+            elif os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, onerror=_force_remove)
+            else:
+                os.chmod(p, stat.S_IWRITE)
+                os.remove(p)
+
+    clear(root)
 
 
 def evidence(passed, detail=""):
@@ -124,7 +136,9 @@ def judge(done, paja_home, sandboxed):
     )
     stacks = [str(o.get("stack", "")).strip().lower() for o in options if isinstance(o, dict)] \
         if shaped else []
-    ev["the preferred python is offered"] = evidence("python" in stacks, f"stacks: {stacks}")
+    ev["the preferred python is offered"] = evidence(
+        any("python" in stack for stack in stacks), f"stacks: {stacks}"
+    )
     envs = os.path.join(paja_home, "envs")
     left = sorted(os.listdir(envs)) if os.path.isdir(envs) else []
     # Paja says on stderr which way the agent ran; with PAJA_SBX set it fails closed rather than
@@ -136,11 +150,13 @@ def judge(done, paja_home, sandboxed):
 
 
 def one_case(case, paja, base_env):
-    scratch = tempfile.mkdtemp(prefix="paja-eval-recommend-")
+    scratch = SCRATCH
+    home, paja_home = os.path.join(scratch, "home"), os.path.join(scratch, "paja-home")
+    keep = [os.path.join(paja_home, "envs")]
+    reset(scratch, keep)
     try:
-        home, paja_home = os.path.join(scratch, "home"), os.path.join(scratch, "paja-home")
         cwd = os.path.join(scratch, "work")
-        for d in (home, paja_home, cwd):
+        for d in (home, cwd):
             os.makedirs(d)
         # Claude Code's own sign-in, so the headless agent can run under the temporary HOME.
         real_home = os.path.expanduser("~")
@@ -152,28 +168,21 @@ def one_case(case, paja, base_env):
             shutil.copy(creds, os.path.join(home, ".claude", ".credentials.json"))
         env = dict(base_env)
         env.update({"HOME": home, "USERPROFILE": home, "PAJA_HOME": paja_home})
-        env.pop("PAJA_SBX", None)
-        # The eval's own sandbox, so the person's `paja` sandbox is never used or touched.
-        name = f"paja-eval-recommend-{os.getpid()}"
-        env["PAJA_SBX_NAME"] = name
+        for var in ("PAJA_SBX", "PAJA_SBX_NAME"):
+            env.pop(var, None)
         if case["sandbox"]:
             env["PAJA_SBX"] = case["sandbox"]
-            if not remove_sandbox(case["sandbox"], name):
-                return {"passed": False, "error": f"an earlier sandbox `{name}` can't be removed; "
-                        f"run `sbx rm {name}`, then rerun"}
-        try:
-            done = run(
-                [paja, "--json", "init", "--recommend", BUILDING, "--prefer", "python"], cwd, env
-            )
-        finally:
-            if case["sandbox"] and not remove_sandbox(case["sandbox"], name):
-                print(f"warning: remove the eval's sandbox with `sbx rm {name}`", file=sys.stderr)
+            env["PAJA_SBX_NAME"] = SANDBOX
+        done = run(
+            [paja, "--json", "init", "--recommend", BUILDING, "--prefer", "python"], cwd, env
+        )
         ev = judge(done, paja_home, bool(case["sandbox"]))
         return {"passed": all(e["passed"] for e in ev.values()), "evidence": ev}
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-        if os.path.exists(scratch):
-            print(f"warning: delete {scratch}; it holds a copy of Claude Code's sign-in",
+        try:
+            reset(scratch, keep)
+        except OSError as err:
+            print(f"warning: delete {home}; it holds a copy of Claude Code's sign-in ({err})",
                   file=sys.stderr)
 
 
