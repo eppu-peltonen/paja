@@ -4783,14 +4783,22 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
         let reason = report["items"][kept]["reason"].as_str().unwrap();
         assert!(reason.contains("after the issue was opened"), "{reason}");
     }
-    // The same commit counts for an issue opened before it.
+    // The same commit counts for an issue opened before it that names a file the commit
+    // changes, and not for one that names none.
     std::fs::write(
         dir.join("followups.json"),
-        format!("[{}]", issue(11, "Fix the helper", "2020-01-01T00:00:00Z")),
+        format!(
+            "[{}, {}]",
+            issue(11, "Fix the helper in .paja/checks", "2020-01-01T00:00:00Z"),
+            issue(12, "Fix the helper", "2020-01-01T00:00:00Z")
+        ),
     )
     .unwrap();
     let answer = format!(
-        r#"{{"issues": [{{"number": 11, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}}]}}"#
+        r#"{{"issues": [
+            {{"number": 11, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}},
+            {{"number": 12, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}}
+        ]}}"#
     );
     std::fs::write(
         dir.join("answer.json"),
