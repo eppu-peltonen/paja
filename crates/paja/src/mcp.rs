@@ -58,6 +58,16 @@ pub struct RepoArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct UsageArgs {
+    /// Any path inside the repository. Defaults to the directory the server runs in.
+    repo: Option<String>,
+    /// Only this work item.
+    item: Option<u64>,
+    /// Only steps recorded on or after this UTC date (YYYY-MM-DD).
+    since: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {
     /// Any path inside the repository. Defaults to the directory the server runs in.
     repo: Option<String>,
@@ -300,6 +310,19 @@ impl PajaMcp {
             Ok(serde_json::to_value(crate::mestari::pool::status(
                 &home, &name,
             )?)?)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Mestari: what each work item and each day spent, from the recorded steps: per item the rounds, steps by role and model, tokens, turns, wall time and outcome; totals per day and overall; the median and 90th percentile per landed item. Steps whose usage couldn't be read are counted as unknown, never as zero. `item` keeps one item, `since` (YYYY-MM-DD, UTC) the steps from that date."
+    )]
+    async fn usage(&self, Parameters(args): Parameters<UsageArgs>) -> Result<String, String> {
+        let home = self.home.clone();
+        call(move || {
+            let name = jono::repo_name(&home, &checkout(args.repo)?)?;
+            let report = crate::usage::report(&home, &name, args.item, args.since.as_deref())?;
+            crate::usage::to_json(&report)
         })
         .await
     }

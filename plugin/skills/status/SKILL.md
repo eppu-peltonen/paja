@@ -13,4 +13,6 @@ Use only the `paja` MCP tools and don't run shell commands. Apart from the sync 
 4. Call `log` with `limit` 10 and describe the latest events in plain words (for example "round 2 of #31: the checks failed", "landed #12"), newest first.
 5. Where an item has a `usage` total, give its estimated cost and turns in one short line.
 
+6. Call `usage` with `since` set to today's UTC date (`YYYY-MM-DD`) and mention today's total in one line: steps, tokens in and out, and how many steps were unknown. If it fails or has no steps, say nothing about it.
+
 Keep it short: a few lines per group, no raw JSON.
