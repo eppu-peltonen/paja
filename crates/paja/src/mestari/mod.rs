@@ -52,7 +52,15 @@ pub const CHECKS_FILE: &str = ".paja/checks";
 pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
 /// The model and effort for each agent role, read from the base commit.
 pub const MODELS_FILE: &str = ".paja/models";
+/// Whether the repository has CI Paja waits for before landing (`required` or `none`), read from
+/// the base commit.
 pub const CI_FILE: &str = ".paja/ci";
+/// The default branch when `gh` names none.
+const FALLBACK_BRANCH: &str = "main";
+/// The `gh pr merge` flags landing uses, and the summary names the same ones.
+const SQUASH: &str = "--squash";
+const REBASE: &str = "--rebase";
+const MERGE: &str = "--merge";
 /// The roles `.paja/models` may name, besides `fallback`.
 pub const ROLES: [&str; 8] = [
     "build",
@@ -399,8 +407,8 @@ fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bo
     progress(&format!("repository: {}", item.repo));
     progress(&format!("item: #{} {}", item.number, item.title));
     let method = match target.merge_flag() {
-        Some("--squash") => "by squash",
-        Some("--rebase") => "by rebase",
+        Some(SQUASH) => "by squash",
+        Some(REBASE) => "by rebase",
         Some(_) => "by a merge commit",
         None => "no merge method allowed, so landing escalates",
     };
@@ -424,12 +432,52 @@ fn summary(item: &jono::WorkItem, target: &RepoSettings, ci: CiMode, sandbox: bo
     }
 }
 
-/// Ask on stderr and read a yes or no from stdin.
+/// Ask on stderr and read a yes or no from stdin. `PAJA_TEST_ANSWER` stands in for the person
+/// in tests (the smoke harness has no terminal).
 fn confirmed() -> Result<bool> {
     eprint!("Go ahead? [y/N] ");
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    match std::env::var("PAJA_TEST_ANSWER") {
+        Ok(forced) if cfg!(debug_assertions) => answer = forced,
+        _ => {
+            std::io::stdin().read_line(&mut answer)?;
+        }
+    }
     Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Give an item claimed for this pass back, so stopping before the build leaves the queue as it
+/// was. A resumed item was active already and stays so.
+fn unclaim(home: &Home, repo: &Path, item: &WorkItem, resumed: bool) -> Result<()> {
+    if !resumed {
+        jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
+        // And off GitHub too, where other runners look.
+        jono::release_claim(home, repo, item.number);
+    }
+    Ok(())
+}
+
+/// With required CI the repository must have an active GitHub Actions workflow, or Paja would
+/// wait for checks that never come. It checks that one exists, not that it runs on pull
+/// requests: a repository whose workflows only run on push or on a schedule passes here and
+/// then waits for CI that never reports.
+fn require_workflow(repo: &Path) -> Result<()> {
+    let list = run_gh(repo, &["workflow", "list"]).with_context(|| {
+        format!(
+            "listing the repository's workflows failed (a token without the `workflow` or \
+             `repo` scope does this); fix the sign-in, or put `none` in {CI_FILE} on the default \
+             branch to land on Vasara's checks and the reviewers alone"
+        )
+    })?;
+    if list.is_empty() {
+        bail!(
+            "this repository has no active GitHub Actions workflow, so Paja would wait for CI \
+             that never comes; add a workflow that runs the checks on pull requests, or put \
+             `none` in {CI_FILE} on the default branch to land on Vasara's checks and the \
+             reviewers alone"
+        );
+    }
+    Ok(())
 }
 
 /// Take the next work item and run it to an outcome.
@@ -484,14 +532,6 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         jono::repo_name(home, &repo)?
     };
     let config = read_config(&repo, &base, labels, target)?;
-    // Before an item is claimed: waiting for CI that will never run fails after the whole build.
-    if config.ci == CiMode::Required && run_gh(&repo, &["workflow", "list"])?.is_empty() {
-        bail!(
-            "this repository has no GitHub Actions workflow, so Paja would wait for CI that never \
-             comes; add a workflow that runs the checks on pull requests, or put `none` in \
-             {CI_FILE} on the default branch to land on Vasara's checks and the reviewers alone"
-        );
-    }
     // A new item starts with a build, which a nearly used window would cut off, so it isn't
     // claimed at all (no status events) and the pass waits. A resumed item goes on to its round,
     // which makes the same check for each build.
@@ -531,20 +571,34 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
+    // After the claim, so an idle pass never calls GitHub for it; before the build, because
+    // waiting for CI that will never run fails after the whole build.
+    if config.ci == CiMode::Required {
+        if let Err(err) = require_workflow(&repo) {
+            unclaim(home, &repo, &item, resumed)?;
+            return Err(err);
+        }
+    }
+    if let Some(number) = opts.item {
+        if let Some(other) = jono::left_active(home, &name)?
+            .into_iter()
+            .find(|&n| n != number)
+        {
+            progress(&format!(
+                "#{other} was left active by an earlier run and is not resumed with --item; \
+                 `paja run` without --item resumes it"
+            ));
+        }
+    }
     summary(
         &item,
         &config.target,
         config.ci,
         crate::sandbox::active().is_some(),
     );
-    if opts.confirm && !confirmed()? {
-        // Put the item back, so declining leaves the queue as it was. A resumed item was
-        // active already and stays so.
-        if !resumed {
-            jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
-            // And off GitHub too, where other runners look.
-            jono::release_claim(home, &repo, item.number);
-        }
+    let go = if opts.confirm { confirmed()? } else { true };
+    if !go {
+        unclaim(home, &repo, &item, resumed)?;
         return Err(Declined.into());
     }
     if resumed {
@@ -733,7 +787,7 @@ impl RepoSettings {
         let v: Value = serde_json::from_str(json).ok()?;
         let branch = match v["defaultBranchRef"]["name"].as_str() {
             Some(name) if !name.is_empty() => name.to_string(),
-            _ if v.get("defaultBranchRef").is_none() => "main".to_string(),
+            _ if v.get("defaultBranchRef").is_none() => FALLBACK_BRANCH.to_string(),
             _ => return None,
         };
         let flag = |key: &str, default: bool| v[key].as_bool().unwrap_or(default);
@@ -748,11 +802,11 @@ impl RepoSettings {
     /// The `gh pr merge` flag to land with: squash, else rebase, else a merge commit.
     fn merge_flag(&self) -> Option<&'static str> {
         if self.squash {
-            Some("--squash")
+            Some(SQUASH)
         } else if self.rebase {
-            Some("--rebase")
+            Some(REBASE)
         } else if self.merge_commit {
-            Some("--merge")
+            Some(MERGE)
         } else {
             None
         }

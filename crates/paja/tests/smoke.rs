@@ -2340,6 +2340,16 @@ fn a_repository_without_workflows_stops_before_claiming() {
 }
 
 #[test]
+fn an_idle_pass_does_not_look_for_workflows() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "idle", "{report}");
+    assert!(!f.gh_log().contains("workflow list"), "{}", f.gh_log());
+}
+
+#[test]
 fn a_repository_without_ci_lands_on_the_checks_alone() {
     let f = Factory::new("test -f feature.txt\n", "land");
     std::fs::write(f.tmp.path().join("no-workflows"), "").unwrap();
@@ -3716,6 +3726,103 @@ fn run_once_lands_one_of_two_items_and_says_what_it_will_do_without_asking() {
     // Only one item was taken; the other is still queued.
     let (_, other) = paja(&f.home, &f.repo, &["work", "show", "6"]);
     assert_eq!(other["status"], "queued");
+}
+
+/// `paja --json run <args>` on the factory's checkout with no terminal, and `answer` standing in
+/// for the person (debug builds only): its stdout as JSON and its stderr.
+fn run_args(f: &Factory, args: &[&str], answer: Option<&str>) -> (bool, Value, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+    cmd.current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env_remove("PAJA_SBX")
+        .args(["--json", "run"])
+        .args(args)
+        .stdin(std::process::Stdio::null());
+    if let Some(answer) = answer {
+        cmd.env("PAJA_TEST_ANSWER", answer);
+    }
+    let output = cmd.output().unwrap();
+    let json = serde_json::from_slice(&output.stdout).unwrap();
+    (
+        output.status.success(),
+        json,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn two_items(f: &Factory) {
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 5, "title": "Add a feature file", "body": "Please.", "url": "https://example.com/5"},
+            {"number": 6, "title": "Another", "body": "Later.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn run_item_takes_a_queued_item_that_is_not_the_oldest() {
+    let f = Factory::new("true\n", "land");
+    two_items(&f);
+    let (ok, report, _) = run_args(&f, &["--item", "6"], None);
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["number"], 6, "{report}");
+    let (_, oldest) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(oldest["status"], "queued", "{oldest}");
+}
+
+#[test]
+fn run_item_names_the_way_out_when_the_item_is_not_queued() {
+    let f = Factory::new("true\n", "land");
+    let (ok, report, _) = run_args(&f, &["--item", "9"], None);
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap();
+    assert!(
+        error.contains("#9 is not queued") && error.contains("paja work list"),
+        "{error}"
+    );
+    // The queued item was left alone and no agent ran.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(!f.tmp.path().join("claude-args.log").exists());
+}
+
+#[test]
+fn declining_the_confirmation_leaves_the_queue_as_it_was() {
+    let f = Factory::new("true\n", "land");
+    let (ok, report, stderr) = run_args(&f, &[], Some("n"));
+    assert!(!ok, "{report}");
+    assert!(
+        report["error"].as_str().unwrap().contains("not confirmed"),
+        "{report}"
+    );
+    assert!(stderr.contains("repository: acme/app"), "{stderr}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(!f.tmp.path().join("claude-args.log").exists());
+    // Answering yes goes on to land it.
+    let (ok, report, _) = run_args(&f, &[], Some("y"));
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+}
+
+#[test]
+fn yes_with_every_is_refused() {
+    let f = Factory::new("true\n", "land");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .args(["--json", "run", "--every", "1", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["error"].as_str().unwrap().contains("--yes"),
+        "{report}"
+    );
 }
 
 #[test]

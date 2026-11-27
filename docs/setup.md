@@ -271,9 +271,13 @@ the repository's checkout, because the MCP tools work on the checkout they run i
 
 Paja waits for the pull request's CI before it lands. `.paja/ci`, read from the default branch next to `.paja/checks`,
 says whether the repository has any: `required` (the default when the file is missing) or `none`. With `required`, a
-repository with no GitHub Actions workflow (`gh workflow list` is empty) stops the pass before an item is claimed, with an
-error that names the two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the
-default branch. With `none`, Paja lands on Vasara's checks and the reviewers alone, and says so in the pull request body.
+repository with no active GitHub Actions workflow (`gh workflow list` is empty) stops the run once it has an item to work
+on (a pass with nothing to claim doesn't call GitHub for this), puts the item back, and gives an error that names the
+two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the default branch. The
+check only sees that a workflow exists, not that it runs on pull requests: a repository whose workflows run only on push
+or on a schedule passes it and then waits five minutes for checks that never appear. With `none`, Paja lands on Vasara's
+checks and the reviewers alone, and says so in the pull request body. If the default branch's protection still requires
+status checks, GitHub refuses the merge and the error says so.
 
 ## Paja Desk
 

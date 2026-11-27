@@ -58,8 +58,8 @@ enum Command {
         /// Take this item instead of the oldest queued one.
         #[arg(long, value_name = "NUMBER", conflicts_with = "every")]
         item: Option<u64>,
-        /// Don't ask for confirmation, even on a terminal.
-        #[arg(long)]
+        /// Don't ask for confirmation, even on a terminal. Not with --every, which never asks.
+        #[arg(long, conflicts_with = "every")]
         yes: bool,
         /// After Paja stopped because git's configuration changed during a run: you have
         /// checked and restored the files it named, and Paja may run git in this repository
@@ -562,7 +562,9 @@ fn run(cli: &Cli) -> Result<()> {
             let confirm = every.is_none()
                 && !*yes
                 && !*stop_on_stdin
-                && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                && (std::io::IsTerminal::is_terminal(&std::io::stdin())
+                    // Debug builds only: lets tests answer the question with no terminal.
+                    || (cfg!(debug_assertions) && std::env::var_os("PAJA_TEST_ANSWER").is_some()));
             // The person's word that the repository was checked counts once, for the first
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
