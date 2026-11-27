@@ -179,8 +179,9 @@ fn as_data(text: &str, one_line: bool) -> String {
 }
 
 /// `<` and the characters that look like it, which issue text shows as `‹`. The look-alikes are
-/// a best effort: arrowheads, angle brackets and guillemets from the scripts and symbol blocks
-/// that have them.
+/// a best effort: arrowheads, angle brackets, guillemets and the vertical angle-bracket forms.
+/// Some are real letters or quote marks (Canadian syllabics PA and PO, `«»`), which then read as
+/// angle brackets; the prompt says what `‹` and `›` stand for.
 const OPENING: &[char] = &[
     '<', '\u{AB}', '\u{2C2}', '\u{2F1}', '\u{1438}', '\u{226A}', '\u{22D6}', '\u{2329}',
     '\u{276C}', '\u{276E}', '\u{2770}', '\u{27E8}', '\u{29FC}', '\u{3008}', '\u{300A}', '\u{FE3F}',
@@ -1211,6 +1212,10 @@ mod tests {
             "{prompt}"
         );
         assert!(!prompt.chars().any(is_invisible), "{prompt}");
+        assert!(
+            prompt.contains("`‹` and `›` stand for any angle bracket"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -1297,6 +1302,33 @@ mod tests {
             assert!(!is_invisible(c), "U+{:04X}", c as u32);
         }
         // Brackets that look like angle brackets become the same escapes.
+        // The look-alike pairs, written out again apart from `OPENING` and `CLOSING`.
+        let pairs: &[(u32, u32)] = &[
+            (0x3C, 0x3E),
+            (0xAB, 0xBB),
+            (0x2C2, 0x2C3),
+            (0x2F1, 0x2F2),
+            (0x1438, 0x1433),
+            (0x226A, 0x226B),
+            (0x22D6, 0x22D7),
+            (0x2329, 0x232A),
+            (0x276C, 0x276D),
+            (0x276E, 0x276F),
+            (0x2770, 0x2771),
+            (0x27E8, 0x27E9),
+            (0x29FC, 0x29FD),
+            (0x3008, 0x3009),
+            (0x300A, 0x300B),
+            (0xFE3F, 0xFE40),
+            (0xFE64, 0xFE65),
+            (0xFF1C, 0xFF1E),
+        ];
+        let listed: Vec<(u32, u32)> = OPENING
+            .iter()
+            .zip(CLOSING)
+            .map(|(&open, &close)| (open as u32, close as u32))
+            .collect();
+        assert_eq!(listed, pairs);
         assert_eq!(OPENING.len(), CLOSING.len());
         let looks: String = OPENING
             .iter()
