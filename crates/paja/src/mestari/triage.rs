@@ -307,11 +307,17 @@ fn check_evidence(
         && !file.starts_with(['-', '/'])
         && !file.split(['/', '\\']).any(|part| part == "..")
         && names_file(issue, file)
-        && read_from_base(repo, base, file).ok().flatten().is_some()
+        && is_file_on(repo, base, file)
     {
         shown.push(format!("file `{file}`"));
     }
     (!shown.is_empty()).then(|| shown.join(", "))
+}
+
+/// Whether `file` is a file (not a directory) on `base`.
+fn is_file_on(repo: &Path, base: &str, file: &str) -> bool {
+    git(repo, &["cat-file", "-t", &format!("{base}:{file}")])
+        .is_ok_and(|kind| kind.trim() == "blob")
 }
 
 /// Whether `issue`'s title or body names `file`: the whole path, or its file name when that
@@ -319,12 +325,18 @@ fn check_evidence(
 fn names_file(issue: &Open, file: &str) -> bool {
     let file = file.replace('\\', "/");
     let file = file.trim_start_matches("./");
+    // A path to a file: no empty, `.` or `..` part, so `./`, `a//b` or a directory name with a
+    // trailing `/` never matches the empty words between two separators.
+    if file.split('/').any(|part| matches!(part, "" | "." | "..")) {
+        return false;
+    }
     let text = format!("{}\n{}", issue.title, issue.body).replace('\\', "/");
     let name = file.rsplit('/').next().unwrap_or(file);
     // The words of the text that could be paths, without quotes or trailing punctuation.
     let words = text
         .split(|c: char| !(c.is_alphanumeric() || "/._-".contains(c)))
-        .map(|word| word.trim_end_matches('.').trim_start_matches("./"));
+        .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
+        .filter(|word| !word.is_empty());
     let is = |word: &str, path: &str| word == path || word.ends_with(&format!("/{path}"));
     let named_name = name.contains('.') && name.len() > 3;
     words
@@ -622,7 +634,18 @@ mod tests {
         ] {
             assert!(names_file(&issue, named), "{named}");
         }
-        for unnamed in ["README.md", "crates/paja/src/mod.rs", "docs", "a.rs"] {
+        for unnamed in [
+            "README.md",
+            "crates/paja/src/mod.rs",
+            "docs",
+            "a.rs",
+            "./",
+            ".\\",
+            "././",
+            "",
+            "crates/paja/",
+            "crates//paja/src/hook.rs",
+        ] {
             assert!(!names_file(&issue, unnamed), "{unnamed}");
         }
     }

@@ -4704,10 +4704,12 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
     std::fs::write(
         dir.join("followups.json"),
         format!(
-            "[{}, {}, {}]",
+            "[{}, {}, {}, {}, {}]",
             issue(11, "Fix the helper", "2099-01-01T00:00:00Z"),
             issue(12, "Fix the helper too", "2020-01-01T00:00:00Z"),
-            issue(13, "Say more in .paja/checks.", "2020-01-01T00:00:00Z")
+            issue(13, "Say more in .paja/checks.", "2020-01-01T00:00:00Z"),
+            issue(14, "Tidy, then tidy: again", "2020-01-01T00:00:00Z"),
+            issue(15, "Sort out .paja", "2020-01-01T00:00:00Z")
         ),
     )
     .unwrap();
@@ -4715,7 +4717,9 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
         r#"{{"issues": [
             {{"number": 11, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}},
             {{"number": 12, "verdict": "already_fixed", "file": ".paja/checks", "reason": "Fixed."}},
-            {{"number": 13, "verdict": "already_fixed", "file": ".paja/checks", "reason": "Fixed."}}
+            {{"number": 13, "verdict": "already_fixed", "file": ".paja/checks", "reason": "Fixed."}},
+            {{"number": 14, "verdict": "already_fixed", "file": "./", "reason": "Fixed."}},
+            {{"number": 15, "verdict": "already_fixed", "file": ".paja", "reason": "Fixed."}}
         ]}}"#
     );
     std::fs::write(
@@ -4726,7 +4730,8 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
     let (ok, report) = triage(&f, &dir);
     assert!(ok, "{report}");
     assert_eq!(report["closed"], serde_json::json!([13]), "{report}");
-    for kept in [0, 1] {
+    // Neither the top of the tree nor a directory the issue names is a file that shows a fix.
+    for kept in [0, 1, 3, 4] {
         assert_eq!(report["items"][kept]["verdict"], "keep", "{report}");
         let reason = report["items"][kept]["reason"].as_str().unwrap();
         assert!(reason.contains("after the issue was opened"), "{reason}");
