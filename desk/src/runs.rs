@@ -363,11 +363,12 @@ mod tests {
         let home = Home::at(dir.path().join("home")).unwrap();
         let checkout = dir.path().join("app");
         std::fs::create_dir_all(&checkout).unwrap();
-        // A `paja` that reads stop lines and never ends.
+        // A `paja` that says when it is up, reads stop lines and never ends.
         let stuck = dir.path().join("stuck");
+        let up = dir.path().join("stuck.up");
         std::fs::write(
             &stuck,
-            "#!/bin/sh\nwhile read -r line; do echo \"got: $line\"; done\nsleep 60\n",
+            "#!/bin/sh\ntouch \"$0.up\"\nwhile read -r line; do echo \"got: $line\"; done\nsleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -384,7 +385,16 @@ mod tests {
         stuck
             .start(&home, "acme/lib", &checkout, false, None)
             .unwrap();
-        stuck.stop_all_now(Duration::from_millis(500));
+        // Stop it only once it is reading, and give it time to echo the line on a slow machine.
+        let waited = std::time::Instant::now();
+        while !up.exists() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(30),
+                "the stuck run never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stuck.stop_all_now(Duration::from_secs(2));
         assert!(stuck.running().is_empty());
         let output = stuck.status(&home, "acme/lib")["output"]
             .as_str()
