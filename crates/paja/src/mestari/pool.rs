@@ -51,6 +51,11 @@ pub const MAX_LANES: u32 = 32;
 /// How often the pool looks at its lanes and the lane count.
 const TICK: Duration = Duration::from_millis(500);
 
+/// How long [`Pool::stop_all`] waits for its lanes after `stop now` before it ends the ones
+/// still going: longer than a lane's own run takes to stop at once, so only a stuck one is
+/// ended.
+const STOP_GRACE: Duration = Duration::from_secs(30);
+
 pub struct PoolOptions<'a> {
     /// Any path inside the repository's main checkout.
     pub repo: &'a Path,
@@ -493,9 +498,10 @@ impl Pool<'_> {
         for lane in self.lanes.values_mut() {
             lane.tell("stop now");
         }
-        for lane in self.lanes.values_mut() {
-            let _ = lane.child.wait();
-        }
+        stop_children(
+            self.lanes.values_mut().map(|lane| &mut lane.child),
+            STOP_GRACE,
+        );
         self.lanes.clear();
     }
 
@@ -505,6 +511,24 @@ impl Pool<'_> {
         } else {
             println!("error: {err:#}");
         }
+    }
+}
+
+/// Wait for `children`, told to stop, to end, up to `grace` in all, then end the ones still
+/// going, so a run that never ends can't hang the pool.
+fn stop_children<'c>(children: impl Iterator<Item = &'c mut Child>, grace: Duration) {
+    let mut children: Vec<&mut Child> = children.collect();
+    let deadline = Instant::now() + grace;
+    loop {
+        children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        if children.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for child in children {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -1143,6 +1167,21 @@ pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_ends_a_lane_that_never_stops() {
+        let mut quick = Command::new("true").spawn().unwrap();
+        let mut stuck = Command::new("sleep").arg("60").spawn().unwrap();
+        let started = Instant::now();
+        stop_children(
+            [&mut quick, &mut stuck].into_iter(),
+            Duration::from_millis(300),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(stuck.try_wait().unwrap().is_some());
+        assert!(quick.try_wait().unwrap().is_some());
+    }
 
     fn event(seq: u64, kind: &str, data: Value) -> Event {
         Event {
