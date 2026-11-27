@@ -39,16 +39,7 @@ pub fn touches_line(body: &str) -> Option<Vec<String>> {
     })?;
     let paths: Vec<String> = line
         .split([',', ' ', '\t'])
-        .map(|p| {
-            let p = p.trim_matches(['`', '"', '\'', '*', '(', ')', ';', ':']);
-            // A sentence's full stop, but not `.` itself (the whole repository).
-            if p.len() > 1 && p.ends_with('.') && !p.ends_with("..") {
-                &p[..p.len() - 1]
-            } else {
-                p
-            }
-        })
-        .map(|p| p.trim_matches(['`', '"', '\'', '*', '(', ')', ';', ':']))
+        .map(token)
         .filter(|p| {
             !p.is_empty()
                 && !["and", "or", "&", "+", "none", "nothing"]
@@ -58,6 +49,57 @@ pub fn touches_line(body: &str) -> Option<Vec<String>> {
         .map(clean)
         .collect();
     (!paths.is_empty()).then_some(paths)
+}
+
+/// The punctuation around a path in a sentence, other than brackets and a full stop.
+const PUNCTUATION: [char; 6] = ['`', '"', '\'', '*', ';', ':'];
+
+/// One word of a `Touches:` line without the sentence around it: quotes and punctuation, a
+/// full stop (but not `.` itself, the whole repository), and a bracket only when it has no
+/// partner in the word, so `src/app/(auth)/` keeps its brackets. A word wrapped whole, such as
+/// `(src/a.rs)`, loses that pair when the inside looks like a path (has a `/` or `.`).
+fn token(word: &str) -> &str {
+    let mut p = word;
+    loop {
+        let before = p;
+        p = p.trim_matches(PUNCTUATION);
+        if p.len() > 1 && p.ends_with('.') && !p.ends_with("..") {
+            p = &p[..p.len() - 1];
+        }
+        let open = p.matches('(').count();
+        let close = p.matches(')').count();
+        if open > close {
+            p = p.strip_prefix('(').unwrap_or(p);
+        } else if close > open {
+            p = p.strip_suffix(')').unwrap_or(p);
+        } else if let Some(inner) = p.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+            if wraps_whole(p) && inner.contains(['/', '.']) {
+                p = inner;
+            }
+        }
+        if p == before {
+            return p;
+        }
+    }
+}
+
+/// Whether a word's first `(` is closed only by its last `)`, as in `(src/(a)/b.rs)` but not
+/// `(a)/(b)`.
+fn wraps_whole(word: &str) -> bool {
+    let mut depth = 0usize;
+    for (i, c) in word.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i == word.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The path plans use for the whole repository, which overlaps every other.
@@ -329,6 +371,19 @@ mod tests {
             ])
         );
         assert_eq!(touches_line("Touches: none"), None);
+        // A bracket that belongs to the path stays; one from the sentence goes.
+        assert_eq!(
+            touches_line(
+                "Touches: src/app/(auth) (auth)/x.tsx (src/a.rs), (src/app/(b)/c.ts). (a)/(b)"
+            ),
+            Some(vec![
+                "src/app/(auth)".into(),
+                "(auth)/x.tsx".into(),
+                "src/a.rs".into(),
+                "src/app/(b)/c.ts".into(),
+                "(a)/(b)".into()
+            ])
+        );
         assert_eq!(touches_line("Touches: `.`"), Some(vec![WHOLE.into()]));
     }
 

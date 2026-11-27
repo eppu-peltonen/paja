@@ -186,7 +186,7 @@ A pool admits an item to a lane only when the files it will touch don't overlap 
 (`crates/paja/src/mestari/plan.rs`). Before a lane starts it, the pool plans the item in a `paja pool plan <number>` of
 its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; recorded as `pool.planning`):
 the item's `Touches:` line names the paths when it has one (`source: spec`; the words `and`, `or`, `none` and
-`nothing` and a sentence's punctuation are skipped, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
+`nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
 `plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). The plan,
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
