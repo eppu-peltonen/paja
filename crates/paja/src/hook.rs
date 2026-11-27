@@ -717,8 +717,11 @@ fn short_name_of_protected(word: &str) -> bool {
         return false;
     }
     let chars: Vec<char> = stem.chars().collect();
-    let hashed = (chars.len() == 6 && chars[2..].iter().all(char::is_ascii_hexdigit))
-        .then(|| chars[..2].iter().collect::<String>());
+    // Eight characters in all: a longer counter (`GI3F2~10`) takes the hash's last digit.
+    let hashed = (chars.len() >= 3
+        && chars.len() + 1 + digits == 8
+        && chars[2..].iter().all(char::is_ascii_hexdigit))
+    .then(|| chars[..2].iter().collect::<String>());
     PROTECTED_NAMES.iter().any(|name| {
         let name = name.trim_start_matches('.').to_uppercase();
         name.starts_with(stem) || hashed.as_ref().is_some_and(|two| name.starts_with(two))
@@ -1872,6 +1875,7 @@ mod program_tests {
             "npm test 'out=clippy.toml '",
             "npm test 'clippy.toml::$DATA'",
             "npm test 'x=GIT~1.'",
+            "npm test GI3F2~10",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
