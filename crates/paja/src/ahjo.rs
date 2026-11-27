@@ -451,6 +451,11 @@ pub fn clear_tampered(home: &Home, path: &Path) -> Result<String> {
     Ok(key)
 }
 
+/// The top of the checkout `ok` proved safe (it may have been named by a folder inside it).
+pub(crate) fn top_level(ok: &Untampered) -> Result<PathBuf> {
+    git(ok, ok.path(), &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+}
+
 /// The main repository's top level for any path inside it, even from inside a linked
 /// worktree (an agent creating an environment from within its own environment) or a
 /// submodule. git lists the main worktree first.

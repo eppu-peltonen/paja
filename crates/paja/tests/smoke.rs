@@ -792,7 +792,7 @@ fn the_mcp_server_answers_and_files_issues() {
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"issue create\") echo https://example.com/9 ;;\n\
@@ -825,7 +825,11 @@ fn the_mcp_server_answers_and_files_issues() {
     assert!(ok, "{filed}");
     assert_eq!(filed["url"], "https://example.com/9");
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
-    assert!(log.contains("issue comment 3 --body"), "{log}");
+    assert!(
+        log.contains("issue comment 3 --body-file")
+            && log.contains("\n**Answer to Paja's question.**"),
+        "{log}"
+    );
     assert!(
         log.contains(
             "issue create --label factory --title Add a status page --body What to build."
@@ -873,7 +877,7 @@ fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
         dir,
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {log}\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {log}; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              *) cat {issues} ;;\nesac\n",
             log = slash(&dir.join("gh.log")),
@@ -1029,7 +1033,7 @@ fn work_waits_on_open_dependencies_until_they_close() {
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"api repos/\"*) cat {d}/state-${{2##*/}} ;;\n\
@@ -1103,7 +1107,7 @@ fn work_answer_says_when_it_cannot_read_the_labels_file() {
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              *) ;;\nesac\n"
@@ -1165,7 +1169,7 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"issue list\") cat {d}/issues.json ;;\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"issue create\") echo https://example.com/9 ;;\n\
@@ -1225,20 +1229,26 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
             .contains("paja work answer 3"),
         "{err}"
     );
-    let (ok, item) = paja_with(&home, &repo, &["work", "answer", "3", "Use v2"], &with_gh);
+    let (ok, item) = paja_with(
+        &home,
+        &repo,
+        &["work", "answer", "3", "Use v2, ask @octocat"],
+        &with_gh,
+    );
     assert!(ok, "{item}");
     assert_eq!(item["status"], "queued");
     assert_eq!(item["note"], Value::Null);
     assert_eq!(
         item["answers"],
-        serde_json::json!([{"question": "Which API?", "answer": "Use v2"}])
+        serde_json::json!([{"question": "Which API?", "answer": "Use v2, ask @octocat"}])
     );
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(
-        log.contains("issue comment 3 --body **Answer to Paja's question.**"),
+        log.contains("issue comment 3 --body-file")
+            && log.contains("\n**Answer to Paja's question.**"),
         "{log}"
     );
-    assert!(log.contains("Use v2"), "{log}");
+    assert!(log.contains("Use v2, ask @\u{200b}octocat"), "{log}");
 
     let (ok, filed) = paja_with(
         &home,
@@ -1283,7 +1293,7 @@ fn a_repository_names_its_own_work_and_follow_up_labels() {
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/game\"}}' ;;\n\
              \"issue list\") case \"$*\" in *\"--label game \"*) echo '[{{\"number\": 4, \"title\": \"Add a boss\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; *) echo '[]' ;; esac ;;\n\
              \"issue create\") echo https://example.com/9 ;;\n\
@@ -1318,7 +1328,7 @@ fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
         dir,
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"issue list\") case \"$*\" in \
              *\"--label factory-follow-up \"*) echo '[{{\"number\": 2, \"title\": \"Tidy\", \"body\": \"\", \"url\": \"https://example.com/2\"}}]' ;; \
@@ -1648,7 +1658,7 @@ fn gh_naming(dir: &Path, name: &str, issues: &str) -> std::path::PathBuf {
         dir,
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"{name}\"}}' ;;\n\
              \"issue list\") cat {d}/issues.json ;;\n\
              *) ;;\nesac\n"
@@ -2220,7 +2230,7 @@ impl Factory {
         let gh = script(
             "gh",
             format!(
-                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && cat \"$a\" >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
+                "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
                  \"repo view\") echo '{view}' ;;\n\
                  \"workflow list\") if [ -f {d}/workflows-down ]; then echo 'HTTP 403: Resource not accessible' >&2; exit 1; fi\n\
@@ -2243,17 +2253,20 @@ impl Factory {
                  if [ ! -f {d}/claim-vanishes ]; then printf '{{\"body\": \"%s\", \"url\": \"https://example.com/acme/app/issues/%s#issuecomment-%s\"}}\\n' \"$5\" \"$3\" \"$id\" >> {d}/posted-$3; fi\n\
                  echo https://example.com/acme/app/issues/$3#issuecomment-$id ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi\n\
-                 if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi ;;\n\
-                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; id=${{4##*/}}; if [ \"$id\" -ge 88 ] 2>/dev/null; then if [ -f {d}/posted-5 ]; then grep -v \"issuecomment-$id\\\"\" {d}/posted-5 > {d}/posted-5.tmp; mv {d}/posted-5.tmp {d}/posted-5; fi; else rm -f {d}/view-5.json; fi; fi ;;\n\
+                 if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
+                 case \"$*\" in *\"--add-label factory-claimed\"*) touch {d}/labelled-$3 ;; *\"--remove-label factory-claimed\"*) rm -f {d}/labelled-$3 ;; esac ;;\n\
+                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; id=${{4##*/}}; if [ \"$id\" -ge 88 ] 2>/dev/null; then if [ -f {d}/posted-5 ]; then grep -v \"issuecomment-$id\\\"\" {d}/posted-5 > {d}/posted-5.tmp; mv {d}/posted-5.tmp {d}/posted-5; fi; for x in {d}/after-race-before {d}/after-race-after; do if [ -f $x ] && grep -q \"issuecomment-$id\\\"\" $x; then rm -f $x; fi; done; else rm -f {d}/view-5.json; fi; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-down ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  p=; if [ -f {d}/posted-$3 ]; then p=$(tr '\\n' ',' < {d}/posted-$3 | sed 's/,$//'); fi\n\
                  if [ -f {d}/claim-goes-stale ] && [ -f {d}/race-read ]; then p=$(echo \"$p\" | sed 's/stale after [^\"]*/stale after 2020-01-02T00:00:00Z/')\n\
                  if [ -f {d}/then-claimed ]; then if [ -n \"$p\" ]; then p=\"$p,\"; fi; p=\"$p{{\\\"body\\\": \\\"Claimed by runner abc123 at 2020-01-01T00:00:00Z; stale after 2999-01-01T00:00:00Z\\\", \\\"url\\\": \\\"https://example.com/acme/app/issues/5#issuecomment-77\\\"}}\"; fi; fi\n\
-                 if [ -f {d}/claim-goes-stale ] && [ -n \"$p\" ]; then touch {d}/race-read; fi\n\
+                 if [ -f {d}/race-read ] && [ -f {d}/after-race-before ]; then b=$(cat {d}/after-race-before); if [ -n \"$p\" ]; then p=\"$b,$p\"; else p=$b; fi; fi\n\
+                 if [ -f {d}/race-read ] && [ -f {d}/after-race-after ]; then a=$(cat {d}/after-race-after); if [ -n \"$p\" ]; then p=\"$p,$a\"; else p=$a; fi; fi\n\
+                 if [ -n \"$p\" ]; then touch {d}/race-read; fi\n\
+                 l='[]'; if [ -f {d}/labelled-$3 ]; then l='[{{\"name\": \"factory-claimed\"}}]'; fi\n\
                  if [ -f {d}/view-$3.json ] && [ -n \"$p\" ]; then sed -e \"s|\\\"comments\\\":\\[\\]|\\\"comments\\\":[$p]|\" -e t -e \"s|],\\\"labels\\\"|,$p],\\\"labels\\\"|\" {d}/view-$3.json\n\
                  elif [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json\n\
-                 elif [ -n \"$p\" ]; then echo \"{{\\\"labels\\\": [], \\\"comments\\\": [$p]}}\"\n\
-                 else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
+                 else echo \"{{\\\"labels\\\": $l, \\\"comments\\\": [$p]}}\"; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -2291,6 +2304,7 @@ impl Factory {
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
                  if [ -f {d}/build-429 ]; then echo \"{{\\\"is_error\\\": true, \\\"api_error_status\\\": 429, \\\"result\\\": \\\"Claude usage limit reached|$(cat {d}/reset-at 2>/dev/null)\\\", \\\"session_id\\\": \\\"s-1\\\", \\\"total_cost_usd\\\": 0.3}}\"; exit 1; fi\n\
+                 if [ -f {d}/ask.json ]; then cat {d}/ask.json; git checkout -q -- . ; exit 0; fi\n\
                  if [ -f {d}/ask ]; then printf '%s\\n' '{{\"is_error\": false, \"result\": \"I need a decision.\\nPAJA-QUESTION: Which API, A or B? I recommend A.\"}}'; git checkout -q -- . ; exit 0; fi\n\
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
@@ -4563,7 +4577,8 @@ fn the_arbiter_answers_a_reviewer_escalation_and_the_item_is_queued_again() {
         serde_json::json!({
             "verdict": "answer",
             "answer": "Use v2; the issue names it.",
-            "reason": "The issue says which API."
+            // Agent text on a public issue: a path under the factory home and a mention.
+            "reason": format!("The issue says which API; see {} and @octocat.", f.home.join("envs").display()),
         }),
     );
     let (ok, report) = run_notified(&f, &notifier);
@@ -4589,6 +4604,15 @@ fn the_arbiter_answers_a_reviewer_escalation_and_the_item_is_queued_again() {
         gh.contains("answered this instead of asking you") && gh.contains("paja work answer 5"),
         "{gh}"
     );
+    assert!(gh.contains("issue comment 5 --body-file"), "{gh}");
+    assert!(
+        gh.contains(&format!(
+            "see <factory home>{}envs and @\u{200b}octocat",
+            std::path::MAIN_SEPARATOR
+        )),
+        "{gh}"
+    );
+    assert!(!gh.contains("and @octocat"), "{gh}");
     assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty());
     assert!(events_of(&f, "notify.sent").is_empty());
     assert!(events_of(&f, "run.escalated").is_empty());
@@ -4938,6 +4962,50 @@ fn the_builder_can_ask_for_a_decision() {
 }
 
 #[test]
+fn an_escalation_comment_hides_the_factory_home_and_mentions_no_one() {
+    let f = Factory::new("false\n", "land");
+    // The builder's question quotes a path under the factory home, which lies outside the
+    // user's home here, and a GitHub handle.
+    let log = f.home.join("envs").join("app-1").join("check.log");
+    // Long enough to be cut: the instructions after it must still be there.
+    let question = format!(
+        "The check failed, see {}; ask @octocat. A or B?\n{}",
+        log.display(),
+        "x".repeat(25_000)
+    );
+    std::fs::write(
+        f.tmp.path().join("ask.json"),
+        serde_json::json!({
+            "is_error": false,
+            "result": format!("I need a decision.\nPAJA-QUESTION: {question}"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let gh = f.gh_log();
+    assert!(gh.contains("issue comment 5"), "{gh}");
+    assert!(gh.contains("<factory home>"), "{gh}");
+    // The log names the body's file, under the factory home; the body itself doesn't.
+    assert!(!gh.contains(&log.display().to_string()), "{gh}");
+    assert!(gh.contains("issue comment 5 --body-file"), "{gh}");
+    assert!(gh.contains("ask @\u{200b}octocat"), "{gh}");
+    assert!(!gh.contains("ask @octocat"), "{gh}");
+    assert!(gh.contains("(cut short)"), "not cut");
+    assert!(
+        gh.contains("Answer with `paja work answer 5"),
+        "the instructions were cut"
+    );
+    // The body's file is gone once gh is done.
+    let left: Vec<_> = std::fs::read_dir(f.home.join("tmp"))
+        .map(|dir| dir.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
 fn run_escalates_when_the_reviewer_asks_a_question() {
     let f = Factory::new("true\n", "escalate");
     let (ok, report) = f.run();
@@ -4945,7 +5013,7 @@ fn run_escalates_when_the_reviewer_asks_a_question() {
     assert_eq!(report["outcome"], "escalated");
     assert_eq!(report["question"], "Which API?");
     assert!(
-        f.gh_log().contains("issue comment 5 --body"),
+        f.gh_log().contains("issue comment 5 --body-file"),
         "{}",
         f.gh_log()
     );
@@ -5038,12 +5106,13 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
         &dir,
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"workflow list\") echo 'CI	active	1' ;;\n\
              \"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/followups.json ;; *) echo '[]' ;; esac ;;\n\
-             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi; \
-             if [ -f {d}/comment-posts-then-fails ]; then n=$3; shift 3; echo \"$2\" | head -n 1 >> {d}/posted-$n; echo 'connection reset' >&2; exit 1; fi ;;\n\
+             \"issue comment\") if [ -f {d}/comment-fails ] && grep -q 'as a duplicate of this issue' \"$5\"; then echo 'comment refused' >&2; exit 1; fi; \
+             if [ -f {d}/close-comment-fails ] && ! grep -q 'as a duplicate of this issue' \"$5\"; then echo 'comment refused' >&2; exit 1; fi; \
+             if [ -f {d}/comment-posts-then-fails ] && grep -q 'as a duplicate of this issue' \"$5\"; then head -n 1 \"$5\" >> {d}/posted-$3; echo 'connection reset' >&2; exit 1; fi ;;\n\
              \"api user\") if [ -f {d}/user-fails ]; then echo 'HTTP 403' >&2; exit 1; fi; echo paja-bot ;;\n\
              \"api \"*) case \"$2\" in *comments) if [ -f {d}/comments-fail ]; then echo 'HTTP 502' >&2; exit 1; fi; \
              n=${{2#*issues/}}; n=${{n%%/*}}; if [ -f {d}/posted-$n ]; then cat {d}/posted-$n; fi ;; esac ;;\n\
@@ -5109,14 +5178,18 @@ fn triage_closes_a_duplicate_and_an_already_fixed_issue_and_reports_all_three() 
         "{report}"
     );
     let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
-    assert!(log.contains("issue close 12 --comment"), "{log}");
+    // Closed, then the reason posted from a file.
+    assert!(log.lines().any(|l| l == "issue close 12"), "{log}");
+    assert!(log.contains("issue comment 12 --body-file"), "{log}");
     // The original, which stays open, notes the duplicate so its finding isn't lost.
     assert!(
-        log.contains("issue comment 11 --body **Paja triage closed #12 (Tidy the helper, again)"),
+        log.contains("issue comment 11 --body-file")
+            && log.contains("\n**Paja triage closed #12 (Tidy the helper, again)"),
         "{log}"
     );
-    assert!(!log.contains("issue comment 13"), "{log}");
-    assert!(log.contains("issue close 13 --comment"), "{log}");
+    // An already-fixed issue gets only its own closing comment, no note elsewhere.
+    assert_eq!(log.matches("issue comment 13 ").count(), 1, "{log}");
+    assert!(log.lines().any(|l| l == "issue close 13"), "{log}");
     assert!(!log.contains("issue close 11"), "{log}");
     assert!(
         log.contains("closed this issue as a duplicate of #11"),
@@ -5398,7 +5471,7 @@ fn triage_closes_a_duplicate_of_a_follow_up_a_later_pass_reads() {
     );
     assert!(!prompt.contains("details of 61."), "{prompt}");
     let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
-    assert!(log.contains("issue close 1 --comment"), "{log}");
+    assert!(log.lines().any(|l| l == "issue close 1"), "{log}");
     assert!(log.contains("a duplicate of #62"), "{log}");
     assert!(!log.contains("issue close 62"), "{log}");
 }
@@ -5455,8 +5528,8 @@ fn triage_lists_at_most_two_hundred_later_follow_ups_and_keeps_a_duplicate_of_on
         .collect();
     assert_eq!(kept, (2..=60).collect::<Vec<u64>>(), "{ran:?}");
     let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
-    assert!(log.contains("issue close 1 --comment"), "{log}");
-    assert!(!log.contains("issue close 2 "), "{log}");
+    assert!(log.lines().any(|l| l == "issue close 1"), "{log}");
+    assert!(!log.lines().any(|l| l == "issue close 2"), "{log}");
 }
 
 #[test]
@@ -5507,6 +5580,35 @@ fn triage_gives_every_follow_up_a_turn_past_the_first_sixty() {
     assert_eq!(&numbers[..3], [61, 62, 1], "{report}");
     assert_eq!(numbers.len(), 60, "{report}");
     assert!(prompt().contains("details of 62."), "{}", prompt());
+}
+
+#[test]
+fn an_issue_whose_reason_cant_be_posted_is_left_open_and_no_note_is_pending() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("close-comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    // Without its reason, #12 isn't closed, and its original gets no note.
+    assert_eq!(report["closed"], serde_json::json!([]), "{report}");
+    assert_eq!(report["items"][1]["closed"], false, "{report}");
+    let error = report["items"][1]["error"].as_str().unwrap();
+    assert!(error.contains("left open"), "{error}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(!log.lines().any(|l| l.starts_with("issue close")), "{log}");
+    assert!(!log.contains("as a duplicate of this issue"), "{log}");
+    // Nothing is left for the next pass to retry.
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran[0]["data"]["note_failed"],
+        serde_json::json!([]),
+        "{ran:?}"
+    );
 }
 
 #[test]
@@ -6187,6 +6289,106 @@ fn a_lapsed_claim_another_runner_took_is_not_renewed() {
         .count();
     assert_eq!(posts, 1, "no second claim behind that runner's: {log}");
     assert!(!log.contains("PATCH"), "{log}");
+}
+
+/// A claim comment by `runner` with comment id `id`, live for centuries, as the fake gh's
+/// `issue view` prints it. Written to the fake's `after-race-before` or `after-race-after`
+/// file, it shows up in every `issue view` after the race check's read, ahead of or behind the
+/// comments the run posted, until a DELETE names its id. With no `view-N.json`, the fake's
+/// view also carries the claimed label while `labelled-N` (set and cleared by `issue edit`)
+/// says it is on.
+fn live_claim(runner: &str, id: u64) -> String {
+    format!(
+        r#"{{"body": "Claimed by runner {runner} at 2020-01-01T00:00:00Z; stale after 2999-01-01T00:00:00Z", "url": "https://example.com/acme/app/issues/5#issuecomment-{id}"}}"#
+    )
+}
+
+/// The last `work.claim` the log recorded for item 5.
+fn last_claim(f: &Factory) -> Value {
+    events_of(f, "work.claim")
+        .into_iter()
+        .rfind(|e| e["data"]["number"] == 5)
+        .map(|e| e["data"].clone())
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn a_give_back_deletes_its_own_claim_and_the_later_losers() {
+    let f = Factory::new("true\n", "land");
+    // Another runner claimed after this one won and before it gave the item back.
+    std::fs::write(
+        f.tmp.path().join("after-race-after"),
+        live_claim("cccc", 90),
+    )
+    .unwrap();
+    let (ok, report, stderr) = run_args(&f, &[], Some("n"));
+    assert!(!stderr.contains("couldn't free"), "{stderr}");
+    assert!(!ok, "{report}");
+    let log = f.gh_log();
+    assert!(log.contains("/issues/comments/88"), "its own: {log}");
+    assert!(
+        log.contains("/issues/comments/90"),
+        "the later loser's: {log}"
+    );
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "nobody holds it now: {log}"
+    );
+    assert_eq!(last_claim(&f)["runner"], Value::Null, "{}", last_claim(&f));
+}
+
+#[test]
+fn a_give_back_leaves_an_earlier_runners_claim_and_label() {
+    let f = Factory::new("true\n", "land");
+    // A claim ahead of this one's that the race check didn't see.
+    std::fs::write(
+        f.tmp.path().join("after-race-before"),
+        live_claim("bbbb", 70),
+    )
+    .unwrap();
+    let (ok, report, stderr) = run_args(&f, &[], Some("n"));
+    assert!(!stderr.contains("couldn't free"), "{stderr}");
+    assert!(!ok, "{report}");
+    let log = f.gh_log();
+    assert!(log.contains("/issues/comments/88"), "its own: {log}");
+    assert!(!log.contains("/issues/comments/70"), "{log}");
+    assert!(
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "that runner's label stays: {log}"
+    );
+    let claim = last_claim(&f);
+    assert_eq!(claim["runner"], "bbbb", "{claim}");
+    assert_eq!(claim["stale_after"], "2999-01-01T00:00:00Z", "{claim}");
+}
+
+#[test]
+fn a_give_back_between_an_earlier_claim_and_a_later_one_keeps_only_the_earlier() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(
+        f.tmp.path().join("after-race-before"),
+        live_claim("bbbb", 70),
+    )
+    .unwrap();
+    std::fs::write(
+        f.tmp.path().join("after-race-after"),
+        live_claim("cccc", 90),
+    )
+    .unwrap();
+    let (ok, report, stderr) = run_args(&f, &[], Some("n"));
+    assert!(!ok, "{report}");
+    assert!(!stderr.contains("couldn't free"), "{stderr}");
+    let log = f.gh_log();
+    assert!(log.contains("/issues/comments/88"), "its own: {log}");
+    assert!(
+        log.contains("/issues/comments/90"),
+        "the later loser's: {log}"
+    );
+    assert!(!log.contains("/issues/comments/70"), "{log}");
+    assert!(
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "the earlier runner's label stays: {log}"
+    );
+    assert_eq!(last_claim(&f)["runner"], "bbbb", "{}", last_claim(&f));
 }
 
 #[test]
@@ -7756,7 +7958,7 @@ fn init_fixture(
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"pr create\") echo https://example.com/pull/7 ;;\n\
              *) ;;\nesac\n"
@@ -7928,7 +8130,7 @@ fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo create\") echo \"https://github.com/acme/$3\" ;;\n\
              \"repo clone\") git clone -q {d}/origin-$(basename \"$3\").git \"$4\" ;;\n\
              *) ;;\nesac\n"
@@ -8190,7 +8392,7 @@ fn init_new_generated_with(
         tmp.path(),
         "gh",
         &format!(
-            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
              \"repo create\") echo \"https://github.com/acme/$3\" ;;\n\
              \"repo clone\") git clone -q {d}/origin-$(basename \"$3\").git \"$4\" ;;\n\
              *) ;;\nesac\n"

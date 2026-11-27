@@ -144,7 +144,7 @@ a sync judges it. A sync that reads its full limit of issues refuses to close an
 not see.
 
 `paja work answer <issue> <text>` records a person's answer to an escalated item (`work.answered`, with the question it
-answers) and queues the item again under the home lock, then posts the answer as a comment on the issue. Each item
+answers) and queues the item again under the home lock, then posts the answer as a comment on the issue, made public like Paja's own comments: paths and tokens hidden, mentions made inert (an agent can write the answer too), and cut to fit. The log keeps the answer as given. Each item
 keeps its `answers`, and every later run passes them to the builder and the reviewers, since agents can't read the
 issue's comments; a reply on the issue alone doesn't reach them, and Paja's question on the issue says so. For the
 same reason `paja work set <issue> queued` refuses an escalated item and points at `paja work answer`; it is the only
@@ -367,7 +367,7 @@ default branch moved on meanwhile (GitHub runs none on a conflicting pull reques
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
 otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
 setting to change. On `escalate`, five failed rounds or
-an error it can't fix, it comments on the issue with the question (redacted like a follow-up) and marks the item escalated; the branch
+an error it can't fix, it comments on the issue with the question (redacted like a follow-up: the factory home, repository and home folder named, tokens hidden, mentions made inert, code fences made plain text so the frame after a quote never renders as code) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
 `run.escalated`, plus a `run.follow_up` (`error` `not filed: ...`, never an issue) for each review finding the change landed without. Before an escalation Mestari's arbiter
