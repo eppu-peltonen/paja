@@ -703,7 +703,9 @@ const PROTECTED_NAMES: [&str; 11] = [
 ];
 
 /// A Windows 8.3 short name such as `GIT~1` or `RUST-T~1.TOM`: the start of a protected name
-/// (leading dot dropped), then `~` and digits.
+/// (leading dot dropped), then `~` and digits. After several names collide, NTFS keeps only
+/// the first two letters and adds four hex digits of a hash (`GI3F2A~1`), so any such stem
+/// whose first two letters start a protected name counts too.
 fn short_name_of_protected(word: &str) -> bool {
     let upper = word.to_uppercase();
     let (stem, tail) = match upper.split_once('~') {
@@ -714,10 +716,12 @@ fn short_name_of_protected(word: &str) -> bool {
     if stem.is_empty() || digits == 0 {
         return false;
     }
+    let chars: Vec<char> = stem.chars().collect();
+    let hashed = (chars.len() == 6 && chars[2..].iter().all(char::is_ascii_hexdigit))
+        .then(|| chars[..2].iter().collect::<String>());
     PROTECTED_NAMES.iter().any(|name| {
-        name.trim_start_matches('.')
-            .to_uppercase()
-            .starts_with(stem)
+        let name = name.trim_start_matches('.').to_uppercase();
+        name.starts_with(stem) || hashed.as_ref().is_some_and(|two| name.starts_with(two))
     })
 }
 
@@ -1180,10 +1184,25 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
             // too, `=` and all.
             Some(rest) => {
                 let glued = rest.char_indices().nth(1).map_or("", |(at, _)| &rest[at..]);
-                let starts_as_path = glued.starts_with(['/', '\\', '.', '~']) || has_drive(glued);
+                // A glued `.` starts a path only as `.`, `..`, `./` or `../`: in `-x.C/tmp/a`
+                // the `.` could be one more flag letter, before `C` and `/tmp/a`.
+                let dot_path = matches!(glued, "." | "..")
+                    || ["./", ".\\", "../", "..\\"]
+                        .iter()
+                        .any(|start| glued.starts_with(start));
+                let starts_as_path =
+                    glued.starts_with(['/', '\\', '~']) || dot_path || has_drive(glued);
+                // A letter before a `:` could be a drive (`-xfC:x`); a port (`-p8080:80`)
+                // can't.
+                let drive_inside = glued
+                    .as_bytes()
+                    .windows(2)
+                    .any(|pair| pair[0].is_ascii_alphabetic() && pair[1] == b':');
                 // A cluster such as `-xvf/tmp/a` or `-xC..` hides where its path starts, so it
                 // is refused rather than guessed at.
-                if !starts_as_path && (glued.contains(['/', '\\', ':']) || glued.contains("..")) {
+                if !starts_as_path
+                    && (glued.contains(['/', '\\']) || drive_inside || glued.contains(".."))
+                {
                     return Some(format!(
                         "`{arg}` glues a path to a short flag; put a space between the flag and \
                          its value so the hook can check the path"
@@ -1226,6 +1245,21 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
             }
             None => values.push(arg),
         }
+        // A protected name after any `=` (`out=clippy.toml`, `--cfg=a=rustfmt.toml`) is checked
+        // as a path of its own.
+        let after_equals: Vec<&str> = values
+            .iter()
+            .flat_map(|value| {
+                value
+                    .match_indices('=')
+                    .map(move |(at, _)| &value[at + 1..])
+            })
+            .filter(|rest| {
+                rest.split(['/', '\\'])
+                    .any(|part| is_protected_word(part.split('=').next().unwrap_or(part)))
+            })
+            .collect();
+        values.extend(after_equals);
         for value in values {
             let protected = value
                 .split(['/', '\\'])
@@ -1799,6 +1833,15 @@ mod program_tests {
             "npm test GIT~1",
             "npm test -xfGIT~1",
             "npm test GIT~1/config",
+            "npm test -x.C/tmp/a",
+            "npm test -x.C..",
+            "npm test -xfC:x",
+            "npm test GI3F2A~1",
+            "npm test -xfCL0A1B~2",
+            "npm test RU12AB~1/x",
+            "npm test out=clippy.toml",
+            "npm test --cfg=a=rustfmt.toml",
+            "npm test -Da=b=.git",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -1819,6 +1862,12 @@ mod program_tests {
         ok("npm test -ofile.txt");
         ok("npm test -Dversion=1.2.3");
         ok("npm test --out=./build");
+        ok("npm test -p8080:80");
+        ok("npm test -o.");
+        ok("npm test -o.hidden");
+        ok("npm test -o../work-1/x");
+        ok("npm test out=file.txt");
+        ok("npm test AB12CD~1");
     }
 }
 
