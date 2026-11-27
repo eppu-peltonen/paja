@@ -2481,7 +2481,13 @@ pub fn known_checkouts(home: &Home, repo: &str) -> Result<Vec<std::path::PathBuf
         .iter()
         .rev()
         .filter_map(|e| match e.kind.as_str() {
-            EV_CHECKOUT if e.data["repo"] == repo => e.data["path"].as_str(),
+            EV_CHECKOUT
+                if e.data["repo"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(repo)) =>
+            {
+                e.data["path"].as_str()
+            }
             crate::ahjo::EV_CREATED
                 if e.data["name"].as_str().is_some_and(|name| {
                     name.strip_prefix(prefix)
@@ -2987,6 +2993,26 @@ mod tests {
         assert_eq!(
             known_checkout(&home, R).unwrap(),
             Some(dir.path().join("env-repo"))
+        );
+    }
+
+    #[test]
+    fn a_checkout_is_found_whatever_the_case_of_the_repository_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        std::fs::create_dir_all(dir.path().join("synced")).unwrap();
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                EV_CHECKOUT,
+                json!({ "repo": R, "path": dir.path().join("synced") }),
+            )
+            .unwrap();
+        drop(lock);
+        assert_eq!(
+            known_checkouts(&home, "Acme/App").unwrap(),
+            vec![dir.path().join("synced")]
         );
     }
 
