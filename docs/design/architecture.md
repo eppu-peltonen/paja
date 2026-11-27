@@ -98,7 +98,8 @@ skipped by `paja run` and by `paja run --workers` until that claim is stale; `pa
 `claim`, and `paja pool status` gives "claimed by runner <id> on GitHub" as why the item waits. A label with no claim
 comment (put there by hand) holds the item until a person removes it. A run renews its claim at each round by
 editing its claim comment's times (and putting the label back if it was taken off). `paja work set N queued`, and a
-run the person declines at the confirmation, take the label off; an escalated item keeps it, and its claim can't go
+run the person declines at the confirmation, delete the live claim comments and take the label off, so another runner
+can take the item at once; an escalated item keeps it, and its claim can't go
 stale while it carries the needs-answer label. `paja work answer` renews the claim, so the runner that escalated the
 item runs it next.
 

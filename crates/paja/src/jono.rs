@@ -1518,7 +1518,17 @@ pub fn release_claim(home: &Home, checkout: &Path, number: u64) {
         let labels = Labels::of_default_branch(&ok)?;
         // Looked at first: the label may be gone already, or this repository may never have
         // had it, and removing a label that doesn't exist is an error.
-        if view_issue(&ok, number)?.has_label(&labels.claimed()) {
+        let view = view_issue(&ok, number)?;
+        // The live claim comments go too: left behind, one would win every other runner's race
+        // check until it went stale.
+        let now = now_secs();
+        for comment in view.claims().into_iter().filter(|c| !c.is_stale(now)) {
+            if let Some(id) = comment.id {
+                let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+                gh(&ok, &["api", "-X", "DELETE", &path])?;
+            }
+        }
+        if view.has_label(&labels.claimed()) {
             remove_label(&ok, number, &labels.claimed())?;
         }
         let name = name_of(&ok)?;

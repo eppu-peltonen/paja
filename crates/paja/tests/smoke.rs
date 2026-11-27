@@ -1803,6 +1803,7 @@ impl Factory {
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
+                 \"api -X\") if [ \"$3\" = DELETE ]; then rm -f {d}/view-5.json; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
                  *) ;;\nesac\n"
             ),
@@ -4220,6 +4221,31 @@ fn work_set_queued_frees_the_claimed_label() {
     // The label comes off, and the next sync (which finds none) clears the claim in the log.
     let (_, item) = f.with_gh(&["work", "show", "5"]);
     assert!(item.get("claim").is_none(), "{item}");
+}
+
+#[test]
+fn a_freed_claim_leaves_no_comment_so_another_runner_takes_the_item_at_once() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let (ok, synced) = f.with_gh(&["work", "sync"]);
+    assert!(ok, "{synced}");
+    // Runner A's live claim (the fake deletes the issue's comments when asked to).
+    f.claimed_by_other(true, "2999-01-01T00:00:00Z");
+    let (ok, item) = f.with_gh(&["work", "set", "5", "queued"]);
+    assert!(ok, "{item}");
+    let log = f.gh_log();
+    assert!(
+        log.contains("api -X DELETE") && log.contains("/issues/comments/77"),
+        "{log}"
+    );
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "{log}"
+    );
+    // Runner B, whose sync still lists the label (the fake's list doesn't change), finds no
+    // live claim on the issue and takes the item.
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
 }
 
 #[test]
