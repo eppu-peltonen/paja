@@ -4503,6 +4503,81 @@ fn a_usage_limit_in_a_review_keeps_the_work_and_waits_for_the_reset() {
 }
 
 #[test]
+fn a_run_after_the_reset_resumes_the_kept_round_without_building_again() {
+    let f = Factory::new("true\n", "land");
+    // A reset a moment ahead; the review of the finished build hits the limit.
+    let resets = epoch_secs_in(2);
+    std::fs::write(f.tmp.path().join("review-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
+    // Let the window reset, and the limit go away.
+    while epoch_secs_in(0) <= resets {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::fs::remove_file(f.tmp.path().join("review-429")).unwrap();
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "landed", "{again}\n{stderr}");
+    assert!(stderr.contains("resuming"), "{stderr}");
+    // The build was not repeated: one build, and the review that hit the limit ran again.
+    let calls = f.claude_calls();
+    let reviews = calls.iter().filter(|c| c.contains("--json-schema")).count();
+    assert_eq!(calls.len() - reviews, 1, "one build only: {calls:?}");
+    assert_eq!(reviews, 2, "{calls:?}");
+    // The same round as the one the limit stopped.
+    let rounds = round_events(&f);
+    assert!(rounds.iter().all(|r| r["data"]["round"] == 1), "{rounds:?}");
+}
+
+#[test]
+fn run_every_waits_for_the_reset_instead_of_polling() {
+    use std::io::{BufRead, BufReader};
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run", "--every", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let waiting = BufReader::new(every.stderr.take().unwrap())
+        .lines()
+        .map(|line| line.unwrap())
+        .find(|line| {
+            line.contains("waiting until it resets at") || line.contains("checking again in")
+        });
+    // Long enough for a busy loop to show itself as repeated passes.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let still_running = every.try_wait().unwrap().is_none();
+    every.kill().unwrap();
+    every.wait().unwrap();
+    let waiting = waiting.expect("no wait line before stderr closed");
+    assert!(
+        waiting.contains("waiting until it resets at"),
+        "polling instead of waiting for the reset: {waiting}"
+    );
+    assert!(still_running, "the loop stopped by itself");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut every.stdout.take().unwrap(), &mut stdout).unwrap();
+    let reports: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 1, "one pass, then the wait: {reports:?}");
+    assert_eq!(reports[0]["outcome"], "usage_limit", "{reports:?}");
+    assert_eq!(reports[0]["resets_at"], resets * 1000, "{reports:?}");
+}
+
+#[test]
 fn a_second_usage_limit_without_a_reset_time_parks_the_item() {
     let f = Factory::new("true\n", "land");
     std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
@@ -4519,6 +4594,9 @@ fn a_second_usage_limit_without_a_reset_time_parks_the_item() {
     assert!(question.contains("Wait until it resets"), "{question}");
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "escalated", "{item}");
+    // Parked, but the worktree and the builder's edits in it are kept.
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
 }
 
 #[test]
@@ -6099,6 +6177,33 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
         );
     }
     assert_eq!(events_of(&f, "pool.stopped").len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
+    let f = pool_factory(false);
+    let dir = f.tmp.path();
+    for t in ["Alpha", "Beta", "Gamma"] {
+        std::fs::remove_file(dir.join("holds").join(t)).unwrap();
+    }
+    let resets = epoch_secs_in(3600);
+    std::fs::write(dir.join("build-429"), "").unwrap();
+    std::fs::write(dir.join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    let calls = f.claude_calls().len();
+    let admitted = events_of(&f, "pool.admitted").len();
+    let pool = start_pool(&f, "2");
+    // Several ticks of the pool, which would have admitted lanes without the pause.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    assert_eq!(events_of(&f, "pool.admitted").len(), admitted);
+    assert!(events_of(&f, "pool.planning").is_empty());
+    assert_eq!(f.claude_calls().len(), calls, "no agent started");
+    let reports = stop_pool(&f, pool);
+    assert!(reports.is_empty(), "{reports:?}");
+    let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
+    assert!(err.contains("starting nothing until"), "{err}");
 }
 
 #[cfg(unix)]
