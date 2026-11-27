@@ -8,6 +8,7 @@ owns it. Instructions for agents working on Paja's own code live in [`../CLAUDE.
 | [`quickstart.md`](./quickstart.md) | You want Paja to build your own project: install, set it up, write the first issue and land it |
 | [`setup.md`](./setup.md) | You want to install Paja and start it, on Windows, Linux or macOS |
 | [`safety.md`](./safety.md) | You are about to run Paja on your own machine and want to know what it can touch, how to limit it and how to undo it |
+| [`usage.md`](./usage.md) | You want to know what a work item costs against your Claude plan, and how to lower it |
 | [`troubleshooting.md`](./troubleshooting.md) | Paja printed an error, or you want to update or uninstall it |
 | [`design/overview.md`](./design/overview.md) | You want to know what Paja is for and the principles every part follows |
 | [`design/architecture.md`](./design/architecture.md) | You need the parts (Jono, Kaava, Posti, Mestari, Ahjo, Vasara, Paja Desk), what each does and how they connect |
