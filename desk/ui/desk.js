@@ -117,6 +117,8 @@ function readRun(key, item, box) {
   invoke("work_run", { repo: item.repo, number: item.number })
     .then((run) => {
       if (run && run.error) throw new Error(run.error);
+      // A reply that comes after "Hide run" is dropped, so a quick re-open doesn't flash it.
+      if (!following.has(key)) return;
       lastRun.set(key, run);
       box.replaceChildren(...runParts(run));
     })
@@ -143,6 +145,11 @@ function runParts(run) {
   if (run.state === "interrupted") {
     parts.push(el("p", { className: "warning-inline" },
       "Interrupted: no paja run is working on it now. Start paja run in its checkout to go on from here."));
+  }
+  if (run.state === "claimed") {
+    parts.push(el("p", { className: "muted" },
+      "Claimed by hand since its last run, so paja run leaves it alone. Set it back to queued for a run to take it."));
+    return parts;
   }
   // An interrupted run's step isn't running, so it gets no clock.
   const now = !run.step ? []

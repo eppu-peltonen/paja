@@ -16,8 +16,9 @@ use crate::jono::{self, Status, WorkItem};
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Live {
     /// `running` while a `paja run` holds the item's run lock, `interrupted` when the item is
-    /// still active but no run holds it (the run stopped or was killed), else the item's
-    /// status (`queued`, `landed`, `escalated`).
+    /// still active but no run holds it (the run stopped or was killed), `claimed` when the
+    /// item was claimed by hand (`paja work claim`) since its last run, which no `paja run`
+    /// resumes, else the item's status (`queued`, `landed`, `escalated`).
     pub state: String,
     /// The run's Ahjo environment, while it exists.
     pub env: Option<LiveEnv>,
@@ -63,9 +64,9 @@ pub struct LiveRound {
 }
 
 /// The latest run of item `number` of `repo`, or None when no run has started it. Whether the
-/// run is live comes from its run lock, which this takes and lets go of at once. It does so
-/// holding the home lock, under which `paja run` claims items, so a claim never meets the
-/// probe's hold and skips the item.
+/// run is live comes from its run lock, which this tries and lets go of at once, without
+/// creating it. It does so holding the home lock, under which `paja run` claims items, so a
+/// claim never meets the probe's hold and skips the item.
 pub fn live(home: &Home, repo: &str, number: u64) -> Result<Option<Live>> {
     let events = home.events().read_all()?;
     let item = jono::replay_repo(&events, repo)?
@@ -73,12 +74,17 @@ pub fn live(home: &Home, repo: &str, number: u64) -> Result<Option<Live>> {
         .with_context(|| {
             format!("no work item #{number} in {repo}; run `paja work sync` in its checkout")
         })?;
+    live_of(home, &events, &item)
+}
+
+/// [`live`] for an item already replayed from `events`.
+pub fn live_of(home: &Home, events: &[Event], item: &WorkItem) -> Result<Option<Live>> {
     let held = item.status == Status::Active && {
         let _home = home.lock()?;
-        home.try_run_lock(repo, number)?.is_none()
+        home.run_held(&item.repo, item.number)?
     };
-    let envs = crate::ahjo::replay(&events)?;
-    Ok(from_events(&events, &item, held, |name| {
+    let envs = crate::ahjo::replay(events)?;
+    Ok(from_events(events, item, held, |name| {
         envs.get(name).map(|env| LiveEnv {
             name: env.name.clone(),
             path: env.path.clone(),
@@ -97,15 +103,28 @@ pub fn from_events(
 ) -> Option<Live> {
     let mine: Vec<&Event> = jono::item_events(events, &item.repo, item.number).collect();
     let start = mine.iter().rposition(|e| e.kind == EV_STARTED)?;
-    let run = &mine[start..];
+    // A claim since that run started: by a new `paja run` that hasn't recorded `run.started`
+    // yet, or by hand. Either way the earlier run's steps aren't this one's.
+    let claim = mine[start..]
+        .iter()
+        .rposition(|e| e.kind == jono::EV_STATUS && e.data["status"] == "active")
+        .map(|at| mine[start + at]);
     let state = match item.status {
         Status::Active if held => "running".to_string(),
+        Status::Active if claim.is_some_and(|c| c.data["run"] != true) => "claimed".to_string(),
         Status::Active => "interrupted".to_string(),
         other => other.as_str().to_string(),
     };
+    let run: &[&Event] = match (item.status, claim) {
+        (Status::Active, Some(_)) => &[],
+        _ => &mine[start..],
+    };
     let mut live = Live {
         state,
-        env: run[0].data["env"].as_str().and_then(&env),
+        env: run
+            .first()
+            .and_then(|e| e.data["env"].as_str())
+            .and_then(&env),
         round: 0,
         max_rounds: MAX_ROUNDS,
         step: None,
@@ -161,7 +180,7 @@ pub fn from_events(
             _ => {}
         }
     }
-    // A run that is over has no current step.
+    // A run that is over, or an item claimed by hand, has no current step.
     if live.state != "running" && live.state != "interrupted" {
         live.step = None;
     }
@@ -255,6 +274,28 @@ mod tests {
         assert_eq!(live.state, "interrupted");
         assert!(live.env.is_none());
         assert_eq!(live.step.unwrap().role, "fix");
+    }
+
+    #[test]
+    fn a_claim_since_the_last_run_hides_that_runs_steps() {
+        let claimed = |by_run: bool| {
+            let mut events = run();
+            let mut data = json!({"repo": "acme/app", "number": 7, "status": "active"});
+            if by_run {
+                data["run"] = json!(true);
+            }
+            events.push(event(7, jono::EV_STATUS, data));
+            events
+        };
+        // A new `paja run` claimed it and hasn't started yet: running, with nothing to show.
+        let live = from_events(&claimed(true), &item(Status::Active), true, |_| None).unwrap();
+        assert_eq!(live.state, "running");
+        assert_eq!((live.round, live.steps.len(), live.rounds.len()), (0, 0, 0));
+        assert!(live.step.is_none());
+        // Claimed by hand after the run stopped: no `paja run` resumes it.
+        let live = from_events(&claimed(false), &item(Status::Active), false, |_| None).unwrap();
+        assert_eq!(live.state, "claimed");
+        assert!(live.steps.is_empty() && live.step.is_none());
     }
 
     #[test]

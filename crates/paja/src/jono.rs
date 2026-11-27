@@ -712,10 +712,13 @@ pub fn get(home: &Home, repo: &str, number: u64) -> Result<WorkItem> {
 /// One item as `paja work show` and its MCP tool print it: the item, plus `run` (its latest
 /// run's round, step and finished rounds, see [`crate::mestari::live`]) while it is active.
 pub fn show(home: &Home, repo: &str, number: u64) -> Result<Value> {
-    let item = get(home, repo, number)?;
+    let events = home.events().read_all()?;
+    let item = replay_repo(&events, repo)?
+        .remove(&number)
+        .with_context(|| no_item(repo, number))?;
     let mut shown = serde_json::to_value(&item)?;
     if item.status == Status::Active {
-        shown["run"] = serde_json::to_value(crate::mestari::live::live(home, repo, number)?)?;
+        shown["run"] = serde_json::to_value(crate::mestari::live::live_of(home, &events, &item)?)?;
     }
     Ok(shown)
 }

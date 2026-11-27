@@ -1518,6 +1518,8 @@ fn work_show_tells_where_an_active_items_run_is_and_that_it_stopped() {
     let run = &item["run"];
     // No `paja run` holds the item, so it shows as interrupted, not running.
     assert_eq!(run["state"], "interrupted", "{item}");
+    // Looking wrote no run lock file.
+    assert!(!home.join("runs").exists());
     assert_eq!(
         (&run["round"], &run["max_rounds"]),
         (&1.into(), &3.into()),

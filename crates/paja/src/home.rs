@@ -112,10 +112,27 @@ impl Home {
         self.try_runs_lock(repo, "land")
     }
 
-    /// A lock file `runs/<owner>@<name>@<tail>.lock`, taken without waiting.
-    fn try_runs_lock(&self, repo: &str, tail: &str) -> Result<Option<RunLock>> {
-        let dir = self.root.join("runs");
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    /// Whether a live run holds item `number` of `repo`'s run lock, found without writing: a
+    /// lock file that isn't there yet is held by no one, so a probe never creates one.
+    pub fn run_held(&self, repo: &str, number: u64) -> Result<bool> {
+        let path = self.runs_lock_path(repo, &number.to_string());
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+        };
+        match file.try_lock() {
+            // Free: the probe lets go at once (the file closes here).
+            Ok(()) => Ok(false),
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(err)) => {
+                Err(err).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
+    /// The path of lock file `runs/<owner>@<name>@<tail>.lock`.
+    fn runs_lock_path(&self, repo: &str, tail: &str) -> PathBuf {
         // `owner/name` as one file name: GitHub names hold only letters, digits and `-_.`, and
         // `@` can't appear in them, so two repositories never share a file.
         let repo: String = repo
@@ -126,7 +143,14 @@ impl Home {
                 _ => '_',
             })
             .collect();
-        let path = dir.join(format!("{repo}@{tail}.lock"));
+        self.root.join("runs").join(format!("{repo}@{tail}.lock"))
+    }
+
+    /// A lock file `runs/<owner>@<name>@<tail>.lock`, taken without waiting.
+    fn try_runs_lock(&self, repo: &str, tail: &str) -> Result<Option<RunLock>> {
+        let dir = self.root.join("runs");
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = self.runs_lock_path(repo, tail);
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
