@@ -4852,6 +4852,29 @@ fn a_push_url_that_is_not_a_url_is_recorded_and_the_run_carries_on() {
 }
 
 #[test]
+fn a_plain_http_push_url_to_another_machine_is_refused() {
+    let f = Factory::new("true\n", "escalate");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PAJA_NOTIFIER", "none")
+        .env("PAJA_NOTIFY", "http://ntfy.example/paja")
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("http:// only for this machine"), "{stderr}");
+    let failed = events_of(&f, "notify.failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["data"]["channel"], "push");
+    assert!(events_of(&f, "notify.sent").is_empty());
+}
+
+#[test]
 fn run_text_says_how_to_answer_an_escalation() {
     let f = Factory::new("true\n", "escalate");
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
