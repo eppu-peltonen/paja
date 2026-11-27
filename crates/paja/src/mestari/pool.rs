@@ -542,8 +542,6 @@ fn stop_children<'c>(children: impl Iterator<Item = &'c mut Child>, grace: Durat
     }
 }
 
-/// End the planners in `planners` that have run longer than `limit`, and return their items.
-/// They stay in the map: the caller records why and removes them.
 /// Take out of `planners` the plans that ended, ending first any going longer than `limit`, and
 /// return each that recorded no plan with why. A plan killed for its time may still have
 /// recorded one in the instant before, which counts like any other.
@@ -590,6 +588,8 @@ fn reap(
     Ok(failed)
 }
 
+/// End the planners in `planners` that have run longer than `limit`, and return their items.
+/// They stay in the map, for [`reap`] to take out.
 fn end_overdue(planners: &mut BTreeMap<u64, (Child, u64, Instant)>, limit: Duration) -> Vec<u64> {
     let mut overdue = Vec::new();
     for (&number, (child, _, started)) in planners.iter_mut() {
