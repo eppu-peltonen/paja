@@ -2278,6 +2278,7 @@ impl Factory {
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
+                 if [ -f {d}/mode-rejected ]; then echo \"error: option '--permission-mode <mode>' argument 'auto' is invalid.\" >&2; exit 1; fi\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/hang-fix ]; then : > {d}/hanging; while [ -f {d}/hang-fix ]; do sleep 0.1; done; exit 1; fi ;; esac\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
@@ -3228,6 +3229,50 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert!(stderr.contains("resuming #5"), "{stderr}");
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "landed", "{item}");
+}
+
+#[test]
+fn rounds_spent_count_toward_the_cap_when_the_environment_is_lost() {
+    let f = Factory::new("true\n", "changes");
+    let dir = f.tmp.path();
+    // Round 1 builds and is told to fix; round 2's fix is cut off.
+    std::fs::write(dir.join("hang-fix"), "").unwrap();
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(dir.join("hang-fix")).unwrap();
+    // The environment and its branch are lost before the next run.
+    let (_, list) = paja(&f.home, &f.repo, &["env", "list"]);
+    let env = list[0]["name"].as_str().unwrap().to_string();
+    let (ok, _) = paja(&f.home, &f.repo, &["env", "remove", &env, "--force"]);
+    assert!(ok);
+    git(&f.repo, &["branch", "-D", &format!("paja/{env}")]);
+    std::fs::write(dir.join("verdict.txt"), "land").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    // The new branch starts in round 2, with a build, not back at round 1.
+    assert!(
+        stderr.contains("resuming #5 in round 2 on a new branch"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("round 1 of"), "{stderr}");
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let last = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["kind"] == "run.round")
+        .unwrap()
+        .clone();
+    assert_eq!(last["data"]["round"], 2, "{last}");
+    assert_eq!(last["data"]["steps"][0]["role"], "build", "{last}");
 }
 
 /// Start `paja run` with its output discarded, wait until the fake agent writes `marker` (it is
@@ -4818,6 +4863,29 @@ fn a_push_url_that_is_not_a_url_is_recorded_and_the_run_carries_on() {
 }
 
 #[test]
+fn a_plain_http_push_url_to_another_machine_is_refused() {
+    let f = Factory::new("true\n", "escalate");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PAJA_NOTIFIER", "none")
+        .env("PAJA_NOTIFY", "http://ntfy.example/paja")
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("http:// only for this machine"), "{stderr}");
+    let failed = events_of(&f, "notify.failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["data"]["channel"], "push");
+    assert!(events_of(&f, "notify.sent").is_empty());
+}
+
+#[test]
 fn run_text_says_how_to_answer_an_escalation() {
     let f = Factory::new("true\n", "escalate");
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
@@ -6370,6 +6438,28 @@ fn a_resume_that_fails_starts_a_fresh_session() {
     assert_eq!(builds.len(), 3, "{steps:?}");
     assert_eq!(builds[1]["session_id"], "s-2", "{steps:?}");
     assert_eq!(builds[1]["cost_usd"], 0.05, "{steps:?}");
+}
+
+#[test]
+fn a_claude_code_that_rejects_auto_mode_stops_the_run_without_a_retry() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("mode-rejected"), "").unwrap();
+    let (_, report) = f.run();
+    let text = report.to_string();
+    assert!(
+        text.contains("does not accept `--permission-mode auto`")
+            && text.contains("argument 'auto' is invalid"),
+        "{report}"
+    );
+    // One build, no other mode, no second try, nothing landed.
+    let calls = f.claude_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        calls[0].matches("--permission-mode").count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(!f.gh_log().contains("pr merge"));
 }
 
 #[test]

@@ -187,7 +187,9 @@ While it works on an item the run holds an OS file lock,
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
 stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and
 says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
-abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. It rebuilds where it stood
+abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. When the environment or its
+branch is gone, the item starts again on a new branch with a build, but in the round it had reached ("resuming #5 in
+round 2 on a new branch"), so the rounds already spent still count toward the cap. It rebuilds where it stood
 from every run event of the item since it was last queued, claimed or answered, not only the last run's, so an item
 interrupted again before it records a round keeps its round count and blockers: the round, the feedback for the
 builder, and the reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on
@@ -407,10 +409,16 @@ shows escalated items first, each with its answer command. A notice goes to two 
   through `platform.rs`); `none` turns it off. Unset, it is a desktop notification only when stderr is a terminal, so
   scripts and tests never show one.
 - **Push.** `PAJA_NOTIFY`, else the first line of `.paja/notify` on the default branch that isn't empty or a `#`
-  comment, names an `https://` (or `http://`) URL, such as an ntfy topic. Paja POSTs the title and text there with
-  `curl`. The texts hold no question, error or local path, since a push leaves the machine; the question stays on the
-  issue and the error in the terminal. The issue's title is included, so pick a private topic for a private
-  repository. A repository the tamper lock holds isn't read for the URL.
+  comment, names an `https://` URL, such as an ntfy topic. Plain `http://` is only for this machine (`localhost`,
+  `127.x.x.x` or `[::1]`), since a notice crosses the network, and then goes past any configured proxy. Paja POSTs
+  the title and text there with `curl`. The texts hold no question, error or local path, since a push leaves the
+  machine; the question stays on the issue and the error in the terminal. The issue's title is included, so pick a
+  private topic for a private repository. A repository the tamper lock holds isn't read for the URL.
+
+Unlike the settings `paja run` reads from the default branch's tip as fetched, `.paja/notify`, `.paja/labels` and
+`.paja/queue` are read from the local refs (`origin/HEAD`, `origin/main`, `main`), which an agent with local git in a
+worktree could move. That could send the notice's text to a URL it picks, or change the work and follow-up labels and
+whether Jono takes follow-ups, for the passes that read them.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed` or
 `stopped`, `channel`, and the `error`), so Paja Desk can show the same inbox. A notice that can't be delivered never

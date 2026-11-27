@@ -185,12 +185,49 @@ fn push_url(home: &Home, checkout: &Path) -> Result<Option<String>, String> {
             }
         }
     };
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(format!(
-            "the push URL in PAJA_NOTIFY or {NOTIFY_FILE} must start with https:// (or http://)"
-        ));
+    if url.starts_with("https://") {
+        return Ok(Some(url));
     }
-    Ok(Some(url))
+    if url.strip_prefix("http://").is_some_and(loopback) {
+        return Ok(Some(url));
+    }
+    Err(format!(
+        "the push URL in PAJA_NOTIFY or {NOTIFY_FILE} must start with https:// (http:// only for \
+         this machine: localhost, 127.x.x.x or [::1]), since a notice crosses the network"
+    ))
+}
+
+/// Whether the rest of an `http://` URL names this machine: `localhost`, `127.x.x.x` or
+/// `[::1]`, with or without a port.
+fn loopback(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Credentials before an `@` don't name the host.
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((addr, port)) if port.is_empty() || port.starts_with(':') => {
+                return addr == "::1" && port_ok(port);
+            }
+            _ => return false,
+        },
+        None => host,
+    };
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, format!(":{port}")),
+        None => (host, String::new()),
+    };
+    let ipv4 = name
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    (name.eq_ignore_ascii_case("localhost") || ipv4) && port_ok(&port)
+}
+
+/// An empty port part, or `:` and digits.
+fn port_ok(port: &str) -> bool {
+    match port.strip_prefix(':') {
+        None => port.is_empty(),
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+    }
 }
 
 /// POST the notice's title and text to `url` with `curl`, which Windows 10 and later, macOS
@@ -198,6 +235,11 @@ fn push_url(home: &Home, checkout: &Path) -> Result<Option<String>, String> {
 fn push(url: &str, notice: &Notice) -> Result<(), String> {
     let body = format!("{}\n{}", notice.title, notice.text);
     let mut cmd = std::process::Command::new("curl");
+    // Plain http is only ever this machine: never through a proxy, where it would cross the
+    // network in clear text.
+    if url.starts_with("http://") {
+        cmd.args(["--noproxy", "*"]);
+    }
     cmd.args([
         "-fsS",
         "-m",
@@ -249,6 +291,36 @@ fn outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_http_is_only_for_this_machine() {
+        for ok in [
+            "localhost",
+            "localhost:8080/paja",
+            "LOCALHOST/x",
+            "127.0.0.1:80",
+            "127.1.2.3/t",
+            "[::1]:2586/t",
+            "[::1]",
+            "me:pw@localhost/t",
+        ] {
+            assert!(loopback(ok), "{ok}");
+        }
+        for bad in [
+            "ntfy.example/paja",
+            "localhost.example/t",
+            "127.0.0.1.example/t",
+            "localhost@ntfy.example/t",
+            "[::2]/t",
+            "[::1]x/t",
+            "localhost:/t",
+            "localhost:80x",
+            "10.0.0.1/t",
+            "",
+        ] {
+            assert!(!loopback(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn an_escalation_names_the_issue_and_the_answer_command() {
