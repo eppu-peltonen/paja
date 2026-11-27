@@ -542,8 +542,13 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
             String::from_utf8_lossy(&output.stderr).trim()
         )
     };
+    // Refused here rather than with `--end-of-options`, which an older git (before 2.30)
+    // doesn't know: every caller passes a ref name or a commit id.
+    if rev.starts_with('-') {
+        bail!("reading {spec}: {rev:?} is not a revision");
+    }
     let commit = format!("{rev}^{{commit}}");
-    let resolved = run(&["rev-parse", "--verify", "--end-of-options", &commit])?;
+    let resolved = run(&["rev-parse", "--verify", &commit])?;
     if !resolved.status.success() {
         return Err(failed(format!("git rev-parse {commit}"), &resolved));
     }
@@ -578,18 +583,31 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
         .split_once('\t')
         .with_context(|| format!("reading {spec}: git ls-tree printed {entry:?}"))?;
     if listed_path != path {
-        bail!("reading {spec}: git lists it as {listed_path:?}; name the file from the top of the tree");
+        bail!(
+            "reading {spec}: git lists it as {listed_path:?}; name the file from the top of the \
+             tree, with no `.` or `..` parts and no trailing `/`"
+        );
     }
-    let mut fields = head.split(' ');
-    let (kind, object) = (fields.nth(1).unwrap_or(""), fields.next().unwrap_or(""));
-    if kind != "blob" {
-        bail!("reading {spec}: it is a {kind}, not a file");
+    let fields: Vec<&str> = head.split(' ').collect();
+    let [mode, kind, object] = fields.as_slice() else {
+        bail!("reading {spec}: git ls-tree printed {entry:?}");
+    };
+    // A symbolic link is a blob too, whose content is the path it points to: not a file to read.
+    if *kind != "blob" || *mode == "120000" {
+        let what = if *kind == "blob" {
+            "symbolic link"
+        } else {
+            kind
+        };
+        bail!("reading {spec}: it is a {what}, not a file");
     }
     let output = run(&["cat-file", "blob", object])?;
     if !output.status.success() {
         return Err(failed(format!("git cat-file blob {object}"), &output));
     }
-    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+    String::from_utf8(output.stdout)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("reading {spec}: it is not UTF-8 text; save it as UTF-8"))
 }
 
 /// A file as it is on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
@@ -606,7 +624,9 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
             .output()
             .context("running git (is it installed?)")?;
         if found.status.success() {
-            return show_at(ok.path(), rev, path);
+            // The commit just found, so the file is read from it and the ref isn't looked up twice.
+            let commit = String::from_utf8_lossy(&found.stdout).trim().to_string();
+            return show_at(ok.path(), &commit, path);
         }
     }
     Ok(None)
@@ -724,6 +744,44 @@ mod tests {
         // A rev that looks like an option is not taken for one.
         assert!(show_at(repo, "--output=x", "kept.txt").is_err());
         assert!(!repo.join("x").exists());
+        // An empty file is a file; a symbolic link and a file that isn't UTF-8 are errors. They
+        // go in the index by hand, so the test needs no symbolic link on disk (Windows).
+        let add = |mode: &str, name: &str, content: &[u8]| {
+            let file = dir.path().join("content");
+            std::fs::write(&file, content).unwrap();
+            let oid = git_unchecked(repo, &["hash-object", "-w", &file.to_string_lossy()]).unwrap();
+            git_unchecked(
+                repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("{mode},{oid},{name}"),
+                ],
+            )
+            .unwrap();
+        };
+        add("100644", "empty", b"");
+        add("120000", "link", b"kept.txt");
+        add("100644", "latin1", b"caf\xe9\n");
+        git_unchecked(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "e",
+            ],
+        )
+        .unwrap();
+        assert_eq!(show_at(repo, "HEAD", "empty").unwrap().as_deref(), Some(""));
+        let err = show_at(repo, "HEAD", "link").unwrap_err().to_string();
+        assert!(err.contains("symbolic link"), "{err}");
+        let err = show_at(repo, "HEAD", "latin1").unwrap_err().to_string();
+        assert!(err.contains("UTF-8"), "{err}");
     }
 
     #[test]
