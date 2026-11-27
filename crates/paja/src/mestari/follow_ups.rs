@@ -348,7 +348,17 @@ fn is_jwt(value: &str) -> bool {
 /// value (`"password": "", "user"`), a blank line, or a line break with no `:` or `=` before it
 /// (a lead at the end of a sentence). `password:` and its value on the next line still go.
 fn ends_lead(gap: &str) -> bool {
-    if ["\"\"", "''", "``"].iter().any(|empty| gap.contains(empty)) {
+    // A pair of quotes counts only as a whole value: not part of a longer run (`"""`, a
+    // Markdown ``` `` ```), and followed in the gap by a space, `,` or `;`.
+    let chars: Vec<char> = gap.chars().collect();
+    let empty_value = (0..chars.len().saturating_sub(2)).any(|i| {
+        let q = chars[i];
+        matches!(q, '"' | '\'' | '`')
+            && chars[i + 1] == q
+            && (i == 0 || chars[i - 1] != q)
+            && (chars[i + 2].is_whitespace() || matches!(chars[i + 2], ',' | ';'))
+    });
+    if empty_value {
         return true;
     }
     let lines: Vec<&str> = gap.split('\n').collect();
@@ -604,14 +614,23 @@ mod tests {
         let text = format!(
             "the password field is empty; secret scanners flag it; \"password\": \"\", \"user\": \
              \"bob\"; a secret\nmanager; the password.\n\nNext paragraph; password: {short}; \
-             secret {mixed}; api_key:\n  {long}"
+             secret {mixed}; api_key:\n  {long}; password:\n  {short}; secret\n\nFinally"
         );
         assert_eq!(
             redact_tokens(&text),
             "the password field is empty; secret scanners flag it; \"password\": \"\", \"user\": \
              \"bob\"; a secret\nmanager; the password.\n\nNext paragraph; password: <redacted>; \
-             secret <redacted>; api_key:\n  <redacted>"
+             secret <redacted>; api_key:\n  <redacted>; password:\n  <redacted>; secret\n\nFinally"
         );
+        // A value that opens with a run of quotes or backticks is still a value, not an empty one.
+        let text = format!("password = \"\"\"{short}\"\"\" and password: ``{short}``");
+        assert_eq!(
+            redact_tokens(&text),
+            "password = \"\"\"<redacted>\"\"\" and password: ``<redacted>``"
+        );
+        // Known gap, taken on purpose: a short all-lowercase word right after a lead, with
+        // nothing between, reads as prose ("the password field"), so it stays.
+        assert_eq!(redact_tokens("password hunter"), "password hunter");
     }
 
     #[test]
