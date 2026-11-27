@@ -321,9 +321,9 @@ such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a 
 Every session also gets `--max-turns`, from `max-turns <role> <turns>` lines in the same file (80 for `build` and
 `fix`, 30 for the reviews when a role has no line), so an agent going in circles can't spend the account's usage
 window. A session that stops at its limit fails the round with a note (`turn_limit`, "the builder hit the turn limit
-of 80") and its spend is still recorded. The builder's next round is told to finish smaller. A reviewer that hits the
-limit first runs once more in the same round, in a fresh session told to stay focused, and the other reviewer's
-finished verdict is kept. If it hits the limit again, its worktree is put back as after any review, the round fails and
+of 80") and its spend is still recorded. The builder's next round is told to finish smaller, and about a merge it
+left with conflicts, if there is one. A reviewer that hits the limit first runs once more in the same round, in a fresh
+session told to stay focused, and the other reviewer's finished verdict is kept. If it hits the limit again, its worktree is put back as after any review, the round fails and
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
