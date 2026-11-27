@@ -582,31 +582,26 @@ fn names_file(issue: &Open, file: &str) -> bool {
 /// host (written without a scheme, after any `/`, `:` or `@`) is `github.com` or a GitHub
 /// subdomain, or `githubusercontent.com`'s. Everything from it to the run's end is the link.
 fn link_in(run: &str) -> Option<(usize, String)> {
-    let (at, link) = if let Some(at) = run.find("//") {
-        // `scheme://host/...`, or `//host/...` at the start; a `//` inside other text
-        // (`evil.com//github.com/...`) makes the whole run a link to its first host.
+    // `scheme://host/...`, or `//host/...` at the start; a `//` inside other text
+    // (`evil.com//github.com/...`) makes the whole run a link to its first host.
+    let slashes = run.find("//").map(|at| {
         if at == 0 || run[..at].ends_with(':') {
             (at, run[at..].to_string())
         } else {
             (0, format!("//{run}"))
         }
-    } else {
-        let host_part = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-';
-        let lower = run.to_ascii_lowercase();
-        let found = lower.match_indices("github").find_map(|(i, _)| {
-            let start = run[..i]
-                .char_indices()
-                .rev()
-                .take_while(|&(_, c)| host_part(c))
-                .last()
-                .map_or(i, |(at, _)| at);
-            let host = lower[start..].split(['/', ':', '@']).next().unwrap_or("");
-            let github = ["github.com", "githubusercontent.com"]
-                .iter()
-                .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")));
-            github.then_some(start)
-        })?;
-        (found, format!("//{}", &run[found..]))
+    });
+    let host = github_host_at(run).map(|at| (at, format!("//{}", &run[at..])));
+    // Whichever starts first, so a link with a later `https://` in it is still one link.
+    let (at, link) = match (slashes, host) {
+        (Some(slashes), Some(host)) => {
+            if host.0 < slashes.0 {
+                host
+            } else {
+                slashes
+            }
+        }
+        (slashes, host) => slashes.or(host)?,
     };
     let mut to = link.split(['?', '#']).next().unwrap_or(&link);
     loop {
@@ -621,6 +616,27 @@ fn link_in(run: &str) -> Option<(usize, String)> {
         to = trimmed;
     }
     Some((at, to.to_string()))
+}
+
+/// Where in `run` a host written without a scheme starts that is `github.com`,
+/// `githubusercontent.com` or a subdomain of either: at the run's start or after a `/`, `:`,
+/// `@` or other character a host can't have.
+fn github_host_at(run: &str) -> Option<usize> {
+    let host_part = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-';
+    let lower = run.to_ascii_lowercase();
+    lower.match_indices("github").find_map(|(i, _)| {
+        let start = run[..i]
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| host_part(c))
+            .last()
+            .map_or(i, |(at, _)| at);
+        let host = lower[start..].split(['/', ':', '@']).next().unwrap_or("");
+        let github = ["github.com", "githubusercontent.com"]
+            .iter()
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")));
+        github.then_some(start)
+    })
 }
 
 /// Whether `link` (from [`link_in`]) links to `file` in `repo`
@@ -1261,6 +1277,23 @@ mod tests {
     }
 
     #[test]
+    fn only_a_github_host_without_a_scheme_starts_a_link() {
+        for (host, is_link) in [
+            ("github.com", true),
+            ("gist.github.com", true),
+            ("GitHub.com", true),
+            ("x-github.com", false),
+            ("evilgithub.com", false),
+            ("github.com.evil.com", false),
+            ("githubusercontent.com", true),
+            ("raw.githubusercontent.com", true),
+        ] {
+            let run = format!("Ref:{host}/a/b");
+            assert_eq!(github_host_at(&run).is_some(), is_link, "{run}");
+        }
+    }
+
+    #[test]
     fn a_path_with_a_line_a_drive_or_an_at_sign_names_its_file() {
         for body in [
             "panics at crates/paja/src/hook.rs:42",
@@ -1392,6 +1425,12 @@ mod tests {
             "api.github.com/repos/other/repo/contents/crates/paja/src/hook.rs",
             "github.com@evil.com/other/repo/blob/main/crates/paja/src/hook.rs",
             "evil.com//github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "github.com/other/repo/blob/main/crates/paja/src/hook.rs?next=https://example.com",
+            "github.com/other/repo/blob/main/crates/paja/src/hook.rs:https://x",
+            "raw.githubusercontent.com/other/repo/main/crates/paja/src/hook.rs#https://x",
+            "Ref:github.com/other/repo/blob/main/crates/paja/src/hook.rs,see:https://x",
+            "[see](https://github.com/other/repo/blob/main/crates/paja/src/hook.rs)",
+            "HTTPS://GITHUB.COM/other/repo/blob/main/crates/paja/src/hook.rs",
         ] {
             assert!(
                 !names_file(&linked(body), "crates/paja/src/hook.rs"),
@@ -1407,6 +1446,9 @@ mod tests {
             "Ref:github.com/acme/app/blob/main/crates/paja/src/hook.rs",
             "See https://github.com/acme/app/blob/main/crates/paja/src/hook.rs, and more.",
             "(https://github.com/acme/app/blob/main/crates/paja/src/hook.rs#L3)",
+            "[the hook](https://github.com/acme/app/blob/main/crates/paja/src/hook.rs)",
+            "HTTPS://GITHUB.COM/acme/app/blob/main/crates/paja/src/hook.rs!",
+            "See https://github.com/acme/app/blob/main/crates/paja/src/hook.rs;",
         ] {
             assert!(
                 names_file(&linked(body), "crates/paja/src/hook.rs"),
