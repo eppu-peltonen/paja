@@ -547,7 +547,7 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
         ));
     }
     let commit = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
-    if path.is_empty() || path.starts_with('/') || path.ends_with('/') || path.contains('\0') {
+    if path.contains('\0') || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
         bail!("reading {spec}: name a file from the top of the tree, such as .paja/checks");
     }
     let mut path = path.to_string();
@@ -752,6 +752,30 @@ fn git_failed(spec: &str, repo: &Path, what: &str, output: &std::process::Output
     )
 }
 
+/// The commit the ref named exactly `full` (`refs/remotes/origin/main`, say) points at, or None
+/// when there is no such ref. Exactly: `git rev-parse` would fall back to a tag or branch named
+/// `refs/remotes/origin/main` (`refs/tags/refs/remotes/origin/main`) when the ref is missing.
+pub(crate) fn ref_commit(repo: &Path, full: &str) -> Result<Option<String>> {
+    let found = run_git(repo, &["show-ref", "--verify", "--hash", full])?;
+    if !found.status.success() {
+        return Ok(None);
+    }
+    let object = String::from_utf8_lossy(&found.stdout).trim().to_string();
+    let commit = run_git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{object}^{{commit}}"),
+        ],
+    )?;
+    Ok(commit
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&commit.stdout).trim().to_string()))
+}
+
 /// The refs that name the default branch, in the order Paja tries them, each with the short name
 /// messages use.
 pub(crate) const DEFAULT_REFS: [(&str, &str); 3] = [
@@ -786,19 +810,7 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
         }
     }
     // The commit a ref names, so the file is read from it and the ref isn't looked up twice.
-    let resolves = |rev: &str| -> Result<Option<String>> {
-        let spec = format!("{rev}^{{commit}}");
-        let found = git_command()
-            .arg("-C")
-            .arg(ok.path())
-            .args(["rev-parse", "--verify", "-q", &spec])
-            .output()
-            .context("running git (is it installed?)")?;
-        Ok(found
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&found.stdout).trim().to_string()))
-    };
+    let resolves = |full: &str| ref_commit(ok.path(), full);
     let at = |rev: &str, commit: &str| {
         show_at(ok.path(), commit, path)
             .with_context(|| format!("reading {path} from {rev}, the default branch"))
@@ -1046,7 +1058,13 @@ mod tests {
         }
         // A folder that isn't there at all still means the file is missing.
         assert_eq!(show_at(repo, "HEAD", "nowhere/checks").unwrap(), None);
-        for path in ["", "/kept.txt", "kept.txt/"] {
+        for path in [
+            "",
+            "/kept.txt",
+            "kept.txt/",
+            "nowhere/../gone",
+            "./kept.txt",
+        ] {
             let err = show_at(repo, "HEAD", path).unwrap_err().to_string();
             assert!(err.contains("name a file from the top"), "{err}");
         }
@@ -1148,6 +1166,28 @@ mod tests {
         git_unchecked(
             repo,
             &["checkout", "-q", "refs/remotes/origin/trunk", "--", "."],
+        )
+        .unwrap();
+        // Nor does a tag named like the full ref when the ref itself is missing.
+        git_unchecked(
+            repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        )
+        .unwrap();
+        git_unchecked(repo, &["tag", "refs/remotes/origin/HEAD"]).unwrap();
+        assert_eq!(
+            ref_commit(repo, "refs/remotes/origin/HEAD").unwrap(),
+            None,
+            "a tag stood in for origin/HEAD"
+        );
+        git_unchecked(repo, &["tag", "-d", "refs/remotes/origin/HEAD"]).unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
         )
         .unwrap();
         // An error reading it names the default branch it came from.
