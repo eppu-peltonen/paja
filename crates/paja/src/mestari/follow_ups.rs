@@ -210,9 +210,11 @@ pub(super) fn redact(text: &str, places: &[(&Path, &str)]) -> String {
         .filter(|(_, label)| *label == "<home>")
         .map(|(path, _)| spelling(path))
         .collect();
-    let mut spellings: Vec<(String, &str)> = Vec::new();
+    let mut spellings: Vec<(String, &str, bool)> = Vec::new();
     for (path, label) in places {
         let shown = spelling(path);
+        // A `~/...` form under a Windows home is as case-insensitive as the home itself.
+        let fold = is_windows_path(&shown);
         let mut forms = vec![shown.clone()];
         for user_home in &user_homes {
             if let Some(rest) = shown.strip_prefix(user_home.as_str()) {
@@ -226,16 +228,16 @@ pub(super) fn redact(text: &str, places: &[(&Path, &str)]) -> String {
             for each in [form.replace('\\', "/"), form.replace('/', "\\"), form] {
                 // A path of one or two characters (`/`, `C:`) would redact far too much.
                 if each.len() > 2 {
-                    spellings.push((each, *label));
+                    spellings.push((each, *label, fold));
                 }
             }
         }
     }
-    spellings.sort_by_key(|(spelling, _)| std::cmp::Reverse(spelling.len()));
+    spellings.sort_by_key(|(spelling, _, _)| std::cmp::Reverse(spelling.len()));
     spellings.dedup();
     let mut text = text.to_string();
-    for (spelling, label) in &spellings {
-        text = replace_path(&text, spelling, label);
+    for (spelling, label, fold) in &spellings {
+        text = replace_path(&text, spelling, label, *fold);
     }
     redact_tokens(&text)
 }
@@ -254,27 +256,38 @@ fn is_windows_path(path: &str) -> bool {
     path.contains('\\') || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
+/// The end of `needle` if `text` starts with it; with `fold`, letters match in any case (Unicode
+/// included, char by char, so byte offsets stay those of `text`).
+fn match_at(text: &str, needle: &str, fold: bool) -> Option<usize> {
+    let mut chars = text.char_indices();
+    for n in needle.chars() {
+        let (_, t) = chars.next()?;
+        if t != n && !(fold && t.to_lowercase().eq(n.to_lowercase())) {
+            return None;
+        }
+    }
+    Some(chars.next().map_or(text.len(), |(i, _)| i))
+}
+
 /// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
-/// `label`. A Windows path matches in any letter case, as Windows itself does.
-fn replace_path(text: &str, path: &str, label: &str) -> String {
-    // ASCII lowercasing keeps every byte offset, so a match in `haystack` is one in `text`.
-    let fold = is_windows_path(path);
-    let (haystack, needle) = if fold {
-        (text.to_ascii_lowercase(), path.to_ascii_lowercase())
-    } else {
-        (text.to_string(), path.to_string())
-    };
+/// `label`. With `fold`, the path matches in any letter case, as Windows itself does.
+fn replace_path(text: &str, path: &str, label: &str, fold: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut from = 0;
-    while let Some(found) = haystack[from..].find(&needle) {
-        let at = from + found;
-        let end = at + needle.len();
+    let mut at = 0;
+    while at < text.len() {
+        let Some(len) = match_at(&text[at..], path, fold) else {
+            at += text[at..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        let end = at + len;
         // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
         // around the path, so a path before one is still redacted.
         let ends = !text[end..].starts_with(char::is_alphanumeric);
         out.push_str(&text[from..at]);
         out.push_str(if ends { label } else { &text[at..end] });
         from = end;
+        at = end;
     }
     out.push_str(&text[from..]);
     out
@@ -303,59 +316,105 @@ const TOKEN_PREFIXES: &[&str] = &[
 /// quotes, backticks, `:`, `=` or `,`, is redacted whatever it looks like.
 const TOKEN_LEADS: &[&str] = &["bearer", "token", "password", "secret", "apikey", "api_key"];
 
+/// Leads that name a secret whatever follows: after one, even a short value is redacted. After
+/// the others (`token`, `bearer`) a short value needs a `:`, `=` or a quote before it, since
+/// "a token of ours" is prose.
+const STRONG_LEADS: &[&str] = &["password", "secret", "apikey", "api_key"];
+
+/// Whether `word` leads a credential, and if so whether it is a strong lead. A compound name
+/// leads too when it ends in a lead after `_` or `-`: `access_token`, `GITHUB_TOKEN`.
+fn lead_strength(word: &str) -> Option<bool> {
+    if word.len() > 64 {
+        return None;
+    }
+    let lower = word.to_ascii_lowercase();
+    TOKEN_LEADS.iter().find_map(|lead| {
+        let named = lower == *lead
+            || lower
+                .strip_suffix(lead)
+                .is_some_and(|head| head.ends_with(['_', '-']));
+        named.then(|| STRONG_LEADS.contains(lead))
+    })
+}
+
+/// A JSON Web Token however short: `eyJ`, then three non-empty dotted parts.
+fn is_jwt(value: &str) -> bool {
+    value.starts_with("eyJ")
+        && value.split('.').count() == 3
+        && value.split('.').all(|p| !p.is_empty())
+}
+
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
-/// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole.
+/// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole; after
+/// a lead it runs to the next space, quote, backtick, comma or backslash, so symbols stay inside.
 fn redact_tokens(text: &str) -> String {
     let token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     let value_char = |c: char| token_char(c) || matches!(c, '.' | '+' | '/' | '=');
+    let gap_char =
+        |c: char| c.is_whitespace() || matches!(c, ':' | '=' | ',' | '"' | '\'' | '`' | '\\');
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    // Whether the previous word leads a credential and only spaces, quotes, backticks, `:`, `=`
-    // or `,` came since.
-    let mut led = false;
+    // Whether the previous word leads a credential (and whether strongly) and only spaces,
+    // quotes (escaped or not), backticks, `:`, `=` or `,` came since.
+    let mut led: Option<bool> = None;
+    // Whether a `:`, `=` or quote came between the lead and now.
+    let mut delimited = false;
     while !rest.is_empty() {
-        // After a lead, a value may also start with base64's `+` or `/`.
-        let start = rest
-            .find(|c: char| token_char(c) || (led && matches!(c, '+' | '/')))
-            .unwrap_or(rest.len());
+        let start = if led.is_some() {
+            rest.find(|c: char| !gap_char(c))
+        } else {
+            rest.find(token_char)
+        }
+        .unwrap_or(rest.len());
         let gap = &rest[..start];
         out.push_str(gap);
-        if !gap
+        delimited |= gap
             .chars()
-            .all(|c| c.is_whitespace() || matches!(c, ':' | '=' | ',' | '"' | '\'' | '`'))
-        {
-            led = false;
-        }
+            .any(|c| matches!(c, ':' | '=' | '"' | '\'' | '`'));
         rest = &rest[start..];
         if rest.is_empty() {
             break;
         }
-        // A short value that starts with `+` or `/` is left as it is, one character at a time.
+        if let Some(strong) = led {
+            // Only a lead starts this scan, and a redacted value is skipped, so each character
+            // is still read a bounded number of times.
+            let run_end = rest
+                .find(|c: char| c.is_whitespace() || matches!(c, ',' | '"' | '\'' | '`' | '\\'))
+                .unwrap_or(rest.len());
+            let value = rest[..run_end].trim_end_matches(['.', ';', ')', ']', '}']);
+            let starts_plain = value.starts_with(char::is_alphanumeric);
+            if value.len() >= 16 || (starts_plain && (strong || delimited)) {
+                out.push_str("<redacted>");
+                rest = &rest[value.len()..];
+                led = None;
+                continue;
+            }
+        }
+        // A short value that starts with a symbol is left as it is, one character at a time.
         let end = match rest.find(|c: char| !token_char(c)).unwrap_or(rest.len()) {
             0 => rest.chars().next().map_or(0, char::len_utf8),
             end => end,
         };
         let word = &rest[..end];
-        let prefixed =
-            word.len() >= 16 && TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix));
-        if prefixed || led {
+        let prefixed = word.len() >= 16 && TOKEN_PREFIXES.iter().any(|p| word.starts_with(p));
+        let value_end = if prefixed || word.starts_with("eyJ") {
             // The whole value, up to the first character no token holds; a sentence's full
-            // stop stays outside it. Only a lead or a prefix starts this scan, and a redacted
-            // value is skipped, so each character is still read a bounded number of times.
-            let value_end = rest[..rest.find(|c: char| !value_char(c)).unwrap_or(rest.len())]
+            // stop stays outside it.
+            rest[..rest.find(|c: char| !value_char(c)).unwrap_or(rest.len())]
                 .trim_end_matches('.')
-                .len();
-            if prefixed || value_end >= 16 {
-                out.push_str("<redacted>");
-                rest = &rest[value_end..];
-                led = false;
-                continue;
-            }
+                .len()
+        } else {
+            0
+        };
+        if prefixed || (value_end > 0 && is_jwt(&rest[..value_end])) {
+            out.push_str("<redacted>");
+            rest = &rest[value_end..];
+            led = None;
+            continue;
         }
         out.push_str(word);
-        led = TOKEN_LEADS
-            .iter()
-            .any(|lead| word.eq_ignore_ascii_case(lead));
+        led = lead_strength(word);
+        delimited = false;
         rest = &rest[end..];
     }
     out
@@ -501,6 +560,27 @@ mod tests {
             shown,
             r"<home>\.paja, <home>/x, C:\Users\Meg and /home/me/y"
         );
+    }
+
+    #[test]
+    fn more_shapes_of_secrets_go() {
+        let long = "e5".repeat(10);
+        let text = format!(
+            r#"token=\"{long}\" "access_token": "{long}" GITHUB_TOKEN={long} client_secret={long} password: Abc$defghijklmnopqrstuvw password: a$b password hunter2 token=abc eyJhIjoxfQ.{long}.{long} a token of ours"#
+        );
+        assert_eq!(
+            redact_tokens(&text),
+            r#"token=\"<redacted>\" "access_token": "<redacted>" GITHUB_TOKEN=<redacted> client_secret=<redacted> password: <redacted> password: <redacted> password <redacted> token=<redacted> <redacted> a token of ours"#
+        );
+    }
+
+    #[test]
+    fn windows_paths_fold_unicode_and_tilde_forms() {
+        let home = Path::new(r"C:\Users\Jürgen");
+        let proj = Path::new(r"C:\Users\Jürgen\src\proj");
+        let places = [(proj, "<repository>"), (home, "<home>")];
+        let shown = redact(r"C:\USERS\JÜRGEN\x and ~/SRC/PROJ/y", &places);
+        assert_eq!(shown, r"<home>\x and <repository>/y");
     }
 
     #[test]
