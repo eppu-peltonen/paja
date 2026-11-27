@@ -384,6 +384,11 @@ mod tests {
                 "(a)/(b)".into()
             ])
         );
+        // A quoted path wrapped in brackets, and a parenthetical that ends a sentence.
+        assert_eq!(
+            touches_line("Touches: (\"src/a.rs\") (see src/b.rs)."),
+            Some(vec!["src/a.rs".into(), "see".into(), "src/b.rs".into()])
+        );
         assert_eq!(touches_line("Touches: `.`"), Some(vec![WHOLE.into()]));
     }
 
