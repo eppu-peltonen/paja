@@ -380,8 +380,11 @@ round, like a failed check, with the failing checks and the end of the first fai
 --log-failed`); the pull request stays open and the next round pushes to it. So do checks that never start because the
 default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
-otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
-setting to change. On `escalate`, five failed rounds or
+otherwise a merge commit; a repository that allows none escalates with the setting to change. When `gh pr merge`
+fails, Mestari asks `gh repo view` why rather than reading the error's wording: an account below write access, or the
+chosen method now off (an answer is enough when another is still on), escalates naming the fix. A refusal those
+settings don't explain, such as a token without write scope or a branch rule, is an error the item is parked on with
+gh's message. Once answered, the next run lands through the pull request already open. On `escalate`, five failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up: the factory home, repository and home folder named, tokens hidden, mentions made inert, code fences made plain text so the frame after a quote never renders as code) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
