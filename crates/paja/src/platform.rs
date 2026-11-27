@@ -381,6 +381,19 @@ pub fn quote_hook_word(path: &Path) -> Result<String> {
     }
 }
 
+/// Write one line to stdout. Not `println!`, which panics when stdout is closed (the program
+/// that started Paja exited without redirecting it, a broken pipe on Unix, a closed pipe on
+/// Windows): the line is lost then, but the exit code still says how it went.
+pub fn print_line(text: impl std::fmt::Display) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{text}").and_then(|()| out.flush());
+}
+
+/// How the first stop's message says to stop now: 0 a second Ctrl-C, 1 a `stop now` line on
+/// stdin ([`stop_on_stdin`]), 2 not at all (a pool's lane: the pool says it).
+static STOP_HINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// How many times the person pressed Ctrl-C since [`catch_interrupts`].
 static INTERRUPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -405,7 +418,11 @@ fn announce(now: u32) {
         let _ = std::io::Write::write_all(&mut std::io::stderr(), text.as_bytes());
     };
     if before < 1 && now >= 1 {
-        say("paja: stopping after this step; press Ctrl-C again to stop now\n");
+        say(match STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => "paja: stopping after this step; press Ctrl-C again to stop now\n",
+            1 => "paja: stopping after this step; send `stop now` to stop now\n",
+            _ => "paja: stopping after this step\n",
+        });
     }
     if before < 2 && now >= 2 {
         say("paja: stopping now\n");
@@ -424,8 +441,14 @@ fn interrupted() {
 /// (Paja Desk): a `stop` line counts as the first Ctrl-C (stop after this step) and `stop now`
 /// as the second. The same on every platform, since a windowed program has no console to send
 /// Ctrl-C through. Other lines are ignored, and stdin closing (the program that started the
-/// run exited) leaves the run going.
-pub fn stop_on_stdin() {
+/// run exited) leaves the run going. A pool's `lane` reads its stop requests the same way, but
+/// the pool, not the lane, says how to stop now: the pool's own stdin or a terminal's Ctrl-C,
+/// which reaches the lane too.
+pub fn stop_on_stdin(lane: bool) {
+    STOP_HINT.store(
+        if lane { 2 } else { 1 },
+        std::sync::atomic::Ordering::SeqCst,
+    );
     std::thread::spawn(|| {
         let mut stdin = std::io::stdin().lock();
         let mut line = Vec::new();
