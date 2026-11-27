@@ -544,8 +544,11 @@ round's verdict and what every step spent (tokens, cost, turns, time, from `run.
 `run.step` names it. The view is read again on every refresh, and every five seconds while one is open, since a run that is killed writes no event;
 the timer reads only the open run views, so an answer being typed elsewhere keeps its focus, and a view closes once its
 item is no longer active. An active item that no `paja run` holds (its
-`runs/<repo>@<number>.lock` is free) shows as interrupted, not running; checking takes and lets go of that lock at once,
-holding the home lock that `paja run` claims items under, so a claim never meets it. `paja work show` and its MCP tool add
+`runs/<repo>@<number>.lock` is free or missing) shows as interrupted, not running; checking tries that lock and lets go
+of it at once, without creating it, holding the home lock that `paja run` claims items under, so a claim never meets it.
+A claim since the latest `run.started` means that run's steps aren't the current ones: a new `paja run` that hasn't
+started yet shows an empty view, and an item claimed by hand (`paja work claim`, which no run resumes) shows as
+claimed. `paja work show` and its MCP tool add
 the same view as `run` for an active item.
 
 The person's two jobs are answering and writing work, and Desk does both through the core: an escalated item has an
