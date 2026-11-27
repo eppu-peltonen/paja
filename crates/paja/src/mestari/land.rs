@@ -208,9 +208,9 @@ pub(super) fn land(
         }
         return Err(err).with_context(|| {
             format!(
-                "{gh} pr merge {pr} failed, and GitHub's settings for {} don't say why: check \
-                 that the token `{gh} auth status` shows may write there, and the default \
-                 branch's protection rules, then answer what you fixed",
+                "{gh} pr merge {pr} failed; unless gh's message says why (a network error, a \
+                 conflict), check that the token `{gh} auth status` shows may write to {}, and \
+                 the default branch's protection rules",
                 item.repo
             )
         });
@@ -298,8 +298,8 @@ fn merge_refusal(v: &Value, repo: &str, flag: &str) -> Option<String> {
         return Some(no_merge_method(repo));
     }
     Some(format!(
-        "{repo} turned off {name} after this run read its settings. Answer to land it with a \
-         method {repo} allows now; the next run picks one."
+        "{repo} doesn't allow {name} now. Answer to land it with a method {repo} allows; the \
+         next run picks one."
     ))
 }
 
@@ -470,7 +470,10 @@ mod tests {
         ] {
             let v = json!({ "viewerPermission": "ADMIN", key: false });
             let text = why(v, flag).unwrap();
-            assert!(text.contains(&format!("turned off {name}")), "{text}");
+            assert!(
+                text.contains(&format!("doesn't allow {name} now")),
+                "{text}"
+            );
             assert!(text.contains("the next run picks one"), "{text}");
         }
         // All three off: the setting to change.
