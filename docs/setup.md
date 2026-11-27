@@ -169,6 +169,8 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
 - The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
   branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.
+- `.paja/models` on the default branch parses. It is a warning when a line names a role this Paja doesn't know: that
+  line is skipped, so the role runs on the default model or turn cap. Install the newer Paja, or fix the typo.
 - The sandbox: a warning, not a failure, when `PAJA_SBX` is not set. Agents and checks then run as your user, with
   your files and sign-ins, behind the deny-list hook only.
 

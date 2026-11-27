@@ -187,9 +187,19 @@ pub struct Models {
     pub max_turns: std::collections::BTreeMap<String, u32>,
     /// `window <percent>`: the share of the usage window that counts as nearly used up.
     pub window: Option<u32>,
+    /// The roles of the lines skipped because this Paja doesn't know them, each once, in file
+    /// order, so `paja doctor` can show them where an unattended runner's stderr would not.
+    pub skipped: Vec<String>,
 }
 
 impl Models {
+    /// Note a skipped line's role, once however many lines name it.
+    fn skip(&mut self, role: &str) {
+        if !self.skipped.iter().any(|r| r == role) {
+            self.skipped.push(role.to_string());
+        }
+    }
+
     /// The used share of the usage window, in percent, from which Mestari starts no build.
     pub fn window_percent(&self) -> u32 {
         self.window.unwrap_or(90)
@@ -238,6 +248,7 @@ impl Models {
                 };
                 if !ROLES.contains(named) {
                     unknown_role(&at(), named);
+                    models.skip(named);
                     continue;
                 }
                 if limit == 0 {
@@ -275,6 +286,7 @@ impl Models {
             }
             if !ROLES.contains(&role) {
                 unknown_role(&at(), role);
+                models.skip(role);
                 continue;
             }
             let (model, effort) = match rest {
@@ -2882,6 +2894,11 @@ mod tests {
                 .unwrap();
         assert_eq!(ahead.roles.keys().collect::<Vec<_>>(), ["build"]);
         assert_eq!(ahead.max_turns.keys().collect::<Vec<_>>(), ["fix"]);
+        assert_eq!(ahead.skipped, ["reviewer", "builder"]);
+        // A well-formed `max-turns` line for an unknown role, alone, is skipped too.
+        let alone = Models::parse("max-turns builder 3\n").unwrap();
+        assert!(alone.max_turns.is_empty(), "{alone:?}");
+        assert_eq!(alone.skipped, ["builder"]);
         // Its model and effort are still checked: a skipped line can't hide a flag.
         let err = format!("{:#}", Models::parse("newrole --x").unwrap_err());
         assert!(err.contains("not a plain model or effort name"), "{err}");
