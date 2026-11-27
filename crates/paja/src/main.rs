@@ -367,7 +367,7 @@ fn main() -> ExitCode {
                 ),
                 _ => (json!({ "error": text }), ExitCode::from(2)),
             };
-            println!("{value}");
+            paja::platform::print_line(format_args!("{value}"));
             return code;
         }
     };
@@ -391,7 +391,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             if cli.json {
-                println!("{}", json!({ "error": format!("{err:#}") }));
+                paja::platform::print_line(json!({ "error": format!("{err:#}") }));
             } else {
                 eprintln!("error: {err:#}");
             }
@@ -578,7 +578,7 @@ fn run(cli: &Cli) -> Result<()> {
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
             if *stop_on_stdin {
-                paja::platform::stop_on_stdin();
+                paja::platform::stop_on_stdin(*lane);
             }
             if let (Some(lanes), Some(minutes)) = (workers, every) {
                 let pool = mestari::pool::run(
@@ -868,11 +868,11 @@ fn run(cli: &Cli) -> Result<()> {
 
 fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
     if cli.json {
-        println!("{value}");
+        paja::platform::print_line(format_args!("{value}"));
     } else {
         let text = text();
         if !text.is_empty() {
-            println!("{text}");
+            paja::platform::print_line(format_args!("{text}"));
         }
     }
 }

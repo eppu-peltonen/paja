@@ -50,12 +50,14 @@ fn fake_token() -> String {
     ["ghp", "ABCDEFGHIJKLMNOPQRSTuvwx"].join("_")
 }
 
-/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
+/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`. A
+/// sandbox the developer's shell names is left out unless `vars` names one.
 fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(cwd)
         .env("PAJA_HOME", home)
         .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .env_remove("PAJA_SBX")
         .envs(vars.iter().copied())
         .arg("--json")
         .args(args)
@@ -884,6 +886,171 @@ fn fake_gh(dir: &Path, issues: &str) -> std::path::PathBuf {
             issues = slash(&dir.join("issues.json"))
         ),
     )
+}
+
+/// A run's fetch sweeps the `refs/paja/fetch/*` refs a killed run left over an hour ago, and
+/// moves `origin/main` wherever a force-push put the default branch.
+#[test]
+fn a_fetch_sweeps_stale_fetch_refs_and_follows_a_rewritten_main() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main("one.txt", "one\n");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let stale = "refs/paja/fetch/1-1000-0";
+    let fresh = format!("refs/paja/fetch/1-{now}-0");
+    git(&f.repo, &["update-ref", stale, "HEAD"]);
+    git(&f.repo, &["update-ref", &fresh, "HEAD"]);
+    // main rewritten elsewhere: the same parent, another commit.
+    let before = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["commit", "-q", "--amend", "-m", "rewritten"]);
+    let rewritten = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &before],
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    let refs = git_out(
+        &f.repo,
+        &["for-each-ref", "--format=%(refname)", "refs/paja/fetch/"],
+    );
+    assert_eq!(refs, fresh, "{refs}");
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        rewritten
+    );
+    // Rewound to a commit origin/main already holds: followed too, since fetches in the
+    // checkout take turns and a slower one can't come last.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD~1:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", &rewritten],
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        git_out(&f.repo, &["rev-parse", "HEAD~1"])
+    );
+}
+
+/// A fetch that waited its time for another holding the fetch lock goes ahead without it, and
+/// then never moves `origin/main` back onto a commit it holds, since a slower fetch looks so.
+#[test]
+fn a_fetch_without_the_lock_follows_main_only_away_from_what_it_holds() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("issues.json"), "[]").unwrap();
+    f.on_main("one.txt", "one\n");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(f.repo.join(".git").join("paja-fetch.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let run = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_TEST_FETCH_WAIT_MS", "200")
+            .args(["--json", "run"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("fetching without it"), "{stderr}");
+    };
+    let tip = git_out(&f.repo, &["rev-parse", "HEAD"]);
+    // Rewound: origin/main stays where it was.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD~1:main"]);
+    git(&f.repo, &["update-ref", "refs/remotes/origin/main", &tip]);
+    run();
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        tip
+    );
+    // Moved on: followed.
+    git(&f.repo, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    git(
+        &f.repo,
+        &["update-ref", "refs/remotes/origin/main", "HEAD~1"],
+    );
+    run();
+    assert_eq!(
+        git_out(&f.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        tip
+    );
+}
+
+#[test]
+fn a_closed_stdout_ends_paja_with_its_exit_code_not_a_panic() {
+    // The program that started paja exited without reading or redirecting stdout: the report
+    // can't be written, but paja ends as it would have, without panicking.
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    for (answer, code) in [("echo '[]'", 0), ("echo 'HTTP 502' >&2; exit 1", 1)] {
+        // A slow gh, so stdout is closed before paja writes its report.
+        let gh = program(
+            tmp.path(),
+            &format!("gh-{code}"),
+            &format!(
+                "#!/bin/sh\nsleep 1\ncase \"$*\" in *nameWithOwner*) echo '{{\"nameWithOwner\": \"acme/app\"}}' ;; *) {answer} ;; esac\n"
+            ),
+        );
+        let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .args(["--json", "work", "sync"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(run.stdout.take());
+        let output = output_within(run, std::time::Duration::from_secs(60));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+/// A sync through a symlink to a checkout already recorded records nothing new.
+#[cfg(unix)]
+#[test]
+fn a_sync_through_a_symlink_to_a_recorded_checkout_records_no_new_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&repo, &link).unwrap();
+    let gh = fake_gh(tmp.path(), "[]");
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    // Spelled with `--repo`: a process started in the symlink would see the resolved folder.
+    for at in [&repo, &link] {
+        let (ok, report) = paja_with(
+            &home,
+            tmp.path(),
+            &["work", "sync", "--repo", at.to_str().unwrap()],
+            &with_gh,
+        );
+        assert!(ok, "{report}");
+    }
+    let (_, log) = paja(&home, &repo, &["log"]);
+    let recorded: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .collect();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
 }
 
 #[test]
@@ -2739,6 +2906,195 @@ fn make_private(dir: &Path) {
 }
 
 #[test]
+fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    // A pushed review branch with labels of its own, and origin/HEAD moved to it, as code in
+    // a worktree could.
+    git(&repo, &["checkout", "-q", "-b", "paja/app-1"]);
+    std::fs::write(repo.join(".paja/labels"), "work evil\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "labels"]);
+    git(&repo, &["push", "-q", "origin", "paja/app-1"]);
+    git(&repo, &["checkout", "-q", "trunk"]);
+    git(&repo, &["remote", "set-head", "origin", "paja/app-1"]);
+    let doctor = |view: &str| {
+        let gh = program(
+            tmp.path(),
+            "gh",
+            &format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n\
+                 \"repo view\") echo '{view}' ;;\n\
+                 \"label list\") echo '[{{\"name\": \"game\"}}]' ;;\n\
+                 \"workflow list\") echo 'CI\tactive\t1' ;;\nesac\n"
+            ),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        report
+    };
+    let named = |report: &Value, name: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .cloned()
+    };
+    // GitHub names trunk: the labels come from origin/trunk, not the review branch.
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "trunk"}}"#);
+    assert!(named(&report, "default branch").is_none(), "{report}");
+    let label = named(&report, "work label").unwrap();
+    assert_eq!(label["status"], "ok", "{report}");
+    assert!(
+        label["detail"].as_str().unwrap().contains("`game`"),
+        "{report}"
+    );
+    // Doctor still says origin/HEAD was moved, and what it read instead.
+    let head = named(&report, "origin/HEAD").unwrap();
+    assert_eq!(head["status"], "warning", "{report}");
+    assert!(
+        head["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Paja reads origin/trunk instead"),
+        "{report}"
+    );
+    // GitHub can't say: origin/HEAD pointing at one of Paja's own branches is refused.
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("one of Paja's own branches"),
+        "{report}"
+    );
+    // Nor is one that isn't a symbolic ref.
+    git(
+        &repo,
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    );
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "--no-deref",
+            "refs/remotes/origin/HEAD",
+            "paja/app-1",
+        ],
+    );
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("is not a symbolic ref"),
+        "{report}"
+    );
+    assert_eq!(branch["status"], "failed", "{report}");
+    // GitHub names a branch that isn't fetched: neither origin/HEAD nor a local main, which
+    // code in a worktree can make, stands in for it.
+    git(&repo, &["branch", "main", "trunk"]);
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "gone"}}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no origin/gone; run `git fetch origin gone`"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_default_branch_github_names_is_read_without_origin_head_or_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    let log = tmp.path().join("gh.log");
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\", \"defaultBranchRef\": {{\"name\": \"trunk\"}}}}' ;;\n\
+             \"issue list\") echo '[]' ;;\nesac\n",
+            slash(tmp.path().join("gh.log").as_path())
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["--json", "work", "sync"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The work label came from origin/trunk.
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.starts_with("issue list") && l.contains("game")),
+        "{calls}"
+    );
+    // It read two files from the default branch, and asked GitHub for its name once.
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.contains("defaultBranchRef"))
+            .count(),
+        1,
+        "{calls}"
+    );
+}
+
+#[test]
 fn doctor_reads_a_default_branch_that_is_not_main() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -3461,29 +3817,77 @@ fn slow_run(f: &Factory) -> std::process::Child {
         .process_group(0)
         .spawn()
         .unwrap();
+    wait_for_the_builder(&child, dir);
+    child
+}
+
+/// Ends paja if the test panics before [`output_within`] took it over, so a failed step (a
+/// write to its stdin, a file the test removes) doesn't leave it running.
+struct EndOnPanic(u32);
+
+impl Drop for EndOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            end_process(self.0);
+        }
+    }
+}
+
+/// Wait until the fake builder is held on `slow`; past a minute, end `run` and fail, so a run
+/// that never got there doesn't outlive the test.
+fn wait_for_the_builder(run: &std::process::Child, dir: &Path) {
     let started = std::time::Instant::now();
     while !dir.join("slowing").exists() {
-        assert!(
-            started.elapsed().as_secs() < 60,
-            "the builder never started"
-        );
+        if started.elapsed().as_secs() >= 60 {
+            end_process(run.id());
+            panic!("the builder never started");
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    child
+}
+
+/// End the process `pid` and the processes it started, without waiting for them. Paja starts
+/// each agent and check as the leader of a process group of its own, so on Unix each child's
+/// group is ended too.
+fn end_process(pid: u32) {
+    let pid = pid.to_string();
+    #[cfg(unix)]
+    {
+        let children = Command::new("pgrep")
+            .args(["-P", &pid])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let _ = Command::new("kill").args(["-9", &pid]).status();
+        for child in children.split_whitespace() {
+            let group = format!("-{child}");
+            let _ = Command::new("kill")
+                .args(["-9", "--", &group, child])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// `child`'s output, failing the test instead of hanging when it hasn't ended within `limit`:
 /// a watchdog ends it then, so a broken stop shows as a failure.
-#[cfg(unix)]
 fn output_within(child: std::process::Child, limit: std::time::Duration) -> std::process::Output {
-    let pid = child.id().to_string();
+    let pid = child.id();
     let (ended, wait) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
-        let late = wait.recv_timeout(limit).is_err();
-        if late {
-            let _ = Command::new("kill").args(["-9", &pid]).status();
+        // Only the limit passing counts as late. The sender is dropped unsent only when
+        // `wait_with_output` panicked, with paja not reaped; it is ended then too.
+        let waited = wait.recv_timeout(limit);
+        if waited.is_err() {
+            end_process(pid);
         }
-        late
+        matches!(waited, Err(std::sync::mpsc::RecvTimeoutError::Timeout))
     });
     let output = child.wait_with_output().unwrap();
     let _ = ended.send(());
@@ -3497,7 +3901,6 @@ fn output_within(child: std::process::Child, limit: std::time::Duration) -> std:
 
 /// A `stop` line on stdin, as Paja Desk sends it, stops the run after its step, like the first
 /// Ctrl-C; the run's own lock and log are the CLI's.
-#[cfg(unix)]
 #[test]
 fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
     use std::io::Write as _;
@@ -3515,14 +3918,8 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let started = std::time::Instant::now();
-    while !dir.join("slowing").exists() {
-        assert!(
-            started.elapsed().as_secs() < 60,
-            "the builder never started"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let guard = EndOnPanic(run.id());
+    wait_for_the_builder(&run, dir);
     let mut stdin = run.stdin.take().unwrap();
     writeln!(stdin, "hello").unwrap();
     writeln!(stdin, "stop").unwrap();
@@ -3535,16 +3932,25 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
         "paja ended before its step did"
     );
     std::fs::remove_file(dir.join("slow")).unwrap();
+    // Reaped there: past this point the pid may be another process's.
+    std::mem::forget(guard);
     let output = output_within(run, std::time::Duration::from_secs(120));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
-    assert!(stderr.contains("stopping after this step"), "{stderr}");
+    // Started by a program, the run names the line that stops it now, not a second Ctrl-C.
+    assert!(
+        stderr.contains("stopping after this step; send `stop now` to stop now"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("running Vasara's checks"), "{stderr}");
 }
 
 /// `stop now` on stdin stops at once and ends the agent, like a second Ctrl-C, also in a loop.
+// Unix only for now: on Windows CI paja stopped and exited, but the fake builder's processes
+// (Git Bash's `sh` and its `sleep` loop) outlived `taskkill /T` and kept paja's output pipes
+// open, so the run never read as ended.
 #[cfg(unix)]
 #[test]
 fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
@@ -3563,18 +3969,14 @@ fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let started = std::time::Instant::now();
-    while !dir.join("slowing").exists() {
-        assert!(
-            started.elapsed().as_secs() < 60,
-            "the builder never started"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let guard = EndOnPanic(run.id());
+    wait_for_the_builder(&run, dir);
     let mut stdin = run.stdin.take().unwrap();
     writeln!(stdin, "stop now").unwrap();
     stdin.flush().unwrap();
     let stopping = std::time::Instant::now();
+    // Reaped there: past this point the pid may be another process's.
+    std::mem::forget(guard);
     let output = output_within(run, std::time::Duration::from_secs(120));
     assert!(
         stopping.elapsed().as_secs() < 30,
@@ -7332,6 +7734,132 @@ fn a_window_in_a_real_stream_reaches_the_recorded_step() {
 }
 
 #[test]
+fn a_nearly_used_seven_day_window_holds_back_the_next_build_until_it_resets() {
+    // The shape a current Claude Code prints: no top-level utilization, each window's share
+    // under `unifiedWindows`. The five-hour limit binds and is allowed, but the seven-day window
+    // is nearly used, so the next build waits for the seven-day reset.
+    let f = Factory::new("true\n", "changes");
+    let (five, seven) = (epoch_secs_in(3600), epoch_secs_in(5 * 24 * 3600));
+    let stream = [
+        json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
+        json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed", "resetsAt": five, "rateLimitType": "five_hour",
+            "isUsingOverage": false, "unifiedWindows": {
+                "five_hour": {"utilization": 0.2, "resetsAt": five, "status": "allowed"},
+                "seven_day": {"utilization": 0.95, "resetsAt": seven, "status": "allowed"}}}}),
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "s-1", "total_cost_usd": 0.25}),
+    ]
+    .iter()
+    .map(|m| format!("{m}\n"))
+    .collect::<String>();
+    std::fs::write(f.tmp.path().join("stream.jsonl"), stream).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    assert_eq!(report["resets_at"], seven * 1000, "{report}");
+    let rounds = round_events(&f);
+    let build = &rounds[0]["data"]["steps"][0];
+    assert_eq!(build["window_status"], "allowed", "{build}");
+    assert_eq!(build["window_resets_at"], seven * 1000, "{build}");
+    let used = build["window_used_percent"].as_f64().unwrap_or_default();
+    assert!((used - 95.0).abs() < 1e-9, "{build}");
+    // The next pass starts nothing until then.
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "paused", "{again}\n{stderr}");
+    assert_eq!(again["resets_at"], seven * 1000, "{again}");
+}
+
+#[test]
+fn doctor_warns_while_no_step_reports_a_usage_window() {
+    let f = Factory::new("true\n", "land");
+    // Doctor's own `claude`: the factory's fake would take `--version` for a build.
+    let auth = f.tmp.path().join("auth.json");
+    let signed_in = |method: &str| {
+        let status = format!(r#"{{"loggedIn": true, "authMethod": "{method}"}}"#);
+        std::fs::write(&auth, status).unwrap();
+    };
+    signed_in("oauth_token");
+    let doctor_claude = program(
+        f.tmp.path(),
+        "doctor-claude",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\"auth status\") cat '{}' ;;\n*) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+            auth.display()
+        ),
+    );
+    let window = |f: &Factory| {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &doctor_claude)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "usage window");
+        check.cloned().unwrap_or_else(|| panic!("{report}"))
+    };
+    // Nothing has run yet: nothing to judge.
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    // The fake's results carry no window, as a Claude Code printing another shape would.
+    let (_, report) = f.run();
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let check = window(&f);
+    assert_eq!(check["status"], "warning", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reported no usage window"),
+        "{check}"
+    );
+    assert!(
+        check["fix"].as_str().unwrap().contains("rate_limit_event"),
+        "{check}"
+    );
+    // Signed in with an API key there is no window, so nothing to warn of.
+    signed_in("api_key");
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains("API key"),
+        "{check}"
+    );
+    signed_in("oauth_token");
+    // A later step that reports one settles it.
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("reset-at"),
+        epoch_secs_in(3600).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 6, "title": "Another", "body": "Please.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+    paja(&f.home, &f.repo, &["work", "sync"]);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("had allowed_warning, 93% used"),
+        "{check}"
+    );
+}
+
+#[test]
 fn a_nearly_used_window_claims_no_new_item() {
     let f = Factory::new("true\n", "land");
     let resets = epoch_secs_in(3600);
@@ -9381,7 +9909,9 @@ fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
 
 /// `paja init` with the given `files` committed and a fake `claude` that answers with `answer`
 /// (the agent's `structured_output`) and logs each call in `claude-calls` next to the repository.
-/// Returns the temp directory (the fakes' logs are in it), the repository and the result.
+/// Returns the temp directory (the fakes' logs are in it), the repository and the result. The
+/// fake records its arguments one per line in `claude-args`, so an argument with a newline in it
+/// (a harness from a committed `CLAUDE.md`) would be split; the fixtures here have none.
 fn init_with_agent(
     files: &[(&str, &str)],
     answer: &Value,
@@ -9399,7 +9929,7 @@ fn init_with_agent(
         tmp.path(),
         "claude",
         &format!(
-            "#!/bin/sh\ncat > {d}/prompt.txt\necho x >> {d}/claude-calls\ncat {d}/answer.json\n"
+            "#!/bin/sh\ncat > {d}/prompt.txt\necho x >> {d}/claude-calls\nprintf '%s\\n' \"$@\" > {d}/claude-args\ncat {d}/answer.json\n"
         ),
     );
     let mut all = vec!["init"];
@@ -9700,6 +10230,89 @@ fn init_falls_back_to_the_table_and_says_so_when_the_agent_answers_badly() {
 }
 
 #[test]
+fn init_falls_back_to_the_table_without_the_agents_environment() {
+    // No proposed stack is backed by a file, but its toolchain is: the table's stacks are used,
+    // and the environment is theirs alone, not the agent's toolchains beside them.
+    let answer = serde_json::json!({
+        "stacks": [{"name": "ghost", "dir": ".", "file": "ghost.toml",
+            "checks": [{"command": "ghost test", "file": "ghost.toml"}], "commands": ["ghost"]}],
+        "toolchains": [{"name": "go", "version": "1.22", "file": "go.mod"}],
+        "services": [{"name": "postgres", "file": "go.mod"}]
+    });
+    let (_tmp, _repo, ok, out) = init_with_agent(&[("go.mod", "module x\n")], &answer, &[]);
+    assert!(ok, "{out}");
+    let detected = &out["detected"];
+    assert!(
+        detected["fallback"]
+            .as_str()
+            .unwrap()
+            .contains("proposed no stack"),
+        "{out}"
+    );
+    assert_eq!(detected["checks"][0]["source"], "table", "{out}");
+    assert_eq!(
+        detected["environment"]["toolchains"],
+        serde_json::json!([]),
+        "{out}"
+    );
+    assert_eq!(
+        detected["environment"]["services"],
+        serde_json::json!([]),
+        "{out}"
+    );
+}
+
+#[test]
+fn init_agent_gets_read_only_tools_and_hook() {
+    let answer = serde_json::json!({"stacks": [{"name": "go", "dir": ".", "file": "go.mod",
+        "checks": [{"command": "go test ./...", "file": "go.mod"}], "commands": ["go"]}]});
+    let (tmp, _repo, ok, out) = init_with_agent(&[("go.mod", "module x\n")], &answer, &[]);
+    assert!(ok, "{out}");
+    let args = std::fs::read_to_string(tmp.path().join("claude-args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let at = |flag: &str| {
+        args.iter()
+            .position(|a| *a == flag)
+            .unwrap_or_else(|| panic!("no {flag}: {args:?}"))
+    };
+    // Only reading tools are defined at all, and only these reading ones are allowed.
+    assert_eq!(args[at("--tools") + 1], "Read,Glob,Grep,Bash", "{args:?}");
+    let allowed: Vec<&str> = args[at("--allowedTools") + 1..]
+        .iter()
+        .take_while(|a| !a.starts_with("--"))
+        .copied()
+        .collect();
+    assert_eq!(
+        allowed,
+        [
+            "Read",
+            "Glob",
+            "Grep",
+            "Bash(git status*)",
+            "Bash(git diff*)",
+            "Bash(git log*)",
+            "Bash(git show*)",
+            "Bash(tail *)",
+            "Bash(head *)",
+            "Bash(grep *)",
+            "Bash(wc *)",
+            "Bash(pwd)",
+        ],
+        "{args:?}"
+    );
+    // The deny-list hook runs before every tool, in its read-only mode.
+    let settings: Value = serde_json::from_str(args[at("--settings") + 1]).unwrap();
+    let pre = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(pre["matcher"], "*", "{settings}");
+    let command = pre["hooks"][0]["command"].as_str().unwrap();
+    assert!(
+        command.contains(" hook ") && command.contains("--read-only"),
+        "{command}"
+    );
+    assert_eq!(args[at("--permission-mode") + 1], "auto", "{args:?}");
+}
+
+#[test]
 fn init_falls_back_to_the_table_when_claude_is_missing() {
     let (_tmp, repo, home, gh) = init_fixture(&[("go.mod", "module x\n")]);
     let missing = repo.join("no-such-claude");
@@ -9992,6 +10605,43 @@ fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
     assert!(reports.is_empty(), "{reports:?}");
     let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
     assert!(err.contains("starting nothing until"), "{err}");
+}
+
+/// The pool says how to stop it now; its lanes, which read `stop` from the pool, only say they
+/// are stopping, since nobody can write to a lane's stdin.
+#[cfg(unix)]
+#[test]
+fn a_stopping_pools_lanes_leave_the_stop_now_hint_to_the_pool() {
+    use std::io::Write as _;
+    let f = pool_factory(false);
+    let mut pool = start_pool(&f, "1");
+    wait_until(&f, "a lane building", || holding(&f, "Alpha"));
+    let mut stdin = pool.stdin.take().unwrap();
+    writeln!(stdin, "stop").unwrap();
+    stdin.flush().unwrap();
+    let err_path = f.tmp.path().join("pool.err");
+    let lane_stopping = || {
+        std::fs::read_to_string(&err_path)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.starts_with("lane 1 #5: paja: stopping after this step"))
+    };
+    wait_until(&f, "the lane saying it stops", lane_stopping);
+    release(&f, "Alpha");
+    let output = output_within(pool, std::time::Duration::from_secs(120));
+    let err = std::fs::read_to_string(&err_path).unwrap();
+    assert!(output.status.success(), "{err}");
+    assert!(
+        err.lines()
+            .any(|l| l.starts_with("paja: stopping after this step; send `stop now`")),
+        "{err}"
+    );
+    for line in err.lines().filter(|l| l.starts_with("lane ")) {
+        assert!(
+            !line.contains("stop now") && !line.contains("Ctrl-C"),
+            "{line}\n{err}"
+        );
+    }
 }
 
 #[cfg(unix)]

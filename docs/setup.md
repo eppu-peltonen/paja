@@ -137,7 +137,8 @@ A repository with no `init` line in `.paja/models` runs the agent on the account
 skips the agent and uses a small built-in table instead (`Cargo.toml`; `package.json` with its `test` and `lint`
 scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`; `go.mod`).
 The table is also the fallback when `claude` is missing or not signed in, or when the agent's answer is malformed or
-holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`).
+holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`),
+and none of the agent's toolchains or services are kept.
 
 `paja init` writes, in one pull request from the branch `paja/init`:
 
@@ -242,6 +243,12 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
 - No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it
   is answered; if its issue is closed instead, this is a warning that names the environment and the
   `paja env remove <name>` that frees it (the branch is kept).
+- Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
+  `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
+  warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it
+  is current, the warning names where to file an issue. Before any step has run, and when `claude auth status` says
+  you are signed in with an API key or through a cloud provider (no window), it is ok. Billed per token some other
+  way (a Console sign-in), there is no window either, and the warning doesn't apply.
 - The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
   branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.

@@ -267,13 +267,13 @@ impl Pool<'_> {
                         }
                         match super::sync_queue(self.home, self.repo) {
                             Ok(_) => {}
-                            Err(err) if super::is_fatal(&err) => {
-                                fatal = Some(err);
-                                continue;
-                            }
+                            // The next tick tells the lanes and stops, after the usual sleep.
+                            Err(err) if super::is_fatal(&err) => fatal = Some(err),
                             Err(err) => self.say_error(&err),
                         }
                     }
+                }
+                if free > 0 && paused.is_none() && fatal.is_none() {
                     let admitted = self.admit(free)?;
                     if admitted == 0
                         && self.lanes.is_empty()
@@ -473,9 +473,9 @@ impl Pool<'_> {
                 .or_insert(json!(lane.number));
         }
         if self.opts.json {
-            println!("{report}");
+            crate::platform::print_line(format_args!("{report}"));
         } else {
-            println!("{}", describe_report(n, lane.number, &report));
+            crate::platform::print_line(describe_report(n, lane.number, &report));
         }
         Ok(())
     }
@@ -488,18 +488,20 @@ impl Pool<'_> {
         match super::triage_if_due(self.home, self.repo) {
             Ok(Some(report)) => {
                 if self.opts.json {
-                    println!("{}", json!({ "outcome": "triage", "triage": report }));
+                    crate::platform::print_line(json!({ "outcome": "triage", "triage": report }));
                 } else {
-                    println!("triage: {}", serde_json::to_string(&report)?);
+                    crate::platform::print_line(format_args!(
+                        "triage: {}",
+                        serde_json::to_string(&report)?
+                    ));
                 }
             }
             Ok(None) => {}
             Err(err) if super::is_fatal(&err) => return Err(err),
             // Tagged, so a reader of the pool's lines can tell it from a lane's error.
             Err(err) if self.opts.json => {
-                println!(
-                    "{}",
-                    json!({ "outcome": "triage", "error": format!("{err:#}") })
+                crate::platform::print_line(
+                    json!({ "outcome": "triage", "error": format!("{err:#}") }),
                 );
             }
             Err(err) => self.say_error(&err),
@@ -527,9 +529,9 @@ impl Pool<'_> {
 
     fn say_error(&self, err: &anyhow::Error) {
         if self.opts.json {
-            println!("{}", json!({ "error": format!("{err:#}") }));
+            crate::platform::print_line(json!({ "error": format!("{err:#}") }));
         } else {
-            println!("error: {err:#}");
+            crate::platform::print_line(format_args!("error: {err:#}"));
         }
     }
 }
