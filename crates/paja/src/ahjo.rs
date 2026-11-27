@@ -521,29 +521,75 @@ pub(crate) fn git_command() -> Command {
 
 /// A file as it is at `rev` in `repo`, or None if `rev` doesn't have it. Any other git failure
 /// is an error: a settings or check file that can't be read must never count as an empty one.
-/// Git runs in the C locale, since a missing file is told apart by git's English message.
+/// `rev` is resolved to one commit first, so a branch that moves meanwhile can't mix two
+/// trees. Whether that commit has the file is asked of `git ls-tree` (an empty listing), never
+/// read from git's message text, which a translated or changed git words differently; the
+/// content is then read from the very blob the listing names.
 pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<String>> {
     let spec = format!("{rev}:{path}");
-    let output = git_command()
-        .env("LC_ALL", "C")
-        .env_remove("LANGUAGE")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &spec])
-        .output()
-        .context("running git (is it installed?)")?;
-    if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    let run = |args: &[&str]| {
+        git_command()
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .context("running git (is it installed?)")
+    };
+    let failed = |what: String, output: &std::process::Output| {
+        anyhow::anyhow!(
+            "reading {spec}: {what} failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    };
+    let commit = format!("{rev}^{{commit}}");
+    let resolved = run(&["rev-parse", "--verify", "--end-of-options", &commit])?;
+    if !resolved.status.success() {
+        return Err(failed(format!("git rev-parse {commit}"), &resolved));
     }
-    let err = String::from_utf8_lossy(&output.stderr);
-    if err.contains("does not exist in") || err.contains("exists on disk, but not in") {
+    let commit = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+    // From the top of the tree and with the path taken literally, as `rev:path` names it.
+    let listed = run(&[
+        "--literal-pathspecs",
+        "ls-tree",
+        "--full-tree",
+        "-z",
+        &commit,
+        "--",
+        path,
+    ])?;
+    if !listed.status.success() {
+        return Err(failed("git ls-tree".to_string(), &listed));
+    }
+    let entries: Vec<&[u8]> = listed
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .collect();
+    if entries.is_empty() {
         return Ok(None);
     }
-    bail!(
-        "git show {spec} failed in {}: {}",
-        repo.display(),
-        err.trim()
-    )
+    // `<mode> <type> <object>\t<path>`: exactly the one entry asked for, and a file.
+    let entry = match entries.as_slice() {
+        [one] => String::from_utf8_lossy(one).into_owned(),
+        _ => bail!("reading {spec}: {path} names more than one entry"),
+    };
+    let (head, listed_path) = entry
+        .split_once('\t')
+        .with_context(|| format!("reading {spec}: git ls-tree printed {entry:?}"))?;
+    if listed_path != path {
+        bail!("reading {spec}: git lists it as {listed_path:?}; name the file from the top of the tree");
+    }
+    let mut fields = head.split(' ');
+    let (kind, object) = (fields.nth(1).unwrap_or(""), fields.next().unwrap_or(""));
+    if kind != "blob" {
+        bail!("reading {spec}: it is a {kind}, not a file");
+    }
+    let output = run(&["cat-file", "blob", object])?;
+    if !output.status.success() {
+        return Err(failed(format!("git cat-file blob {object}"), &output));
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
 /// A file as it is on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
@@ -637,13 +683,47 @@ mod tests {
         );
         assert_eq!(show_at(repo, "HEAD", "gone.txt").unwrap(), None);
         assert_eq!(show_at(repo, "HEAD", "new.txt").unwrap(), None);
+        // A path is taken literally and from the top, wherever git runs.
+        assert_eq!(show_at(repo, "HEAD", "*.txt").unwrap(), None);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        assert_eq!(
+            show_at(&repo.join("sub"), "HEAD", "kept.txt")
+                .unwrap()
+                .as_deref(),
+            Some("kept\n")
+        );
         let err = show_at(repo, "no-such-rev", "kept.txt")
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("git show no-such-rev:kept.txt failed in"),
-            "{err}"
+        assert!(err.contains("reading no-such-rev:kept.txt"), "{err}");
+        // Nested files, as every real caller reads them.
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+        git_unchecked(repo, &["add", ".paja/checks"]).unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "d",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            show_at(repo, "HEAD", ".paja/checks").unwrap().as_deref(),
+            Some("cargo test\n")
         );
+        assert_eq!(show_at(repo, "HEAD", ".paja/models").unwrap(), None);
+        // A directory or a spelling git folds is an error, never None and never a listing.
+        assert!(show_at(repo, "HEAD", ".paja").is_err());
+        assert!(show_at(repo, "HEAD", ".paja/./checks").is_err());
+        // A rev that looks like an option is not taken for one.
+        assert!(show_at(repo, "--output=x", "kept.txt").is_err());
+        assert!(!repo.join("x").exists());
     }
 
     #[test]
