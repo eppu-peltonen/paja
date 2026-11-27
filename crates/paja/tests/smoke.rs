@@ -926,6 +926,28 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
         .filter(|e| e["kind"] == "work.checkout")
         .count();
     assert_eq!(checkouts, 1, "{events}");
+    // So is a `--repo` spelled with `..` and `.` parts, run from somewhere else.
+    let roundabout = sub.join("..").join(".").join("src");
+    let (ok, again) = paja_with(
+        &home,
+        tmp.path(),
+        &["work", "sync", "--repo", roundabout.to_str().unwrap()],
+        &with_gh,
+    );
+    assert!(ok, "{again}");
+    let (_, events) = paja(&home, &repo, &["log"]);
+    let checkouts: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .collect();
+    assert_eq!(checkouts.len(), 1, "{events}");
+    assert_eq!(
+        checkouts[0]["data"]["path"],
+        serde_json::json!(repo),
+        "{events}"
+    );
 
     let (ok, next) = paja(&home, &repo, &["work", "next"]);
     assert!(ok);
@@ -1281,7 +1303,8 @@ fn a_repository_names_its_own_work_and_follow_up_labels() {
 }
 
 /// A `gh` that lists one work issue (#4) and one follow-up issue (#2, older) by label, and
-/// counts a follow-up listed under both labels once.
+/// counts a follow-up listed under both labels once. An issue's state reads `closed` once the
+/// file `closed-on-github` is in `dir`, and open before.
 fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
     let d = slash(dir);
     program(
@@ -1294,6 +1317,7 @@ fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
              *\"--label factory-follow-up \"*) echo '[{{\"number\": 2, \"title\": \"Tidy\", \"body\": \"\", \"url\": \"https://example.com/2\"}}]' ;; \
              *\"--label factory \"*) echo '[{{\"number\": 4, \"title\": \"Build\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; \
              *) echo '[]' ;; esac ;;\n\
+             \"api \"*) if [ -f {d}/closed-on-github ]; then echo closed; fi ;;\n\
              *) ;;\nesac\n"
         ),
     )
@@ -1372,6 +1396,39 @@ fn a_landed_follow_up_stays_landed_when_follow_ups_come_back_on() {
     let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
     assert_eq!(item["status"], "landed", "{item}");
     assert_eq!(item["open"], true, "{item}");
+}
+
+#[test]
+fn a_landed_follow_up_github_closed_while_follow_ups_were_off_is_queued_when_it_reopens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let queue = |text: &str| {
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/queue"), text).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "queue"]);
+    };
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (_, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert_eq!(set["status"], "landed", "{set}");
+    // Follow-ups go off while GitHub has closed #2: the sync asks, and closes it as GitHub did.
+    std::fs::write(tmp.path().join("closed-on-github"), "").unwrap();
+    queue("follow-ups = off\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(log.contains("issues/2 --jq .state"), "{log}");
+    // GitHub reopens #2 (a revert, say) and follow-ups come back on: it needs work again.
+    std::fs::remove_file(tmp.path().join("closed-on-github")).unwrap();
+    queue("follow-ups = on\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["status"], "queued", "{item}");
 }
 
 #[test]
@@ -4895,6 +4952,54 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
     assert_eq!(report["closed"], serde_json::json!([11]), "{report}");
     let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
     assert!(log.contains("createdAt"), "{log}");
+}
+
+#[test]
+fn triage_closes_a_duplicate_of_a_follow_up_a_later_pass_reads() {
+    let (f, dir) = triage_factory(r#"{"issues": []}"#);
+    let issues: Vec<String> = (1..=62)
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "title": "Issue {n}", "body": "details of {n}.", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issues.join(", ")),
+    )
+    .unwrap();
+    // #1 says the same as #62, which this pass doesn't judge; the rest stay.
+    let mut entries = vec![
+        r#"{"number": 1, "verdict": "duplicate", "duplicate_of": 62, "reason": "Same."}"#
+            .to_string(),
+    ];
+    entries.extend(
+        (2..=60).map(|n| format!(r#"{{"number": {n}, "verdict": "keep", "reason": "open"}}"#)),
+    );
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(
+            r#"{{"is_error": false, "num_turns": 1, "structured_output": {{"issues": [{}]}}}}"#,
+            entries.join(", ")
+        ),
+    )
+    .unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([1]), "{report}");
+    assert_eq!(report["items"][0]["duplicate_of"], 62, "{report}");
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    // The issues past the 60 are listed by number and title only.
+    assert!(
+        prompt.contains("#61: Issue 61\n#62: Issue 62\n"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("details of 61."), "{prompt}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issue close 1 --comment"), "{log}");
+    assert!(log.contains("a duplicate of #62"), "{log}");
+    assert!(!log.contains("issue close 62"), "{log}");
 }
 
 #[test]
