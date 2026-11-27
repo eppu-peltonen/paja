@@ -477,7 +477,11 @@ mod tests {
             .unwrap_err();
         assert!(format!("{refused:#}").contains("acme/app#4"), "{refused:#}");
         drop(held);
-        assert_eq!(runner.status(&home, "acme/app")["terminal"], Value::Null);
+        // Another test's child forked in the instant before the drop shares the lock until it
+        // execs, so the lock may be let go a moment later.
+        wait_until("the terminal run's lock being let go", || {
+            runner.status(&home, "acme/app")["terminal"] == Value::Null
+        });
         runner
             .start(&home, "acme/app", &checkout, false, None)
             .unwrap();
