@@ -94,12 +94,21 @@ pub fn work_file_in(home: &Home, repo: &str, title: &str, body: &str, cwd: &Path
     filed.unwrap_or_else(error)
 }
 
+/// How many remembered checkouts [`checkout_of`] asks `gh` about, newest first, before it
+/// gives up on them: each question is a `gh repo view`.
+const CHECKOUTS_ASKED: usize = 3;
+
 /// Where to run the core's commands for `repo`: the newest checkout Paja worked in for it that
 /// is still a checkout of `repo`, else the directory Desk started in when that is one.
 fn checkout_of(home: &Home, repo: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
+    checkout_within(home, repo, cwd, CHECKOUTS_ASKED)
+}
+
+/// [`checkout_of`], asking about at most `asked` remembered checkouts.
+fn checkout_within(home: &Home, repo: &str, cwd: &Path, asked: usize) -> anyhow::Result<PathBuf> {
     // The core asks `gh` which repository a checkout is, so a checkout whose remote has since
     // changed would act on another repository's item: it must still be `repo`.
-    for path in jono::known_checkouts(home, repo)? {
+    for path in jono::known_checkouts(home, repo)?.into_iter().take(asked) {
         // A failing `gh` is its own error, not a reason to look elsewhere.
         if jono::repo_name(home, &path)? == repo {
             return Ok(path);
@@ -792,6 +801,18 @@ mod tests {
         // Paja only asked the moved checkout which repository it is.
         let asked = std::fs::read_to_string(moved.join("gh.log")).unwrap();
         assert!(!asked.contains("issue"), "{asked}");
+        // Asking about one checkout only, Desk stops at the stale one: the older one isn't tried.
+        let error = checkout_within(&home, "acme/app", dir.path(), 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("doesn't know where acme/app is checked out"),
+            "{error}"
+        );
+        assert_eq!(
+            checkout_within(&home, "acme/app", dir.path(), 2).unwrap(),
+            checkout
+        );
     }
 
     #[cfg(unix)]
