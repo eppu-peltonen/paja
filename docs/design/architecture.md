@@ -589,8 +589,10 @@ while it starts.
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
   of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current
   directory or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not
-  spelling). They are arguments, never exported, so hooks and nested git don't inherit them. Other git commands, and
-  ones that pass their own `--git-dir`, run unchanged. The `.git` file on the host is never rewritten. Only the git
+  spelling). Git passes the git directory down to every process it starts (hooks, `!` aliases, submodule commands),
+  so the shim clears an inherited `GIT_DIR` and `GIT_WORK_TREE` that name the worktree's git directory for git
+  commands aimed outside the worktree. A caller's own `GIT_DIR`, `--git-dir` or `--work-tree` is left alone, and other
+  git commands run unchanged. The `.git` file on the host is never rewritten. Only the git
   found on `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses
   it. The unit tests run the shim against a fake git on the host; the check against real `sbx` is manual. On
   Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status` and
