@@ -453,6 +453,30 @@ mod tests {
     }
 
     #[test]
+    fn a_run_between_items_blocks_a_desk_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let checkout = dir.path().join("app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        // No item is active and no item's run lock is held: only the repository's marker.
+        let marker = home.hold_repo_run("acme/app").unwrap();
+        let runner = Runner::new(fake_paja(dir.path()));
+        let refused = runner
+            .start(&home, "acme/app", &checkout, false, None)
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("acme/app"), "{refused:#}");
+        drop(marker);
+        wait_until("the marker being let go", || {
+            !home.repo_run_held("acme/app").unwrap()
+        });
+        runner
+            .start(&home, "acme/app", &checkout, false, None)
+            .unwrap();
+        runner.stop("acme/app", false).unwrap();
+        wait_until("the run ending", || !runner.is_running("acme/app"));
+    }
+
+    #[test]
     fn a_run_started_elsewhere_blocks_a_desk_run() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path().join("home")).unwrap();

@@ -173,16 +173,24 @@ impl Home {
             .write(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        match file.try_lock_shared() {
-            Ok(()) => Ok(RunLock { _file: file }),
-            Err(TryLockError::WouldBlock) => {
-                bail!(
-                    "{} is locked exclusively; remove it if no `paja` is running",
-                    path.display()
-                )
-            }
-            Err(TryLockError::Error(err)) => {
-                Err(err).with_context(|| format!("locking {}", path.display()))
+        // A probe (`repo_run_held`) holds it exclusively for an instant; wait that out.
+        let started = Instant::now();
+        loop {
+            match file.try_lock_shared() {
+                Ok(()) => return Ok(RunLock { _file: file }),
+                Err(TryLockError::WouldBlock) => {
+                    if started.elapsed() > Duration::from_secs(5) {
+                        bail!(
+                            "{} stayed locked exclusively for 5s; end any other `paja` \
+                             process using this home and run again",
+                            path.display()
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(TryLockError::Error(err)) => {
+                    return Err(err).with_context(|| format!("locking {}", path.display()))
+                }
             }
         }
     }
