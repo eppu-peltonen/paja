@@ -156,12 +156,20 @@ pub fn skeleton_checks(home: &Home, dir: &Path, checks: &[String]) -> Result<Opt
     result
 }
 
+/// The scratch repository's folder name for one `recommend_agent` call: the process id and a
+/// count, so two calls at once in one long-lived `paja mcp` never share (and wipe) one folder.
+fn recommend_scratch_name() -> String {
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("recommend-{}-{n}", std::process::id())
+}
+
 /// Run the init agent for `paja init --recommend`: no repository to read, so it starts in an empty
 /// scratch repository (made under the home's `envs` folder, which the sandbox can reach, and
 /// removed afterwards) with no file or command it may use, and answers from the prompt alone.
 pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Value> {
     let envs = home.envs_dir();
-    let dir = envs.join(format!("recommend-{}", std::process::id()));
+    let dir = envs.join(recommend_scratch_name());
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| {
             format!(
@@ -218,4 +226,18 @@ pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Valu
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn each_recommend_call_gets_its_own_scratch_folder() {
+        let (a, b) = (
+            super::recommend_scratch_name(),
+            super::recommend_scratch_name(),
+        );
+        assert_ne!(a, b);
+        let pid = format!("recommend-{}-", std::process::id());
+        assert!(a.starts_with(&pid) && b.starts_with(&pid), "{a} {b}");
+    }
 }
