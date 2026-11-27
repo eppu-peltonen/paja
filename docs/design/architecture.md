@@ -381,7 +381,7 @@ default branch moved on meanwhile (GitHub runs none on a conflicting pull reques
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
 otherwise a merge commit; a repository that allows none escalates with the setting to change. When `gh pr merge`
 fails, Mestari asks `gh repo view` why rather than reading the error's wording: an account below write access, or the
-method switched off since (an answer is enough when another is still on), escalates naming the fix. A refusal those
+chosen method now off (an answer is enough when another is still on), escalates naming the fix. A refusal those
 settings don't explain, such as a token without write scope or a branch rule, is an error the item is parked on with
 gh's message. Once answered, the next run lands through the pull request already open. On `escalate`, five failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up: the factory home, repository and home folder named, tokens hidden, mentions made inert, code fences made plain text so the frame after a quote never renders as code) and marks the item escalated; the branch

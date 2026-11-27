@@ -197,6 +197,7 @@ pub(super) fn land(
                 format!("GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{why}");
             return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
         }
+        // Only a hint on top of the error, for a repository with no CI: the wording is enough.
         if ci == CiMode::None && text.contains("status check") {
             return Err(err).with_context(|| {
                 format!(
