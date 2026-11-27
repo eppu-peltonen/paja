@@ -127,8 +127,12 @@ pub struct InitArgs {
     /// Write the files again on the branch although .paja/checks is on the default branch.
     #[serde(default)]
     force: bool,
+    /// Don't run the detection agent: use the built-in table of known files (Rust, Node, Python,
+    /// Go).
+    #[serde(default)]
+    no_agent: bool,
     /// Start a new project instead: the name of a GitHub repository to create under the
-    /// signed-in account. Needs `stack`; `repo`, `ci` and `force` are not used.
+    /// signed-in account. Needs `stack`; `repo`, `ci`, `force` and `no_agent` are not used.
     new: Option<String>,
     /// With `new`: rust, node or python.
     stack: Option<String>,
@@ -408,7 +412,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Set an existing repository up for Paja in one pull request: detects the stack, writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true. With new (a repository name) and stack (rust, node or python) it instead creates that GitHub repository, clones it (to dir, or the name) and pushes a walking skeleton as the first commit on the default branch, returning {repo, url, directory, files, next_steps}."
+        description = "Set an existing repository up for Paja in one pull request: an agent on the init role detects the stacks (any language, each with its directory), checks, commands, toolchains and services, and Paja keeps only what files on the default branch back up (detected.dropped lists the rest; no_agent, or an agent that can't run, uses the built-in table for Rust, Node, Python and Go and says why in detected.fallback). Writes .paja/checks, commands, models and high-risk, adds CLAUDE.md (or a Working with Paja section), creates the work label (uses gh), pushes the branch paja/init and opens a pull request to the default branch. Refuses when .paja/checks is already on the default branch, unless force is true. With new (a repository name) and stack (rust, node or python) it instead creates that GitHub repository, clones it (to dir, or the name) and pushes a walking skeleton as the first commit on the default branch, returning {repo, url, directory, files, next_steps}."
     )]
     async fn init(&self, Parameters(args): Parameters<InitArgs>) -> Result<String, String> {
         let home = self.home.clone();
@@ -435,6 +439,7 @@ impl PajaMcp {
                 crate::init::Options {
                     ci: args.ci,
                     force: args.force,
+                    no_agent: args.no_agent,
                 },
             )?;
             Ok(serde_json::to_value(report)?)

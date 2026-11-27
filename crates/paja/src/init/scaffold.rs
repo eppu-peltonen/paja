@@ -269,7 +269,11 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
     let stacks = detect_stacks(&dir);
     let mut d = detected(&stacks);
     if stack == "python" {
-        d.checks.push("ruff format --check .".into());
+        d.checks.push(Check {
+            command: "ruff format --check .".into(),
+            source: Source::Table,
+            file: Some("pyproject.toml".into()),
+        });
     }
     let labels = Labels::parse(LABELS)?;
 
@@ -329,7 +333,7 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
         stack,
         default_branch,
         files: names,
-        checks: d.checks,
+        checks: d.checks.into_iter().map(|c| c.command).collect(),
         labels_created,
         next_steps: vec![
             format!(

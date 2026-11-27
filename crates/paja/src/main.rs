@@ -96,8 +96,9 @@ enum Command {
     },
     /// Set an existing repository up for Paja in one pull request.
     ///
-    /// Detects the stack, writes `.paja/checks`, `.paja/commands`, `.paja/models` and
-    /// `.paja/high-risk`, adds a `CLAUDE.md` (or a "Working with Paja" section to the existing
+    /// An agent detects the stacks, checks and environment (any language); Paja keeps what the
+    /// files on the default branch back up. Writes `.paja/checks`, `.paja/commands`,
+    /// `.paja/models` and `.paja/high-risk`, adds a `CLAUDE.md` (or a "Working with Paja" section to the existing
     /// one), creates the work label, and opens a pull request from `paja/init`. Never pushes to
     /// the default branch; Paja starts working once the pull request is merged.
     Init {
@@ -111,6 +112,10 @@ enum Command {
         /// Write the files again on the branch although `.paja/checks` is on the default branch.
         #[arg(long, conflicts_with = "new")]
         force: bool,
+        /// Don't run the detection agent: use the built-in table of known files (Rust, Node,
+        /// Python, Go). The agent also steps aside when `claude` is missing or not signed in.
+        #[arg(long, conflicts_with = "new")]
+        no_agent: bool,
         /// Start a new project instead: create this GitHub repository under the signed-in
         /// account, clone it, and push a walking skeleton (a minimal app with a passing test, a
         /// formatter, a linter, a CI workflow, and the `.paja/` files and `CLAUDE.md`) as the
@@ -411,7 +416,11 @@ fn run(cli: &Cli) -> Result<()> {
             });
         }
         Command::Init {
-            repo, ci, force, ..
+            repo,
+            ci,
+            force,
+            no_agent,
+            ..
         } => {
             let report = paja::init::run(
                 &home,
@@ -419,6 +428,7 @@ fn run(cli: &Cli) -> Result<()> {
                 paja::init::Options {
                     ci: *ci,
                     force: *force,
+                    no_agent: *no_agent,
                 },
             )?;
             emit(cli, serde_json::to_value(&report)?, || {
@@ -942,18 +952,40 @@ fn describe_init(report: &paja::init::Report) -> String {
     let found = if report.detected.stacks.is_empty() {
         "no stack Paja knows".to_string()
     } else {
-        report.detected.stacks.join(", ")
+        report
+            .detected
+            .environment
+            .stacks
+            .iter()
+            .map(|s| {
+                if s.dir == "." {
+                    s.name.clone()
+                } else {
+                    format!("{} ({})", s.name, s.dir)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let mut text = format!(
         "detected: {found}\nchecks: {}\nwrote: {}\nci: {}\n",
         if report.detected.checks.is_empty() {
             "none".to_string()
         } else {
-            report.detected.checks.join("; ")
+            report
+                .detected
+                .checks
+                .iter()
+                .map(|c| c.command.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         },
         report.files.join(", "),
         report.ci
     );
+    for item in &report.detected.dropped {
+        text.push_str(&format!("dropped: {}: {}\n", item.item, item.reason));
+    }
     if report.ci == "none" {
         text.push_str(
             "  the repository has no CI; `.paja/ci` says `none` (use --ci to add a workflow)\n",

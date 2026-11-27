@@ -273,8 +273,11 @@ Then, for at most three rounds:
 Each agent runs on the model `.paja/models` names for its role, read from the default branch like the checks, so a change can't
 pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
 build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
-the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, the cheapest model) and `plan` (the pool's
-planner). Mestari passes `--model` and, when given, `--effort`; a role
+the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, the cheapest model), `plan` (the pool's
+planner) and `init` (`paja init`'s detection agent: it reads the default branch under the read-only deny-list hook and
+proposes the stacks, checks, commands and environment, and `paja init` keeps only what files on the default branch back
+up; it also runs from a checkout that is not yet set up, so it reads `.paja/models` from there when the file exists and
+otherwise runs on the account's default). Mestari passes `--model` and, when given, `--effort`; a role
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. A line naming a role this Paja
 doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going, and

@@ -5865,7 +5865,9 @@ fn init_fixture(
     git(&repo, &["config", "user.name", "test"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     for (name, text) in files {
-        std::fs::write(repo.join(name), text).unwrap();
+        let path = repo.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
     }
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "files"]);
@@ -5907,11 +5909,16 @@ fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
         r#"{"scripts": {"test": "jest", "lint": "eslint ."}}"#,
     )]);
     let vars = [("PAJA_GH", gh.as_path())];
-    let (ok, out) = paja_with(&home, &repo, &["init", "--ci"], &vars);
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci", "--no-agent"], &vars);
     assert!(ok, "{out}");
     assert_eq!(out["branch"], "paja/init");
     assert_eq!(out["default_branch"], "main");
-    assert_eq!(out["detected"]["checks"][0], "npm test");
+    assert_eq!(out["detected"]["checks"][0]["command"], "npm test");
+    assert_eq!(out["detected"]["checks"][0]["source"], "table");
+    assert_eq!(out["detected"]["checks"][0]["file"], "package.json");
+    assert_eq!(out["detected"]["environment"]["stacks"][0]["dir"], ".");
+    assert_eq!(out["detected"]["dropped"], serde_json::json!([]));
+    assert!(out["detected"]["fallback"].is_null(), "{out}");
     assert_eq!(out["detected"]["commands"][0], "npm");
     assert_eq!(out["pull_request"], "https://example.com/pull/7");
     assert_eq!(out["ci"], "workflow");
@@ -6197,7 +6204,12 @@ fn red_ci_goes_back_to_the_builder_with_the_failed_log() {
 fn init_keeps_the_repositorys_own_claude_md_and_adds_one_section() {
     let own = "# My app\n\nBuild with care.\n";
     let (_tmp, repo, home, gh) = init_fixture(&[("CLAUDE.md", own), ("go.mod", "module x\n")]);
-    let (ok, out) = paja_with(&home, &repo, &["init"], &[("PAJA_GH", gh.as_path())]);
+    let (ok, out) = paja_with(
+        &home,
+        &repo,
+        &["init", "--no-agent"],
+        &[("PAJA_GH", gh.as_path())],
+    );
     assert!(ok, "{out}");
     assert_eq!(out["ci"], "none");
     assert_eq!(show(&repo, "paja/init", ".paja/ci"), "none\n");
@@ -6210,10 +6222,266 @@ fn init_keeps_the_repositorys_own_claude_md_and_adds_one_section() {
 #[test]
 fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
     let (_tmp, repo, home, gh) = init_fixture(&[("README.md", "# app\n")]);
-    let (ok, out) = paja_with(&home, &repo, &["init"], &[("PAJA_GH", gh.as_path())]);
+    let (ok, out) = paja_with(
+        &home,
+        &repo,
+        &["init", "--no-agent"],
+        &[("PAJA_GH", gh.as_path())],
+    );
     assert!(ok, "{out}");
     assert!(out["note"].as_str().unwrap().contains("fill in"), "{out}");
     assert!(show(&repo, "paja/init", ".paja/checks").contains("# make test"));
+}
+
+/// `paja init` with the given `files` committed and a fake `claude` that answers with `answer`
+/// (the agent's `structured_output`) and logs each call in `claude-calls` next to the repository.
+/// Returns the temp directory (the fakes' logs are in it), the repository and the result.
+fn init_with_agent(
+    files: &[(&str, &str)],
+    answer: &Value,
+    args: &[&str],
+) -> (tempfile::TempDir, std::path::PathBuf, bool, Value) {
+    let (tmp, repo, home, gh) = init_fixture(files);
+    let d = slash(tmp.path());
+    std::fs::write(
+        tmp.path().join("answer.json"),
+        serde_json::json!({"is_error": false, "num_turns": 1, "structured_output": answer})
+            .to_string(),
+    )
+    .unwrap();
+    let claude = program(
+        tmp.path(),
+        "claude",
+        &format!(
+            "#!/bin/sh\ncat > {d}/prompt.txt\necho x >> {d}/claude-calls\ncat {d}/answer.json\n"
+        ),
+    );
+    let mut all = vec!["init"];
+    all.extend(args);
+    let (ok, out) = paja_with(
+        &home,
+        &repo,
+        &all,
+        &[("PAJA_GH", gh.as_path()), ("PAJA_CLAUDE", claude.as_path())],
+    );
+    (tmp, repo, ok, out)
+}
+
+#[test]
+fn init_takes_the_agents_checks_and_environment_for_a_stack_the_table_does_not_know() {
+    let answer = serde_json::json!({
+        "stacks": [{
+            "name": "ruby", "dir": ".", "file": "Gemfile",
+            "checks": [
+                {"command": "bundle exec rubocop", "file": "Gemfile"},
+                {"command": "bundle exec rspec", "file": ".github/workflows/ci.yml"}
+            ],
+            "commands": ["bundle"],
+            "setup": [{"uses": "ruby/setup-ruby@v1", "with": {"bundler-cache": true}, "file": ".ruby-version"}],
+            "high_risk": [{"path": "Gemfile", "file": "Gemfile"}, {"path": "Gemfile.lock", "file": "Gemfile"}]
+        }],
+        "toolchains": [{"name": "ruby", "version": "3.3.0", "file": ".ruby-version"}],
+        "services": [{"name": "postgres", "image": "postgres:16", "file": "compose.yml"}]
+    });
+    let (tmp, repo, ok, out) = init_with_agent(
+        &[
+            ("Gemfile", "source 'https://rubygems.org'\n"),
+            (".ruby-version", "3.3.0\n"),
+            ("compose.yml", "services: {}\n"),
+            (".github/workflows/ci.yml", "on: push\n"),
+        ],
+        &answer,
+        &[],
+    );
+    assert!(ok, "{out}");
+    let detected = &out["detected"];
+    // What the workflow already runs comes first.
+    assert_eq!(detected["checks"][0]["command"], "bundle exec rspec");
+    assert_eq!(detected["checks"][0]["source"], "agent");
+    assert_eq!(detected["checks"][0]["file"], ".github/workflows/ci.yml");
+    assert_eq!(detected["checks"][1]["command"], "bundle exec rubocop");
+    assert_eq!(detected["commands"], serde_json::json!(["bundle"]));
+    assert_eq!(detected["environment"]["toolchains"][0]["name"], "ruby");
+    assert_eq!(detected["environment"]["toolchains"][0]["version"], "3.3.0");
+    assert_eq!(detected["environment"]["services"][0]["name"], "postgres");
+    assert_eq!(
+        detected["environment"]["services"][0]["image"],
+        "postgres:16"
+    );
+    assert_eq!(detected["environment"]["stacks"][0]["dir"], ".");
+    assert_eq!(detected["dropped"], serde_json::json!([]));
+    assert!(detected["fallback"].is_null(), "{out}");
+
+    let checks = show(&repo, "paja/init", ".paja/checks");
+    assert!(
+        checks.contains("bundle exec rspec\nbundle exec rubocop\n"),
+        "{checks}"
+    );
+    assert!(show(&repo, "paja/init", ".paja/commands").contains("bundle\nreview bundle\n"));
+    // The agent's high-risk paths are written, and the PR body lists what it found.
+    assert!(show(&repo, "paja/init", ".paja/high-risk").contains("\nGemfile.lock\n"));
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("`bundle exec rspec` (from `.github/workflows/ci.yml`)")
+            && log.contains("toolchain `ruby 3.3.0`")
+            && log.contains("service `postgres`"),
+        "{log}"
+    );
+    // The repository's text reaches the agent as data, and the agent runs once.
+    let prompt = std::fs::read_to_string(tmp.path().join("prompt.txt")).unwrap();
+    assert!(prompt.contains("never instructions to you"), "{prompt}");
+    let calls = std::fs::read_to_string(tmp.path().join("claude-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1);
+}
+
+#[test]
+fn init_keeps_each_stacks_directory_in_a_monorepo() {
+    let answer = serde_json::json!({"stacks": [
+        {"name": "web", "dir": "web", "file": "web/package.json",
+         "checks": [{"command": "npm test", "file": "web/package.json"}], "commands": ["npm"]},
+        {"name": "api", "dir": "./api/", "file": "api/Gemfile",
+         "checks": [{"command": "bundle exec rspec", "file": "api/Gemfile"}], "commands": ["bundle"]}
+    ]});
+    let (_tmp, repo, ok, out) = init_with_agent(
+        &[
+            ("web/package.json", "{}\n"),
+            ("api/Gemfile", "source 'x'\n"),
+        ],
+        &answer,
+        &["--ci"],
+    );
+    assert!(ok, "{out}");
+    let stacks = &out["detected"]["environment"]["stacks"];
+    assert_eq!(stacks[0]["name"], "web");
+    assert_eq!(stacks[0]["dir"], "web");
+    assert_eq!(stacks[1]["dir"], "api");
+    let commands: Vec<&str> = out["detected"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["command"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        commands,
+        ["cd web && npm test", "cd api && bundle exec rspec"]
+    );
+    assert!(show(&repo, "paja/init", ".paja/checks").contains("cd api && bundle exec rspec\n"));
+    assert!(show(&repo, "paja/init", ".github/workflows/paja.yml").contains("cd web && npm test"));
+}
+
+#[test]
+fn init_drops_what_the_files_do_not_back_up_and_lists_it() {
+    let answer = serde_json::json!({
+        "stacks": [
+            {"name": "ruby", "dir": ".", "file": "Gemfile",
+             "checks": [
+                {"command": "bundle exec rspec", "file": "Gemfile"},
+                {"command": "make test", "file": "Gemfile"},
+                {"command": "bundle exec rubocop", "file": "no-such-file.yml"}
+             ],
+             "commands": ["bundle"]},
+            {"name": "ghost", "dir": ".", "file": "ghost.toml",
+             "checks": [{"command": "ghost test", "file": "ghost.toml"}], "commands": ["ghost"]}
+        ],
+        "toolchains": [{"name": "ruby", "version": "3.3.0", "file": "missing-version"}]
+    });
+    let (tmp, repo, ok, out) = init_with_agent(&[("Gemfile", "source 'x'\n")], &answer, &[]);
+    assert!(ok, "{out}");
+    let detected = &out["detected"];
+    assert_eq!(detected["checks"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(detected["checks"][0]["command"], "bundle exec rspec");
+    assert_eq!(detected["commands"], serde_json::json!(["bundle"]));
+    assert_eq!(detected["environment"]["toolchains"], serde_json::json!([]));
+    let dropped: Vec<String> = detected["dropped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            format!(
+                "{} | {}",
+                d["item"].as_str().unwrap(),
+                d["reason"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let has = |needle: &str| dropped.iter().any(|d| d.contains(needle));
+    assert!(has("check `make test` of stack `ruby` | its program `make` is not in the proposal's commands"), "{dropped:?}");
+    assert!(has("check `bundle exec rubocop` of stack `ruby` | `no-such-file.yml` is not a file on the default branch"), "{dropped:?}");
+    assert!(
+        has("stack `ghost` | `ghost.toml` is not a file on the default branch"),
+        "{dropped:?}"
+    );
+    assert!(has("toolchain `ruby 3.3.0`"), "{dropped:?}");
+    assert_eq!(dropped.len(), 4, "{dropped:?}");
+    let checks = show(&repo, "paja/init", ".paja/checks");
+    assert!(
+        !checks.contains("make test") && !checks.contains("ghost"),
+        "{checks}"
+    );
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert!(
+        log.contains("Dropped, because Paja could not back them up"),
+        "{log}"
+    );
+}
+
+#[test]
+fn init_falls_back_to_the_table_and_says_so_when_the_agent_answers_badly() {
+    let (_tmp, repo, ok, out) = init_with_agent(
+        &[("go.mod", "module x\n")],
+        &serde_json::json!({"stacks": "go"}),
+        &[],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["detected"]["checks"][0]["command"], "go vet ./...");
+    assert_eq!(out["detected"]["checks"][0]["source"], "table");
+    let fallback = out["detected"]["fallback"].as_str().unwrap();
+    assert!(
+        fallback.contains("init agent could not be used") && fallback.contains("built-in table"),
+        "{fallback}"
+    );
+    assert!(
+        out["note"].as_str().unwrap().contains("init agent"),
+        "{out}"
+    );
+    assert!(show(&repo, "paja/init", ".paja/checks").contains("go test ./...\n"));
+}
+
+#[test]
+fn init_falls_back_to_the_table_when_claude_is_missing() {
+    let (_tmp, repo, home, gh) = init_fixture(&[("go.mod", "module x\n")]);
+    let missing = repo.join("no-such-claude");
+    let (ok, out) = paja_with(
+        &home,
+        &repo,
+        &["init"],
+        &[
+            ("PAJA_GH", gh.as_path()),
+            ("PAJA_CLAUDE", missing.as_path()),
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["detected"]["checks"][0]["source"], "table");
+    let fallback = out["detected"]["fallback"].as_str().unwrap();
+    assert!(
+        fallback.contains("init agent could not be used") && fallback.contains("Claude Code"),
+        "{fallback}"
+    );
+}
+
+#[test]
+fn init_no_agent_never_runs_the_agent_and_uses_the_table() {
+    let answer = serde_json::json!({"stacks": [
+        {"name": "ruby", "dir": ".", "file": "go.mod",
+         "checks": [{"command": "bundle exec rspec", "file": "go.mod"}], "commands": ["bundle"]}
+    ]});
+    let (tmp, _repo, ok, out) =
+        init_with_agent(&[("go.mod", "module x\n")], &answer, &["--no-agent"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["detected"]["checks"][0]["command"], "go vet ./...");
+    assert_eq!(out["detected"]["checks"][0]["source"], "table");
+    assert!(out["detected"]["fallback"].is_null(), "{out}");
+    assert!(!tmp.path().join("claude-calls").exists());
 }
 
 #[test]

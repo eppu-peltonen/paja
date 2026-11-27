@@ -107,11 +107,32 @@ In a checkout of an existing repository, with `gh` signed in and the default bra
 paja init          # --ci also writes a GitHub Actions workflow when the repository has none
 ```
 
-`paja init` finds the stack from the files on the default branch (`Cargo.toml`; `package.json` with its `test` and
-`lint` scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`;
-`go.mod`) and writes, in one pull request from the branch `paja/init`:
+### Detection
 
-- `.paja/checks` and `.paja/commands` for what it found. When it finds nothing it knows, both hold commented templates
+`paja init` runs one agent, on the `init` role in `.paja/models`, to detect the project, whatever its languages. The
+agent reads the default branch in a temporary worktree, under the same deny-list hook and read-only tools as
+`paja triage`, and treats the repository's text (READMEs, scripts, workflows) as data to judge, never as instructions.
+It returns each stack with its directory (so monorepos and workspaces work), its checks, the programs they need, the CI
+setup steps, the high-risk paths, the toolchain versions it finds in files such as `rust-toolchain.toml`, `.nvmrc`,
+`.python-version`, `.tool-versions` and `global.json`, and the services in compose files. When `.github/workflows/`
+already runs test, lint or format commands, it proposes those first, since the project already trusts them. Every item
+names the file that backs it.
+
+Paja keeps only what it can back up: the named file must exist on the default branch, and each check's program must be
+one of the proposal's commands (a check is also one plain command, with no `;`, `|`, `&`, redirects or `$`). Everything
+else is dropped. A stack in a subdirectory gets `cd <dir> && ` in front of its checks. The pull request body lists what
+the agent found, each check with the file it comes from, the environment, and what was dropped, so you review it there
+before merging.
+
+A repository with no `init` line in `.paja/models` runs the agent on the account's default model. `paja init --no-agent`
+skips the agent and uses a small built-in table instead (`Cargo.toml`; `package.json` with its `test` and `lint`
+scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`; `go.mod`).
+The table is also the fallback when `claude` is missing or not signed in, or when the agent's answer is malformed or
+holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`).
+
+`paja init` writes, in one pull request from the branch `paja/init`:
+
+- `.paja/checks` and `.paja/commands` for what it found. When it finds nothing, both hold commented templates
   and `paja init` says to fill in the checks in the pull request.
 - `.paja/models` with Paja's defaults, and `.paja/high-risk` listing `.paja/`, `CLAUDE.md`, `.github/`, `.claude/` and
   the stack's build configuration.
@@ -126,7 +147,10 @@ never the default branch. Read the pull request, change what is wrong, and merge
 merged, on issues with the work label.
 
 If `.paja/checks` is already on the default branch, `paja init` refuses; `--force` writes the files again on the branch.
-`--json` prints what it detected, the files it wrote and the pull request, and the MCP tool `init` returns the same.
+`--json` prints what it detected, the files it wrote and the pull request, and the MCP tool `init` (which takes
+`no_agent`) returns the same. `detected` holds `stacks`, `checks` (each `{command, source, file}`, `source` being
+`agent` or `table`), `commands`, `environment` (`stacks` with each one's `dir`, `toolchains`, `services`), `dropped` (each
+`{item, reason}`) and `fallback`.
 
 ## Starting a new project
 
