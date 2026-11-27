@@ -2266,6 +2266,7 @@ impl Factory {
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
+                 if [ -f {d}/mode-rejected ]; then echo \"error: option '--permission-mode <mode>' argument 'auto' is invalid.\" >&2; exit 1; fi\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/hang-fix ]; then : > {d}/hanging; while [ -f {d}/hang-fix ]; do sleep 0.1; done; exit 1; fi ;; esac\n\
                  if [ -f {d}/slow ]; then : > {d}/slowing; while [ -f {d}/slow ]; do sleep 0.1; done; fi\n\
@@ -6222,6 +6223,28 @@ fn a_resume_that_fails_starts_a_fresh_session() {
     assert_eq!(builds.len(), 3, "{steps:?}");
     assert_eq!(builds[1]["session_id"], "s-2", "{steps:?}");
     assert_eq!(builds[1]["cost_usd"], 0.05, "{steps:?}");
+}
+
+#[test]
+fn a_claude_code_that_rejects_auto_mode_stops_the_run_without_a_retry() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("mode-rejected"), "").unwrap();
+    let (_, report) = f.run();
+    let text = report.to_string();
+    assert!(
+        text.contains("does not accept `--permission-mode auto`")
+            && text.contains("argument 'auto' is invalid"),
+        "{report}"
+    );
+    // One build, no other mode, no second try, nothing landed.
+    let calls = f.claude_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        calls[0].matches("--permission-mode").count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(!f.gh_log().contains("pr merge"));
 }
 
 #[test]
