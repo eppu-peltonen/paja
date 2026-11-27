@@ -160,6 +160,51 @@ impl Home {
         }
     }
 
+    /// Mark `repo` as having a `paja run` for as long as the returned lock lives: a shared lock,
+    /// so a pool and its lanes, or runs on different items, all hold it together. It covers the
+    /// gaps no item's run lock does (a loop sleeping between items, a run still starting).
+    pub fn hold_repo_run(&self, repo: &str) -> Result<RunLock> {
+        let dir = self.root.join("runs");
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = self.runs_lock_path(repo, "any");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock_shared() {
+            Ok(()) => Ok(RunLock { _file: file }),
+            Err(TryLockError::WouldBlock) => {
+                bail!(
+                    "{} is locked exclusively; remove it if no `paja` is running",
+                    path.display()
+                )
+            }
+            Err(TryLockError::Error(err)) => {
+                Err(err).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
+    /// Whether any live `paja run` holds [`Self::hold_repo_run`]'s marker for `repo`, found
+    /// without writing.
+    pub fn repo_run_held(&self, repo: &str) -> Result<bool> {
+        let path = self.runs_lock_path(repo, "any");
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(false),
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(err)) => {
+                Err(err).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
     /// The path of lock file `runs/<owner>@<name>@<tail>.lock`.
     fn runs_lock_path(&self, repo: &str, tail: &str) -> PathBuf {
         // `owner/name` as one file name: GitHub names hold only letters, digits and `-_.`, and
@@ -227,6 +272,22 @@ mod tests {
         assert!(format!("{err:#}").contains("timed out after"), "{err:#}");
         drop(held);
         assert!(home.lock_within(Duration::from_millis(50)).is_ok());
+    }
+
+    #[test]
+    fn the_repo_run_marker_is_shared_by_runs_and_seen_by_a_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path()).unwrap();
+        let repo = "owner/name";
+        assert!(!home.repo_run_held(repo).unwrap());
+        let first = home.hold_repo_run(repo).unwrap();
+        let second = home.hold_repo_run(repo).unwrap();
+        assert!(home.repo_run_held(repo).unwrap());
+        assert!(!home.repo_run_held("owner/other").unwrap());
+        drop(first);
+        assert!(home.repo_run_held(repo).unwrap());
+        drop(second);
+        assert!(!home.repo_run_held(repo).unwrap());
     }
 
     #[test]

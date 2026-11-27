@@ -569,6 +569,12 @@ fn run(cli: &Cli) -> Result<()> {
             // pass, not for every later stop of a long-running loop.
             let mut checked = *tamper_checked;
             let mut failures = paja::posti::Failures::default();
+            // Marks the repository as having a run, for the whole life of this process.
+            // A repository that can't be named has its error reported by the run itself.
+            let _repo_run = match paja::jono::repo_name(&home, repo) {
+                Ok(name) => Some(home.hold_repo_run(&name)?),
+                Err(_) => None,
+            };
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
             if *stop_on_stdin {

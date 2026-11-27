@@ -72,6 +72,12 @@ impl Runner {
                  Desk); change its lanes with the lane count, or stop it there first"
             );
         }
+        if home.repo_run_held(repo)? {
+            bail!(
+                "a paja run is already going for {repo} (started from a terminal or another \
+                 Desk, maybe between items); stop it there first"
+            );
+        }
         if let Some(number) = running_item(home, repo)? {
             bail!(
                 "a paja run is already working on {repo}#{number} (started from a terminal or \
