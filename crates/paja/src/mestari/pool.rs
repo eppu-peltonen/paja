@@ -972,6 +972,8 @@ enum Why {
     /// It waits on these other items.
     WaitsOn(Vec<u64>),
     NoPool,
+    /// Another runner holds it on GitHub, under this runner id.
+    HeldBy(String),
     /// Its files overlap this lane's item's, for this reason.
     Overlaps(u64, String),
     Planning,
@@ -986,6 +988,7 @@ impl std::fmt::Display for Why {
                 let on: Vec<String> = on.iter().map(|n| format!("#{n}")).collect();
                 write!(f, "waits on {}", on.join(", "))
             }
+            Why::HeldBy(runner) => write!(f, "claimed by runner {runner} on GitHub"),
             Why::NoPool => f.write_str("no pool is running"),
             Why::Overlaps(other, why) => write!(f, "overlaps #{other}: {why}"),
             Why::Planning => f.write_str("planning which files it touches"),
@@ -1145,6 +1148,8 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
     let why_waiting = |item: &WorkItem| {
         if !item.waiting_on.is_empty() {
             Why::WaitsOn(item.waiting_on.clone())
+        } else if let Some(runner) = jono::held_by_other(events, item, jono::now_secs()) {
+            Why::HeldBy(runner.to_string())
         } else if !running {
             Why::NoPool
         } else if let Some((other, why)) = plans

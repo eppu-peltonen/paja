@@ -502,7 +502,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         item,
         lock: _working,
         resumed,
-    }) = jono::claim_for_run_item(home, &name, opts.item, nearly.is_none())?
+    }) = jono::claim_for_run_on(home, &repo, &name, opts.item, nearly.is_none())?
     else {
         if let Some(resets_at) = nearly {
             let ready = jono::runnable(home, &name)?
@@ -539,6 +539,8 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         // active already and stays so.
         if !resumed {
             jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
+            // And off GitHub too, where other runners look.
+            jono::release_claim(home, &repo, item.number);
         }
         return Err(Declined.into());
     }
@@ -876,6 +878,16 @@ fn run_item(
     for round in start..=MAX_ROUNDS {
         run.round = round;
         stop_point()?;
+        // The claim on GitHub goes stale after six hours without this. Round 1 of a new run
+        // has just made it.
+        if round > 1 || resumed {
+            if let Err(err) = jono::renew_claim(home, repo, item.number) {
+                progress(&format!(
+                    "couldn't renew #{}'s claim on GitHub: {err:#}",
+                    item.number
+                ));
+            }
+        }
         let steps = &mut run.steps;
         steps.clear();
         // Only the round that was cut off may reuse what it had: the build, and the checks if
@@ -2997,6 +3009,7 @@ mod tests {
             answers: Vec::new(),
             waiting_on: Vec::new(),
             priority: Default::default(),
+            claim: None,
         };
         let checks: Vec<String> = ["cargo fmt --all --check", "cargo test"]
             .map(String::from)

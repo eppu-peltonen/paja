@@ -44,6 +44,12 @@ impl Default for Labels {
 }
 
 impl Labels {
+    /// The label a claimed item carries on GitHub: the work label and `-claimed` (`paja-claimed`
+    /// for `paja`).
+    pub fn claimed(&self) -> String {
+        format!("{}-claimed", self.work)
+    }
+
     /// Read the file's text: `work <label>`, `follow-up <label>` and `needs-answer <label>`
     /// lines (any may be left out), `#` starts a comment line. Anything else is an error naming the line and the fix.
     pub fn parse(text: &str) -> Result<Self> {
@@ -206,6 +212,161 @@ pub const EV_SYNCED: &str = "work.synced";
 /// A sync ran in a checkout of the repository: `{"repo", "path"}`, recorded when the path
 /// differs from the last one recorded, so Paja Desk knows where to run `gh` and `paja run`.
 pub const EV_CHECKOUT: &str = "work.checkout";
+/// The id this home's runner claims items under, created once: `{"id"}`.
+pub const EV_RUNNER: &str = "runner.created";
+/// What GitHub says about an item's claim, recorded when it changes: `{"repo", "number",
+/// "runner", "stale_after"}`, with `runner` null once the claim is gone.
+pub const EV_CLAIM: &str = "work.claim";
+
+/// How long a claim lasts without being renewed. A run renews it at each round.
+pub const CLAIM_SECS: u64 = 6 * 60 * 60;
+
+/// Who holds an item on GitHub: the claimed label, and the runner in its latest claim comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    /// The runner id in the latest claim comment; `unknown` when the label has no comment.
+    pub runner: String,
+    /// The UTC time after which another runner may take the item. None when the claim can't go
+    /// stale: the item is escalated and waits on a person, or the label has no comment.
+    #[serde(default)]
+    pub stale_after: Option<String>,
+}
+
+impl Claim {
+    fn is_stale(&self, now: u64) -> bool {
+        self.stale_after
+            .as_deref()
+            .and_then(parse_utc)
+            .is_some_and(|t| t <= now)
+    }
+}
+
+/// The runner id of the first `runner.created` event, if one was recorded.
+fn runner_of(events: &[Event]) -> Option<&str> {
+    events
+        .iter()
+        .find(|e| e.kind == EV_RUNNER)
+        .and_then(|e| e.data["id"].as_str())
+}
+
+/// The runner holding `item` when it is not the runner of `events` and its claim is still live
+/// at `now`: such an item is skipped.
+pub fn held_by_other<'a>(events: &[Event], item: &'a WorkItem, now: u64) -> Option<&'a str> {
+    let claim = item.claim.as_ref()?;
+    (Some(claim.runner.as_str()) != runner_of(events) && !claim.is_stale(now))
+        .then_some(claim.runner.as_str())
+}
+
+/// The seconds since the Unix epoch.
+pub fn now_secs() -> u64 {
+    crate::events::now_ms() / 1000
+}
+
+/// `secs` as `2026-01-31T09:05:00Z`.
+fn format_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rest = secs % 86_400;
+    // Days since 1970-01-01 to a calendar date.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+/// The seconds since the Unix epoch of a time written as `2026-01-31T09:05:00Z`.
+fn parse_utc(text: &str) -> Option<u64> {
+    let text = text.trim().strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let mut d = date.split('-');
+    let mut t = time.split(':');
+    let (year, month, day): (i64, i64, i64) = (
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+    );
+    let (h, m, s): (i64, i64, i64) = (
+        t.next()?.parse().ok()?,
+        t.next()?.parse().ok()?,
+        t.next()?.parse().ok()?,
+    );
+    if d.next().is_some()
+        || t.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&m)
+        || !(0..61).contains(&s)
+        || year < 1970
+    {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + m * 60 + s).ok()
+}
+
+/// The text of a claim comment: `Claimed by runner <id> at <UTC time>; stale after <time>`.
+fn claim_text(runner: &str, now: u64) -> String {
+    format!(
+        "Claimed by runner {runner} at {}; stale after {}",
+        format_utc(now),
+        format_utc(now + CLAIM_SECS)
+    )
+}
+
+/// A claim comment read back: the runner and the time it goes stale.
+struct ClaimComment {
+    runner: String,
+    stale_after: String,
+    /// The comment's id on GitHub, from its URL.
+    id: Option<u64>,
+}
+
+impl ClaimComment {
+    fn is_stale(&self, now: u64) -> bool {
+        parse_utc(&self.stale_after).is_none_or(|t| t <= now)
+    }
+}
+
+/// Read a comment as a claim, or None when it isn't one.
+fn parse_claim_comment(body: &str, url: &str) -> Option<ClaimComment> {
+    let line = body.lines().next()?.trim();
+    let rest = line.strip_prefix("Claimed by runner ")?;
+    let (runner, rest) = rest.split_once(" at ")?;
+    let (at, stale_after) = rest.split_once("; stale after ")?;
+    parse_utc(at)?;
+    parse_utc(stale_after)?;
+    if runner.is_empty()
+        || !runner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return None;
+    }
+    let id = url
+        .rsplit_once("issuecomment-")
+        .and_then(|(_, id)| id.parse().ok());
+    Some(ClaimComment {
+        runner: runner.to_string(),
+        stale_after: stale_after.trim().to_string(),
+        id,
+    })
+}
 
 /// An item's identity: its repository (`owner/name`) and its issue number.
 pub type Key = (String, u64);
@@ -268,6 +429,10 @@ pub struct WorkItem {
     /// label. Jono starts every ready `work` item before any `follow-up`.
     #[serde(default)]
     pub priority: Priority,
+    /// Who holds the item on GitHub, as the last sync or claim saw it. A run takes an item held
+    /// by another runner only once the claim is stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<Claim>,
 }
 
 impl WorkItem {
@@ -384,6 +549,15 @@ pub struct SyncReport {
 struct Waiting {
     number: u64,
     on: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct ClaimSeen {
+    number: u64,
+    #[serde(default)]
+    runner: Option<String>,
+    #[serde(default)]
+    stale_after: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -514,8 +688,19 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                         answers: Vec::new(),
                         waiting_on: Vec::new(),
                         priority: issue.priority,
+                        claim: None,
                     },
                 );
+            }
+            EV_CLAIM => {
+                let seen: ClaimSeen =
+                    serde_json::from_value(event.data.clone()).with_context(|| bad(event))?;
+                if let Some(item) = items.get_mut(&key(seen.number)) {
+                    item.claim = seen.runner.map(|runner| Claim {
+                        runner,
+                        stale_after: seen.stale_after,
+                    });
+                }
             }
             EV_CHANGED => {
                 let issue: Issue =
@@ -989,6 +1174,387 @@ pub fn claim_for_run_item(
     Ok(None)
 }
 
+/// This home's runner id, created and recorded on first use. It is random and names no host or
+/// user, because claims are written on GitHub, where the repository may be public.
+pub fn runner_id(home: &Home) -> Result<String> {
+    let lock = home.lock()?;
+    runner_id_locked(&lock, &home.events())
+}
+
+fn runner_id_locked(lock: &crate::home::HomeLock, log: &crate::events::EventLog) -> Result<String> {
+    if let Some(id) = runner_of(&log.read_all()?) {
+        return Ok(id.to_string());
+    }
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    let id: String = (0..2)
+        .map(|_| {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u64(crate::events::now_ms());
+            hasher.write_u32(std::process::id());
+            format!("{:08x}", hasher.finish() as u32)
+        })
+        .collect();
+    log.append(lock, EV_RUNNER, json!({ "id": id }))?;
+    Ok(id)
+}
+
+/// [`claim_for_run_item`] for runners that share the queue through GitHub: before an item is
+/// taken, its claim is written on the issue (the claimed label and a claim comment), and the
+/// issue is read again to see that no other runner's claim came first. An item that lost the
+/// race is left to the winner and the next one is tried. When GitHub can't be reached nothing is
+/// taken, and the error says why. `checkout` is where `gh` runs. With `new` false only an item
+/// to resume is taken, and nothing is claimed on GitHub.
+pub fn claim_for_run_on(
+    home: &Home,
+    checkout: &Path,
+    repo: &str,
+    only: Option<u64>,
+    new: bool,
+) -> Result<Option<RunClaim>> {
+    let wanted = |item: &WorkItem| only.is_none_or(|n| n == item.number);
+    let ok = crate::ahjo::untampered(home, checkout)?;
+    let labels = Labels::of_default_branch(&ok)?;
+    let (me, ready) = {
+        let lock = home.lock()?;
+        let log = home.events();
+        pin_legacy(&lock, &log, repo)?;
+        let me = runner_id_locked(&lock, &log)?;
+        let (left, ready) = run_candidates(&log.read_all()?, repo)?;
+        // An item this runner left active keeps its claim, which each round renews.
+        for item in left.into_iter().filter(wanted) {
+            if let Some(run_lock) = home.try_run_lock(repo, item.number)? {
+                return Ok(Some(RunClaim {
+                    item,
+                    lock: run_lock,
+                    resumed: true,
+                }));
+            }
+        }
+        (me, ready)
+    };
+    for item in ready.into_iter().filter(wanted).filter(|_| new) {
+        let run_lock = {
+            let _lock = home.lock()?;
+            home.try_run_lock(repo, item.number)?
+        };
+        // A queued item a live run still holds (set back by hand mid-run) waits for that run.
+        let Some(run_lock) = run_lock else {
+            continue;
+        };
+        let lost = claim_on_github(&ok, &labels, item.number, &me)?;
+        let lock = home.lock()?;
+        let log = home.events();
+        if let Some(winner) = lost {
+            log.append(
+                &lock,
+                EV_CLAIM,
+                claim_event(repo, item.number, Some(&winner)),
+            )?;
+            continue;
+        }
+        let mine = Claim {
+            runner: me.clone(),
+            stale_after: Some(format_utc(now_secs() + CLAIM_SECS)),
+        };
+        log.append(&lock, EV_CLAIM, claim_event(repo, item.number, Some(&mine)))?;
+        log.append(
+            &lock,
+            EV_STATUS,
+            json!({
+                "repo": repo, "number": item.number, "status": Status::Active, "note": null,
+                "run": true
+            }),
+        )?;
+        let mut item = item;
+        item.status = Status::Active;
+        item.note = None;
+        item.claim = Some(mine);
+        return Ok(Some(RunClaim {
+            item,
+            lock: run_lock,
+            resumed: false,
+        }));
+    }
+    Ok(None)
+}
+
+fn claim_event(repo: &str, number: u64, claim: Option<&Claim>) -> Value {
+    json!({
+        "repo": repo, "number": number,
+        "runner": claim.map(|c| c.runner.as_str()),
+        "stale_after": claim.and_then(|c| c.stale_after.as_deref()),
+    })
+}
+
+/// An issue as `gh issue view --json labels,comments` prints it.
+#[derive(Deserialize)]
+struct View {
+    #[serde(default)]
+    labels: Vec<LabelName>,
+    #[serde(default)]
+    comments: Vec<ViewComment>,
+}
+
+#[derive(Deserialize)]
+struct LabelName {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct ViewComment {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    url: String,
+}
+
+impl View {
+    fn has_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l.name == label)
+    }
+
+    /// The claim comments, oldest first.
+    fn claims(&self) -> Vec<ClaimComment> {
+        self.comments
+            .iter()
+            .filter_map(|c| parse_claim_comment(&c.body, &c.url))
+            .collect()
+    }
+}
+
+fn view_issue(ok: &Untampered, number: u64) -> Result<View> {
+    let out = gh(
+        ok,
+        &[
+            "issue",
+            "view",
+            &number.to_string(),
+            "--json",
+            "labels,comments",
+        ],
+    )?;
+    serde_json::from_str(&out).with_context(|| {
+        format!(
+            "`{} issue view {number}` printed something that is not an issue's labels and \
+             comments; check `gh auth status`",
+            gh_program()
+        )
+    })
+}
+
+/// Who holds an issue, from its labels and comments: the runner in the latest claim comment,
+/// when the issue has the claimed label. An escalated item (it carries `needs_answer`) stays
+/// claimed however old its claim is.
+fn holder(view: &View, labels: &Labels) -> Option<Claim> {
+    if !view.has_label(&labels.claimed()) {
+        return None;
+    }
+    let escalated = view.has_label(&labels.needs_answer);
+    Some(match view.claims().pop() {
+        Some(c) => Claim {
+            runner: c.runner,
+            stale_after: (!escalated).then_some(c.stale_after),
+        },
+        None => Claim {
+            runner: "unknown".into(),
+            stale_after: None,
+        },
+    })
+}
+
+/// Write this runner's claim on issue `number` and check that it won. None when it did; the
+/// holder when another runner's live claim comment came first, after taking this runner's label
+/// and comment back off.
+fn claim_on_github(
+    ok: &Untampered,
+    labels: &Labels,
+    number: u64,
+    me: &str,
+) -> Result<Option<Claim>> {
+    let claimed = labels.claimed();
+    add_label(
+        ok,
+        number,
+        &claimed,
+        "fbca04",
+        "A Paja runner holds this item; the claim comment says who and until when",
+    )?;
+    let now = now_secs();
+    let posted = gh(
+        ok,
+        &[
+            "issue",
+            "comment",
+            &number.to_string(),
+            "--body",
+            &claim_text(me, now),
+        ],
+    );
+    let url = match posted {
+        Ok(out) => out.lines().last().unwrap_or_default().trim().to_string(),
+        Err(err) => {
+            let _ = remove_label(ok, number, &claimed);
+            return Err(err.context(format!(
+                "claiming #{number} on GitHub failed, so it was not taken"
+            )));
+        }
+    };
+    let view = match view_issue(ok, number) {
+        Ok(view) => view,
+        Err(err) => {
+            let _ = remove_label(ok, number, &claimed);
+            return Err(err.context(format!(
+                "claiming #{number} on GitHub failed, so it was not taken"
+            )));
+        }
+    };
+    let first = view.claims().into_iter().find(|c| !c.is_stale(now));
+    let Some(first) = first.filter(|c| c.runner != me) else {
+        return Ok(None);
+    };
+    let _ = remove_label(ok, number, &claimed);
+    if let Some(id) = url
+        .rsplit_once("issuecomment-")
+        .and_then(|(_, id)| id.parse::<u64>().ok())
+    {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+        let _ = gh(ok, &["api", "-X", "DELETE", &path]);
+    }
+    Ok(Some(Claim {
+        runner: first.runner,
+        stale_after: Some(first.stale_after),
+    }))
+}
+
+fn add_label(
+    ok: &Untampered,
+    number: u64,
+    label: &str,
+    color: &str,
+    description: &str,
+) -> Result<()> {
+    let add = |ok: &Untampered| {
+        gh(
+            ok,
+            &["issue", "edit", &number.to_string(), "--add-label", label],
+        )
+    };
+    if add(ok).is_err() {
+        gh(
+            ok,
+            &[
+                "label",
+                "create",
+                label,
+                "--color",
+                color,
+                "--description",
+                description,
+            ],
+        )?;
+        add(ok)?;
+    }
+    Ok(())
+}
+
+fn remove_label(ok: &Untampered, number: u64, label: &str) -> Result<()> {
+    gh(
+        ok,
+        &[
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--remove-label",
+            label,
+        ],
+    )
+    .map(drop)
+}
+
+/// Renew this runner's claim on `number`: move its claim comment's times on, and put the claimed
+/// label back if it was taken off. A run calls this at each round; the caller reports a failure
+/// and goes on, since the claim only matters to other runners.
+pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
+    let me = runner_id(home)?;
+    let ok = crate::ahjo::untampered(home, checkout)?;
+    let labels = Labels::of_default_branch(&ok)?;
+    let claimed = labels.claimed();
+    let view = view_issue(&ok, number)?;
+    let now = now_secs();
+    let text = claim_text(&me, now);
+    let mine = view.claims().into_iter().rev().find(|c| c.runner == me);
+    match mine.and_then(|c| c.id) {
+        Some(id) => {
+            let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+            gh(
+                &ok,
+                &["api", "-X", "PATCH", &path, "-f", &format!("body={text}")],
+            )?;
+        }
+        None => {
+            gh(
+                &ok,
+                &["issue", "comment", &number.to_string(), "--body", &text],
+            )?;
+        }
+    }
+    if !view.has_label(&claimed) {
+        add_label(
+            &ok,
+            number,
+            &claimed,
+            "fbca04",
+            "A Paja runner holds this item",
+        )?;
+    }
+    let mine = Claim {
+        runner: me,
+        stale_after: Some(format_utc(now + CLAIM_SECS)),
+    };
+    let name = name_of(&ok)?;
+    let lock = home.lock()?;
+    home.events()
+        .append(&lock, EV_CLAIM, claim_event(&name, number, Some(&mine)))?;
+    Ok(())
+}
+
+/// Take the claimed label off `number`'s issue, so any runner may take the item. A failure is
+/// reported on stderr and nothing more, since the item's status is already recorded.
+pub fn release_claim(home: &Home, checkout: &Path, number: u64) {
+    let result = (|| -> Result<()> {
+        let ok = crate::ahjo::untampered(home, checkout)?;
+        let labels = Labels::of_default_branch(&ok)?;
+        // Looked at first: the label may be gone already, or this repository may never have
+        // had it, and removing a label that doesn't exist is an error.
+        let view = view_issue(&ok, number)?;
+        // The live claim comments go too: left behind, one would win every other runner's race
+        // check until it went stale.
+        let now = now_secs();
+        for comment in view.claims().into_iter().filter(|c| !c.is_stale(now)) {
+            if let Some(id) = comment.id {
+                let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+                gh(&ok, &["api", "-X", "DELETE", &path])?;
+            }
+        }
+        if view.has_label(&labels.claimed()) {
+            remove_label(&ok, number, &labels.claimed())?;
+        }
+        let name = name_of(&ok)?;
+        let lock = home.lock()?;
+        home.events()
+            .append(&lock, EV_CLAIM, claim_event(&name, number, None))?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "paja: couldn't free #{number}'s claim on GitHub: {err:#}; remove its claimed label \
+             by hand so other runners can take it"
+        );
+    }
+}
+
 /// What a `paja run` could take now, in the order it takes them: the items earlier runs left
 /// active whose run is gone, then the ready ones. Items a live run holds are left out. A pool
 /// hands these to its lanes; the lanes' own runs claim them.
@@ -1033,7 +1599,13 @@ fn run_candidates(events: &[Event], repo: &str) -> Result<(Vec<WorkItem>, Vec<Wo
         })
         .cloned()
         .collect();
-    let mut ready: Vec<WorkItem> = items.into_values().filter(is_ready).collect();
+    // An item another runner holds on GitHub is that runner's until its claim goes stale.
+    let now = now_secs();
+    let mut ready: Vec<WorkItem> = items
+        .into_values()
+        .filter(is_ready)
+        .filter(|item| held_by_other(events, item, now).is_none())
+        .collect();
     ready.sort_by_key(|item| item.priority);
     Ok((left, ready))
 }
@@ -1109,16 +1681,28 @@ pub fn sync_with(
         None => QueueRules::of_default_branch(&ok)?,
     };
     let name = name_of(&ok)?;
-    let mut issues = fetch_issues(&ok, &labels.work)?;
+    let mut listed = fetch_issues(&ok, &labels.work)?;
     if rules.follow_ups {
         // An issue with both labels is a work item.
         let mut follow_ups = fetch_issues(&ok, &labels.follow_up)?;
-        follow_ups.retain(|f| !issues.iter().any(|i| i.number == f.number));
-        for issue in &mut follow_ups {
-            issue.priority = Priority::FollowUp;
+        follow_ups.retain(|f| !listed.iter().any(|i| i.issue.number == f.issue.number));
+        for f in &mut follow_ups {
+            f.issue.priority = Priority::FollowUp;
         }
-        issues.extend(follow_ups);
+        listed.extend(follow_ups);
     }
+    // Who holds each item on GitHub: asked of the issues that carry the claimed label only.
+    let claimed = labels.claimed();
+    let mut held: BTreeMap<u64, Claim> = BTreeMap::new();
+    for l in &listed {
+        if l.labels.iter().any(|label| label.name == claimed) {
+            if let Some(claim) = holder(&view_issue(&ok, l.issue.number)?, &labels) {
+                held.insert(l.issue.number, claim);
+            }
+        }
+    }
+    let seen: BTreeSet<u64> = listed.iter().map(|l| l.issue.number).collect();
+    let issues: Vec<Issue> = listed.into_iter().map(|l| l.issue).collect();
     // A dependency outside the queue (another label, or already closed) is asked about once
     // per sync; one in the queue is open by definition.
     let queued: BTreeSet<u64> = issues.iter().map(|issue| issue.number).collect();
@@ -1134,6 +1718,7 @@ pub fn sync_with(
         }
     }
     let report = apply_with(home, &name, &issues, &open_outside)?;
+    apply_claims(home, &name, &seen, &held)?;
     record_checkout(home, &name, &checkout_top(repo)?)?;
     Ok(report)
 }
@@ -1290,6 +1875,46 @@ pub fn apply_with(
     Ok(report)
 }
 
+/// Whether the log says this runner holds item `number` of `repo`.
+fn item_claimed_here(home: &Home, repo: &str, number: u64) -> bool {
+    let Ok(events) = home.events().read_all() else {
+        return false;
+    };
+    let Ok(items) = replay_repo(&events, repo) else {
+        return false;
+    };
+    items
+        .get(&number)
+        .and_then(|item| item.claim.as_ref())
+        .is_some_and(|claim| Some(claim.runner.as_str()) == runner_of(&events))
+}
+
+/// Record what a sync read of the claims on `seen`, the issues it listed: `held` holds the claim
+/// of each that carries the claimed label. Only a change is recorded.
+fn apply_claims(
+    home: &Home,
+    repo: &str,
+    seen: &BTreeSet<u64>,
+    held: &BTreeMap<u64, Claim>,
+) -> Result<()> {
+    let lock = home.lock()?;
+    let log = home.events();
+    let items = replay_repo(&log.read_all()?, repo)?;
+    for number in seen {
+        let Some(item) = items.get(number) else {
+            continue;
+        };
+        if item.claim.as_ref() != held.get(number) {
+            log.append(
+                &lock,
+                EV_CLAIM,
+                claim_event(repo, *number, held.get(number)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Answer an escalated item: record the person's answer in the event log and queue the item
 /// again, in one step under the home lock, then post the answer on the issue so it is visible
 /// there too. The next run passes every recorded answer to its agents.
@@ -1367,6 +1992,18 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
             std::io::stderr(),
             "paja: couldn't remove the `{needs_answer}` label from #{number}: {err:#}"
         );
+    }
+    // The item stays claimed by this runner, which runs it next: a claim that went stale while
+    // the item waited is renewed, so no other runner takes it first. Only when the item holds a
+    // claim at all, so a repository that never claimed it gains none.
+    if item_claimed_here(home, &name, number) {
+        if let Err(err) = renew_claim(home, repo, number) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "paja: couldn't renew #{number}'s claim on GitHub: {err:#}"
+            );
+        }
     }
     gh(
         &ok,
@@ -1519,7 +2156,16 @@ pub fn gh_program() -> String {
     std::env::var("PAJA_GH").unwrap_or_else(|_| "gh".to_string())
 }
 
-fn fetch_issues(ok: &Untampered, label: &str) -> Result<Vec<Issue>> {
+/// An issue with the labels it carries, as `gh issue list --json` prints it.
+#[derive(Deserialize)]
+struct Listed {
+    #[serde(flatten)]
+    issue: Issue,
+    #[serde(default)]
+    labels: Vec<LabelName>,
+}
+
+fn fetch_issues(ok: &Untampered, label: &str) -> Result<Vec<Listed>> {
     let repo = ok.path();
     let gh = gh_program();
     let output = gh_output(
@@ -1534,7 +2180,7 @@ fn fetch_issues(ok: &Untampered, label: &str) -> Result<Vec<Issue>> {
             "--limit",
             &FETCH_LIMIT.to_string(),
             "--json",
-            "number,title,body,url",
+            "number,title,body,url,labels",
         ],
     )?;
     if !output.status.success() {
@@ -1544,7 +2190,7 @@ fn fetch_issues(ok: &Untampered, label: &str) -> Result<Vec<Issue>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let issues: Vec<Issue> = serde_json::from_slice(&output.stdout).with_context(|| {
+    let issues: Vec<Listed> = serde_json::from_slice(&output.stdout).with_context(|| {
         format!("`{gh} issue list` printed something that is not a list of issues")
     })?;
     if issues.len() >= FETCH_LIMIT {
@@ -1581,6 +2227,25 @@ mod tests {
             url: format!("https://example.com/{number}"),
             priority: Priority::Work,
         }
+    }
+
+    #[test]
+    fn claim_times_round_trip_and_claim_comments_read_back() {
+        for secs in [0, 951_782_400, 1_785_000_123, 4_102_444_799] {
+            assert_eq!(parse_utc(&format_utc(secs)), Some(secs), "{secs}");
+        }
+        assert_eq!(format_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(parse_utc("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_utc("yesterday"), None);
+        let text = claim_text("0a1b2c3d4e5f6071", 1_785_000_000);
+        let url = "https://github.com/a/b/issues/5#issuecomment-4242";
+        let claim = parse_claim_comment(&text, url).unwrap();
+        assert_eq!(claim.runner, "0a1b2c3d4e5f6071");
+        assert_eq!(claim.id, Some(4242));
+        assert!(!claim.is_stale(1_785_000_000 + CLAIM_SECS - 1));
+        assert!(claim.is_stale(1_785_000_000 + CLAIM_SECS));
+        assert!(parse_claim_comment("Claimed by someone", url).is_none());
+        assert!(parse_claim_comment("hello", url).is_none());
     }
 
     #[test]
