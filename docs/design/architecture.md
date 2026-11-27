@@ -110,7 +110,9 @@ the queue by priority and then age, so every ready work item goes before any fol
 ready wins at the next pick. A follow-up passes through the same loop, risk tier and `Depends on` rules as any item.
 `.paja/queue`, read from the default branch like `.paja/labels`, turns this off with `follow-ups = off` (`on` is the
 default); a sync with it off doesn't list the follow-up label, so the follow-ups already imported close like any item
-whose label went away. A line Jono can't read is an error naming the line.
+whose label went away. Their `work.closed` events carry `follow_ups_off: true`, so when follow-ups come back on a
+follow-up that had landed stays landed instead of being queued again like a reopened landing. A line Jono can't read is
+an error naming the line.
 
 An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed by
 issue numbers (`Depends on #12, #14`), after optional quote, list or number markers. Lines in fenced code blocks don't
@@ -275,7 +277,8 @@ Each agent runs on the model `.paja/models` names for its role, read from the de
 pick the models that judge it. One line per role, `role model [effort]`, with `#` comment lines: `build` (the first
 build round), `fix` (later build rounds), `review` (the first full review), `re-review` (a normal-risk review of only
 the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, the cheapest model), `plan` (the pool's
-planner) and `init` (`paja init`'s detection agent: it reads the default branch under the read-only deny-list hook and
+planner), `arbiter` (the read-only agent that settles an escalation before it reaches the person, on the `review` model
+when it has no line; see `landing.md`) and `init` (`paja init`'s detection agent: it reads the default branch under the read-only deny-list hook and
 proposes the stacks, checks, commands and environment, and `paja init` keeps only what files on the default branch back
 up; it also runs from a checkout that is not yet set up, so it reads `.paja/models` from there when the file exists and
 otherwise runs on the account's default). Mestari passes `--model` and, when given, `--effort`; a role
@@ -337,7 +340,10 @@ setting to change. On `escalate`, three failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
-`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. `run.step` (`round`, `role`, `model`,
+`run.escalated`, plus a `run.follow_up` for each non-blocking review finding. Before an escalation Mestari's arbiter
+agent looks at it: `run.arbitrated` (`number`, `verdict` `answer` or `escalate`, the `answer` or the `question`,
+`model`, `overruled`, `steps`) follows, and for an answer a `work.answered` with `by: arbiter` and a status event that
+queues the item again, with no `run.escalated`. `run.step` (`round`, `role`, `model`,
 `reviewer`, `pr`) records that a step starts, so the run can be followed from outside its terminal: an agent step under
 its `.paja/models` role, `checks` for Vasara's checks, and `ci` (or `land` with no CI) once the pull request `pr` is
 open; logs from before it replay with no steps. `run.checked` (`round`, `commit`, `base`)
