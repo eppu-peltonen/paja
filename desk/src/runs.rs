@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 /// How often `paja run --every` checks for work when the queue is empty, in minutes.
 pub const EVERY_MINUTES: u32 = 5;
 /// How long "Stop now" waits for `paja` to end its agents before Desk ends `paja` itself.
-const STOP_NOW_GRACE: Duration = Duration::from_secs(15);
+pub const STOP_NOW_GRACE: Duration = Duration::from_secs(15);
 /// How much of a run's output Desk shows.
 const OUTPUT_LINES: usize = 200;
 
@@ -148,6 +148,29 @@ impl Runner {
             self.end_later(repo.to_string(), pid);
         }
         sent.with_context(|| format!("telling the run of {repo} to stop"))
+    }
+
+    /// Tell every run Desk started to stop now, and wait for them to end, up to `grace`; a
+    /// `paja` still going then is ended. For closing Desk, which takes [`Self::end_later`]'s
+    /// timers with it.
+    pub fn stop_all_now(&self, grace: Duration) {
+        for repo in self.running() {
+            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stdin) = runs.get_mut(&repo).and_then(|run| run.stdin.as_mut()) {
+                let _ = stdin.write_all(b"stop now\n").and_then(|()| stdin.flush());
+            }
+        }
+        let deadline = std::time::Instant::now() + grace;
+        while !self.running().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        for run in runs.values_mut() {
+            if alive(&mut run.child) {
+                let _ = run.child.kill();
+                let _ = run.child.wait();
+            }
+        }
     }
 
     /// End `paja` (process `pid`) for `repo` if it is still going after the grace period.
@@ -331,6 +354,43 @@ mod tests {
         assert!(output.contains("--every 5"), "{output}");
         assert!(output.contains("got: stop now"), "{output}");
         assert!(runner.stop("acme/app", false).is_err());
+    }
+
+    #[test]
+    fn closing_stops_every_run_and_ends_one_that_is_stuck() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let checkout = dir.path().join("app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        // A `paja` that reads stop lines and never ends.
+        let stuck = dir.path().join("stuck");
+        std::fs::write(
+            &stuck,
+            "#!/bin/sh\nwhile read -r line; do echo \"got: $line\"; done\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fine = Runner::new(fake_paja(dir.path()));
+        fine.start(&home, "acme/app", &checkout, false, None)
+            .unwrap();
+        let started = std::time::Instant::now();
+        fine.stop_all_now(Duration::from_secs(10));
+        // The run that stops on `stop now` isn't waited on for the whole grace period.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(fine.running().is_empty());
+
+        let stuck = Runner::new(stuck);
+        stuck
+            .start(&home, "acme/lib", &checkout, false, None)
+            .unwrap();
+        stuck.stop_all_now(Duration::from_millis(500));
+        assert!(stuck.running().is_empty());
+        let output = stuck.status(&home, "acme/lib")["output"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(output.contains("got: stop now"), "{output}");
     }
 
     #[test]
