@@ -725,9 +725,20 @@ fn short_name_of_protected(word: &str) -> bool {
     })
 }
 
+/// `name` as Windows opens it: without a stream after `:` and without trailing dots and spaces.
+fn windows_name(name: &str) -> &str {
+    name.split(':')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(['.', ' '])
+}
+
 /// A word that is, or could be shorthand for, a protected name: compared with Unicode's upper
-/// case, as NTFS folds names (`ruſtfmt.toml` is `rustfmt.toml` there).
+/// case, as NTFS folds names (`ruſtfmt.toml` is `rustfmt.toml` there), and without what
+/// Windows drops or reads as the same file: trailing dots and spaces (`clippy.toml.`) and a
+/// stream after `:` (`clippy.toml::$DATA`).
 fn is_protected_word(word: &str) -> bool {
+    let word = windows_name(word);
     let upper = word.to_uppercase();
     short_name_of_protected(word)
         || PROTECTED_NAMES
@@ -744,8 +755,9 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     // Git and cargo read configuration from these at any depth.
     let inner = full.strip_prefix(&b.root).unwrap_or(&full);
     // Compared without case, for case-insensitive file systems (macOS's default, NTFS), and
-    // with Unicode's upper case, as NTFS folds names: `ſ` is `S` there.
-    let upper = |text: &str| text.to_uppercase();
+    // with Unicode's upper case, as NTFS folds names: `ſ` is `S` there. Windows also opens
+    // `clippy.toml.` and `clippy.toml::$DATA` as `clippy.toml`.
+    let upper = |text: &str| windows_name(text).to_uppercase();
     let named = |name: &str| {
         inner
             .components()
@@ -754,7 +766,7 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     // Windows 8.3 short names (`GIT~1` for `.git`) reach the same files.
     if inner
         .components()
-        .any(|c| short_name_of_protected(&c.as_os_str().to_string_lossy()))
+        .any(|c| short_name_of_protected(windows_name(&c.as_os_str().to_string_lossy())))
     {
         return Some(format!(
             "{} is a Windows short name for configuration that agents never change; use the \
@@ -1856,6 +1868,10 @@ mod program_tests {
             "npm test -.C/tmp/a",
             "npm test -xf.Git",
             "npm test -plocalhost:80",
+            "npm test 'clippy.toml.'",
+            "npm test 'out=clippy.toml '",
+            "npm test 'clippy.toml::$DATA'",
+            "npm test 'x=GIT~1.'",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -2130,6 +2146,18 @@ mod tests {
         assert!(decide("Write", json!({"file_path": "/etc/passwd"})).is_some());
         assert!(decide("Edit", json!({"file_path": "../../other/x"})).is_some());
         assert!(decide("Write", json!({"file_path": ".git"})).is_some());
+        // Windows opens these as `clippy.toml` and `.git/config`.
+        for path in [
+            "clippy.toml.",
+            "clippy.toml ",
+            "clippy.toml::$DATA",
+            ".git./config",
+        ] {
+            assert!(
+                decide("Write", json!({ "file_path": path })).is_some(),
+                "{path}"
+            );
+        }
         assert!(decide("Write", json!({"file_path": "/h/.paja/events.jsonl"})).is_some());
         assert!(decide("Read", json!({"file_path": "/h/.ssh/id_rsa"})).is_some());
         assert!(decide("Read", json!({"file_path": "/h/.config/gh/hosts.yml"})).is_some());
