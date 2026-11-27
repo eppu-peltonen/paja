@@ -7285,12 +7285,27 @@ fn a_window_in_a_real_stream_reaches_the_recorded_step() {
 #[test]
 fn doctor_warns_while_no_step_reports_a_usage_window() {
     let f = Factory::new("true\n", "land");
+    // Doctor's own `claude`: the factory's fake would take `--version` for a build.
+    let auth = f.tmp.path().join("auth.json");
+    let signed_in = |method: &str| {
+        let status = format!(r#"{{"loggedIn": true, "authMethod": "{method}"}}"#);
+        std::fs::write(&auth, status).unwrap();
+    };
+    signed_in("oauth_token");
+    let doctor_claude = program(
+        f.tmp.path(),
+        "doctor-claude",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\"auth status\") cat '{}' ;;\n*) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+            auth.display()
+        ),
+    );
     let window = |f: &Factory| {
         let output = Command::new(env!("CARGO_BIN_EXE_paja"))
             .current_dir(&f.repo)
             .env("PAJA_HOME", &f.home)
             .env("PAJA_GH", &f.gh)
-            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_CLAUDE", &doctor_claude)
             .env("PAJA_CLAUDE_LATEST", NO_LATEST)
             .args(["--json", "doctor"])
             .output()
@@ -7322,6 +7337,15 @@ fn doctor_warns_while_no_step_reports_a_usage_window() {
         check["fix"].as_str().unwrap().contains("rate_limit_event"),
         "{check}"
     );
+    // Signed in with an API key there is no window, so nothing to warn of.
+    signed_in("api_key");
+    let check = window(&f);
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains("API key"),
+        "{check}"
+    );
+    signed_in("oauth_token");
     // A later step that reports one settles it.
     std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
     std::fs::write(
@@ -7343,7 +7367,7 @@ fn doctor_warns_while_no_step_reports_a_usage_window() {
         check["detail"]
             .as_str()
             .unwrap()
-            .contains("allowed_warning, 93% used"),
+            .contains("had allowed_warning, 93% used"),
         "{check}"
     );
 }

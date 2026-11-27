@@ -54,6 +54,9 @@ pub struct Report {
 pub const TROUBLESHOOTING_URL: &str =
     "https://github.com/eppu-peltonen/paja/blob/main/docs/troubleshooting.md";
 
+/// Where Paja's issues are filed.
+const ISSUES_URL: &str = "https://github.com/eppu-peltonen/paja/issues";
+
 fn ok(name: &str, detail: impl Into<String>) -> Check {
     Check {
         name: name.into(),
@@ -171,11 +174,16 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     }
     // claude
     let claude = std::env::var("PAJA_CLAUDE").unwrap_or_else(|_| "claude".to_string());
+    // Whether the account has a usage window, from `claude auth status`; assumed until it says.
+    let mut windowed = true;
     match run(Command::new(&claude).arg("--version")) {
         Ok(out) if out.status.success() => {
             checks.push(claude_version(&claude, text(&out)));
             match run(Command::new(&claude).args(["auth", "status"])) {
-                Ok(out) if out.status.success() => checks.push(ok("claude sign-in", "signed in")),
+                Ok(out) if out.status.success() => {
+                    windowed = has_window(&String::from_utf8_lossy(&out.stdout));
+                    checks.push(ok("claude sign-in", "signed in"));
+                }
                 Ok(out) => checks.push(failed(
                     "claude sign-in",
                     format!("`{claude} auth status` failed: {}", text(&out)),
@@ -235,46 +243,55 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         }
     }
     checks.push(left_over_environments(home));
-    checks.push(usage_window(home));
+    checks.push(match home.events().read_all() {
+        Ok(events) => usage_window(&events, &claude, windowed),
+        Err(err) => warning(
+            "usage window",
+            format!("couldn't read the event log: {err:#}"),
+            format!("check {}", home.root().display()),
+        ),
+    });
 }
 
 /// How many of the latest agent steps the usage window check reads.
 const WINDOW_STEPS: usize = 5;
 
+/// Whether `claude auth status` (JSON) says the account has a usage window to report: signed
+/// in to a Claude subscription, not with an API key or through a cloud provider. Output that
+/// isn't the JSON expected counts as a subscription, so the check still runs.
+fn has_window(status: &str) -> bool {
+    let Ok(status) = serde_json::from_str::<Value>(status) else {
+        return true;
+    };
+    let provider = status["apiProvider"].as_str().unwrap_or("firstParty");
+    let method = status["authMethod"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    provider == "firstParty" && !method.contains("api")
+}
+
 /// Whether Claude Code's results tell Paja the usage window. The window comes from the
 /// `rate_limit_event` messages of `claude -p --output-format stream-json`, whose shape Paja
 /// assumes; if a Claude Code prints it differently, no step records a window and a nearly used
-/// one never holds a build back, silently. So the latest agent steps the log has are read: none
-/// at all is ok (nothing has run yet), and none of them with a window is a warning.
-fn usage_window(home: &Home) -> Check {
+/// one never holds a build back, silently. So the latest agent steps that ran a session are
+/// read: none at all is ok (nothing has run yet), and none of them with a window is a warning.
+/// `windowed` is false for an account with no window (an API key, a cloud provider).
+fn usage_window(events: &[crate::events::Event], claude: &str, windowed: bool) -> Check {
     let name = "usage window";
-    let steps = home.events().read_all().map(|events| {
-        let mut steps: Vec<crate::mestari::StepUsage> = events
-            .iter()
-            .filter(|e| e.kind == crate::mestari::EV_ROUND)
-            .filter_map(|e| e.data["steps"].as_array())
-            .flatten()
-            .filter_map(|s| serde_json::from_value(s.clone()).ok())
-            // A step that ran a session; one that never started has nothing to report.
-            .filter(|s: &crate::mestari::StepUsage| s.session_id.is_some())
-            .collect();
-        steps.drain(..steps.len().saturating_sub(WINDOW_STEPS));
-        steps
-    });
-    let steps = match steps {
-        Ok(steps) => steps,
-        Err(err) => {
-            return warning(
-                name,
-                format!("couldn't read the event log: {err:#}"),
-                format!("check {}", home.root().display()),
-            );
-        }
-    };
-    let reported = |s: &&crate::mestari::StepUsage| {
-        s.window_status.is_some() || s.window_used_percent.is_some() || s.window_resets_at.is_some()
-    };
-    let Some(latest) = steps.iter().rfind(reported) else {
+    if !windowed {
+        return ok(
+            name,
+            "signed in with an API key or through a cloud provider: there is no usage window to \
+             report",
+        );
+    }
+    let mut steps: Vec<_> = crate::mestari::StepUsage::recorded(events)
+        // A step that ran a session; one that never started has nothing to report.
+        .filter(|s| s.session_id.is_some())
+        .collect();
+    steps.drain(..steps.len().saturating_sub(WINDOW_STEPS));
+    let Some(latest) = steps.iter().rfind(|s| s.reports_window()) else {
         if steps.is_empty() {
             return ok(name, "no agent step has run yet");
         }
@@ -286,17 +303,16 @@ fn usage_window(home: &Home) -> Check {
                 steps.len(),
                 if steps.len() == 1 { "" } else { "s" }
             ),
-            "run `claude update`; signed in with an API key there is no window, and this is \
-             expected. If Claude Code is current and signed in to a subscription, its stream-json \
-             output no longer has `rate_limit_event` messages with `rate_limit_info` (`status`, \
-             `utilization`, `resetsAt`) as Paja reads them: file an issue with the \
-             `rate_limit_event` line that `claude -p --output-format stream-json --verbose hi` \
-             prints",
+            format!(
+                "run `{claude} update`. If Claude Code is current, file an issue at {ISSUES_URL} \
+                 with the `rate_limit_event` line that `{claude} -p --output-format stream-json \
+                 --verbose hi` prints: Paja reads the window from its `rate_limit_info`"
+            ),
         );
     };
     let mut detail = format!(
-        "the latest step reported {}",
-        latest.window_status.as_deref().unwrap_or("a window")
+        "the latest step that reported a window had {}",
+        latest.window_status.as_deref().unwrap_or("no status")
     );
     if let Some(used) = latest.window_used_percent {
         detail.push_str(&format!(", {used:.0}% used"));
@@ -727,6 +743,74 @@ fn sandbox(checks: &mut Vec<Check>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rounds(steps: &[serde_json::Value]) -> Vec<crate::events::Event> {
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| crate::events::Event {
+                v: 1,
+                seq: i as u64 + 1,
+                ts_ms: 0,
+                kind: crate::mestari::EV_ROUND.to_string(),
+                data: serde_json::json!({ "steps": [step] }),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_usage_window_check_reads_the_latest_five_steps_that_ran() {
+        let windowed = serde_json::json!({"step": "build", "session_id": "s",
+            "window_status": "allowed", "window_used_percent": 40.0});
+        let bare = serde_json::json!({"step": "build", "session_id": "s"});
+        let unstarted = serde_json::json!({"step": "build"});
+        let check = |steps: &[serde_json::Value]| usage_window(&rounds(steps), "claude", true);
+        assert_eq!(check(&[]).status, Status::Ok);
+        assert_eq!(check(std::slice::from_ref(&unstarted)).status, Status::Ok);
+        // A window four steps back is among the latest five.
+        let mut steps = vec![windowed.clone()];
+        steps.extend(std::iter::repeat_n(bare.clone(), 4));
+        let ok = check(&steps);
+        assert_eq!(ok.status, Status::Ok);
+        assert!(ok.detail.contains("had allowed, 40% used"), "{}", ok.detail);
+        // Steps that never ran a session don't push it out.
+        steps.extend(std::iter::repeat_n(unstarted, 3));
+        assert_eq!(check(&steps).status, Status::Ok);
+        // Five steps since it, none with a window: a warning that names the configured claude.
+        steps.push(bare);
+        let warned = usage_window(&rounds(&steps), "my-claude", true);
+        assert_eq!(warned.status, Status::Warning);
+        assert!(
+            warned.detail.contains("latest 5 agent steps"),
+            "{}",
+            warned.detail
+        );
+        let fix = warned.fix.unwrap();
+        assert!(
+            fix.contains("`my-claude update`") && fix.contains(ISSUES_URL),
+            "{fix}"
+        );
+        // An account with no window is never warned.
+        assert_eq!(
+            usage_window(&rounds(&steps), "claude", false).status,
+            Status::Ok
+        );
+    }
+
+    #[test]
+    fn only_a_subscription_has_a_usage_window() {
+        assert!(has_window(
+            r#"{"authMethod": "oauth_token", "apiProvider": "firstParty"}"#
+        ));
+        assert!(has_window(r#"{"loggedIn": true}"#));
+        assert!(has_window("Logged in"));
+        assert!(!has_window(
+            r#"{"authMethod": "api_key", "apiProvider": "firstParty"}"#
+        ));
+        assert!(!has_window(
+            r#"{"authMethod": "oauth_token", "apiProvider": "bedrock"}"#
+        ));
+    }
 
     #[test]
     fn versions_of_different_lengths_compare_by_their_numbers() {

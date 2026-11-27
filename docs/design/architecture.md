@@ -333,8 +333,11 @@ the builder is told to make the change easier to review. The same kind of step (
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
 Agents run with `--output-format stream-json --verbose`; Mestari folds the stream back into its final `result`
-message, with the latest `rate_limit_event`'s `rate_limit_info` added when the result has none of its own. A step
-records the usage window when that object is there (`window_status`,
+message, with the latest `rate_limit_event`'s `rate_limit_info` added when the result has none of its own. That
+object has the binding limit's `status` and `resetsAt` (`rateLimitType`) and each window's `utilization` under
+`unifiedWindows`; the used share is the fullest window's, with its own reset time, or while the status is a warning
+(or rejected) the binding window's, until the binding limit resets. A step records the usage window when that object
+is there (`window_status`,
 `window_used_percent`, `window_resets_at`; all absent for a Claude Code that reports nothing, and `paja doctor` warns
 when none of the latest five steps has them). Before a `build` or
 `fix` session, and before a new item is claimed, Mestari reads the latest recorded state: if it is a warning (or
