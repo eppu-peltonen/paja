@@ -94,13 +94,13 @@ impl Notice {
 const ROLE_SHOWN: usize = 64;
 const ROLES_SHOWN: usize = 10;
 
-/// A role as a notice shows it: quoted and escaped, as the run's warning shows it, so a
+/// A role as a notice shows it: quoted and escaped at least as much as the run's warning, so a
 /// control character in the file never reaches a terminal or a phone, and cut after
 /// `ROLE_SHOWN` escaped characters, never inside one character's escape.
 fn shown_role(role: &str) -> String {
     let mut shown = String::new();
     for c in role.chars() {
-        // As `{:?}` escapes a string: a quote `'` stays plain, as in the run's warning.
+        // Escaped as `{:?}` escapes a one-character string: a quote `'` stays plain.
         let quoted = format!("{:?}", c.to_string());
         let escaped = &quoted[1..quoted.len() - 1];
         if shown.chars().count() + escaped.chars().count() > ROLE_SHOWN {
