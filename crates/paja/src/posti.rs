@@ -100,11 +100,13 @@ const ROLES_SHOWN: usize = 10;
 fn shown_role(role: &str) -> String {
     let mut shown = String::new();
     for c in role.chars() {
-        let escaped: String = c.escape_debug().collect();
+        // As `{:?}` escapes a string: a quote `'` stays plain, as in the run's warning.
+        let quoted = format!("{:?}", c.to_string());
+        let escaped = &quoted[1..quoted.len() - 1];
         if shown.chars().count() + escaped.chars().count() > ROLE_SHOWN {
             return format!("\"{shown}\"…");
         }
-        shown.push_str(&escaped);
+        shown.push_str(escaped);
     }
     format!("\"{shown}\"")
 }
@@ -447,6 +449,7 @@ mod tests {
         // Escapes count toward the cut, and only so many roles are listed.
         let escapes = "\u{1b}".repeat(500);
         assert_eq!(shown_role(&escapes).chars().count(), 2 + 60 + 1);
+        assert_eq!(shown_role("it's"), format!("{:?}", "it's"));
         let many: Vec<String> = (0..1000).map(|i| format!("{escapes}{i}")).collect();
         let n = Notice::skipped_roles("acme/app", "main", &many);
         assert!(n.text.len() < 1500, "{}", n.text.len());
