@@ -2744,6 +2744,36 @@ fn a_round_that_errors_still_records_what_it_spent() {
 }
 
 #[test]
+fn an_item_parked_on_an_error_before_any_step_is_reported_failed() {
+    let f = Factory::new("true\n", "land");
+    // A directory where the item's environment goes makes the run fail before any agent starts.
+    std::fs::create_dir_all(f.home.join("envs").join(WORK_5)).unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert!(
+        !f.tmp.path().join("claude-args.log").exists(),
+        "no agent ran"
+    );
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    let rounds: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .collect();
+    assert_eq!(rounds.len(), 1, "{log}");
+    assert_eq!(rounds[0]["data"]["verdict"], "error", "{log}");
+    assert_eq!(rounds[0]["data"]["steps"], serde_json::json!([]), "{log}");
+    let (ok, usage) = paja(&f.home, &f.repo, &["usage"]);
+    assert!(ok, "{usage}");
+    let items = usage["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{usage}");
+    assert_eq!(items[0]["outcome"], "failed", "{usage}");
+    assert_eq!(items[0]["steps"], 0, "{usage}");
+}
+
+#[test]
 fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     let f = Factory::new("true\n", "land");
     let dir = f.tmp.path();
