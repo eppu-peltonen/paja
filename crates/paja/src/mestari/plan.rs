@@ -241,12 +241,12 @@ fn ask(
     models: &Models,
 ) -> Result<Vec<String>> {
     let name = format!("plan-{}", item.number);
-    // A checkout left behind by a plan that was killed is reused, put back on the default branch.
+    // A checkout or branch left behind by a plan that was killed is reused; `discard` puts it
+    // back on the default branch.
     let branch = format!("refs/heads/paja/{name}");
     let env = match ahjo::get(home, &name) {
         Ok(env) => env,
         Err(_) => {
-            // A branch a killed plan left is reused; `discard` puts it back on the default branch.
             let left = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
             ahjo::create(
                 home,

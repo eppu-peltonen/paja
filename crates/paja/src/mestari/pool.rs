@@ -321,7 +321,6 @@ impl Pool<'_> {
             let Some(item) = next.iter().find(|item| item.number == plan.number) else {
                 continue;
             };
-            let plan = &plan;
             let lane = (1..).find(|n| !self.lanes.contains_key(n)).unwrap_or(1);
             let start = record_lane(self.home, self.name, lane, item.number, "starting", None)?;
             record(
