@@ -589,10 +589,10 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 Some(&question),
             )?;
             // The steps that ran before the error were spent too; keep them in the item's usage.
-            if !run.steps.is_empty() {
-                let error = format!("{err:#}");
-                record_round(home, &item, rounds, "error", &error, &mut run.steps)?;
-            }
+            // The round is recorded even with no step, so the item's last verdict is `error`
+            // (`paja usage` reports it as failed) and not an earlier round's.
+            let error = format!("{err:#}");
+            record_round(home, &item, rounds, "error", &error, &mut run.steps)?;
             record(
                 home,
                 EV_ESCALATED,
