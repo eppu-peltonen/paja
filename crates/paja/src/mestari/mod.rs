@@ -2097,8 +2097,13 @@ fn vasara(
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     // Read before any check runs: later, the branch's code may have changed the configuration.
     let identity = git_identity(dir);
-    let scratch = tempfile_dir(dir)?;
+    // The sandbox has its own `PAJA_HOME` (`sandbox::SCRATCH`), so no host directory is made then.
     let sbx = crate::sandbox::active();
+    let scratch = if sbx.is_none() {
+        tempfile_dir(dir)?
+    } else {
+        PathBuf::new()
+    };
     let result = (|| {
         for check in checks {
             let mut cmd = match &sbx {
@@ -2121,7 +2126,9 @@ fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
         }
         Ok(None)
     })();
-    let _ = std::fs::remove_dir_all(&scratch);
+    if sbx.is_none() {
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
     result
 }
 

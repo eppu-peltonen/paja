@@ -482,7 +482,9 @@ while it starts.
 - **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If `PAJA_SBX` is
   set and the sandbox can't start, it stops with an error that says what to install or set up. It never falls back to
   running on the host. Without `PAJA_SBX`, `paja run` says on stderr that there is no sandbox, and runs as described
-  above, behind the deny-list hook only. Detection is optional by design: Paja has no Docker dependency, and its tests
+  above, behind the deny-list hook only. The sandbox is named `paja`; `PAJA_SBX_NAME` names another one (the real-`sbx`
+  test uses it, so it never removes the person's own). `.paja/setup` runs with stderr merged into stdout, so a failure's
+  last lines keep their order, and writes a progress line to stderr while it runs. Detection is optional by design: Paja has no Docker dependency, and its tests
   use a fake `sbx`.
 - **Permissions.** Claude Code is always started with `--permission-mode auto`, with or without a sandbox; the sandbox
   image's default, `bypassPermissions`, and every weaker mode are never used. Auto mode is an extra layer, not a
