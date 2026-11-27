@@ -3574,6 +3574,10 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
 }
 
 /// `stop now` on stdin stops at once and ends the agent, like a second Ctrl-C, also in a loop.
+// Unix only for now: on Windows CI paja stopped and exited, but the fake builder's processes
+// (Git Bash's `sh` and its `sleep` loop) outlived `taskkill /T` and kept paja's output pipes
+// open, so the run never read as ended.
+#[cfg(unix)]
 #[test]
 fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
     use std::io::Write as _;
