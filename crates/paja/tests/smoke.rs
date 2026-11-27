@@ -1855,6 +1855,44 @@ fn run_lands_on_the_default_branch_with_an_allowed_merge_method() {
 }
 
 #[test]
+fn run_takes_a_work_item_before_an_older_follow_up_and_the_follow_up_next() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    // The fake gh lists follow-up #3, older than work item #5, under the follow-up label only.
+    let d = slash(f.tmp.path());
+    std::fs::write(
+        f.tmp.path().join("follow-ups.json"),
+        r#"[{"number": 3, "title": "Tidy the helper", "body": "Tidy it.", "url": "https://example.com/3"}]"#,
+    )
+    .unwrap();
+    let gh_script = f.tmp.path().join("gh");
+    let listed = format!("\"issue list\") cat {d}/issues.json ;;");
+    let script = std::fs::read_to_string(&gh_script).unwrap();
+    assert!(script.contains(&listed), "{script}");
+    let script = script.replace(
+        &listed,
+        &format!(
+            "\"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/follow-ups.json ;; \
+             *) cat {d}/issues.json ;; esac ;;"
+        ),
+    );
+    std::fs::write(&gh_script, script).unwrap();
+
+    // `paja run` claims through its own ordering, not `work list`'s: the work item goes first.
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(log.contains(&format!("--head paja/{WORK_5}")), "{log}");
+    assert!(!log.contains("work-3"), "{log}");
+    // With the work item landed, the follow-up is next.
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = f.gh_log();
+    assert!(log.contains("--head paja/app-a9afab-work-3"), "{log}");
+}
+
+#[test]
 fn run_escalates_when_the_repository_allows_no_merge_method() {
     let view = r#"{"nameWithOwner": "acme/app", "defaultBranchRef": {"name": "main"}, "squashMergeAllowed": false, "mergeCommitAllowed": false, "rebaseMergeAllowed": false}"#;
     let f = Factory::on_branch("test -f feature.txt\n", "land", "main", view);
