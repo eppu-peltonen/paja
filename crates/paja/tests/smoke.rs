@@ -2248,12 +2248,25 @@ impl Factory {
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
-                 if [ -f {d}/view-down-after-claim ]; then touch {d}/view-down; fi; echo https://example.com/acme/app/issues/$3#issuecomment-88 ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
+                 if [ -f {d}/view-down-after-claim ]; then touch {d}/view-down; fi\n\
+                 id=88; if [ -f {d}/comment-id ]; then id=$(cat {d}/comment-id); fi; echo $((id + 1)) > {d}/comment-id\n\
+                 if [ ! -f {d}/claim-vanishes ]; then printf '{{\"body\": \"%s\", \"url\": \"https://example.com/acme/app/issues/%s#issuecomment-%s\"}}\\n' \"$5\" \"$3\" \"$id\" >> {d}/posted-$3; fi\n\
+                 echo https://example.com/acme/app/issues/$3#issuecomment-$id ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi\n\
-                 if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi ;;\n\
-                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; rm -f {d}/view-5.json; fi ;;\n\
+                 if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
+                 case \"$*\" in *\"--add-label factory-claimed\"*) touch {d}/labelled-$3 ;; *\"--remove-label factory-claimed\"*) rm -f {d}/labelled-$3 ;; esac ;;\n\
+                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; id=${{4##*/}}; if [ \"$id\" -ge 88 ] 2>/dev/null; then if [ -f {d}/posted-5 ]; then grep -v \"issuecomment-$id\\\"\" {d}/posted-5 > {d}/posted-5.tmp; mv {d}/posted-5.tmp {d}/posted-5; fi; for x in {d}/after-race-before {d}/after-race-after; do if [ -f $x ] && grep -q \"issuecomment-$id\\\"\" $x; then rm -f $x; fi; done; else rm -f {d}/view-5.json; fi; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-down ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
-                 if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
+                 p=; if [ -f {d}/posted-$3 ]; then p=$(tr '\\n' ',' < {d}/posted-$3 | sed 's/,$//'); fi\n\
+                 if [ -f {d}/claim-goes-stale ] && [ -f {d}/race-read ]; then p=$(echo \"$p\" | sed 's/stale after [^\"]*/stale after 2020-01-02T00:00:00Z/')\n\
+                 if [ -f {d}/then-claimed ]; then if [ -n \"$p\" ]; then p=\"$p,\"; fi; p=\"$p{{\\\"body\\\": \\\"Claimed by runner abc123 at 2020-01-01T00:00:00Z; stale after 2999-01-01T00:00:00Z\\\", \\\"url\\\": \\\"https://example.com/acme/app/issues/5#issuecomment-77\\\"}}\"; fi; fi\n\
+                 if [ -f {d}/race-read ] && [ -f {d}/after-race-before ]; then b=$(cat {d}/after-race-before); if [ -n \"$p\" ]; then p=\"$b,$p\"; else p=$b; fi; fi\n\
+                 if [ -f {d}/race-read ] && [ -f {d}/after-race-after ]; then a=$(cat {d}/after-race-after); if [ -n \"$p\" ]; then p=\"$p,$a\"; else p=$a; fi; fi\n\
+                 if [ -n \"$p\" ]; then touch {d}/race-read; fi\n\
+                 l='[]'; if [ -f {d}/labelled-$3 ]; then l='[{{\"name\": \"factory-claimed\"}}]'; fi\n\
+                 if [ -f {d}/view-$3.json ] && [ -n \"$p\" ]; then sed -e \"s|\\\"comments\\\":\\[\\]|\\\"comments\\\":[$p]|\" -e t -e \"s|],\\\"labels\\\"|,$p],\\\"labels\\\"|\" {d}/view-$3.json\n\
+                 elif [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json\n\
+                 else echo \"{{\\\"labels\\\": $l, \\\"comments\\\": [$p]}}\"; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -6229,6 +6242,194 @@ fn a_failed_claim_keeps_another_runners_label() {
         "{log}"
     );
     assert!(!log.contains("api -X DELETE"), "{log}");
+}
+
+#[test]
+fn a_claim_renewed_after_going_stale_is_posted_again() {
+    // The run wins its race, then its claim goes stale before round two renews it (another
+    // runner may have claimed the item meanwhile, after it in comment order).
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    std::fs::write(f.tmp.path().join("claim-goes-stale"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let log = f.gh_log();
+    // Edited in place, the stale comment would keep its early place and win that race back.
+    assert!(!log.contains("PATCH"), "{log}");
+    let posts: Vec<usize> = log
+        .match_indices("issue comment 5 --body Claimed by runner ")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(posts.len(), 2, "{log}");
+    let deleted = log
+        .find("/issues/comments/88")
+        .unwrap_or_else(|| panic!("the stale comment is deleted: {log}"));
+    assert!(deleted > posts[1], "deleted after the new one is up: {log}");
+    // The old comment goes, not the one just posted.
+    assert!(!log.contains("/issues/comments/89"), "{log}");
+}
+
+#[test]
+fn a_lapsed_claim_another_runner_took_is_not_renewed() {
+    // The run's claim goes stale before round two, and another runner claims the item then.
+    let f = Factory::new("true\n", "changes");
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    std::fs::write(f.tmp.path().join("claim-goes-stale"), "").unwrap();
+    std::fs::write(f.tmp.path().join("then-claimed"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["rounds"], 2, "{report}");
+    assert!(
+        stderr.contains("runner abc123 claimed it on GitHub since"),
+        "{stderr}"
+    );
+    let log = f.gh_log();
+    let posts = log
+        .matches("issue comment 5 --body Claimed by runner ")
+        .count();
+    assert_eq!(posts, 1, "no second claim behind that runner's: {log}");
+    assert!(!log.contains("PATCH"), "{log}");
+}
+
+/// A claim comment by `runner` with comment id `id`, live for centuries, as the fake gh's
+/// `issue view` prints it. Written to the fake's `after-race-before` or `after-race-after`
+/// file, it shows up in every `issue view` after the race check's read, ahead of or behind the
+/// comments the run posted, until a DELETE names its id. With no `view-N.json`, the fake's
+/// view also carries the claimed label while `labelled-N` (set and cleared by `issue edit`)
+/// says it is on.
+fn live_claim(runner: &str, id: u64) -> String {
+    format!(
+        r#"{{"body": "Claimed by runner {runner} at 2020-01-01T00:00:00Z; stale after 2999-01-01T00:00:00Z", "url": "https://example.com/acme/app/issues/5#issuecomment-{id}"}}"#
+    )
+}
+
+/// The last `work.claim` the log recorded for item 5.
+fn last_claim(f: &Factory) -> Value {
+    events_of(f, "work.claim")
+        .into_iter()
+        .rfind(|e| e["data"]["number"] == 5)
+        .map(|e| e["data"].clone())
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn a_give_back_deletes_its_own_claim_and_the_later_losers() {
+    let f = Factory::new("true\n", "land");
+    // Another runner claimed after this one won and before it gave the item back.
+    std::fs::write(
+        f.tmp.path().join("after-race-after"),
+        live_claim("cccc", 90),
+    )
+    .unwrap();
+    let (ok, report, stderr) = run_args(&f, &[], Some("n"));
+    assert!(!stderr.contains("couldn't free"), "{stderr}");
+    assert!(!ok, "{report}");
+    let log = f.gh_log();
+    assert!(log.contains("/issues/comments/88"), "its own: {log}");
+    assert!(
+        log.contains("/issues/comments/90"),
+        "the later loser's: {log}"
+    );
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "nobody holds it now: {log}"
+    );
+    assert_eq!(last_claim(&f)["runner"], Value::Null, "{}", last_claim(&f));
+}
+
+#[test]
+fn a_give_back_leaves_an_earlier_runners_claim_and_label() {
+    let f = Factory::new("true\n", "land");
+    // A claim ahead of this one's that the race check didn't see.
+    std::fs::write(
+        f.tmp.path().join("after-race-before"),
+        live_claim("bbbb", 70),
+    )
+    .unwrap();
+    let (ok, report, stderr) = run_args(&f, &[], Some("n"));
+    assert!(!stderr.contains("couldn't free"), "{stderr}");
+    assert!(!ok, "{report}");
+    let log = f.gh_log();
+    assert!(log.contains("/issues/comments/88"), "its own: {log}");
+    assert!(!log.contains("/issues/comments/70"), "{log}");
+    assert!(
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "that runner's label stays: {log}"
+    );
+    let claim = last_claim(&f);
+    assert_eq!(claim["runner"], "bbbb", "{claim}");
+    assert_eq!(claim["stale_after"], "2999-01-01T00:00:00Z", "{claim}");
+}
+
+#[test]
+fn a_give_back_between_an_earlier_claim_and_a_later_one_keeps_only_the_earlier() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(
+        f.tmp.path().join("after-race-before"),
+        live_claim("bbbb", 70),
+    )
+    .unwrap();
+    std::fs::write(
+        f.tmp.path().join("after-race-after"),
+        live_claim("cccc", 90),
+    )
+    .unwrap();
+    let (ok, report, stderr) = run_args(&f, &[], Some("n"));
+    assert!(!ok, "{report}");
+    assert!(!stderr.contains("couldn't free"), "{stderr}");
+    let log = f.gh_log();
+    assert!(log.contains("/issues/comments/88"), "its own: {log}");
+    assert!(
+        log.contains("/issues/comments/90"),
+        "the later loser's: {log}"
+    );
+    assert!(!log.contains("/issues/comments/70"), "{log}");
+    assert!(
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "the earlier runner's label stays: {log}"
+    );
+    assert_eq!(last_claim(&f)["runner"], "bbbb", "{}", last_claim(&f));
+}
+
+#[test]
+fn a_claim_deleted_before_it_is_read_back_is_lost() {
+    // A runner giving the item back deleted this run's comment as a later claim before the
+    // run read the issue back.
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("claim-vanishes"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "idle", "{report}");
+    assert!(
+        !f.tmp.path().join("claude-args.log").exists(),
+        "no agent ran"
+    );
+    let log = f.gh_log();
+    // Nobody else holds it, so the label comes back off.
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "{log}"
+    );
+    let (_, item) = f.with_gh(&["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(item.get("claim").is_none_or(Value::is_null), "{item}");
+}
+
+#[test]
+fn a_claim_deleted_before_it_is_read_back_loses_to_the_runner_still_there() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("claim-vanishes"), "").unwrap();
+    f.claimed_by_other(false, "2999-01-01T00:00:00Z");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "idle", "{report}");
+    let log = f.gh_log();
+    assert!(
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "that runner's label stays: {log}"
+    );
+    let (_, item) = f.with_gh(&["work", "show", "5"]);
+    assert_eq!(item["claim"]["runner"], "abc123", "{item}");
 }
 
 #[test]
