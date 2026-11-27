@@ -588,22 +588,40 @@ fn closing_comment(item: &Triaged, repo: &Path) -> String {
     follow_ups::redact_for_issue(&text, repo)
 }
 
-/// The comment a duplicate's original gets, so the duplicate's finding isn't lost if the
-/// original is later closed without being done.
-/// Whether issue `on` already has a comment noting duplicate `number`, in either form a pass
-/// writes (`**Paja triage closed #<n> (title) as ...` or `**Paja triage closed #<n> as ...`).
-/// A listing `gh` can't give counts as no: the note is posted, as before.
+/// Whether issue `on` already has a note on duplicate `number` that this `gh` user wrote, in
+/// either form a pass writes. Only the account Paja comments as counts, so nobody else's
+/// comment can stand in for a note. A listing `gh` can't give, or a login it can't name, counts
+/// as no: the note is posted, as before.
 fn already_noted(repo: &Path, on: u64, number: u64) -> bool {
-    let path = format!("repos/{{owner}}/{{repo}}/issues/{on}/comments");
-    let Ok(bodies) = run_gh(repo, &["api", &path, "--paginate", "--jq", ".[].body"]) else {
+    let Ok(login) = run_gh(repo, &["api", "user", "--jq", ".login"]) else {
         return false;
     };
-    let start = format!("**Paja triage closed #{number} ");
-    bodies
-        .lines()
-        .any(|line| line.starts_with(&start) && line.contains("as a duplicate of this issue.**"))
+    let login = login.trim();
+    // A GitHub login (or an app's `name[bot]`) is safe to quote in the jq program.
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-[]".contains(c);
+    if login.is_empty() || !login.chars().all(plain) {
+        return false;
+    }
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{on}/comments");
+    let jq =
+        format!(".[] | select(.user.login == \"{login}\") | (.body // \"\") | split(\"\\n\")[0]");
+    run_gh(repo, &["api", &path, "--paginate", "--jq", &jq])
+        .is_ok_and(|first_lines| noted_in(&first_lines, number))
 }
 
+/// Whether one of `first_lines` (each the first line of a comment) is the start of a note on
+/// duplicate `number`: `**Paja triage closed #<n> (title) as a duplicate of this issue.**` or
+/// `**Paja triage closed #<n> as a duplicate of this issue.**`.
+fn noted_in(first_lines: &str, number: u64) -> bool {
+    let start = format!("**Paja triage closed #{number} ");
+    first_lines.lines().any(|line| {
+        let line = line.trim_end();
+        line.starts_with(&start) && line.ends_with("as a duplicate of this issue.**")
+    })
+}
+
+/// The comment a duplicate's original gets, so the duplicate's finding isn't lost if the
+/// original is later closed without being done.
 fn duplicate_note(item: &Triaged, repo: &Path) -> String {
     let text = format!(
         "**Paja triage closed #{n} ({title}) as a duplicate of this issue.**\n\n{reason}\n\nIf \
@@ -1570,6 +1588,34 @@ mod tests {
         let mut order = vec![1u64, 2, 5, 6, 7];
         order.sort_by_key(|n| (read.get(n).copied(), *n));
         assert_eq!(order, [6, 7, 1, 2, 5]);
+    }
+
+    #[test]
+    fn a_note_is_found_in_either_form_and_only_for_its_own_duplicate() {
+        let lines =
+            "**Paja triage closed #12 (Tidy the helper) as a duplicate of this issue.**\r\n\
+                     Thanks!\n";
+        assert!(noted_in(lines, 12));
+        assert!(!noted_in(lines, 1));
+        assert!(!noted_in(lines, 120));
+        assert!(noted_in(
+            "**Paja triage closed #120 as a duplicate of this issue.**",
+            120
+        ));
+        assert!(!noted_in(
+            "**Paja triage closed #120 as a duplicate of this issue.**",
+            12
+        ));
+        // The closing comment on the duplicate, or a note quoted mid-line, isn't one.
+        assert!(!noted_in(
+            "Paja triage closed this issue as a duplicate of #11.",
+            12
+        ));
+        assert!(!noted_in(
+            "> **Paja triage closed #12 as a duplicate of this issue.**",
+            12
+        ));
+        assert!(!noted_in("", 12));
     }
 
     #[test]
