@@ -257,9 +257,8 @@ pub fn shell_path(word: &str) -> PathBuf {
 /// which a tool may map to another drive or Git's own directory), names with a trailing dot
 /// or space (`.git.` is `.git`), alternate data streams (`a:stream`), reserved device names (`NUL`, `COM1`) and characters
 /// Windows forbids in names. All are refused rather than interpreted. `revisions` lifts only
-/// the stream and trailing-dot rules, for git's revision forms (`HEAD:path`, `main..`). (An 8.3 short name such
-/// as `GIT~1` only names something that exists, and the hook resolves existing paths to their
-/// long names, so it needs no rule.)
+/// the stream and trailing-dot rules, for git's revision forms (`HEAD:path`, `main..`). (8.3
+/// short names such as `GIT~1` are the hook's to refuse, for protected names only.)
 /// Nothing is refused on Unix.
 pub fn path_problem(text: &str, revisions: bool) -> Option<String> {
     if !cfg!(windows) || text.is_empty() {
