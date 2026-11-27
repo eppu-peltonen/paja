@@ -2548,7 +2548,7 @@ fn gh_output_within(
 ) -> Result<std::process::Output> {
     let gh = gh_program();
     let mut cmd = Command::new(&gh);
-    crate::platform::own_process_group(cmd.env("GH_PROMPT_DISABLED", "1"))
+    crate::platform::own_group_for_caller(cmd.env("GH_PROMPT_DISABLED", "1"))
         .current_dir(ok.path())
         .args(args);
     match limit {

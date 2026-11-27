@@ -480,6 +480,8 @@ fn watch(app: tauri::AppHandle) {
 
 /// Start Desk's window.
 pub fn run() {
+    // Desk has no console: the core's `gh` calls must not open one each.
+    paja::platform::set_windowed();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(Runner::new(paja_program()))

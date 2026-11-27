@@ -548,6 +548,30 @@ pub fn no_console(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+static WINDOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Say the caller is a windowed program (Paja Desk) with no console, so [`own_process_group`]
+/// also starts what it runs without a console window of its own. `paja` itself never calls it.
+pub fn set_windowed() {
+    WINDOWED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run `cmd` in a process group of its own, as [`own_process_group`] does, and without a
+/// console window when [`set_windowed`] was called.
+pub fn own_group_for_caller(cmd: &mut Command) -> &mut Command {
+    own_process_group(cmd);
+    #[cfg(windows)]
+    if WINDOWED.load(std::sync::atomic::Ordering::Relaxed) {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(
+            cmd,
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        );
+    }
+    cmd
+}
+
 /// [`Command::output`] for a long step (an agent or a check), in its own process group, ended
 /// with everything it started when the person presses Ctrl-C a second time.
 pub fn output_until_stopped(cmd: &mut Command) -> std::io::Result<std::process::Output> {
