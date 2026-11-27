@@ -1490,10 +1490,12 @@ fn a_failed_reopen_check_fails_the_sync_and_the_next_sync_asks_again() {
     };
     let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
     assert!(ok, "{report}");
-    let (_, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    let (ok, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert!(ok, "{set}");
     assert_eq!(set["status"], "landed", "{set}");
     queue("follow-ups = off\n");
-    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
     assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
     std::fs::write(
         tmp.path().join("reopened-on-github"),
@@ -1503,6 +1505,8 @@ fn a_failed_reopen_check_fails_the_sync_and_the_next_sync_asks_again() {
     // GitHub can't list #2's events: the sync fails and says so, and records nothing.
     std::fs::write(tmp.path().join("events-down"), "").unwrap();
     queue("follow-ups = on\n");
+    let events = || std::fs::read_to_string(home.join("events.jsonl")).unwrap();
+    let before = events();
     let (ok, err) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
     assert!(!ok, "{err}");
     let msg = err["error"].as_str().unwrap();
@@ -1510,6 +1514,7 @@ fn a_failed_reopen_check_fails_the_sync_and_the_next_sync_asks_again() {
         msg.contains("follow-up #2") && msg.contains("issues/2/events") && msg.contains("HTTP 503"),
         "{msg}"
     );
+    assert_eq!(events(), before, "a failed sync wrote events");
     let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
     assert_eq!(item["open"], false, "{item}");
     // Once GitHub answers, the next sync asks again and queues it.

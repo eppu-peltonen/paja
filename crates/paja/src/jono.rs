@@ -2000,6 +2000,7 @@ fn landed_hidden(events: &[Event], repo: &str) -> Result<BTreeMap<u64, u64>> {
 /// Whether GitHub reopened issue `number` at or after `since` (milliseconds since the epoch, cut
 /// to the second GitHub's times have), read from the issue's events. A listing gh can't give
 /// fails the sync, so the next one asks again instead of the item staying landed unseen.
+/// Cutting to the second leans toward a reopen: one up to a second before the hiding counts too.
 /// `since` is this machine's clock and the events GitHub's; a skew between them matters little,
 /// since the issue was open on GitHub when it was hidden, so a reopen after that needs a close
 /// first.
