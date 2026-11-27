@@ -19,6 +19,7 @@ use crate::jono::{self, Status, WorkItem};
 
 mod agent;
 mod builder;
+mod detect;
 mod follow_ups;
 mod land;
 pub mod live;
@@ -28,6 +29,7 @@ mod progress;
 mod triage;
 mod usage;
 
+pub use detect::init_agent;
 pub use triage::{
     triage, triage_if_due, TriageReport, Triaged, Verdict, EV_TRIAGE_FAILED, EV_TRIAGE_RAN,
 };
@@ -52,7 +54,7 @@ pub const HIGH_RISK_FILE: &str = ".paja/high-risk";
 pub const MODELS_FILE: &str = ".paja/models";
 pub const CI_FILE: &str = ".paja/ci";
 /// The roles `.paja/models` may name, besides `fallback`.
-pub const ROLES: [&str; 7] = [
+pub const ROLES: [&str; 8] = [
     "build",
     "fix",
     "review",
@@ -60,6 +62,7 @@ pub const ROLES: [&str; 7] = [
     "review-2",
     "triage",
     "plan",
+    "init",
 ];
 /// The effort levels Claude Code takes.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
