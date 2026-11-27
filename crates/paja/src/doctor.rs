@@ -306,7 +306,9 @@ fn usage_window(events: &[crate::events::Event], claude: &str, windowed: bool) -
             format!(
                 "run `{claude} update`. If Claude Code is current, file an issue at {ISSUES_URL} \
                  with the `rate_limit_event` line that `{claude} -p --output-format stream-json \
-                 --verbose hi` prints: Paja reads the window from its `rate_limit_info`"
+                 --verbose hi` prints: Paja reads the window from its `rate_limit_info`. Billed \
+                 per token (an API key, a Console sign-in), there is no window and this warning \
+                 doesn't apply"
             ),
         );
     };

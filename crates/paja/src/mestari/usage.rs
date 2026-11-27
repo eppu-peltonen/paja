@@ -73,7 +73,9 @@ pub struct StepUsage {
 /// top-level `utilization` when there is one. Otherwise it comes from `unifiedWindows`: while the
 /// status is a warning (or rejected), the binding window's (`rateLimitType`), with the top-level
 /// reset time, so the hold lasts until that limit resets; else the fullest window's, with its own
-/// reset time, so a window that is nearly used holds builds back until it resets.
+/// reset time, so a window that is nearly used holds builds back until it resets. Every window
+/// counts, whichever model it is for, and `isUsingOverage` (extra usage that keeps work going
+/// past a full window) is not read: both err on holding back.
 pub fn window_of(info: &Value) -> (Option<String>, Option<f64>, Option<u64>) {
     let as_ms = |n: u64| if n < 100_000_000_000 { n * 1000 } else { n };
     let status = info["status"].as_str().map(str::to_string);
@@ -90,19 +92,17 @@ pub fn window_of(info: &Value) -> (Option<String>, Option<f64>, Option<u64>) {
         .and_then(|kind| windows?.get(kind));
     if warned || windows.is_none() {
         let used = binding.and_then(|w| w["utilization"].as_f64());
-        return (status, used.map(|u| u * 100.0), top_reset);
+        let resets = top_reset.or_else(|| binding.and_then(|w| w["resetsAt"].as_u64()).map(as_ms));
+        return (status, used.map(|u| u * 100.0), resets);
     }
+    // Only a window with its own reset time: another window's would end the hold too early.
     let fullest = windows
         .into_iter()
         .flat_map(|w| w.values())
-        .filter_map(|w| Some((w["utilization"].as_f64()?, w)))
+        .filter_map(|w| Some((w["utilization"].as_f64()?, w["resetsAt"].as_u64()?)))
         .max_by(|a, b| a.0.total_cmp(&b.0));
     match fullest {
-        Some((used, w)) => (
-            status,
-            Some(used * 100.0),
-            w["resetsAt"].as_u64().map(as_ms).or(top_reset),
-        ),
+        Some((used, resets)) => (status, Some(used * 100.0), Some(as_ms(resets))),
         None => (status, None, top_reset),
     }
 }
@@ -380,6 +380,18 @@ mod tests {
             (Some("rejected".into()), None, Some(3_000))
         );
         assert_eq!(window_of(&serde_json::Value::Null), (None, None, None));
+        // A warning with no top-level reset waits for the binding window's own.
+        let warned = json!({"status": "allowed_warning", "rateLimitType": "five_hour",
+            "unifiedWindows": {"five_hour": {"utilization": 0.9, "resetsAt": 4}}});
+        assert_eq!(window_of(&warned).2, Some(4_000));
+        // A window with no reset time of its own is passed over for the fullest that has one.
+        let unknown = json!({"status": "allowed", "resetsAt": 1, "unifiedWindows": {
+            "five_hour": {"utilization": 0.3, "resetsAt": 1},
+            "other": {"utilization": 0.99}}});
+        assert_eq!(
+            window_of(&unknown),
+            (Some("allowed".into()), percent(0.3), Some(1_000))
+        );
     }
 
     #[test]

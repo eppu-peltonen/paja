@@ -246,7 +246,8 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
   warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it
   is current, the warning names where to file an issue. Before any step has run, and when `claude auth status` says
-  you are signed in with an API key or through a cloud provider (no window), it is ok.
+  you are signed in with an API key or through a cloud provider (no window), it is ok. Billed per token some other
+  way (a Console sign-in), there is no window either, and the warning doesn't apply.
 - The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
   branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.
