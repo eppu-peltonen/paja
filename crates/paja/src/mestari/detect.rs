@@ -142,7 +142,21 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
         )
     };
     crate::sandbox::activate(None);
-    result.map(|_| ())
+    result?;
+    // The agent may run local git, but the skeleton must stay uncommitted on the clone's branch:
+    // a commit would hide its files from the next step, and another branch would push nothing.
+    let branch = git(dir, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_default();
+    let unborn = git(dir, &["rev-parse", "--verify", "-q", "HEAD"]).is_err();
+    if branch != env.branch || !unborn {
+        bail!(
+            "the init agent committed or switched branches in {} (it must leave the skeleton \
+             uncommitted on `{}`), so nothing was pushed; remove that folder and run `paja init \
+             --new` again, or use a stack with a built-in skeleton (rust, node, python)",
+            dir.display(),
+            env.branch
+        );
+    }
+    Ok(())
 }
 
 /// Run `checks` in `dir` the way Vasara runs them, and return the first failure's command and
@@ -156,12 +170,20 @@ pub fn skeleton_checks(home: &Home, dir: &Path, checks: &[String]) -> Result<Opt
     result
 }
 
+/// The scratch repository's folder name for one `recommend_agent` call: the process id and a
+/// count, so two calls at once in one long-lived `paja mcp` never share (and wipe) one folder.
+fn recommend_scratch_name() -> String {
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("recommend-{}-{n}", std::process::id())
+}
+
 /// Run the init agent for `paja init --recommend`: no repository to read, so it starts in an empty
 /// scratch repository (made under the home's `envs` folder, which the sandbox can reach, and
 /// removed afterwards) with no file or command it may use, and answers from the prompt alone.
 pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Value> {
     let envs = home.envs_dir();
-    let dir = envs.join(format!("recommend-{}", std::process::id()));
+    let dir = envs.join(recommend_scratch_name());
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| {
             format!(
@@ -218,4 +240,18 @@ pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Valu
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn each_recommend_call_gets_its_own_scratch_folder() {
+        let (a, b) = (
+            super::recommend_scratch_name(),
+            super::recommend_scratch_name(),
+        );
+        assert_ne!(a, b);
+        let pid = format!("recommend-{}-", std::process::id());
+        assert!(a.starts_with(&pid) && b.starts_with(&pid), "{a} {b}");
+    }
 }

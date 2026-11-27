@@ -556,9 +556,11 @@ impl Mcp {
 }
 
 /// The tools `text` names: each word in backticks after the word "call" (`Call `name``) or
-/// before the word "tool" (`the `name` tool`), and each backticked `family_name` whose family
-/// (the part before `_`) is one of `tools`' families, so a misspelt `work_lst` is caught
-/// however the sentence is put.
+/// before the word "tool" (`the `name` tool`); each backticked single name (lowercase letters
+/// and `_`) after "run", "use" or "invoke", so "run `doktor`" is caught while "run `git
+/// switch x`" is a command; and each backticked `family_name` whose family (the part before
+/// `_`) is one of `tools`' families, so a misspelt `work_lst` is caught however the sentence
+/// is put.
 fn named_tools(text: &str, tools: &[String]) -> Vec<String> {
     let families: Vec<&str> = tools
         .iter()
@@ -574,11 +576,16 @@ fn named_tools(text: &str, tools: &[String]) -> Vec<String> {
             parts[i],
             parts.get(i + 1).copied().unwrap_or(""),
         );
-        let called = before
+        let verb = before
             .trim_end()
             .rsplit(|c: char| !c.is_ascii_alphabetic())
             .next()
-            .is_some_and(|w| w.eq_ignore_ascii_case("call"));
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let single = !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        let called = verb == "call"
+            || (single
+                && ["run", "runs", "use", "uses", "invoke", "invokes"].contains(&verb.as_str()));
         let tool_after = after
             .split(|c: char| !c.is_ascii_alphabetic())
             .find(|w| !w.is_empty())
@@ -601,10 +608,19 @@ fn named_tools_finds_every_way_a_skill_names_a_tool() {
         .to_vec();
     let text = "1. Call `work_list`. Then call `doktor`. Use the `status` tool. \
                 Read `work_lst` again. A small `note` and the `paja` MCP tools are no tools; \
-                nor is `pull_request` or `ok`.";
+                nor is `pull_request` or `ok`. Run `doctr`, use `usag`, invoke `inti`; \
+                run `git switch paja/init` and use `--json` are no tools either.";
     assert_eq!(
         named_tools(text, &tools),
-        ["work_list", "doktor", "status", "work_lst"]
+        [
+            "work_list",
+            "doktor",
+            "status",
+            "work_lst",
+            "doctr",
+            "usag",
+            "inti"
+        ]
     );
 }
 
@@ -1824,6 +1840,34 @@ fn work_list_names_the_event_of_a_step_it_cannot_read() {
         serde_json::json!([3]),
         "{usage}"
     );
+}
+
+#[test]
+fn work_show_says_claimed_for_an_item_claimed_by_hand_since_its_last_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    // A run claimed the item and started a step, the item went back to the queue, and then
+    // it was claimed by hand.
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.status","data":{"number":3,"status":"active","note":null,"run":true}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"run.started","data":{"number":3,"env":"app-3"}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":4000,"kind":"run.step","data":{"number":3,"round":1,"role":"build","model":"opus"}}"#,
+        r#"{"v":1,"seq":5,"ts_ms":5000,"kind":"work.status","data":{"number":3,"status":"queued","note":null}}"#,
+        // What `paja work claim` records: active, with no `run` flag.
+        r#"{"v":1,"seq":6,"ts_ms":6000,"kind":"work.status","data":{"number":3,"status":"active","note":null}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let (ok, item) = paja(&home, &repo, &["work", "show", "3"]);
+    assert!(ok, "{item}");
+    let run = &item["run"];
+    // No `paja run` resumes a hand claim, and the earlier run's steps aren't this claim's.
+    assert_eq!(run["state"], "claimed", "{item}");
+    assert_eq!(run["step"], Value::Null, "{run}");
+    assert_eq!(run["steps"], serde_json::json!([]), "{run}");
+    assert_eq!(run["round"], 0, "{run}");
 }
 
 #[test]
@@ -6738,6 +6782,18 @@ fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its
 /// by what the prompt says. The detection names `check` as the one check. Returns the temp dir, the
 /// bare origin, and the command's result.
 fn init_new_generated(check: &str) -> (tempfile::TempDir, std::path::PathBuf, bool, Value) {
+    init_new_generated_with(
+        check,
+        "echo 'const std = @import(\"std\");' > build.zig\necho 'zig-out/' > .gitignore",
+    )
+}
+
+/// `paja init --new zippy --stack zig` with a fake skeleton agent that runs `skeleton` (shell) in
+/// the clone, and a detection that backs `check` (none when it is empty).
+fn init_new_generated_with(
+    check: &str,
+    skeleton: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, bool, Value) {
     let tmp = tempfile::tempdir().unwrap();
     let d = slash(tmp.path());
     let gh = program(
@@ -6766,7 +6822,11 @@ fn init_new_generated(check: &str) -> (tempfile::TempDir, std::path::PathBuf, bo
         "detect.json",
         serde_json::json!({"stacks": [{
             "name": "zig", "dir": ".", "file": "build.zig",
-            "checks": [{"command": check, "file": "build.zig"}],
+            "checks": if check.is_empty() {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([{"command": check, "file": "build.zig"}])
+            },
             "commands": ["test"]
         }]}),
     );
@@ -6785,8 +6845,7 @@ fn init_new_generated(check: &str) -> (tempfile::TempDir, std::path::PathBuf, bo
              if [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
              if grep -q 'Name the bare program names' {d}/prompt.txt; then cat {d}/programs.json\n\
              elif grep -q 'Write its walking skeleton here' {d}/prompt.txt; then\n\
-               echo 'const std = @import(\"std\");' > build.zig\n\
-               echo 'zig-out/' > .gitignore\n\
+               {skeleton}\n\
                cat {d}/skeleton.json\n\
              else cat {d}/detect.json; fi\n"
         ),
@@ -6864,6 +6923,79 @@ fn init_new_pushes_a_generated_skeleton_whose_checks_pass() {
         prompts.contains("`zig`") && !prompts.contains("`bash`"),
         "{prompts}"
     );
+}
+
+/// Whether anything reached origin's `main`.
+fn pushed(origin: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(origin)
+        .args(["rev-parse", "--verify", "-q", "refs/heads/main"])
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn init_new_says_so_when_the_skeleton_agent_writes_nothing() {
+    let (_tmp, origin, ok, out) = init_new_generated_with("test -f build.zig", "true");
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("the init agent wrote no files for the zig skeleton")
+            && error.contains("paja init --new"),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
+}
+
+#[test]
+fn init_new_pushes_nothing_when_no_check_is_found_for_a_generated_skeleton() {
+    let (_tmp, origin, ok, out) = init_new_generated("");
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("no check could be found for the generated zig skeleton")
+            && error.contains("nothing was pushed"),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
+}
+
+#[test]
+fn init_new_refuses_a_skeleton_the_agent_committed() {
+    let (tmp, origin, ok, out) = init_new_generated_with(
+        "test -f build.zig",
+        "echo 'const std = @import(\"std\");' > build.zig\n\
+         git add -A && git -c user.name=t -c user.email=t@example.com commit -qm mine",
+    );
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("the init agent committed or switched branches")
+            && error.contains("paja init --new"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&tmp.path().join("work").join("zippy").display().to_string()),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
+}
+
+#[test]
+fn init_new_refuses_a_skeleton_on_another_branch() {
+    let (_tmp, origin, ok, out) = init_new_generated_with(
+        "test -f build.zig",
+        "echo 'const std = @import(\"std\");' > build.zig\ngit checkout -q -b elsewhere",
+    );
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("the init agent committed or switched branches"),
+        "{error}"
+    );
+    assert!(!pushed(&origin));
 }
 
 #[test]
@@ -7125,6 +7257,23 @@ fn init_recommend_returns_options_best_first_and_paja_decides_the_skeleton() {
     );
 
     // Nothing is left of the agent's scratch repository.
+    let left = std::fs::read_dir(home.join("envs"))
+        .map(|dir| dir.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0);
+
+    // The MCP tool returns the same JSON, twice in one server, and leaves nothing behind either.
+    let mut mcp = Mcp::start(&home, tmp.path(), &[("PAJA_CLAUDE", claude.as_path())]);
+    mcp.initialize();
+    for _ in 0..2 {
+        let (ok, via_mcp) = mcp.call(
+            "init_recommend",
+            serde_json::json!({"building": "a reading list web app", "prefer": ["rust", "axum"]}),
+        );
+        assert!(ok, "{via_mcp}");
+        assert_eq!(via_mcp, out);
+    }
+    mcp.finish();
     let left = std::fs::read_dir(home.join("envs"))
         .map(|dir| dir.count())
         .unwrap_or(0);
