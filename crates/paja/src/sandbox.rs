@@ -35,36 +35,55 @@ const WORKTREE_GITDIR_VAR: &str = "PAJA_WT_GITDIR";
 
 /// A `git` that runs in the sandbox ahead of the real one when the worktree's `.git` file holds a
 /// host path (`C:/.../.git/worktrees/x`) the sandbox can't resolve. A git command aimed at the
-/// worktree (the current directory or the `-C` directories are inside it) gets `GIT_DIR` and
-/// `GIT_WORK_TREE` set to the sandbox's spelling; every other git command runs unchanged. Paths
+/// worktree (the current directory or the `-C` directories are inside it, after any other global
+/// options) gets `--git-dir` and `--work-tree` in the sandbox's spelling. Git passes the git
+/// directory down to every process it starts (hooks, `!` aliases, submodule commands) as
+/// `GIT_DIR` and `GIT_WORK_TREE`, so a nested git aimed outside the worktree would inherit the
+/// worktree's: the shim clears an inherited `GIT_DIR` that equals the worktree's git directory
+/// for commands aimed outside the worktree. A caller's own `GIT_DIR` (any other value) or
+/// `--git-dir`/`--work-tree` is left alone, and every other git command runs unchanged. Paths
 /// are compared by identity (`-ef`: each directory from the target up to `/` against the root),
 /// not by spelling, so separators, case, short names (`RUNNER~1`) and mount spellings don't
 /// matter.
 const GIT_SHIM: &str = r#"#!/bin/sh
 dir=.
 want=0
+skip=0
+own=0
+inherited=0
+if [ -n "${GIT_DIR:-}" ]; then
+  if [ "$GIT_DIR" = "$PAJA_WT_GITDIR" ]; then inherited=1; else own=1; fi
+fi
 for a in "$@"; do
   if [ "$want" = 1 ]; then
     dir=$(cd "$dir" 2>/dev/null && cd "$a" 2>/dev/null && pwd -P) || dir=/nonexistent-paja
     want=0
     continue
   fi
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
   case "$a" in
     -C) want=1 ;;
+    -c|--namespace|--super-prefix|--config-env) skip=1 ;;
+    --git-dir|--work-tree) own=1; skip=1 ;;
+    --git-dir=*|--work-tree=*) own=1 ;;
+    -*) ;;
     *) break ;;
   esac
 done
 p=$(cd "$dir" 2>/dev/null && pwd -P)
-while [ -z "${GIT_DIR:-}" ] && [ -n "$p" ]; do
+while [ "$own" = 0 ] && [ -n "$p" ]; do
   if [ "$p" -ef "$PAJA_WT_ROOT" ]; then
-    GIT_DIR="$PAJA_WT_GITDIR"
-    GIT_WORK_TREE="$PAJA_WT_ROOT"
-    export GIT_DIR GIT_WORK_TREE
-    break
+    exec "$PAJA_REAL_GIT" --git-dir="$PAJA_WT_GITDIR" --work-tree="$PAJA_WT_ROOT" "$@"
   fi
   [ "$p" = / ] && break
   p=$(dirname "$p")
 done
+if [ "$inherited" = 1 ] && [ "$own" = 0 ]; then
+  unset GIT_DIR GIT_WORK_TREE
+fi
 exec "$PAJA_REAL_GIT" "$@""#;
 
 /// Puts rustup's directory on `PATH`, installs the git shim when the worktree needs one, then
@@ -669,6 +688,11 @@ mod tests {
     /// Run the git shim with a fake real git that prints the `GIT_DIR` and `GIT_WORK_TREE` it
     /// gets, from `cwd`, for worktree root `root_s` (as the sandbox would spell it).
     fn shim_sees(root_s: &str, cwd: &Path, args: &[&str]) -> String {
+        shim_sees_with(root_s, cwd, args, None)
+    }
+
+    /// Like `shim_sees`, with `GIT_DIR` set in the shim's environment when given.
+    fn shim_sees_with(root_s: &str, cwd: &Path, args: &[&str], git_dir: Option<&str>) -> String {
         let tools = tempfile::tempdir().unwrap();
         let slash = |p: &Path| p.display().to_string().replace('\\', "/");
         let shim = tools.path().join("shim");
@@ -676,7 +700,7 @@ mod tests {
         std::fs::write(&shim, GIT_SHIM).unwrap();
         std::fs::write(
             &real,
-            "#!/bin/sh\necho \"dir=${GIT_DIR:-} tree=${GIT_WORK_TREE:-}\"\n",
+            "#!/bin/sh\ndir=; tree=\nfor a in \"$@\"; do case \"$a\" in --git-dir=*) dir=${a#--git-dir=} ;; --work-tree=*) tree=${a#--work-tree=} ;; esac; done\necho \"dir=$dir tree=$tree env=${GIT_DIR:-}\"\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -684,16 +708,19 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let out = Command::new("sh")
-            .arg(slash(&shim))
+        let mut cmd = Command::new("sh");
+        cmd.arg(slash(&shim))
             .args(args)
             .current_dir(cwd)
             .env("PAJA_REAL_GIT", slash(&real))
             .env(WORKTREE_ROOT_VAR, root_s)
             .env(WORKTREE_GITDIR_VAR, "/gitdirs/w")
             .env_remove("GIT_DIR")
-            .output()
-            .unwrap();
+            .env_remove("GIT_WORK_TREE");
+        if let Some(g) = git_dir {
+            cmd.env("GIT_DIR", g);
+        }
+        let out = cmd.output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -713,8 +740,8 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let other = tempfile::tempdir().unwrap();
         let root_s = shell_path(root.path());
-        let hit = |out: String| out == format!("dir=/gitdirs/w tree={root_s}");
-        let miss = |out: String| out == "dir= tree=";
+        let hit = |out: String| out == format!("dir=/gitdirs/w tree={root_s} env=");
+        let miss = |out: String| out == "dir= tree= env=";
 
         assert!(hit(shim_sees(&root_s, root.path(), &["status"])));
         assert!(hit(shim_sees(&root_s, &sub, &["status"])));
@@ -732,6 +759,62 @@ mod tests {
             root.path(),
             &["-C", &other_s, "status"]
         )));
+        // Other global options before `-C` don't stop the scan.
+        assert!(hit(shim_sees(
+            &root_s,
+            other.path(),
+            &["-c", "k=v", "--no-pager", "-C", &sub_s, "status"]
+        )));
+        assert!(miss(shim_sees(
+            &root_s,
+            root.path(),
+            &["--no-pager", "-c", "k=v", "-C", &other_s, "status"]
+        )));
+        // A `-C` after the subcommand belongs to the subcommand.
+        assert!(miss(shim_sees(
+            &root_s,
+            other.path(),
+            &["log", "-C", &sub_s]
+        )));
+        // A git directory the caller chose is left alone.
+        assert!(miss(shim_sees(
+            &root_s,
+            root.path(),
+            &["--git-dir", "/x", "status"]
+        )));
+    }
+
+    #[test]
+    fn the_git_shim_clears_an_inherited_git_dir_outside_the_worktree_only() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root_s = shell_path(root.path());
+        let other_s = shell_path(other.path());
+        let inherited = Some("/gitdirs/w");
+        let outside = "dir= tree= env=";
+        // Git handed the worktree's git directory to a nested git aimed elsewhere: cleared.
+        assert_eq!(
+            shim_sees_with(&root_s, other.path(), &["status"], inherited),
+            outside
+        );
+        assert_eq!(
+            shim_sees_with(&root_s, root.path(), &["-C", &other_s, "status"], inherited),
+            outside
+        );
+        // Inside the worktree it is still redirected.
+        assert_eq!(
+            shim_sees_with(&root_s, root.path(), &["status"], inherited),
+            format!("dir=/gitdirs/w tree={root_s} env=/gitdirs/w")
+        );
+        // A caller's own GIT_DIR is left alone, inside the worktree or out.
+        assert_eq!(
+            shim_sees_with(&root_s, root.path(), &["status"], Some("/x")),
+            "dir= tree= env=/x"
+        );
+        assert_eq!(
+            shim_sees_with(&root_s, other.path(), &["status"], Some("/x")),
+            "dir= tree= env=/x"
+        );
     }
 
     #[test]
