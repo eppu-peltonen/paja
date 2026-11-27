@@ -400,15 +400,19 @@ pub fn describe(report: &UsageReport) -> String {
     lines.push(format!("total: {}", figure(&report.total)));
     let landed = &report.landed;
     if let (Some(rounds), Some(tokens)) = (&landed.rounds, &landed.tokens) {
-        let wall_ms = landed.wall_ms.as_ref().map_or(0, |w| w.median);
+        let (wall_median, wall_p90) = landed
+            .wall_ms
+            .as_ref()
+            .map_or((0, 0), |w| (w.median, w.p90));
         lines.push(format!(
-            "per landed item ({}): rounds median {} p90 {}, tokens median {} p90 {}, wall median {}{}",
+            "per landed item ({}): rounds median {} p90 {}, tokens median {} p90 {}, wall median {} p90 {}{}",
             landed.items,
             rounds.median,
             rounds.p90,
             tokens.median,
             tokens.p90,
-            wall(wall_ms),
+            wall(wall_median),
+            wall(wall_p90),
             if landed.left_out_unknown > 0 {
                 format!(
                     "; {} left out of tokens and wall time: unknown steps",

@@ -5,6 +5,8 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
 
 ## Unreleased
 
+- `paja usage` gives the 90th percentile of wall time per landed item in its summary line, next to the median.
+
 ## 0.1.0
 
 The first release: Paja for your own projects, on Windows, macOS and Linux. Start with `docs/quickstart.md`.
