@@ -68,6 +68,94 @@ pub fn init_agent(
     result
 }
 
+/// A sandbox, when `PAJA_SBX` asks for one, that can reach the fresh clone `dir`, which is not
+/// under the home's `envs` folder.
+fn clone_sandbox(home: &Home, dir: &Path) -> Result<Option<crate::sandbox::Sbx>> {
+    if crate::sandbox::configured().is_none() {
+        progress(&format!(
+            "no sandbox ({} is not set): agents and checks run as you, behind the deny-list hook only",
+            crate::sandbox::PROGRAM_VAR
+        ));
+        return Ok(None);
+    }
+    progress("starting the sandbox");
+    let envs = home.envs_dir();
+    std::fs::create_dir_all(&envs).with_context(|| format!("creating {}", envs.display()))?;
+    crate::sandbox::start(&[envs, dir.to_path_buf()], None)
+}
+
+/// Run the skeleton agent in `dir`, a fresh clone with no commit, and wait for it to finish: it
+/// writes the files and leaves them uncommitted. Nothing in the clone is on a default branch yet,
+/// so the agent's harness and `.paja/commands` come from an empty commit made for it (no branch
+/// points at it), and `programs`, the stack's tools, are what it may run besides local git.
+pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str) -> Result<()> {
+    let tree = git(dir, &["write-tree"])?;
+    let base = git(
+        dir,
+        &[
+            "-c",
+            "user.name=paja",
+            "-c",
+            "user.email=paja@localhost",
+            "commit-tree",
+            &tree,
+            "-m",
+            "empty",
+        ],
+    )?;
+    let env = Env {
+        name: "init".to_string(),
+        repo: dir.to_path_buf(),
+        path: dir.to_path_buf(),
+        branch: git(dir, &["symbolic-ref", "--short", "HEAD"])?,
+        base_commit: base.clone(),
+        port_base: 0,
+        port_count: 0,
+        created_ms: 0,
+    };
+    crate::sandbox::activate(clone_sandbox(home, dir)?);
+    let result = {
+        let program_tools = program_tools(programs);
+        let mut tools: Vec<&str> = vec!["Read", "Edit", "Write", "Glob", "Grep"];
+        tools.extend(program_tools.iter().map(String::as_str));
+        tools.extend([
+            "Bash(git status*)",
+            "Bash(git diff*)",
+            "Bash(git log*)",
+            "Bash(git show*)",
+            "Bash(tail *)",
+            "Bash(head *)",
+            "Bash(grep *)",
+            "Bash(wc *)",
+            "Bash(pwd)",
+        ]);
+        claude_with(
+            home,
+            &env,
+            &base,
+            prompt,
+            &tools,
+            None,
+            false,
+            &Models::default().args("init"),
+            Some(programs),
+        )
+    };
+    crate::sandbox::activate(None);
+    result.map(|_| ())
+}
+
+/// Run `checks` in `dir` the way Vasara runs them, and return the first failure's command and
+/// output, or None when they all pass.
+pub fn skeleton_checks(home: &Home, dir: &Path, checks: &[String]) -> Result<Option<String>> {
+    let guard = GitGuard::new(dir)?;
+    crate::sandbox::activate(clone_sandbox(home, dir)?);
+    let result = run_checks(dir, checks);
+    crate::sandbox::activate(None);
+    guard.check("Vasara's checks")?;
+    result
+}
+
 /// Run the init agent for `paja init --recommend`: no repository to read, so it starts in an empty
 /// scratch repository (made under the home's `envs` folder, which the sandbox can reach, and
 /// removed afterwards) with no file or command it may use, and answers from the prompt alone.

@@ -272,7 +272,8 @@ impl Drop for Scratch {
 /// the harness (`CLAUDE.md`), the hook settings and the schema all travel on it.
 pub(super) const COMMAND_LINE_BUDGET: usize = 30_000;
 
-/// Run headless Claude Code in the environment and return its JSON result.
+/// Run headless Claude Code in the environment and return its JSON result. The programs it may
+/// run besides local git are the ones `.paja/commands` on `base` lists.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude(
     home: &Home,
@@ -283,6 +284,25 @@ pub(super) fn claude(
     schema: Option<&Value>,
     read_only: bool,
     model_args: &[String],
+) -> Result<Value> {
+    claude_with(
+        home, env, base, prompt, tools, schema, read_only, model_args, None,
+    )
+}
+
+/// [`claude`], with `programs` (when given) as the programs the hook lets it run instead of
+/// `.paja/commands`: for a repository that has no such file yet.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn claude_with(
+    home: &Home,
+    env: &Env,
+    base: &str,
+    prompt: &str,
+    tools: &[&str],
+    schema: Option<&Value>,
+    read_only: bool,
+    model_args: &[String],
+    programs: Option<&[String]>,
 ) -> Result<Value> {
     let program = claude_program();
     let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
@@ -306,9 +326,12 @@ pub(super) fn claude(
     } else {
         // The programs the project allows, as main has them; a file that can't be read or
         // parsed stops the agent before it starts.
-        let listed = read_from_base(&env.path, base, crate::hook::COMMANDS_FILE)
-            .and_then(|text| crate::hook::Commands::parse(text.as_deref()));
-        let programs = listed.map(|c| if read_only { c.reviewer } else { c.builder });
+        let programs = match programs {
+            Some(given) => Ok(given.to_vec()),
+            None => read_from_base(&env.path, base, crate::hook::COMMANDS_FILE)
+                .and_then(|text| crate::hook::Commands::parse(text.as_deref()))
+                .map(|c| if read_only { c.reviewer } else { c.builder }),
+        };
         programs.and_then(|programs| hook_settings(&env.path, home, read_only, &programs))?
     };
     // The prompt goes on stdin, not the command line: a review prompt holds the diff, and

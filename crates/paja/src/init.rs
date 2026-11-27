@@ -20,6 +20,7 @@ use crate::home::Home;
 use crate::jono::{self, Labels, LABELS_FILE};
 
 mod detect;
+mod generate;
 mod recommend;
 mod scaffold;
 pub use detect::{Check, Dropped, Environment, Service, Source, StackDir, Toolchain};
@@ -137,7 +138,7 @@ fn strings(items: &[&str]) -> Vec<String> {
 }
 
 /// The built-in table: the stacks whose manifest files are in `root`. The agent is not limited
-/// to these; this is the fallback, and what the `--new` skeletons use.
+/// to these; this is the fallback, and what the built-in `--new` skeletons use.
 fn detect_stacks(root: &Path) -> Vec<Stack> {
     let has = |name: &str| root.join(name).is_file();
     let mut stacks = Vec::new();
