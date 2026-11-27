@@ -72,7 +72,7 @@ with one command per line (the commands Paja must run before a change may land),
 ### The repository has no CI
 
 ```text
-this repository has no GitHub Actions workflow, so Paja would wait for CI that never comes; add a workflow that runs the
+this repository has no active GitHub Actions workflow, so Paja would wait for CI that never comes; add a workflow that runs the
 checks on pull requests, or put `none` in .paja/ci on the default branch to land on Vasara's checks and the reviewers
 alone
 ```

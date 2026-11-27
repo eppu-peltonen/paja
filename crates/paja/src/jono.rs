@@ -1573,6 +1573,22 @@ pub fn runnable(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
     Ok(free)
 }
 
+/// The numbers of the items an earlier `paja run` left active in `repo` and no live run holds:
+/// the ones a run without `--item` resumes first.
+pub fn left_active(home: &Home, repo: &str) -> Result<Vec<u64>> {
+    let lock = home.lock()?;
+    let log = home.events();
+    pin_legacy(&lock, &log, repo)?;
+    let (left, _) = run_candidates(&log.read_all()?, repo)?;
+    let mut free = Vec::new();
+    for item in left {
+        if home.try_run_lock(repo, item.number)?.is_some() {
+            free.push(item.number);
+        }
+    }
+    Ok(free)
+}
+
 /// The items of `repo` a run may take, before their run locks are looked at: those an earlier
 /// `paja run` left active (its latest status change was a run's claim), and the ready ones in
 /// priority order. Items a person or another worker claimed with `paja work claim` are in
