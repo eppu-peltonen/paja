@@ -688,6 +688,15 @@ pub fn replay_repo(events: &[Event], repo: &str) -> Result<BTreeMap<u64, WorkIte
 /// Every repository's queue, derived by replaying the event log. Events written before they
 /// carried a repository belong to [`legacy_repo`] (`fallback` is the checkout's repository).
 pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem>> {
+    Ok(replay_with_hidden(events, fallback)?.0)
+}
+
+/// [`replay`], and the closed items whose last close was a follow-up hidden by
+/// `follow-ups = off` rather than closed on GitHub.
+fn replay_with_hidden(
+    events: &[Event],
+    fallback: &str,
+) -> Result<(BTreeMap<Key, WorkItem>, BTreeSet<Key>)> {
     let mut items: BTreeMap<Key, WorkItem> = BTreeMap::new();
     // Follow-ups whose last close came from `follow-ups = off`, not from GitHub.
     let mut hidden: BTreeSet<Key> = BTreeSet::new();
@@ -823,7 +832,7 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
             item.waiting_on = dependencies(item.number, &item.body);
         }
     }
-    Ok(items)
+    Ok((items, hidden))
 }
 
 /// The items a `work.waiting` event was ever recorded for.
@@ -1835,7 +1844,21 @@ pub fn sync_with(
             open_outside.insert(number);
         }
     }
-    let report = apply_listed(home, &name, &issues, &open_outside, rules.follow_ups)?;
+    // With follow-ups off, an imported follow-up that wasn't listed is hidden by that rule only
+    // while its issue is still open on GitHub; one closed there closes as any item does.
+    let mut hidden = BTreeSet::new();
+    if !rules.follow_ups {
+        for item in replay_repo(&home.events().read_all()?, &name)?.values() {
+            if item.open
+                && item.priority == Priority::FollowUp
+                && !queued.contains(&item.number)
+                && issue_is_open(&ok, item.number)?
+            {
+                hidden.insert(item.number);
+            }
+        }
+    }
+    let report = apply_listed(home, &name, &issues, &open_outside, &hidden)?;
     apply_claims(home, &name, &seen, &held)?;
     record_checkout(home, &name, &checkout_top(repo)?)?;
     Ok(report)
@@ -1907,24 +1930,33 @@ pub fn apply_with(
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
-    apply_listed(home, repo, open, open_outside, true)
+    apply_listed(home, repo, open, open_outside, &BTreeSet::new())
 }
 
-/// [`apply_with`], where `follow_ups` says whether the sync listed the follow-up label. When it
-/// didn't, a follow-up that closes is recorded as closed by that rule, so a landed one isn't
-/// queued again when follow-ups come back on.
+/// [`apply_with`], where `hidden` are the follow-ups the sync didn't list only because
+/// `follow-ups = off` (their issues are still open on GitHub). Each that closes is recorded as
+/// closed by that rule, so a landed one isn't queued again when follow-ups come back on.
 fn apply_listed(
     home: &Home,
     repo: &str,
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
-    follow_ups: bool,
+    hidden: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
     let events = pin_legacy(&lock, &log, repo)?;
-    let items = replay_repo(&events, repo)?;
-    let back_from_rules = closed_by_rules(&events, repo);
+    let (all, closed_by_rule) = replay_with_hidden(&events, repo)?;
+    let items: BTreeMap<u64, WorkItem> = all
+        .into_iter()
+        .filter(|((r, _), _)| r == repo)
+        .map(|((_, number), item)| (number, item))
+        .collect();
+    let back_from_rules: BTreeSet<u64> = closed_by_rule
+        .into_iter()
+        .filter(|(r, _)| r == repo)
+        .map(|(_, number)| number)
+        .collect();
     let recorded: BTreeSet<u64> = waiting_recorded(&events, legacy_repo(&events, repo))
         .into_iter()
         .filter(|(r, _)| r == repo)
@@ -1997,7 +2029,7 @@ fn apply_listed(
         let still_open = open.iter().any(|issue| issue.number == item.number);
         if item.open && !still_open {
             let mut data = json!({ "repo": repo, "number": item.number });
-            if !follow_ups && item.priority == Priority::FollowUp {
+            if item.priority == Priority::FollowUp && hidden.contains(&item.number) {
                 data[FOLLOW_UPS_OFF] = json!(true);
             }
             log.append(&lock, EV_CLOSED, data)?;
@@ -2005,26 +2037,6 @@ fn apply_listed(
         }
     }
     Ok(report)
-}
-
-/// The items of `repo` whose last close was a follow-up hidden by `follow-ups = off`.
-fn closed_by_rules(events: &[Event], repo: &str) -> BTreeSet<u64> {
-    let legacy = legacy_repo(events, repo);
-    let mut hidden = BTreeSet::new();
-    for event in events
-        .iter()
-        .filter(|e| e.kind == EV_CLOSED && event_repo(e, legacy) == repo)
-    {
-        let Some(number) = event.data["number"].as_u64() else {
-            continue;
-        };
-        if event.data[FOLLOW_UPS_OFF] == true {
-            hidden.insert(number);
-        } else {
-            hidden.remove(&number);
-        }
-    }
-    hidden
 }
 
 /// Whether the log says this runner holds item `number` of `repo`.
@@ -2984,7 +2996,8 @@ mod tests {
             set_status(&home, n, Status::Landed, None).unwrap();
         }
         // Follow-ups off: the sync lists only the work item.
-        let off = super::apply_listed(&home, R, &both[..1], &BTreeSet::new(), false).unwrap();
+        let hidden = BTreeSet::from([2, 3]);
+        let off = super::apply_listed(&home, R, &both[..1], &BTreeSet::new(), &hidden).unwrap();
         assert_eq!(off.closed, vec![2, 3]);
         // A work item that depends on #2 doesn't wait on it once follow-ups are back on.
         let mut dependent = issue(4, "d");
@@ -3003,9 +3016,17 @@ mod tests {
         // A work item closed while follow-ups are off isn't marked: it requeues as before.
         apply(&home, &on).unwrap();
         set_status(&home, 1, Status::Landed, None).unwrap();
-        super::apply_listed(&home, R, &[], &BTreeSet::new(), false).unwrap();
+        let hidden = BTreeSet::from([1, 2, 3]);
+        super::apply_listed(&home, R, &[], &BTreeSet::new(), &hidden).unwrap();
         apply(&home, &on).unwrap();
         assert_eq!(get(&home, 1).unwrap().status, Status::Queued);
+        // A landed follow-up whose issue GitHub closed while follow-ups were off isn't hidden
+        // by the rule, so when GitHub reopens it (a revert, say) it is queued again.
+        set_status(&home, 2, Status::Landed, None).unwrap();
+        let only_3 = BTreeSet::from([3]);
+        super::apply_listed(&home, R, &on[..1], &BTreeSet::new(), &only_3).unwrap();
+        apply(&home, &on).unwrap();
+        assert_eq!(get(&home, 2).unwrap().status, Status::Queued);
     }
 
     #[test]
