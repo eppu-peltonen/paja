@@ -1361,6 +1361,12 @@ pub fn mark_needs_answer(home: &Home, repo: &Path, number: u64) -> Result<String
 /// first, when it still exists. None when neither happened yet. For a front end that starts outside any
 /// checkout, such as Paja Desk, so it can run the core's commands where `gh` finds `repo`.
 pub fn known_checkout(home: &Home, repo: &str) -> Result<Option<std::path::PathBuf>> {
+    Ok(known_checkouts(home, repo)?.into_iter().next())
+}
+
+/// Every checkout [`known_checkout`] could name for `repo`, newest first, each once: a caller
+/// that finds the newest one stale (its remote changed) can try the next.
+pub fn known_checkouts(home: &Home, repo: &str) -> Result<Vec<std::path::PathBuf>> {
     let events = home.events().read_all()?;
     let prefix = env_name(repo, 0);
     let prefix = prefix.strip_suffix('0').unwrap_or(&prefix);
@@ -1380,7 +1386,13 @@ pub fn known_checkout(home: &Home, repo: &str) -> Result<Option<std::path::PathB
             _ => None,
         })
         .map(std::path::PathBuf::from)
-        .find(|path| path.is_dir()))
+        .filter(|path| path.is_dir())
+        .fold(Vec::new(), |mut paths, path| {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+            paths
+        }))
 }
 
 /// A GitHub issue filed for Jono.
@@ -1585,6 +1597,15 @@ mod tests {
             Some(dir.path().join(new))
         );
         assert_eq!(known_checkout(&home, "acme/none").unwrap(), None);
+        // Every one still there, newest first, each once.
+        let lock = home.lock().unwrap();
+        log.append(&lock, crate::ahjo::EV_CREATED, env(R, 1, old))
+            .unwrap();
+        drop(lock);
+        assert_eq!(
+            known_checkouts(&home, R).unwrap(),
+            vec![dir.path().join(old), dir.path().join(new)]
+        );
     }
 
     #[test]

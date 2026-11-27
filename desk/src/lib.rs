@@ -94,12 +94,12 @@ pub fn work_file_in(home: &Home, repo: &str, title: &str, body: &str, cwd: &Path
     filed.unwrap_or_else(error)
 }
 
-/// Where to run the core's commands for `repo`: the checkout Paja last worked in for it, else
-/// the directory Desk started in when that is a checkout of `repo`.
+/// Where to run the core's commands for `repo`: the newest checkout Paja worked in for it that
+/// is still a checkout of `repo`, else the directory Desk started in when that is one.
 fn checkout_of(home: &Home, repo: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
     // The core asks `gh` which repository a checkout is, so a checkout whose remote has since
     // changed would act on another repository's item: it must still be `repo`.
-    if let Some(path) = jono::known_checkout(home, repo)? {
+    for path in jono::known_checkouts(home, repo)? {
         // A failing `gh` is its own error, not a reason to look elsewhere.
         if jono::repo_name(home, &path)? == repo {
             return Ok(path);
@@ -578,7 +578,7 @@ mod tests {
                  [ -f gh-down ] && { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }\n\
                  echo \"$@\" >> gh.log\n\
                  case \"$1 $2\" in\n\
-                 \"repo view\") echo '{\"nameWithOwner\": \"acme/app\"}' ;;\n\
+                 \"repo view\") if [ -f name ]; then cat name; else echo '{\"nameWithOwner\": \"acme/app\"}'; fi ;;\n\
                  \"issue create\") echo https://github.com/acme/app/issues/9 ;;\n\
                  esac\n",
             )
@@ -719,6 +719,49 @@ mod tests {
             error.contains("doesn't know where acme/other is checked out"),
             "{answered}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_newest_checkout_falls_back_to_an_older_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        // A newer checkout remembered for acme/app whose remote now names another repository.
+        let moved = dir.path().join("moved");
+        std::fs::create_dir_all(&moved).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&moved)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(moved.join("name"), r#"{"nameWithOwner": "acme/elsewhere"}"#).unwrap();
+        import(&home, "acme/app", 4, "Add a logout page");
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                paja::ahjo::EV_CREATED,
+                json!({
+                    "name": jono::env_name("acme/app", 4),
+                    "repo": moved,
+                    "path": dir.path().join("env2"),
+                    "branch": "paja/y",
+                    "base_commit": "0",
+                    "port_base": 41010,
+                    "port_count": 10,
+                    "created_ms": 0,
+                }),
+            )
+            .unwrap();
+        drop(lock);
+        let item = work_answer_in(&home, "acme/app", 3, "Use A", dir.path());
+        assert_eq!(item["status"], "queued", "{item}");
+        let log = std::fs::read_to_string(checkout.join("gh.log")).unwrap();
+        assert!(log.contains("issue comment 3"), "{log}");
+        // Paja only asked the moved checkout which repository it is.
+        let asked = std::fs::read_to_string(moved.join("gh.log")).unwrap();
+        assert!(!asked.contains("issue"), "{asked}");
     }
 
     #[cfg(unix)]
