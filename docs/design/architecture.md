@@ -118,7 +118,8 @@ that are carry `follow_ups_off: true`, so when follow-ups come back on a follow-
 of being queued again like a reopened landing. One GitHub closed meanwhile closes like any item, and is queued again if
 it reopens. When follow-ups come back on, each landed follow-up the rule hid is asked about once more: if the issue's
 GitHub events show a reopen since it was hidden (closed and reopened in between, say after a revert), its
-`work.reopened` carries `reopened_on_github: true` and it is queued again. A line Jono can't read is an error naming the
+`work.reopened` carries `reopened_on_github: true` and it is queued again. If GitHub can't list the events, the sync
+fails with that error and records nothing, so the next sync asks again. A line Jono can't read is an error naming the
 line.
 
 An issue declares what it needs first with a line in its body that starts with `Depends on` or `Blocked by`, followed by
