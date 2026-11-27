@@ -177,12 +177,16 @@ setInterval(() => {
   }
 }, 1000);
 
-// A message that stays until the person dismisses it, whatever the queue does meanwhile.
+// A message that stays until the person dismisses it, whatever the queue does meanwhile. The
+// oldest go once more than NOTICES pile up.
+const NOTICES = 20;
 function notice(text) {
   const close = el("button", { type: "button", className: "quiet" }, "Dismiss");
   const entry = el("li", {}, [el("span", {}, text), close]);
   close.addEventListener("click", () => entry.remove());
-  document.getElementById("notices").append(entry);
+  const list = document.getElementById("notices");
+  list.append(entry);
+  while (list.children.length > NOTICES) list.firstElementChild.remove();
 }
 
 // What the person has typed, by item, so a refresh or an error never loses it.
@@ -196,7 +200,7 @@ function answerForm(item) {
   const send = el("button", { type: "button" }, "Send answer");
   send.addEventListener("click", async () => {
     if (!text.value.trim()) {
-      notice(`#${item.number}: write an answer first.`);
+      notice(`${item.repo}#${item.number}: write an answer first.`);
       return;
     }
     send.disabled = true;
@@ -209,7 +213,7 @@ function answerForm(item) {
     if (result && result.error) {
       // A notice outlives the refresh that may rebuild this item (or, when the answer was
       // recorded but posting it failed, drop it from "waiting on you").
-      notice(`#${item.number}: error: ${result.error}`);
+      notice(`${item.repo}#${item.number}: error: ${result.error}`);
       return;
     }
     drafts.delete(key);
