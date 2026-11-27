@@ -355,7 +355,9 @@ fn ends_lead(gap: &str) -> bool {
         let q = chars[i];
         matches!(q, '"' | '\'')
             && chars[i + 1] == q
-            && (i == 0 || chars[i - 1] != q)
+            // Right after the lead it closes the key itself (`''password'', ''x''`).
+            && i > 0
+            && chars[i - 1] != q
             && (chars[i + 2].is_whitespace() || matches!(chars[i + 2], ',' | ';'))
     });
     // A blank line: a line between two breaks with nothing but spaces on it. A line holding a
