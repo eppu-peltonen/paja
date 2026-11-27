@@ -556,9 +556,11 @@ impl Mcp {
 }
 
 /// The tools `text` names: each word in backticks after the word "call" (`Call `name``) or
-/// before the word "tool" (`the `name` tool`), and each backticked `family_name` whose family
-/// (the part before `_`) is one of `tools`' families, so a misspelt `work_lst` is caught
-/// however the sentence is put.
+/// before the word "tool" (`the `name` tool`); each backticked single name (lowercase letters
+/// and `_`) after "run", "use" or "invoke", so "run `doktor`" is caught while "run `git
+/// switch x`" is a command; and each backticked `family_name` whose family (the part before
+/// `_`) is one of `tools`' families, so a misspelt `work_lst` is caught however the sentence
+/// is put.
 fn named_tools(text: &str, tools: &[String]) -> Vec<String> {
     let families: Vec<&str> = tools
         .iter()
@@ -574,11 +576,16 @@ fn named_tools(text: &str, tools: &[String]) -> Vec<String> {
             parts[i],
             parts.get(i + 1).copied().unwrap_or(""),
         );
-        let called = before
+        let verb = before
             .trim_end()
             .rsplit(|c: char| !c.is_ascii_alphabetic())
             .next()
-            .is_some_and(|w| w.eq_ignore_ascii_case("call"));
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let single = !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        let called = verb == "call"
+            || (single
+                && ["run", "runs", "use", "uses", "invoke", "invokes"].contains(&verb.as_str()));
         let tool_after = after
             .split(|c: char| !c.is_ascii_alphabetic())
             .find(|w| !w.is_empty())
@@ -601,10 +608,19 @@ fn named_tools_finds_every_way_a_skill_names_a_tool() {
         .to_vec();
     let text = "1. Call `work_list`. Then call `doktor`. Use the `status` tool. \
                 Read `work_lst` again. A small `note` and the `paja` MCP tools are no tools; \
-                nor is `pull_request` or `ok`.";
+                nor is `pull_request` or `ok`. Run `doctr`, use `usag`, invoke `inti`; \
+                run `git switch paja/init` and use `--json` are no tools either.";
     assert_eq!(
         named_tools(text, &tools),
-        ["work_list", "doktor", "status", "work_lst"]
+        [
+            "work_list",
+            "doktor",
+            "status",
+            "work_lst",
+            "doctr",
+            "usag",
+            "inti"
+        ]
     );
 }
 
