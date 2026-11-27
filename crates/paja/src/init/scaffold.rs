@@ -203,7 +203,6 @@ fn gh(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Create the repository on GitHub, clone it, write the skeleton, and push the first commit.
 /// Write `text` to `target`, creating its folders first.
 fn write_new(target: &Path, text: &str) -> Result<()> {
     if let Some(parent) = target.parent() {
@@ -213,6 +212,7 @@ fn write_new(target: &Path, text: &str) -> Result<()> {
     std::fs::write(target, text).with_context(|| format!("writing {}", target.display()))
 }
 
+/// Create the repository on GitHub, clone it, write the skeleton, and push the first commit.
 pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport> {
     let NewOptions {
         name,
