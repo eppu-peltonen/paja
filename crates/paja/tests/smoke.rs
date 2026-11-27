@@ -735,6 +735,13 @@ fn the_mcp_server_serves_the_same_core() {
         err["error"].as_str().unwrap().contains("already exists"),
         "{err}"
     );
+    // The names Paja gives its own environments are refused here too.
+    let (ok, err) = mcp.call("env_create", serde_json::json!({"name": "plan-5"}));
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("shape Paja gives"),
+        "{err}"
+    );
     // Jono over MCP: nothing imported yet, so next is null and show says how to import.
     let (ok, next) = mcp.call("work_next", serde_json::json!({}));
     assert!(ok);
@@ -5104,6 +5111,15 @@ fn env_create_refuses_the_names_paja_gives_its_own_environments() {
         let (ok, env) = paja(&home, &repo, &["env", "create", name]);
         assert!(ok, "{env}");
     }
+    // A refused name left nothing behind.
+    let (_, envs) = paja(&home, &repo, &["env", "list"]);
+    let names: Vec<&str> = envs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 3, "{envs}");
 }
 
 #[test]

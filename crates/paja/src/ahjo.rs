@@ -86,11 +86,13 @@ pub struct CreateOptions<'a> {
 /// [`create`] for a person (`paja env create`, the MCP tool): names shaped like the ones Paja
 /// gives its own environments are refused, since Paja would reuse, reset and remove them.
 pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
+    validate_name(opts.name)?;
     if is_paja_name(opts.name) {
         bail!(
             "environment name {:?} has the shape Paja gives its own environments \
-             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`), and Paja \
-             would reuse, reset and remove it; pick another name",
+             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`, where \
+             `<hash>` is any six hex digits), and Paja would reuse, reset and remove it; pick \
+             another name",
             opts.name
         );
     }

@@ -169,9 +169,10 @@ creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's
 resumes its old `work-<issue>` environment when that was made in this checkout; one that belongs to another
 repository is never taken, and a hashed name found to belong to another repository stops the run with the
 `paja env remove <name>` fix. `paja env create` and the MCP tool refuse names of that shape (and the triage pass's
-`<repo>-<hash>-triage`, a plan's `plan-<issue>` and the old `work-<issue>`), so Paja never reuses, resets or removes an environment a person made. A mistake in that configuration stops the pass before it claims anything,
-with an error naming the file and line, so one fix on the default branch is all it takes. That holds even when the
-queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
+`<repo>-<hash>-triage`, a plan's `plan-<issue>` and the old `work-<issue>`), so Paja never reuses, resets or removes
+an environment a person made. A mistake in that configuration stops the pass before it claims anything, with an error
+naming the file and line, so one fix on the default branch is all it takes. That holds even when the queue is empty:
+the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
 While it works on an item the run holds an OS file lock,
 `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
 claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
