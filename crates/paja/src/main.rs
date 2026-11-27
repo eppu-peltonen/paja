@@ -905,7 +905,7 @@ fn describe_doctor(report: &paja::doctor::Report) -> String {
     } else {
         "not ready: fix the failed checks above, then run `paja doctor` again".to_string()
     });
-    out.push("more on errors and fixes: docs/troubleshooting.md".to_string());
+    out.push(format!("more on errors and fixes: {}", report.help));
     out.join("\n")
 }
 

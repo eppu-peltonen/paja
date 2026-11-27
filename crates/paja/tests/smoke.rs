@@ -2587,6 +2587,32 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
 }
 
 #[test]
+fn doctor_points_to_the_troubleshooting_guide_in_both_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let run = |json: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+        cmd.current_dir(tmp.path())
+            .env("PAJA_HOME", &home)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST);
+        if json {
+            cmd.arg("--json");
+        }
+        String::from_utf8_lossy(&cmd.arg("doctor").output().unwrap().stdout).into_owned()
+    };
+    let report: Value = serde_json::from_str(run(true).trim()).unwrap();
+    let help = report["help"].as_str().unwrap();
+    assert!(help.ends_with("/docs/troubleshooting.md"), "{report}");
+    let text = run(false);
+    assert!(
+        text.lines()
+            .last()
+            .is_some_and(|l| l.ends_with(help) && l.starts_with("more on errors")),
+        "{text}"
+    );
+}
+
+#[test]
 fn doctor_checks_that_the_sandbox_program_works() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");

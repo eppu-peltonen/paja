@@ -46,7 +46,13 @@ pub struct Report {
     pub checks: Vec<Check>,
     /// No check failed (warnings don't count).
     pub ok: bool,
+    /// Where the errors and their fixes are explained.
+    pub help: &'static str,
 }
+
+/// The troubleshooting guide in Paja's public repository, which works wherever `paja` runs.
+pub const TROUBLESHOOTING_URL: &str =
+    "https://github.com/eppu-peltonen/paja/blob/main/docs/troubleshooting.md";
 
 fn ok(name: &str, detail: impl Into<String>) -> Check {
     Check {
@@ -107,7 +113,11 @@ pub fn run_checks(home: &Home, repo: &Path) -> Result<Report> {
     repository(home, &repo, &mut checks);
     sandbox(&mut checks);
     let ok = checks.iter().all(|c| c.status != Status::Failed);
-    Ok(Report { checks, ok })
+    Ok(Report {
+        checks,
+        ok,
+        help: TROUBLESHOOTING_URL,
+    })
 }
 
 fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
