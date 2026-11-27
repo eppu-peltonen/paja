@@ -83,6 +83,48 @@ pub struct CreateOptions<'a> {
     pub base: Option<&'a str>,
 }
 
+/// [`create`] for a person (`paja env create`, the MCP tool): names shaped like the ones Paja
+/// gives its own environments are refused, since Paja would reuse, reset and remove them.
+pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
+    validate_name(opts.name)?;
+    if is_paja_name(opts.name) {
+        bail!(
+            "environment name {:?} has the shape Paja gives its own environments \
+             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`, where \
+             `<hash>` is any six hex digits), and Paja would reuse, reset and remove it; pick \
+             another name",
+            opts.name
+        );
+    }
+    create(home, opts)
+}
+
+/// Whether `name` has the shape of a name Paja gives its own environments: what
+/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage` or
+/// `-work-<n>`), a plan's `plan-<n>`, or the `work-<n>` of releases before names carried the
+/// repository.
+pub fn is_paja_name(name: &str) -> bool {
+    let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    if ["work-", "plan-"]
+        .iter()
+        .any(|p| name.strip_prefix(p).is_some_and(number))
+    {
+        return true;
+    }
+    let head = if let Some(head) = name.strip_suffix("-triage") {
+        head
+    } else if let Some((head, n)) = name.rsplit_once("-work-") {
+        if !number(n) {
+            return false;
+        }
+        head
+    } else {
+        return false;
+    };
+    let hash = head.rsplit('-').next().unwrap_or(head);
+    hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     validate_name(opts.name)?;
     // Under the lock, so a tamper stop recorded meanwhile is seen before any more git runs.
@@ -457,6 +499,16 @@ fn main_repo(ok: &Untampered, path: &Path) -> Result<PathBuf> {
         .and_then(|l| l.strip_prefix("worktree "))
         .map(PathBuf::from)
         .with_context(|| format!("can't find the main checkout for {}", path.display()))
+}
+
+/// Whether `env` was made from the repository `path` is in (any checkout or worktree of it).
+/// Environment names hold only a short hash of `owner/name`, so two clones of one repository
+/// under one home share them; only git in `path` runs, after `path`'s tamper check.
+pub fn belongs_to(home: &Home, env: &Env, path: &Path) -> Result<bool> {
+    let ok = untampered(home, path)?;
+    let main = main_repo(&ok, path)?;
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok(canonical(&main) == canonical(&env.repo))
 }
 
 /// Whether git still lists `path` as one of `repo`'s worktrees.
@@ -1276,6 +1328,33 @@ mod tests {
             &"x".repeat(41),
         ] {
             assert!(validate_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn paja_shaped_names_are_told_apart_from_a_persons() {
+        for repo in ["acme/app", "acme/a-very-long-repository-name", "acme/---"] {
+            for what in ["triage", "work-7", "work-12345"] {
+                let name = crate::jono::env_name_for(repo, what);
+                assert!(is_paja_name(&name), "{name}");
+            }
+        }
+        for name in ["work-7", "plan-12"] {
+            assert!(is_paja_name(name), "{name}");
+        }
+        for theirs in [
+            "triage",
+            "work-",
+            "plan-a",
+            "work-7-fix",
+            "fix-triage",
+            "app-12345-triage",
+            "app-abcdeg-triage",
+            "app-abcdef-work-",
+            "app-abcdef-work-7a",
+            "app-abcdef-worker",
+        ] {
+            assert!(!is_paja_name(theirs), "{theirs}");
         }
     }
 }

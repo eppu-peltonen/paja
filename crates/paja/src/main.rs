@@ -500,7 +500,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Env { command } => match command {
             EnvCommand::Create { name, repo, base } => {
-                let env = ahjo::create(
+                let env = ahjo::create_by_person(
                     &home,
                     CreateOptions {
                         name,
@@ -911,8 +911,20 @@ fn describe_doctor(report: &paja::doctor::Report) -> String {
 
 fn describe_triage(report: &mestari::TriageReport) -> String {
     use mestari::Verdict;
+    let notes = report.retried_notes.iter().map(|note| match &note.error {
+        None => format!(
+            "noted on #{} that #{} was closed as its duplicate",
+            note.on, note.number
+        ),
+        Some(error) => format!(
+            "noting on #{} that #{} was closed as its duplicate failed again: {error}",
+            note.on, note.number
+        ),
+    });
     if report.items.is_empty() {
-        return "no open follow-up issues to triage".to_string();
+        let mut lines = vec!["no open follow-up issues to triage".to_string()];
+        lines.extend(notes);
+        return lines.join("\n");
     }
     let mut lines: Vec<String> = report
         .items
@@ -926,7 +938,9 @@ fn describe_triage(report: &mestari::TriageReport) -> String {
                 (Verdict::NotWorthDoing, _) => "not worth doing".to_string(),
             };
             let state = match (&item.error, item.closed) {
-                (Some(error), _) => format!(" (not closed: {error})"),
+                // A closed item's error is its note's, which says it was closed.
+                (Some(error), true) => format!(" ({error})"),
+                (Some(error), false) => format!(" (not closed: {error})"),
                 (None, true) => " (closed)".to_string(),
                 (None, false) => String::new(),
             };
@@ -947,6 +961,7 @@ fn describe_triage(report: &mestari::TriageReport) -> String {
                 .join(", ")
         ));
     }
+    lines.extend(notes);
     lines.join("\n")
 }
 

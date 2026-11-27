@@ -457,7 +457,8 @@ pub fn env_name(repo: &str, number: u64) -> String {
 }
 
 /// An Ahjo environment name of `repo` for `what` (`work-5`, `triage`): the repository's name,
-/// a short hash of `owner/name` and `what`, at most 40 characters as long as `what` leaves room.
+/// a short hash of `owner/name`, and `what`; at most 40 characters as long as `what` leaves
+/// room. Two clones of one repository get the same names.
 pub fn env_name_for(repo: &str, what: &str) -> String {
     let name = repo.rsplit('/').next().unwrap_or(repo).to_ascii_lowercase();
     let name: String = name
@@ -1997,12 +1998,16 @@ fn landed_hidden(events: &[Event], repo: &str) -> Result<BTreeMap<u64, u64>> {
     Ok(found)
 }
 
-/// Whether GitHub reopened issue `number` at or after `since` (milliseconds since the epoch),
-/// read from the issue's events. A listing gh can't give counts as no reopen: the item stays
-/// as the log has it.
+/// Whether GitHub reopened issue `number` at or after `since` (milliseconds since the epoch, cut
+/// to the second GitHub's times have), read from the issue's events. A listing gh can't give
+/// fails the sync, so the next one asks again instead of the item staying landed unseen.
+/// Cutting to the second leans toward a reopen: one up to a second before the hiding counts too.
+/// `since` is this machine's clock and the events GitHub's; a skew between them matters little,
+/// since the issue was open on GitHub when it was hidden, so a reopen after that needs a close
+/// first.
 fn reopened_since(ok: &Untampered, number: u64, since: u64) -> Result<bool> {
     let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/events");
-    let output = gh_output(
+    let listed = gh(
         ok,
         &[
             "api",
@@ -2011,14 +2016,17 @@ fn reopened_since(ok: &Untampered, number: u64, since: u64) -> Result<bool> {
             "--jq",
             ".[] | select(.event == \"reopened\") | .created_at",
         ],
-    )?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    )
+    .with_context(|| {
+        format!(
+            "asking GitHub whether follow-up #{number}, hidden while follow-ups were off, was \
+             reopened since; the next `paja work sync` asks again"
+        )
+    })?;
+    Ok(listed
         .lines()
         .filter_map(parse_utc)
-        .any(|at| at.saturating_mul(1000) >= since))
+        .any(|at| at >= since / 1000))
 }
 
 /// [`apply_with`], where `hidden` are the follow-ups the sync didn't list only because

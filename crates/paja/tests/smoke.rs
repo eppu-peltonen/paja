@@ -735,6 +735,13 @@ fn the_mcp_server_serves_the_same_core() {
         err["error"].as_str().unwrap().contains("already exists"),
         "{err}"
     );
+    // The names Paja gives its own environments are refused here too.
+    let (ok, err) = mcp.call("env_create", serde_json::json!({"name": "plan-5"}));
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("shape Paja gives"),
+        "{err}"
+    );
     // Jono over MCP: nothing imported yet, so next is null and show says how to import.
     let (ok, next) = mcp.call("work_next", serde_json::json!({}));
     assert!(ok);
@@ -1317,7 +1324,8 @@ fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
              *\"--label factory-follow-up \"*) echo '[{{\"number\": 2, \"title\": \"Tidy\", \"body\": \"\", \"url\": \"https://example.com/2\"}}]' ;; \
              *\"--label factory \"*) echo '[{{\"number\": 4, \"title\": \"Build\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; \
              *) echo '[]' ;; esac ;;\n\
-             \"api \"*) case \"$2\" in *events) if [ -f {d}/reopened-on-github ]; then cat {d}/reopened-on-github; fi ;; \
+             \"api \"*) case \"$2\" in *events) if [ -f {d}/events-down ]; then echo 'HTTP 503' >&2; exit 1; fi; \
+             if [ -f {d}/reopened-on-github ]; then cat {d}/reopened-on-github; fi ;; \
              *) if [ -f {d}/closed-on-github ]; then echo closed; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
@@ -1475,6 +1483,57 @@ fn a_landed_follow_up_github_reopened_while_hidden_by_follow_ups_off_is_queued_w
 }
 
 #[test]
+fn a_failed_reopen_check_fails_the_sync_and_the_next_sync_asks_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let queue = |text: &str| {
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/queue"), text).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "queue"]);
+    };
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (ok, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert!(ok, "{set}");
+    assert_eq!(set["status"], "landed", "{set}");
+    queue("follow-ups = off\n");
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
+    std::fs::write(
+        tmp.path().join("reopened-on-github"),
+        "2099-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    // GitHub can't list #2's events: the sync fails and says so, and records nothing.
+    std::fs::write(tmp.path().join("events-down"), "").unwrap();
+    queue("follow-ups = on\n");
+    let events = || std::fs::read_to_string(home.join("events.jsonl")).unwrap();
+    let before = events();
+    let (ok, err) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("follow-up #2") && msg.contains("issues/2/events") && msg.contains("HTTP 503"),
+        "{msg}"
+    );
+    assert_eq!(events(), before, "a failed sync wrote events");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["open"], false, "{item}");
+    // Once GitHub answers, the next sync asks again and queues it.
+    std::fs::remove_file(tmp.path().join("events-down")).unwrap();
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["status"], "queued", "{item}");
+}
+
+#[test]
 fn a_follow_up_hidden_by_follow_ups_off_and_reopened_only_before_stays_landed() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -1487,10 +1546,13 @@ fn a_follow_up_hidden_by_follow_ups_off_and_reopened_only_before_stays_landed() 
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "queue"]);
     };
-    paja_with(&home, &repo, &["work", "sync"], &with_gh);
-    paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (_, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert_eq!(set["status"], "landed", "{set}");
     queue("follow-ups = off\n");
-    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
     // GitHub's only reopen of #2 is older than the hiding.
     std::fs::write(
         tmp.path().join("reopened-on-github"),
@@ -2022,7 +2084,7 @@ fn work_show_tells_where_an_active_items_run_is_and_that_it_stopped() {
     assert!(!home.join("runs").exists());
     assert_eq!(
         (&run["round"], &run["max_rounds"]),
-        (&1.into(), &3.into()),
+        (&1.into(), &5.into()),
         "{run}"
     );
     assert_eq!(run["step"]["role"], "build", "{run}");
@@ -2155,7 +2217,6 @@ impl Factory {
         std::fs::write(dir.join("verdict.txt"), verdict).unwrap();
         let script = |name: &str, body: String| program(dir, name, &body);
         let d = slash(dir);
-        let token = fake_token();
         let gh = script(
             "gh",
             format!(
@@ -2200,8 +2261,9 @@ impl Factory {
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
-                 v=$(cat {d}/verdict.txt)\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": [{{\\\"kind\\\": \\\"risk\\\", \\\"finding\\\": \\\"Tidy the helper, which logs {token}\\\"}}, {{\\\"kind\\\": \\\"nit\\\", \\\"finding\\\": \\\"Rename the variable\\\"}}]}}}}\" ;;\n\
+                 v=$(cat {d}/verdict.txt); f='[]'\n\
+                 if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/hang ]; then : > {d}/hanging; while [ -f {d}/hang ]; do sleep 0.1; done; exit 1; fi\n\
@@ -2247,6 +2309,15 @@ impl Factory {
                 ("PAJA_CLAUDE", self.claude.as_path()),
             ],
         )
+    }
+
+    /// Have the fake reviewer report `findings` (a JSON array) with its verdict: on every
+    /// review, or with `once` on the first only.
+    fn reviewer_finds(&self, findings: Value, once: bool) {
+        std::fs::write(self.tmp.path().join("findings.json"), findings.to_string()).unwrap();
+        if once {
+            std::fs::write(self.tmp.path().join("findings-once"), "").unwrap();
+        }
     }
 
     /// `run`, with the progress lines it wrote on stderr.
@@ -2320,10 +2391,6 @@ fn a_run_uses_the_labels_main_names() {
     let log = f.gh_log();
     assert!(
         log.contains("issue list --label game --state open"),
-        "{log}"
-    );
-    assert!(
-        log.contains("issue create --label game-ideas --title Tidy the helper"),
         "{log}"
     );
     assert!(!log.contains("factory"), "{log}");
@@ -2464,31 +2531,10 @@ fn run_builds_reviews_and_lands_an_issue() {
     assert_eq!(item["status"], "landed");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]));
-    // A finding that didn't block landing becomes an issue for a person to queue, not queued
-    // work.
-    assert!(
-        log.contains("issue create --label factory-follow-up --title Tidy the helper"),
-        "{log}"
-    );
-    // The reviewer's risk and nit make one issue that holds only the risk: nits are not filed.
-    assert_eq!(
-        log.matches("issue create --label factory-follow-up")
-            .count(),
-        1,
-        "{log}"
-    );
-    assert!(!log.contains("Rename the variable"), "{log}");
-    assert!(
-        log.contains("Reviewers found these while reviewing #5"),
-        "{log}"
-    );
+    // A clean review files no issue.
+    assert!(!log.contains("issue create"), "{log}");
     // The prompt reaches `claude` on stdin, not on its command line.
     assert!(f.tmp.path().join("prompt-on-stdin").exists());
-    // A token in a finding never reaches the public issue.
-    assert!(
-        !log.contains(&fake_token()) && log.contains("logs <redacted>"),
-        "{log}"
-    );
     // Every agent runs under the deny-list hook, bounded to its environment, and with no
     // settings files that could switch the hook off.
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
@@ -3239,7 +3285,7 @@ fn a_run_stopped_twice_in_a_fix_keeps_its_round_and_its_blockers() {
     let (report, stderr) = f.run_with_stderr();
     assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
     assert!(stderr.contains("resuming #5 in round 2"), "{stderr}");
-    assert!(!stderr.contains("round 1 of 3"), "{stderr}");
+    assert!(!stderr.contains("round 1 of 5"), "{stderr}");
     let calls = f.claude_calls();
     let fix = calls
         .iter()
@@ -3877,9 +3923,16 @@ fn run_records_what_each_agent_step_spent() {
 }
 
 #[test]
-fn a_fix_round_hands_the_builder_the_nits() {
-    // Round one asks for changes, so the nit goes to the fix round instead of an issue.
+fn a_fix_round_hands_the_builder_the_findings() {
+    // Round one asks for changes, so the findings go to the fix round, never to an issue.
     let f = Factory::new("true\n", "changes");
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": "Tidy the helper"},
+            {"kind": "nit", "finding": "Rename the variable"}
+        ]),
+        true,
+    );
     std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
@@ -3891,18 +3944,93 @@ fn a_fix_round_hands_the_builder_the_nits() {
     assert_eq!(builds.len(), 2, "{calls:?}");
     assert!(!builds[0].contains("Rename the variable"), "{}", builds[0]);
     assert!(
-        builds[1].contains("also noted these nits") && builds[1].contains("Rename the variable"),
+        builds[1].contains("also noted these findings")
+            && builds[1].contains("Rename the variable")
+            && builds[1].contains("Tidy the helper"),
+        "{}",
+        builds[1]
+    );
+    assert!(!f.gh_log().contains("issue create"), "{}", f.gh_log());
+}
+
+#[test]
+fn a_land_verdict_with_findings_sends_them_back_and_lands_when_the_re_review_is_clean() {
+    let f = Factory::new("true\n", "land");
+    let token = fake_token();
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": format!("Tidy the helper, which logs {token}")},
+            {"kind": "nit", "finding": "Rename the variable"}
+        ]),
+        true,
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 2, "{report}");
+    let calls = f.claude_calls();
+    let builds: Vec<&String> = calls
+        .iter()
+        .filter(|c| !c.contains("--json-schema"))
+        .collect();
+    assert_eq!(builds.len(), 2, "{calls:?}");
+    assert!(
+        builds[1].contains("Tidy the helper") && builds[1].contains("Rename the variable"),
         "{}",
         builds[1]
     );
     let log = f.gh_log();
-    assert_eq!(
-        log.matches("issue create --label factory-follow-up")
-            .count(),
-        1,
+    assert!(!log.contains("issue create"), "{log}");
+    assert!(!log.contains("Reviewers left these findings"), "{log}");
+}
+
+#[test]
+fn a_change_holding_a_finding_at_the_round_limit_lands_and_lists_it_without_an_issue() {
+    let f = Factory::new("true\n", "land");
+    let token = fake_token();
+    f.reviewer_finds(
+        serde_json::json!([
+            {"kind": "risk", "finding": format!("Tidy the helper, which logs {token}")},
+            {"kind": "outside", "finding": "The parser drops a line"}
+        ]),
+        false,
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["rounds"], 5, "{report}");
+    let log = f.gh_log();
+    assert!(!log.contains("issue create"), "{log}");
+    // The pull request lists what was left, with the token redacted.
+    assert!(
+        log.contains("Reviewers left these findings")
+            && log.contains("The parser drops a line")
+            && log.contains("logs <redacted>")
+            && !log.contains(&fake_token()),
         "{log}"
     );
-    assert!(!log.contains("Rename the variable"), "{log}");
+    let (_, events) = paja(&f.home, &f.repo, &["log"]);
+    let left: Vec<&str> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.follow_up")
+        .filter_map(|e| e["data"]["error"].as_str())
+        .collect();
+    assert!(
+        left.contains(&"not filed: round limit") && left.contains(&"not filed: outside the change"),
+        "{left:?}"
+    );
+}
+
+#[test]
+fn a_change_holding_a_blocker_at_the_round_limit_escalates() {
+    let f = Factory::new("true\n", "changes");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    assert_eq!(report["rounds"], 5, "{report}");
+    assert!(!f.gh_log().contains("issue create"), "{}", f.gh_log());
 }
 
 #[test]
@@ -4255,7 +4383,7 @@ fn run_says_what_it_is_doing_on_stderr() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     for step in [
         "picked #5: Add a feature file",
-        "round 1 of 3: Claude is building the change",
+        "round 1 of 5: Claude is building the change",
         "running Vasara's checks",
         "reviewer 1 of 1 is reading the change",
         "review verdict: land",
@@ -4778,12 +4906,12 @@ fn the_next_run_gets_the_persons_answer() {
 }
 
 #[test]
-fn run_gives_up_after_three_failed_rounds_and_asks() {
+fn run_gives_up_after_five_failed_rounds_and_asks() {
     let f = Factory::new("test -f never.txt\n", "land");
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "escalated");
-    assert_eq!(report["rounds"], 3);
+    assert_eq!(report["rounds"], 5);
     assert!(
         report["question"].as_str().unwrap().contains("never.txt"),
         "{report}"
@@ -4795,7 +4923,7 @@ fn run_gives_up_after_three_failed_rounds_and_asks() {
         .iter()
         .filter(|e| e["kind"] == "run.round")
         .count();
-    assert_eq!(rounds, 3);
+    assert_eq!(rounds, 5);
 }
 
 /// A repository, a fake `gh` listing three open follow-up issues (#11, #12, #13) and no work
@@ -4834,6 +4962,11 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"workflow list\") echo 'CI	active	1' ;;\n\
              \"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/followups.json ;; *) echo '[]' ;; esac ;;\n\
+             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi; \
+             if [ -f {d}/comment-posts-then-fails ]; then n=$3; shift 3; echo \"$2\" | head -n 1 >> {d}/posted-$n; echo 'connection reset' >&2; exit 1; fi ;;\n\
+             \"api user\") if [ -f {d}/user-fails ]; then echo 'HTTP 403' >&2; exit 1; fi; echo paja-bot ;;\n\
+             \"api \"*) case \"$2\" in *comments) if [ -f {d}/comments-fail ]; then echo 'HTTP 502' >&2; exit 1; fi; \
+             n=${{2#*issues/}}; n=${{n%%/*}}; if [ -f {d}/posted-$n ]; then cat {d}/posted-$n; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
     );
@@ -4860,9 +4993,14 @@ fn triage_vars(dir: &Path) -> [(&'static str, std::path::PathBuf); 2] {
 }
 
 fn triage(f: &Factory, dir: &Path) -> (bool, Value) {
+    triage_in(f, dir, &f.repo)
+}
+
+/// `paja triage` run from `repo`.
+fn triage_in(f: &Factory, dir: &Path, repo: &Path) -> (bool, Value) {
     let vars = triage_vars(dir);
     let vars: Vec<(&str, &Path)> = vars.iter().map(|(k, v)| (*k, v.as_path())).collect();
-    paja_with(&f.home, &f.repo, &["triage"], &vars)
+    paja_with(&f.home, repo, &["triage"], &vars)
 }
 
 #[test]
@@ -4965,6 +5103,95 @@ fn triage_leaves_a_persons_triage_environment_alone_and_waits_for_a_running_pass
         std::fs::read_to_string(theirs.join("my-work.txt")).unwrap(),
         "unsaved"
     );
+}
+
+#[test]
+fn triage_leaves_another_clones_triage_environment_alone() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "keep", "reason": "still open"},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // A second clone of acme/app under the same home, whose killed pass left its environment.
+    let clone = f.tmp.path().join("second-clone");
+    let status = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&f.repo)
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let name = paja::jono::env_name_for("acme/app", "triage");
+    // A person can't make one of that name, so it is made the way the killed pass made it.
+    let (ok, err) = paja(&f.home, &clone, &["env", "create", &name]);
+    assert!(!ok, "{err}");
+    let home = paja::home::Home::at(&f.home).unwrap();
+    let env = paja::ahjo::create(
+        &home,
+        paja::ahjo::CreateOptions {
+            name: &name,
+            repo: &clone,
+            base: None,
+        },
+    )
+    .unwrap();
+    let theirs = env.path.clone();
+    std::fs::write(theirs.join("my-work.txt"), "unsaved").unwrap();
+    let (ok, err) = triage(&f, &dir);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("belongs to the repository at") && msg.contains("paja env remove"),
+        "{msg}"
+    );
+    assert!(!dir.join("claude-calls").exists(), "the agent ran");
+    assert_eq!(
+        std::fs::read_to_string(theirs.join("my-work.txt")).unwrap(),
+        "unsaved"
+    );
+    // From the clone that made it, the environment is its own: reused, reset and removed.
+    let (ok, report) = triage_in(&f, &dir, &clone);
+    assert!(ok, "{report}");
+    assert!(dir.join("claude-calls").exists(), "the agent didn't run");
+    assert!(!theirs.exists(), "the environment was left behind");
+    let (_, envs) = paja(&f.home, &clone, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]), "{envs}");
+}
+
+#[test]
+fn env_create_refuses_the_names_paja_gives_its_own_environments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, repo) = (tmp.path().join("home"), tmp.path().join("repo"));
+    init_repo(&repo);
+    let paja_names = ["triage", "work-5"]
+        .map(|what| paja::jono::env_name_for("acme/app", what))
+        .into_iter()
+        .chain(["work-5".to_string(), "plan-5".to_string()]);
+    for name in paja_names {
+        let (ok, err) = paja(&home, &repo, &["env", "create", &name]);
+        assert!(!ok, "{err}");
+        let msg = err["error"].as_str().unwrap();
+        assert!(
+            msg.contains("shape Paja gives its own environments") && msg.contains("another name"),
+            "{msg}"
+        );
+    }
+    // Names that only look a little like them are a person's to use.
+    for name in ["triage", "work-5-notes", "app-triage"] {
+        let (ok, env) = paja(&home, &repo, &["env", "create", name]);
+        assert!(ok, "{env}");
+    }
+    // A refused name left nothing behind.
+    let (_, envs) = paja(&home, &repo, &["env", "list"]);
+    let names: Vec<&str> = envs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 3, "{envs}");
 }
 
 #[test]
@@ -5203,6 +5430,309 @@ fn triage_gives_every_follow_up_a_turn_past_the_first_sixty() {
 }
 
 #[test]
+fn a_duplicate_note_that_fails_is_reported_and_tried_again_next_pass() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    // #12 is closed even though the note on #11 failed, and the report says both.
+    assert_eq!(report["closed"], serde_json::json!([12]), "{report}");
+    assert_eq!(report["items"][1]["closed"], true, "{report}");
+    let error = report["items"][1]["error"].as_str().unwrap();
+    assert!(error.contains("noting it on #11 failed"), "{error}");
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran[0]["data"]["note_failed"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{ran:?}"
+    );
+    // The text report doesn't call a closed issue "not closed": this pass closes #13 as a
+    // duplicate of #11 too, and its note fails as #12's retry does.
+    std::fs::write(
+        dir.join("answer.json"),
+        r#"{"is_error": false, "num_turns": 1, "structured_output": {"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "keep", "reason": "reopened"},
+            {"number": 13, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."}
+        ]}}"#,
+    )
+    .unwrap();
+    let vars = triage_vars(&dir);
+    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .envs(vars.iter().map(|(k, v)| (*k, v.as_path())))
+        .arg("triage")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("(closed, but noting it on #11 failed"),
+        "{text}"
+    );
+    assert!(!text.contains("not closed"), "{text}");
+    assert!(text.contains("failed again"), "{text}");
+    // Once comments work, the next pass posts the note and records it.
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(
+        report["retried_notes"],
+        serde_json::json!([{"number": 12, "on": 11}, {"number": 13, "on": 11}]),
+        "{report}"
+    );
+    let notes = events_of(&f, "triage.notes");
+    assert_eq!(
+        notes.last().unwrap()["data"]["noted"],
+        serde_json::json!([{"number": 12, "on": 11}, {"number": 13, "on": 11}]),
+        "{notes:?}"
+    );
+    // A pass after that has nothing left to retry.
+    let (_, report) = triage(&f, &dir);
+    assert!(report.get("retried_notes").is_none(), "{report}");
+}
+
+#[test]
+fn a_duplicate_note_github_took_though_gh_failed_is_not_posted_again() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // GitHub takes the note on #11, but gh exits non-zero, so the pass records it as failed.
+    std::fs::write(dir.join("comment-posts-then-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran[0]["data"]["note_failed"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{ran:?}"
+    );
+    let posted = std::fs::read_to_string(dir.join("posted-11")).unwrap();
+    assert!(posted.starts_with("**Paja triage closed #12 ("), "{posted}");
+    // The next pass finds the note on #11 and records it as noted without posting it again.
+    std::fs::remove_file(dir.join("comment-posts-then-fails")).unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(
+        report["retried_notes"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issues/11/comments"), "{log}");
+    // Only the account gh comments as counts.
+    assert!(log.contains("api user --jq .login"), "{log}");
+    assert!(
+        log.contains(r#"select(.user.login == "paja-bot")"#),
+        "{log}"
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        1,
+        "{log}"
+    );
+    let notes = events_of(&f, "triage.notes");
+    assert_eq!(
+        notes.last().unwrap()["data"]["noted"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn a_retried_note_github_took_is_found_and_an_unreadable_listing_posts_the_note() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    let comments = || {
+        std::fs::read_to_string(dir.join("gh.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count()
+    };
+    // The first note fails outright; the retry's short form is taken though gh fails.
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("comment-posts-then-fails"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(report["retried_notes"][0]["error"].is_string(), "{report}");
+    let posted = std::fs::read_to_string(dir.join("posted-11")).unwrap();
+    assert_eq!(
+        posted.trim(),
+        "**Paja triage closed #12 as a duplicate of this issue.**"
+    );
+    assert_eq!(comments(), 2);
+    // The third pass finds the short form and posts nothing.
+    std::fs::remove_file(dir.join("comment-posts-then-fails")).unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    assert_eq!(comments(), 2);
+    // With the note gone and the comments unreadable, a pending note is posted as before.
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("comments-fail"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        2,
+        "{log}"
+    );
+    // Nor when gh can't say who it comments as (an app token can't read /user): no listing is
+    // read, and the pending note is posted.
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("user-fails"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("api user"), "{log}");
+    assert!(!log.contains("/comments"), "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        2,
+        "{log}"
+    );
+}
+
+#[test]
+fn a_duplicate_note_is_retried_before_the_agent_and_given_up_after_three_passes() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let comments = || {
+        std::fs::read_to_string(dir.join("gh.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count()
+    };
+    assert_eq!(comments(), 1);
+    // A pass whose agent gives no answer still tries the note first (and fails again).
+    std::fs::write(dir.join("followups.json"), r#"[{"number": 13, "title": "Add", "body": "x", "createdAt": "2020-01-01T00:00:00Z", "labels": []}]"#).unwrap();
+    std::fs::write(
+        dir.join("answer.json"),
+        r#"{"is_error": false, "num_turns": 1}"#,
+    )
+    .unwrap();
+    let (ok, err) = triage(&f, &dir);
+    assert!(!ok, "{err}");
+    assert_eq!(comments(), 2, "the retry didn't run before the agent");
+    // That pass recorded its retry though it failed after it, so the next is the third and last.
+    let notes = events_of(&f, "triage.notes");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (_, report) = triage(&f, &dir);
+    let error = report["retried_notes"][0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("gave up after 3 tries") && error.contains("by hand"),
+        "{error}"
+    );
+    let (_, report) = triage(&f, &dir);
+    assert!(report.get("retried_notes").is_none(), "{report}");
+}
+
+#[test]
+fn a_duplicate_closed_again_while_its_note_is_pending_gets_one_note() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    // #12 was reopened, and the next pass closes it again as a duplicate of #11: the retry
+    // posts the note, and the fresh close doesn't post a second one.
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([12]), "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    let notes = log
+        .lines()
+        .filter(|l| l.starts_with("issue comment 11"))
+        .count();
+    assert_eq!(notes, 2, "one failed, one retried, none fresh: {log}");
+    let (_, report) = triage(&f, &dir);
+    assert!(report.get("retried_notes").is_none(), "{report}");
+}
+
+#[test]
 fn triage_never_closes_not_worth_doing_or_what_it_cannot_back_up() {
     let (f, dir) = triage_factory(
         r#"{"issues": [
@@ -5274,6 +5804,10 @@ fn run_checks_come_from_main_not_the_branch() {
 #[test]
 fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
     let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "Tidy the helper"}]),
+        false,
+    );
     std::fs::write(f.tmp.path().join("gh-down"), "").unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
@@ -5576,7 +6110,7 @@ fn a_second_review_judges_only_the_fix() {
     assert!(first.contains("...HEAD`"), "{args}");
     assert!(first.contains("+++ b/feature.txt"), "{args}");
     let rereview = reviews.get(1).copied().unwrap_or_default();
-    assert!(rereview.contains("found these blockers"), "{args}");
+    assert!(rereview.contains("asked for these fixes"), "{args}");
     assert!(rereview.contains("add more"), "{args}");
     assert!(
         rereview.contains("Judge only the fix, the diff above (`git diff "),
@@ -6088,6 +6622,10 @@ fn a_fix_round_without_commits_is_not_reviewed() {
     // After a review asks for changes, a round that commits nothing goes back to the builder
     // instead of letting the reviewer land the unchanged branch.
     let f = Factory::new("true\n", "changes");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "Tidy the helper"}]),
+        false,
+    );
     std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
     std::fs::write(f.tmp.path().join("lazy"), "").unwrap();
     let (ok, report) = f.run();
@@ -7056,6 +7594,92 @@ fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
         error.contains(".paja/checks is already on main") && error.contains("--force"),
         "{error}"
     );
+}
+
+#[test]
+fn init_force_rewrites_the_branch_without_a_tracking_ref_and_adds_no_second_section() {
+    let (tmp, repo, home, gh) = init_fixture(&[
+        ("requirements.txt", "pytest\n"),
+        ("ruff.toml", ""),
+        (
+            "CLAUDE.md",
+            "# App\n\n## Working with Paja\n\nAlready here.\n",
+        ),
+    ]);
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci", "--no-agent"], &vars);
+    assert!(ok, "{out}");
+    let workflow = show(&repo, "paja/init", ".github/workflows/paja.yml");
+    assert!(
+        workflow.contains("pip install -r requirements.txt pytest ruff"),
+        "{workflow}"
+    );
+    assert!(workflow.contains("run: ruff check ."), "{workflow}");
+    assert!(
+        !out["files"].to_string().contains("CLAUDE.md"),
+        "the section is already there: {out}"
+    );
+
+    // Without --force the second run fails at the push, and says what to do.
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "more"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci", "--no-agent"], &vars);
+    assert!(!ok, "{out}");
+    assert!(out["error"].as_str().unwrap().contains("--force"), "{out}");
+
+    // With --force and no local tracking ref for origin/paja/init, the push still lands.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["update-ref", "-d", "refs/remotes/origin/paja/init"])
+        .status();
+    let (ok, out) = paja_with(
+        &home,
+        &repo,
+        &["init", "--ci", "--no-agent", "--force"],
+        &vars,
+    );
+    assert!(ok, "{out}");
+    let origin = tmp.path().join("origin.git");
+    let tip = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args(["rev-list", "--count", "main..paja/init"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), "1");
+    let claude = show(&repo, "paja/init", "CLAUDE.md");
+    assert_eq!(claude.matches("## Working with Paja").count(), 1);
+}
+
+#[test]
+fn init_reports_an_open_pull_request_when_creating_one_fails_and_says_how_to_recover_otherwise() {
+    let (tmp, repo, home, _) = init_fixture(&[("go.mod", "module x\n")]);
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             \"pr create\") echo 'HTTP 422' >&2; exit 1 ;;\n\
+             \"pr list\") if [ -f {d}/open-pr ]; then echo '[{{\"url\": \"https://example.com/pull/9\"}}]'; else echo '[]'; fi ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--no-agent"], &vars);
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("by hand") && error.contains("--force"),
+        "{error}"
+    );
+
+    std::fs::write(tmp.path().join("open-pr"), "").unwrap();
+    let (ok, out) = paja_with(&home, &repo, &["init", "--no-agent", "--force"], &vars);
+    assert!(ok, "{out}");
+    assert_eq!(out["pull_request"], "https://example.com/pull/9");
 }
 
 #[test]

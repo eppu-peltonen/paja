@@ -11,7 +11,7 @@ for now. Autonomy widens only after each step's exit test passes.
    - `paja mcp`, the core as MCP tools (done).
    - Jono: `paja work sync` imports open GitHub issues with the work label (`.paja/labels`, `paja` in this repository) as work items, and `paja work next` picks one.
    - Mestari's first graph, `paja run`: build the item in a fresh Ahjo environment with headless Claude Code, run the
-     checks, have an independent reviewer agent read the diff cold, then land it or loop back (at most three rounds),
+     checks, have an independent reviewer agent read the diff cold, then land it or loop back (at most five rounds),
      and escalate as an issue comment when it can't decide.
    - The deny-list hook, blocking when it errors, so the first unattended run is already fail-closed.
    - *Exit:* an issue with the work label lands on `main` through `paja run`, with no human touching the code.

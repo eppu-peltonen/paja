@@ -16,24 +16,29 @@ rate stays low. Every landed change is re-verified on `main` and reverted automa
 
 Review has to converge, or a fresh reviewer finding one more edge case each time keeps a change open forever.
 
-- **At most three rounds.** A change gets at most three build, check and review rounds. After the third it lands only if
-  the reviewers say `land`; otherwise it is escalated. A round that fails on a turn limit (the builder's, or a
-  reviewer's after its one focused retry) counts against the three without a verdict. Builder and reviewer limit hits
-  are counted separately: a second round failed by the same kind of step escalates.
-- **Only blockers hold a change up.** A blocker is a bug in what the issue asks for, a security hole the change opens, a
-  broken `CLAUDE.md` rule, or missing tests for the new behaviour. Every other finding is a follow-up, which the
-  reviewer marks `bug` (a wrong result outside what the issue asks), `risk` (a security or data-loss risk, or a missing
-  test for behaviour that could break) or `nit` (style, naming, comment wording, a small refactor); anything that is
-  none of these is left out. Once the change lands, Mestari files the landing round's bugs and risks together as one
-  follow-up issue (the follow-up label of `.paja/labels`, `paja-follow-up` in this repository), so a change asks for
-  at most one more piece of work, and files nothing when there are none. Nits are never filed: when a round asks for
-  changes anyway, the builder gets them to fix if a line or two does it, and otherwise they are dropped, kept only in
-  the event log. Jono doesn't import the follow-up label, so a person queues the issue by relabelling it with the work
-  label (`paja` here): reviewers suggest work, people set intent. Each re-reviewer sees the earlier follow-ups and
-  repeats the ones that still apply. If the change doesn't land in that round (CI fails and the builder gets another round), the follow-ups stay
-  in the event log unfiled, and the next round's reviewers file their own.
-  Follow-ups become public issues, so reviewers never copy secrets, environment details or run output into them, and
-  Mestari checks for itself too: before filing, it replaces values that start like a known credential (GitHub,
+- **At most five rounds.** A change gets at most five build, check and review rounds, since every finding takes a
+  round, not only blockers. After the fifth it lands only if the reviewers say `land`; otherwise it is escalated. A
+  round that fails on a turn limit (the builder's, or a reviewer's after its one focused retry) counts against the
+  five without a verdict. Builder and reviewer limit hits are counted separately: a second round failed by the same
+  kind of step escalates.
+- **Every finding in the change is fixed in it.** A reviewer judges the change against its item. It answers `changes`
+  for a blocker (a bug in what the issue asks for, a security hole the change opens, a broken `CLAUDE.md` rule, or
+  missing tests for the new behaviour) and lists every other finding beside its verdict, marked `bug` (a wrong result
+  in the change), `risk` (a security or data-loss risk, or a missing test for behaviour that could break), `nit`
+  (style, naming, comment wording, a small refactor) or `outside` (a real bug in code the change doesn't touch);
+  anything that is none of these is left out, and so is a nit not worth a round. Every finding except `outside` goes
+  back to the builder as the next round's feedback, even when the verdict is `land`; the change lands when a round
+  has nothing left to fix, CI is green and, for a high-risk change, both reviewers agree. A re-review reads the fix
+  and checks the earlier findings are settled (high risk: the whole change). Mestari files no follow-up issue.
+- **At the round limit.** An open blocker escalates, as before. Any other finding still open lands with the change,
+  recorded as `run.follow_up` (`not filed: round limit`) and listed in the pull request's description. An `outside`
+  finding is not fixed here, since one concern goes in each pull request: it is recorded (`not filed: outside the
+  change`) and listed in the pull request the same way. Each re-reviewer sees the earlier `outside` findings and
+  repeats the ones that still apply.
+- **The follow-up label stays.** Jono still takes the follow-up issues that are already open, oldest first, and
+  `paja triage` still closes duplicates and already-fixed ones. New ones are made only by people.
+  The pull request's description is public, so reviewers never copy secrets, environment details or run output into
+  findings, and Mestari checks for itself too: before it writes them, it replaces values that start like a known credential (GitHub,
   GitLab, Anthropic and other `sk-` keys, AWS, Slack, npm, PyPI, JSON Web Tokens) or follow `Bearer`, `token`,
   `password`, `secret` or `api_key` (past quotes, backticks, `:`, `=` or `,`) with `<redacted>`, the whole value
   including any `.`, `+`, `/` or `=`, and the factory home, the repository and the user's home directory (also as

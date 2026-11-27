@@ -687,6 +687,48 @@ fn link_out(
     None
 }
 
+/// Names agents never write, as spelled on disk.
+const PROTECTED_NAMES: [&str; 11] = [
+    ".git",
+    ".github",
+    ".claude",
+    ".cargo",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".gitattributes",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "clippy.toml",
+    ".clippy.toml",
+];
+
+/// A Windows 8.3 short name such as `GIT~1` or `RUST-T~1.TOM`: the start of a protected name
+/// (leading dot dropped), then `~` and digits.
+fn short_name_of_protected(word: &str) -> bool {
+    let upper = word.to_uppercase();
+    let (stem, tail) = match upper.split_once('~') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let digits = tail.chars().take_while(char::is_ascii_digit).count();
+    if stem.is_empty() || digits == 0 {
+        return false;
+    }
+    PROTECTED_NAMES.iter().any(|name| {
+        name.trim_start_matches('.')
+            .to_uppercase()
+            .starts_with(stem)
+    })
+}
+
+/// A word that is, or could be shorthand for, a protected name.
+fn is_protected_word(word: &str) -> bool {
+    short_name_of_protected(word)
+        || PROTECTED_NAMES
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(word))
+}
+
 /// `path` must be inside the worktree, and not git's link to the repository.
 fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     let full = resolve(path);
@@ -703,6 +745,17 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
             .components()
             .any(|c| upper(&c.as_os_str().to_string_lossy()) == upper(name))
     };
+    // Windows 8.3 short names (`GIT~1` for `.git`) reach the same files.
+    if inner
+        .components()
+        .any(|c| short_name_of_protected(&c.as_os_str().to_string_lossy()))
+    {
+        return Some(format!(
+            "{} is a Windows short name for configuration that agents never change; use the \
+             full name",
+            crate::platform::shown(&full)
+        ));
+    }
     if named(".git") {
         return Some(format!(
             "{} is git's own data or link to the repository; agents never change it",
@@ -1142,6 +1195,14 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
                         "`{arg}` glues `~` to a short flag; name the path inside the worktree"
                     ));
                 }
+                // A `~` that doesn't start a short name (`HEAD~1`) could read as a home
+                // directory after the flag letters (`-xf~user`).
+                let mut after_tilde = glued.match_indices('~').map(|(at, _)| &glued[at + 1..]);
+                if after_tilde.any(|t| !t.starts_with(|c: char| c.is_ascii_digit())) {
+                    return Some(format!(
+                        "`{arg}` glues `~` to a short flag; name the path inside the worktree"
+                    ));
+                }
                 values.push(glued);
                 values.extend(rest.split_once('=').map(|(_, v)| v));
                 // A cluster such as `-xf.git` can hide a dot name after its flag letters: each
@@ -1153,11 +1214,27 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
                         .filter(|&(_, c)| c == '.')
                         .map(|(at, _)| &glued[at..]),
                 );
+                // So can a protected name without a dot (`-xfclippy.toml`) or its Windows 8.3
+                // short name (`-xfGIT~1`): every suffix is checked as a name.
+                values.extend(
+                    glued
+                        .char_indices()
+                        .skip(1)
+                        .map(|(at, _)| &glued[at..])
+                        .filter(|s| is_protected_word(s.split('=').next().unwrap_or(s))),
+                );
             }
             None => values.push(arg),
         }
         for value in values {
-            if !(value.contains(['/', '\\']) || value.starts_with('.') || has_drive(value)) {
+            let protected = value
+                .split(['/', '\\'])
+                .any(|part| is_protected_word(part.split('=').next().unwrap_or(part)));
+            if !(protected
+                || value.contains(['/', '\\'])
+                || value.starts_with('.')
+                || has_drive(value))
+            {
                 continue;
             }
             if let Some(why) = crate::platform::path_problem(value, false) {
@@ -1710,8 +1787,18 @@ mod program_tests {
             "npm test -o=.git",
             "npm test -Dx=.github",
             "npm test -xf.git",
-            "npm test -xo.claude/settings.json",
+            "npm test -xo.claude",
             "npm test -o~",
+            "npm test -xfclippy.toml",
+            "npm test -xfrustfmt.toml",
+            "npm test -xfrust-toolchain",
+            "npm test rustfmt.toml",
+            "npm test rust-toolchain.toml",
+            "npm test -xf~",
+            "npm test -xf~user",
+            "npm test GIT~1",
+            "npm test -xfGIT~1",
+            "npm test GIT~1/config",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -1722,6 +1809,8 @@ mod program_tests {
         let ok = |c: &str| assert_eq!(bash_as(&["npm"], false, c), None, "{c}");
         ok("npm test -o./out.txt");
         ok("npm test -j4");
+        ok("npm test HEAD~1");
+        ok("npm test -xfHEAD~1");
         ok("npm test -C/h/.paja/envs/work-1/web");
         let why = bash_as(&["npm"], false, "npm test -Isrc/include").unwrap();
         assert!(why.contains("put a space between"), "{why}");
