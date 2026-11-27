@@ -549,8 +549,61 @@ impl Mcp {
     }
 }
 
-/// Every tool a plugin skill tells the agent to call (`Call `name``) is one `paja mcp` provides,
-/// and every skill has a description that says when to use it.
+/// The tools `text` names: each word in backticks after the word "call" (`Call `name``) or
+/// before the word "tool" (`the `name` tool`), and each backticked `family_name` whose family
+/// (the part before `_`) is one of `tools`' families, so a misspelt `work_lst` is caught
+/// however the sentence is put.
+fn named_tools(text: &str, tools: &[String]) -> Vec<String> {
+    let families: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.split_once('_'))
+        .map(|(f, _)| f)
+        .collect();
+    let mut named = Vec::new();
+    // Backticked spans alternate with the text between them.
+    let parts: Vec<&str> = text.split('`').collect();
+    for i in (1..parts.len()).step_by(2) {
+        let (before, word, after) = (
+            parts[i - 1],
+            parts[i],
+            parts.get(i + 1).copied().unwrap_or(""),
+        );
+        let called = before
+            .trim_end()
+            .rsplit(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("call"));
+        let tool_after = after
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .find(|w| !w.is_empty())
+            .is_some_and(|w| w == "tool")
+            && after.trim_start().starts_with("tool");
+        let family = word
+            .split_once('_')
+            .is_some_and(|(f, rest)| !rest.is_empty() && families.contains(&f));
+        if called || tool_after || family {
+            named.push(word.to_string());
+        }
+    }
+    named
+}
+
+#[test]
+fn named_tools_finds_every_way_a_skill_names_a_tool() {
+    let tools: Vec<String> = ["work_list", "work_sync", "doctor"]
+        .map(String::from)
+        .to_vec();
+    let text = "1. Call `work_list`. Then call `doktor`. Use the `status` tool. \
+                Read `work_lst` again. A small `note` and the `paja` MCP tools are no tools; \
+                nor is `pull_request` or `ok`.";
+    assert_eq!(
+        named_tools(text, &tools),
+        ["work_list", "doktor", "status", "work_lst"]
+    );
+}
+
+/// Every tool a plugin skill names (see [`named_tools`]) is one `paja mcp` provides, and every
+/// skill has a description that says when to use it.
 #[test]
 fn plugin_skills_name_only_tools_the_mcp_server_provides() {
     let tmp = tempfile::tempdir().unwrap();
@@ -578,11 +631,10 @@ fn plugin_skills_name_only_tools_the_mcp_server_provides() {
             "{} needs a description that says when to use it",
             file.display()
         );
-        for part in text.split("all `").skip(1) {
-            let name = part.split('`').next().unwrap();
+        for name in named_tools(&text, &names) {
             assert!(
-                names.iter().any(|n| n == name),
-                "{} calls `{name}`, which paja mcp doesn't provide: {names:?}",
+                names.iter().any(|n| n == &name),
+                "{} names the tool `{name}`, which paja mcp doesn't provide: {names:?}",
                 file.display()
             );
         }
