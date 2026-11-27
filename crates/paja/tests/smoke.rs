@@ -5977,9 +5977,10 @@ fn two_claims_racing_resolve_to_the_earlier_one() {
         log.contains("issue edit 5 --add-label factory-claimed"),
         "{log}"
     );
+    // The shared label stays: it marks the winner's claim now.
     assert!(
-        log.contains("issue edit 5 --remove-label factory-claimed"),
-        "{log}"
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "the winner's label is left on: {log}"
     );
     assert!(!log.contains("pr create"), "{log}");
     assert!(

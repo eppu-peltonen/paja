@@ -90,7 +90,8 @@ a home claims anything it records a random runner id (`runner.created`); the id 
 repository may be public. `paja run` claims an item by adding the label `<work label>-claimed` (`paja-claimed` for
 `paja`; created when the repository lacks it) and posting one comment, `Claimed by runner <id> at <UTC time>; stale
 after <time>`, six hours on. It then reads the issue again: if another runner's live claim comment is ahead of its
-own, that runner won, so the run takes its label and comment back off and tries the next item. When `gh` can't write
+own, that runner won, so the run deletes its own comment and tries the next item. The label stays: it is shared, and
+it now marks the winner's claim (taking it off would make the item look free until the winner's next renewal). When `gh` can't write
 the claim the item is not taken, and the run's error says why. Every sync reads the claimed label with the other
 labels, and for each issue that carries it the latest claim comment, and records what changed as `work.claim`
 (`runner`, `stale_after`; `runner` is null once the label is gone). An item whose label names another runner is

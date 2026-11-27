@@ -1415,8 +1415,9 @@ fn holder(view: &View, labels: &Labels) -> Option<Claim> {
 }
 
 /// Write this runner's claim on issue `number` and check that it won. None when it did; the
-/// holder when another runner's live claim comment came first, after taking this runner's label
-/// and comment back off.
+/// holder when another runner's live claim comment came first, after deleting this runner's
+/// comment. The claimed label stays then: it is shared, and the winner's live claim is what it
+/// now marks, so taking it off would make the item look free until the winner's next renewal.
 fn claim_on_github(
     ok: &Untampered,
     labels: &Labels,
@@ -1464,7 +1465,6 @@ fn claim_on_github(
     let Some(first) = first.filter(|c| c.runner != me) else {
         return Ok(None);
     };
-    let _ = remove_label(ok, number, &claimed);
     if let Some(id) = url
         .rsplit_once("issuecomment-")
         .and_then(|(_, id)| id.parse::<u64>().ok())
