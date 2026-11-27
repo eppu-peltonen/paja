@@ -315,12 +315,13 @@ line adds `--fallback-model` (left out where it is the role's own model), so a b
 naming a role this Paja doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's
 file keeps going, and `paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr
 would not. Posti tells of each skipped role once per repository (one `skipped_role` notice for the roles a pass finds
-new, each quoted, escaped and cut at 64 characters), so an unattended runner's person hears of it without running
-doctor. A notice that was tried counts, delivered or not, and Posti's lock for the repository, held from reading the log
-until the notice is recorded, keeps a pool's lanes starting together from each sending it. An unknown effort or a
-malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the
-`fallback` it was given; `fell_back: true` marks a step the fallback model spent something in (its name, or an alias
-such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role didn't run only on its model.
+new, each quoted and escaped, cut at 64 characters, ten at most and the rest counted), so an unattended runner's person
+hears of it without running doctor. A notice that was tried counts, delivered or not, and Posti's lock for the
+repository, held from reading the log until the notice is recorded, keeps a pool's lanes starting together from each
+sending it. An unknown effort or a malformed line stops the run with an error naming the line. Each recorded step names
+its `role` and `model`, and the `fallback` it was given; `fell_back: true` marks a step the fallback model spent
+something in (its name, or an alias such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role
+didn't run only on its model.
 
 Every session also gets `--max-turns`, from `max-turns <role> <turns>` lines in the same file (80 for `build` and
 `fix`, 30 for the reviews when a role has no line), so an agent going in circles can't spend the account's usage

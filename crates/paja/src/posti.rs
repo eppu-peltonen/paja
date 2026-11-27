@@ -88,26 +88,39 @@ impl Notice {
     }
 }
 
-/// The longest role word a notice shows; longer ones are cut, so a notice's arguments and push
-/// body stay small whatever main's file holds.
+/// The most characters a notice shows of one role, escaped, and the most roles it lists; the
+/// rest are counted. So a notice's arguments and push body stay small whatever main's file
+/// holds.
 const ROLE_SHOWN: usize = 64;
+const ROLES_SHOWN: usize = 10;
 
 /// A role as a notice shows it: quoted and escaped, as the run's warning shows it, so a
-/// control character in the file never reaches a terminal or a phone, and cut at `ROLE_SHOWN`
-/// characters.
+/// control character in the file never reaches a terminal or a phone, and cut after
+/// `ROLE_SHOWN` escaped characters, never inside one character's escape.
 fn shown_role(role: &str) -> String {
-    if role.chars().count() <= ROLE_SHOWN {
-        return format!("{role:?}");
+    let mut shown = String::new();
+    for c in role.chars() {
+        let escaped: String = c.escape_debug().collect();
+        if shown.chars().count() + escaped.chars().count() > ROLE_SHOWN {
+            return format!("\"{shown}\"…");
+        }
+        shown.push_str(&escaped);
     }
-    let cut: String = role.chars().take(ROLE_SHOWN).collect();
-    format!("{cut:?}…")
+    format!("\"{shown}\"")
 }
 
 impl Notice {
     /// `.paja/models` on `branch` names roles this Paja doesn't know, so their lines are
     /// skipped.
     pub fn skipped_roles(repo: &str, branch: &str, roles: &[String]) -> Self {
-        let shown: Vec<String> = roles.iter().map(|r| shown_role(r)).collect();
+        let mut shown: Vec<String> = roles
+            .iter()
+            .take(ROLES_SHOWN)
+            .map(|r| shown_role(r))
+            .collect();
+        if roles.len() > ROLES_SHOWN {
+            shown.push(format!("and {} more", roles.len() - ROLES_SHOWN));
+        }
         let (named, these) = if roles.len() == 1 {
             (format!("a line for role {}", shown[0]), "the role runs")
         } else {
@@ -431,6 +444,14 @@ mod tests {
         assert!(n.text.contains("x\"…"), "{}", n.text);
         assert!(n.text.len() < 400, "{}", n.text);
         assert_eq!(n.subject, Some(vec!["a".to_string(), long]));
+        // Escapes count toward the cut, and only so many roles are listed.
+        let escapes = "\u{1b}".repeat(500);
+        assert_eq!(shown_role(&escapes).chars().count(), 2 + 60 + 1);
+        let many: Vec<String> = (0..1000).map(|i| format!("{escapes}{i}")).collect();
+        let n = Notice::skipped_roles("acme/app", "main", &many);
+        assert!(n.text.len() < 1500, "{}", n.text.len());
+        assert!(n.text.contains("and 990 more"), "{}", n.text);
+        assert_eq!(n.subject.map(|s| s.len()), Some(1000));
     }
 
     #[test]
