@@ -52,8 +52,13 @@ brackets become `‹` and `›`, so it can't open or close one of the prompt's t
 
 Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. A duplicate's
 original also gets a comment naming the closed issue, so if the original is later closed without being done, the
-duplicate's finding can be found and reopened. "Not worth doing"
-is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
+duplicate's finding can be found and reopened. If that note fails, the item stays closed with the note's failure as its
+`error`, the pass records it in `triage.ran` as `note_failed`, and the next pass tries it again (`retried_notes` in the
+report). Retries run before the agent and are recorded at once as `triage.notes` (`noted`, `note_failed`), so a pass
+whose agent fails still makes them and never posts them twice; a failed retry is also written to stderr. A duplicate
+closed again in a pass that retries its note gets no second note. After three passes fail the same note, Paja gives up
+on it, and the last failure's error says to add the comment by hand. "Not worth doing" is never closed: the report lists
+it, and the person decides. An issue that also has the work label is a work item and
 is left out.
 
 The agent reads the default branch only, in a checkout made from it for the pass, under the deny-list hook with
@@ -69,7 +74,8 @@ paths use `/` whichever way the agent wrote them. A link to one of the repositor
 (`.../<owner>/<name>/blob/<ref>/<path>`) names that path; any other link names nothing. Otherwise the issue is kept. Each issue reaches the agent with when
 it was opened. Issue text reaches the agent as data to judge.
 
-`--json` prints `{repo, base, items, closed, not_worth_doing}`; each item has its `verdict`, `reason`, `duplicate_of` or
+`--json` prints `{repo, base, items, closed, not_worth_doing}`, and `retried_notes` when a pass tried earlier notes
+again; each item has its `verdict`, `reason`, `duplicate_of` or
 `evidence` when it has one, and `closed` (or the `error` that stopped a close). Each pass is recorded as `triage.ran`
 with what was closed, kept and left for the person.
 
