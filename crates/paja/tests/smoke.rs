@@ -1317,7 +1317,8 @@ fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
              *\"--label factory-follow-up \"*) echo '[{{\"number\": 2, \"title\": \"Tidy\", \"body\": \"\", \"url\": \"https://example.com/2\"}}]' ;; \
              *\"--label factory \"*) echo '[{{\"number\": 4, \"title\": \"Build\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; \
              *) echo '[]' ;; esac ;;\n\
-             \"api \"*) if [ -f {d}/closed-on-github ]; then echo closed; fi ;;\n\
+             \"api \"*) case \"$2\" in *events) if [ -f {d}/reopened-on-github ]; then cat {d}/reopened-on-github; fi ;; \
+             *) if [ -f {d}/closed-on-github ]; then echo closed; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
     )
@@ -1429,6 +1430,78 @@ fn a_landed_follow_up_github_closed_while_follow_ups_were_off_is_queued_when_it_
     assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
     let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
     assert_eq!(item["status"], "queued", "{item}");
+}
+
+#[test]
+fn a_landed_follow_up_github_reopened_while_hidden_by_follow_ups_off_is_queued_when_they_come_back()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let queue = |text: &str| {
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/queue"), text).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "queue"]);
+    };
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (_, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert_eq!(set["status"], "landed", "{set}");
+    // Follow-ups go off while #2 is still open on GitHub: the rule hides it.
+    queue("follow-ups = off\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
+    // Meanwhile GitHub closes #2 and reopens it (a revert, say); follow-ups come back on.
+    std::fs::write(
+        tmp.path().join("reopened-on-github"),
+        "2020-01-01T00:00:00Z\n2099-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    queue("follow-ups = on\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["status"], "queued", "{item}");
+    // It was asked about once; the next sync doesn't ask again.
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert_eq!(log.matches("issues/2/events").count(), 1, "{log}");
+    let (ok, _) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok);
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert_eq!(log.matches("issues/2/events").count(), 1, "{log}");
+}
+
+#[test]
+fn a_follow_up_hidden_by_follow_ups_off_and_reopened_only_before_stays_landed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let queue = |text: &str| {
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/queue"), text).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "queue"]);
+    };
+    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    queue("follow-ups = off\n");
+    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    // GitHub's only reopen of #2 is older than the hiding.
+    std::fs::write(
+        tmp.path().join("reopened-on-github"),
+        "2020-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    queue("follow-ups = on\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["status"], "landed", "{item}");
 }
 
 #[test]
