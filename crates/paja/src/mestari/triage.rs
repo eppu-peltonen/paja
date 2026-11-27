@@ -590,6 +590,20 @@ fn closing_comment(item: &Triaged, repo: &Path) -> String {
 
 /// The comment a duplicate's original gets, so the duplicate's finding isn't lost if the
 /// original is later closed without being done.
+/// Whether issue `on` already has a comment noting duplicate `number`, in either form a pass
+/// writes (`**Paja triage closed #<n> (title) as ...` or `**Paja triage closed #<n> as ...`).
+/// A listing `gh` can't give counts as no: the note is posted, as before.
+fn already_noted(repo: &Path, on: u64, number: u64) -> bool {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{on}/comments");
+    let Ok(bodies) = run_gh(repo, &["api", &path, "--paginate", "--jq", ".[].body"]) else {
+        return false;
+    };
+    let start = format!("**Paja triage closed #{number} ");
+    bodies
+        .lines()
+        .any(|line| line.starts_with(&start) && line.contains("as a duplicate of this issue.**"))
+}
+
 fn duplicate_note(item: &Triaged, repo: &Path) -> String {
     let text = format!(
         "**Paja triage closed #{n} ({title}) as a duplicate of this issue.**\n\n{reason}\n\nIf \
@@ -684,11 +698,17 @@ fn triage_holding(
             ),
             &repo,
         );
-        let error = run_gh(
-            &repo,
-            &["issue", "comment", &on.to_string(), "--body", &note],
-        )
-        .err()
+        // A post that went through while `gh` still failed (a dropped connection after the
+        // write, say) is on the original already: record it as noted rather than post it again.
+        let error = if already_noted(&repo, on, number) {
+            None
+        } else {
+            run_gh(
+                &repo,
+                &["issue", "comment", &on.to_string(), "--body", &note],
+            )
+            .err()
+        }
         .map(|err| {
             // This try is the last: say so, so the person adds the note by hand.
             if tries + 1 >= MAX_NOTE_TRIES {

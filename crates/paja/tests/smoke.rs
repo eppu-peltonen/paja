@@ -4887,7 +4887,9 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"workflow list\") echo 'CI	active	1' ;;\n\
              \"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/followups.json ;; *) echo '[]' ;; esac ;;\n\
-             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi ;;\n\
+             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi; \
+             if [ -f {d}/comment-posts-then-fails ]; then shift 3; echo \"$2\" >> {d}/posted; echo 'connection reset' >&2; exit 1; fi ;;\n\
+             \"api \"*) case \"$2\" in *comments) if [ -f {d}/posted ]; then cat {d}/posted; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
     );
@@ -5325,6 +5327,54 @@ fn a_duplicate_note_that_fails_is_reported_and_tried_again_next_pass() {
     // A pass after that has nothing left to retry.
     let (_, report) = triage(&f, &dir);
     assert!(report.get("retried_notes").is_none(), "{report}");
+}
+
+#[test]
+fn a_duplicate_note_github_took_though_gh_failed_is_not_posted_again() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // GitHub takes the note on #11, but gh exits non-zero, so the pass records it as failed.
+    std::fs::write(dir.join("comment-posts-then-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran[0]["data"]["note_failed"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{ran:?}"
+    );
+    let posted = std::fs::read_to_string(dir.join("posted")).unwrap();
+    assert!(posted.starts_with("**Paja triage closed #12 ("), "{posted}");
+    // The next pass finds the note on #11 and records it as noted without posting it again.
+    std::fs::remove_file(dir.join("comment-posts-then-fails")).unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(
+        report["retried_notes"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issues/11/comments"), "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        1,
+        "{log}"
+    );
+    let notes = events_of(&f, "triage.notes");
+    assert_eq!(
+        notes.last().unwrap()["data"]["noted"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{notes:?}"
+    );
 }
 
 #[test]

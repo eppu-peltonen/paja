@@ -58,7 +58,8 @@ duplicate's finding can be found and reopened. If that note fails, the item stay
 `error`, the pass records it in `triage.ran` as `note_failed`, and the next pass tries it again (`retried_notes` in the
 report). Retries run before the agent and are recorded at once as `triage.notes` (`noted`, `note_failed`), so a pass
 whose agent fails still makes them and never posts them twice; a failed retry is also written to stderr. A duplicate
-closed again in a pass that retries its note gets no second note. After three passes fail the same note, Paja gives up
+closed again in a pass that retries its note gets no second note. Before a retry posts, it reads the original's
+comments: a note GitHub took while `gh` still failed is recorded as `noted`, not posted again. After three passes fail the same note, Paja gives up
 on it, and the last failure's error says to add the comment by hand. "Not worth doing" is never closed: the report lists
 it, and the person decides. An issue that also has the work label is a work item and
 is left out.
