@@ -149,6 +149,17 @@ pub struct Review {
     pub follow_ups: Vec<Finding>,
 }
 
+/// Say on stderr that a `.paja/models` line names a role this Paja doesn't know, and that the
+/// line is skipped. A warning, not an error: main may name a role a newer Paja added, and a
+/// runner whose binary is older should keep working rather than fail every pass.
+fn unknown_role(at: &str, role: &str) {
+    progress(&format!(
+        "{at}: unknown role {role:?}, so this line is skipped; this Paja knows {}. If the \
+         role is new, install the newer Paja; if it is a typo, fix the line",
+        ROLES.join(", ")
+    ));
+}
+
 /// The model, and optionally the effort, one role runs on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleModel {
@@ -167,8 +178,9 @@ pub struct Models {
 }
 
 impl Models {
-    /// Read the file's text. `#` starts a comment line. Anything else that isn't a known role
-    /// with a plain model name (and a known effort) is an error naming the line and the fix.
+    /// Read the file's text. `#` starts a comment line. A line naming a role this Paja doesn't
+    /// know is skipped with a warning on stderr. Anything else that isn't a plain model name
+    /// (and a known effort) is an error naming the line and the fix.
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
         Self::parse_on(text, "main")
@@ -208,11 +220,8 @@ impl Models {
                     bail!("{}: write it as `max-turns <role> <turns>`", at());
                 };
                 if !ROLES.contains(named) {
-                    bail!(
-                        "{}: unknown role {named:?}; use one of {}",
-                        at(),
-                        ROLES.join(", ")
-                    );
+                    unknown_role(&at(), named);
+                    continue;
                 }
                 if limit == 0 {
                     bail!("{}: a turn limit must be at least 1", at());
@@ -235,11 +244,8 @@ impl Models {
                 continue;
             }
             if !ROLES.contains(&role) {
-                bail!(
-                    "{}: unknown role {role:?}; use one of {} or fallback",
-                    at(),
-                    ROLES.join(", ")
-                );
+                unknown_role(&at(), role);
+                continue;
             }
             let (model, effort) = match rest {
                 [model] => (model, None),
@@ -2619,8 +2625,17 @@ mod tests {
         assert_eq!(capped.max_turns("review-2"), 7);
         assert_eq!(capped.max_turns("re-review"), 30);
         assert_eq!(Models::parse("").unwrap(), Models::default());
+        // A role this Paja doesn't know (one a newer Paja added, or a typo) is skipped, so a
+        // runner whose binary is behind main keeps going; the other lines still count.
+        let ahead =
+            Models::parse("reviewer opus\nbuild sonnet\nmax-turns builder 3\nmax-turns fix 9\n")
+                .unwrap();
+        assert_eq!(ahead.roles.keys().collect::<Vec<_>>(), ["build"]);
+        assert_eq!(ahead.max_turns.keys().collect::<Vec<_>>(), ["fix"]);
+        // Its model and effort are still checked: a skipped line can't hide a flag.
+        let err = format!("{:#}", Models::parse("newrole --x").unwrap_err());
+        assert!(err.contains("not a plain model or effort name"), "{err}");
         for (text, says) in [
-            ("reviewer opus", "line 1: \"reviewer opus\": unknown role"),
             ("build", "write it as `build <model> [effort]`"),
             (
                 "build sonnet high extra",
@@ -2635,7 +2650,6 @@ mod tests {
                 "max-turns build many",
                 "write it as `max-turns <role> <turns>`",
             ),
-            ("max-turns builder 3", "unknown role \"builder\""),
             ("max-turns build 0", "at least 1"),
             ("max-turns fix 3\nmax-turns fix 4", "named twice"),
             ("build $(x)", "not a plain model or effort name"),
