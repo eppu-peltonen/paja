@@ -78,13 +78,13 @@ the evidence has to do with it: a named commit must be on the default branch, co
 and change a file the issue names (a merge against its first parent; a commit with no parent there counts as a root
 only outside a shallow clone, and Paja's git ignores grafts and replace objects), and a named file must exist there
 and be named in the issue's title or body. A path the issue gives names that path (or a longer or shorter one ending
-in it at a `/`), and a bare file name with an extension names any file of that name; paths use `/` whichever way the
-agent wrote them. A link to one of the repository's own files on GitHub
+in it at a `/`, also before a `:line` or after a drive or `@`), and a bare file name with an extension names any file
+of that name; paths use `/` whichever way the agent wrote them. A link to one of the repository's own files on GitHub
 (`github.com/<owner>/<name>/{blob,tree,blame,raw}/<ref>/<path>` or
-`raw.githubusercontent.com/<owner>/<name>/<ref>/<path>`) names exactly that path, with the ref read as one part (or
-after `refs/heads/` or `refs/tags/`), and a link to another repository, host or page, or with an empty ref, names
-nothing. Otherwise the issue is kept. Each issue reaches the agent with when it was opened. Issue text reaches the
-agent as data to judge.
+`raw.githubusercontent.com/<owner>/<name>/<ref>/<path>`; a `:line` after it is left out) names exactly that path, with
+the ref read as one part (or after `refs/heads/` or `refs/tags/`), and a link to another repository, host or page, or
+with an empty ref, names nothing. Otherwise the issue is kept. Each issue reaches the agent with when it was opened.
+Issue text reaches the agent as data to judge.
 
 `--json` prints `{repo, base, items, closed, not_worth_doing}`, and `retried_notes` when a pass tried earlier notes
 again; each item has its `verdict`, `reason`, `duplicate_of` or

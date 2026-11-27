@@ -540,30 +540,44 @@ fn names_file(issue: &Open, file: &str) -> bool {
     // name (`a.rs%20old`) isn't read as another file.
     let words: Vec<&str> = text
         .split(|c: char| !(c.is_alphanumeric() || "/._-:@%".contains(c)))
-        .map(|word| word.trim_end_matches(['.', ':']).trim_start_matches("./"))
+        .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
         .filter(|word| !word.is_empty())
         .collect();
     // A link (`scheme://...`, or a GitHub host written without one) names exactly the file it
-    // links to in this repository, and nothing else.
+    // links to in this repository, and nothing else; a `:line` or `:line:column` after it, or a
+    // trailing `:`, is left out.
     let link = |word: &str| -> Option<String> {
-        if let Some(at) = word.find("//") {
-            return Some(word[at..].to_string());
+        let link = if let Some(at) = word.find("//") {
+            word[at..].to_string()
+        } else {
+            let host = word.split('/').next()?.to_ascii_lowercase();
+            let host = host.rsplit('@').next()?.split(':').next()?;
+            if !matches!(
+                host,
+                "github.com" | "www.github.com" | "raw.githubusercontent.com"
+            ) {
+                return None;
+            }
+            format!("//{word}")
+        };
+        let mut link = link.as_str();
+        while let Some((before, after)) = link.rsplit_once(':') {
+            if !after.chars().all(|c| c.is_ascii_digit()) {
+                break;
+            }
+            link = before;
         }
-        let host = word.split('/').next()?.to_ascii_lowercase();
-        let host = host.rsplit('@').next()?.split(':').next()?.to_string();
-        matches!(
-            host.as_str(),
-            "github.com" | "www.github.com" | "raw.githubusercontent.com"
-        )
-        .then(|| format!("//{word}"))
+        Some(link.to_string())
     };
-    let (links, words): (Vec<&str>, Vec<&str>) =
-        words.into_iter().partition(|word| link(word).is_some());
-    if links
-        .iter()
-        .filter_map(|word| link(word))
-        .any(|link| link_names(&link, &issue.repo, file))
-    {
+    let mut plain = Vec::new();
+    let mut linked = false;
+    for word in words {
+        match link(word) {
+            Some(to) => linked |= link_names(&to, &issue.repo, file),
+            None => plain.push(word),
+        }
+    }
+    if linked {
         return true;
     }
     // A path the issue gives is matched as a path: the same path, or one of the two ending in
@@ -572,9 +586,13 @@ fn names_file(issue: &Open, file: &str) -> bool {
     // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`).
     let suffix = |long: &str, short: &str| long.ends_with(&format!("/{short}"));
     let named_name = name.contains('.') && name.len() > 3;
-    words
+    // Outside a link, `:` and `@` split a word again, so `hook.rs:42`, `C:/.../hook.rs` and
+    // `@CLAUDE.md` name their file.
+    plain
         .into_iter()
-        .filter(|word| !word.contains(':') && !word.contains('@'))
+        .flat_map(|word| word.split([':', '@']))
+        .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
+        .filter(|word| !word.is_empty())
         .any(|word| {
             word == file
                 || (file.contains('/') && suffix(word, file))
@@ -1221,6 +1239,28 @@ mod tests {
     }
 
     #[test]
+    fn a_path_with_a_line_a_drive_or_an_at_sign_names_its_file() {
+        for body in [
+            "panics at crates/paja/src/hook.rs:42",
+            "--> crates/paja/src/hook.rs:12:5",
+            "In C:\\Projects\\paja\\crates\\paja\\src\\hook.rs it fails.",
+            "Read @crates/paja/src/hook.rs first.",
+            "See hook.rs: the check.",
+        ] {
+            let issue = Open {
+                number: 1,
+                title: "Fix the hook".into(),
+                body: body.into(),
+                labels: Vec::new(),
+                created_at: String::new(),
+                repo: "acme/app".into(),
+            };
+            assert!(names_file(&issue, "crates/paja/src/hook.rs"), "{body}");
+            assert!(!names_file(&issue, "crates/paja/src/mcp.rs"), "{body}");
+        }
+    }
+
+    #[test]
     fn a_link_to_a_file_of_this_repository_names_it_and_other_links_name_nothing() {
         let issue = Open {
             number: 3,
@@ -1255,6 +1295,9 @@ mod tests {
             "https://www.github.com/acme/app/blob/main/crates/paja/src/hook.rs",
             "https://raw.githubusercontent.com/acme/app/refs/heads/main/crates/paja/src/hook.rs",
             "https://github.com/acme/app/blob/refs/tags/v1/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs:12",
+            "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs:12:5",
+            "Fix https://github.com/acme/app/blob/main/crates/paja/src/hook.rs: it fails.",
         ] {
             assert!(
                 names_file(&linked(body), "crates/paja/src/hook.rs"),
@@ -1283,6 +1326,8 @@ mod tests {
         // scheme name nothing; this repository's link without a scheme or with a port does.
         for body in [
             "https://github.com/acme/app/blob//crates/paja/src/hook.rs",
+            "https://github.com/acme/app//blob/main/crates/paja/src/hook.rs",
+            "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs:12/x",
             "https://github.com/acme/app/blob/main/crates/paja/src/hook.rs%20old",
             "https://u@github.com/other/repo/blob/main/crates/paja/src/hook.rs",
             "https://github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
