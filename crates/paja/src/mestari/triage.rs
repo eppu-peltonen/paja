@@ -73,6 +73,10 @@ pub struct Triaged {
     /// Why a close that should have happened didn't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether the note on the original of a closed duplicate failed, so the next pass tries
+    /// it again. Only that failure: another error on the item never makes a note pending.
+    #[serde(skip)]
+    pub note_failed: bool,
 }
 
 /// What a triage pass found and did.
@@ -365,6 +369,7 @@ fn decide(
             reason: String::new(),
             closed: false,
             error: None,
+            note_failed: false,
         };
         let Some(said) = said else {
             done.reason = "the triage agent said nothing about it".into();
@@ -707,22 +712,25 @@ fn link_names(link: &str, repo: &str, file: &str) -> bool {
 }
 
 /// The comment that closes an issue: the reason, the evidence, and how to undo it.
-fn closing_comment(item: &Triaged, repo: &Path) -> String {
+fn closing_comment(item: &Triaged, repo: &Path, factory_home: &Path) -> String {
+    let public = |text: &str| {
+        follow_ups::redact_for_comment(text, repo, factory_home, follow_ups::QUOTED_CHARS)
+    };
     let what = match (item.verdict, item.duplicate_of) {
         (Verdict::Duplicate, Some(of)) => format!("a duplicate of #{of}"),
         _ => "already fixed on the default branch".to_string(),
     };
     let mut text = format!(
         "**Paja triage closed this issue as {what}.**\n\n{}",
-        item.reason
+        public(&item.reason)
     );
     if let Some(evidence) = &item.evidence {
-        text.push_str(&format!("\n\nEvidence: {evidence}"));
+        text.push_str(&format!("\n\nEvidence: {}", public(evidence)));
     }
     text.push_str(
         "\n\nIf this is wrong, reopen the issue; the next triage pass will read it again.",
     );
-    follow_ups::redact_for_issue(&text, repo)
+    text
 }
 
 /// The account `gh` comments as, if it can name one that is safe to quote in a jq program (a
@@ -786,15 +794,17 @@ fn noted_in(first_lines: &str, number: u64) -> bool {
 
 /// The comment a duplicate's original gets, so the duplicate's finding isn't lost if the
 /// original is later closed without being done.
-fn duplicate_note(item: &Triaged, repo: &Path) -> String {
-    let text = format!(
+fn duplicate_note(item: &Triaged, repo: &Path, factory_home: &Path) -> String {
+    let public = |text: &str| {
+        follow_ups::redact_for_comment(text, repo, factory_home, follow_ups::QUOTED_CHARS)
+    };
+    format!(
         "**Paja triage closed #{n} ({title}) as a duplicate of this issue.**\n\n{reason}\n\nIf \
          this issue is closed without being done, reopen #{n} so its finding isn't lost.",
         n = item.number,
-        title = item.title,
-        reason = item.reason
-    );
-    follow_ups::redact_for_issue(&text, repo)
+        title = public(&item.title),
+        reason = public(&item.reason)
+    )
 }
 
 /// Sort the repository's open follow-up issues, close the duplicates and the already-fixed ones,
@@ -879,23 +889,17 @@ fn triage_holding(
         commenter(&repo)
     };
     for (number, on, tries) in pending {
-        let note = follow_ups::redact_for_issue(
-            &format!(
-                "**Paja triage closed #{number} as a duplicate of this issue.**\n\nIf this issue \
-                 is closed without being done, reopen #{number} so its finding isn't lost."
-            ),
-            &repo,
+        // Only issue numbers: nothing an agent wrote, so nothing to redact.
+        let note = format!(
+            "**Paja triage closed #{number} as a duplicate of this issue.**\n\nIf this issue is \
+             closed without being done, reopen #{number} so its finding isn't lost."
         );
         // A post that went through while `gh` still failed (a dropped connection after the
         // write, say) is on the original already: record it as noted rather than post it again.
         let error = if already_noted(&repo, login.as_deref(), on, number) {
             None
         } else {
-            run_gh(
-                &repo,
-                &["issue", "comment", &on.to_string(), "--body", &note],
-            )
-            .err()
+            follow_ups::comment_on_issue(home, &repo, on, &note).err()
         }
         .map(|err| {
             // This try is the last: say so, so the person adds the note by hand.
@@ -950,19 +954,28 @@ fn triage_holding(
         .iter_mut()
         .filter(|i| matches!(i.verdict, Verdict::Duplicate | Verdict::AlreadyFixed))
     {
-        let body = closing_comment(item, &repo);
-        match run_gh(
-            &repo,
-            &[
-                "issue",
-                "close",
-                &item.number.to_string(),
-                "--comment",
-                &body,
-            ],
-        ) {
-            Ok(_) => item.closed = true,
-            Err(err) => item.error = Some(format!("{err:#}")),
+        // The reason first, posted from a file (`gh issue close` takes a comment only on the
+        // command line, which a long reason would not fit on Windows), then the close: an
+        // issue is never closed without saying why and how to undo it. If the reason can't be
+        // posted, the issue stays open for the next pass.
+        let body = closing_comment(item, &repo, home.root());
+        match follow_ups::comment_on_issue(home, &repo, item.number, &body) {
+            Err(err) => {
+                item.error = Some(format!(
+                    "saying why on #{} failed, so it was left open: {err:#}",
+                    item.number
+                ))
+            }
+            Ok(()) => match run_gh(&repo, &["issue", "close", &item.number.to_string()]) {
+                Ok(_) => item.closed = true,
+                Err(err) => {
+                    item.error = Some(format!(
+                        "the reason is on #{n}, but closing it failed: {err:#}; close #{n} by \
+                         hand",
+                        n = item.number
+                    ))
+                }
+            },
         }
         // The original carries the duplicate's finding from now on: if it is closed without
         // being done, its comments say which issue to reopen.
@@ -974,14 +987,16 @@ fn triage_holding(
                 .any(|n| (n.number, n.on) == (item.number, of))
         };
         if let (true, Some(of)) = (item.closed, item.duplicate_of.filter(|of| !retried(*of))) {
-            let note = duplicate_note(item, &repo);
-            if let Err(err) = run_gh(
-                &repo,
-                &["issue", "comment", &of.to_string(), "--body", &note],
-            ) {
-                item.error = Some(format!(
+            let note = duplicate_note(item, &repo, home.root());
+            if let Err(err) = follow_ups::comment_on_issue(home, &repo, of, &note) {
+                let noted = format!(
                     "closed, but noting it on #{of} failed: {err:#}; the next triage pass tries again"
-                ));
+                );
+                item.error = Some(match item.error.take() {
+                    Some(earlier) => format!("{earlier}; {noted}"),
+                    None => noted,
+                });
+                item.note_failed = true;
             }
         }
     }
@@ -1005,7 +1020,7 @@ fn triage_holding(
     let note_failed: Vec<Value> = report
         .items
         .iter()
-        .filter(|i| i.closed && i.error.is_some())
+        .filter(|i| i.closed && i.note_failed)
         .filter_map(|i| i.duplicate_of.map(|on| (i.number, on)))
         .map(|(number, on)| json!({ "number": number, "on": on }))
         .collect();
@@ -1226,6 +1241,38 @@ pub fn triage_if_due(home: &Home, repo: &Path) -> Result<Option<TriageReport>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_closing_comment_and_a_duplicate_note_are_made_public() {
+        let item = super::Triaged {
+            number: 12,
+            title: "Tidy @octocat's helper".into(),
+            verdict: super::Verdict::Duplicate,
+            duplicate_of: Some(11),
+            evidence: Some("/srv/paja-home/envs/x".into()),
+            reason: format!("Same as /work/app/a.rs, cc @octocat {}", "y".repeat(30_000)),
+            closed: false,
+            error: None,
+            note_failed: false,
+        };
+        let (repo, home) = (
+            std::path::Path::new("/work/app"),
+            std::path::Path::new("/srv/paja-home"),
+        );
+        for text in [
+            super::closing_comment(&item, repo, home),
+            super::duplicate_note(&item, repo, home),
+        ] {
+            assert!(
+                !text.contains("/work/app") && !text.contains("/srv/paja-home"),
+                "{text}"
+            );
+            assert!(!text.contains("@octocat"), "{text}");
+            assert!(text.contains("(cut short)"), "not cut");
+            // The way back survives the cut.
+            assert!(text.contains("reopen"), "{text}");
+        }
+    }
+
     use super::*;
 
     fn open(numbers: &[u64]) -> Vec<Open> {

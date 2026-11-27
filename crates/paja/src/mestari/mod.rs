@@ -42,6 +42,7 @@ use follow_ups::*;
 use land::*;
 use usage::*;
 
+pub(crate) use follow_ups::{body_file, redact_for_comment, QUOTED_CHARS};
 pub use progress::progress;
 use progress::*;
 pub use usage::{ModelUsage, StepUsage};
@@ -711,7 +712,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 )?;
                 return Err(err);
             }
-            let asked = comment(&repo, &item, &question);
+            let asked = comment(home, &repo, &item, &question);
             tell(home, &repo, &item);
             progress(&parked_line(
                 &format!("#{} stopped on an error and was parked", item.number),
@@ -1102,6 +1103,12 @@ fn run_item(
                      issue needs, avoid long explorations, commit what works, and keep outputs \
                      short (pipe long ones through `tail` or `grep`)."
                 );
+                // A merge it was finishing still has conflicts: name them, or the next round
+                // starts without knowing. One resolved but not committed is committed with the
+                // next round's leftovers.
+                if let Some(merge) = unfinished_merge(&env, &target.branch)? {
+                    feedback.push_str(&format!("\n\n{merge}"));
+                }
                 if let Some(p) = &prior {
                     feedback.push_str(&format!(
                         "\n\nThe review's blockers still need fixing too:\n\n{}",
@@ -1138,19 +1145,8 @@ fn run_item(
         }
         // A merge Paja handed over must be finished, not committed with its conflicts. It stays
         // in progress, so the next round sees the files that still conflict.
-        let left = if merging(&env.path) {
-            unmerged(&env.path)?
-        } else {
-            Vec::new()
-        };
-        if !left.is_empty() {
-            feedback = format!(
-                "The merge of {} isn't finished: these files still have conflicts: {}. Resolve \
-                 each one, keeping what both sides meant, then `git add` the files and \
-                 `git commit -m '<message>'` to finish the merge.",
-                target.branch,
-                left.join(", ")
-            );
+        if let Some(merge) = unfinished_merge(&env, &target.branch)? {
+            feedback = merge;
             if let Some(p) = &prior {
                 feedback.push_str(&format!(
                     "\n\nThe review's blockers still need fixing too:\n\n{}",
@@ -2940,6 +2936,23 @@ fn conflict_feedback(branch: &str, files: &[String], prior: Option<&Prior>) -> S
         ));
     }
     feedback
+}
+
+/// What the builder is told about a merge of `branch` still in progress in the environment with
+/// files that conflict, or None when there is no such merge.
+fn unfinished_merge(env: &Env, branch: &str) -> Result<Option<String>> {
+    if !merging(&env.path) {
+        return Ok(None);
+    }
+    let left = unmerged(&env.path)?;
+    Ok((!left.is_empty()).then(|| {
+        format!(
+            "The merge of {branch} isn't finished: these files still have conflicts: {}. Resolve \
+             each one, keeping what both sides meant, then `git add` the files and \
+             `git commit -m '<message>'` to finish the merge.",
+            left.join(", ")
+        )
+    }))
 }
 
 /// Whether a merge is in progress in `dir`.

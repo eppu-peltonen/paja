@@ -144,7 +144,7 @@ a sync judges it. A sync that reads its full limit of issues refuses to close an
 not see.
 
 `paja work answer <issue> <text>` records a person's answer to an escalated item (`work.answered`, with the question it
-answers) and queues the item again under the home lock, then posts the answer as a comment on the issue. Each item
+answers) and queues the item again under the home lock, then posts the answer as a comment on the issue, made public like Paja's own comments: paths and tokens hidden, mentions made inert (an agent can write the answer too), and cut to fit. The log keeps the answer as given. Each item
 keeps its `answers`, and every later run passes them to the builder and the reviewers, since agents can't read the
 issue's comments; a reply on the issue alone doesn't reach them, and Paja's question on the issue says so. For the
 same reason `paja work set <issue> queued` refuses an escalated item and points at `paja work answer`; it is the only
@@ -326,9 +326,9 @@ didn't run only on its model.
 Every session also gets `--max-turns`, from `max-turns <role> <turns>` lines in the same file (80 for `build` and
 `fix`, 30 for the reviews when a role has no line), so an agent going in circles can't spend the account's usage
 window. A session that stops at its limit fails the round with a note (`turn_limit`, "the builder hit the turn limit
-of 80") and its spend is still recorded. The builder's next round is told to finish smaller. A reviewer that hits the
-limit first runs once more in the same round, in a fresh session told to stay focused, and the other reviewer's
-finished verdict is kept. If it hits the limit again, its worktree is put back as after any review, the round fails and
+of 80") and its spend is still recorded. The builder's next round is told to finish smaller, and about a merge it
+left with conflicts, if there is one. A reviewer that hits the limit first runs once more in the same round, in a fresh
+session told to stay focused, and the other reviewer's finished verdict is kept. If it hits the limit again, its worktree is put back as after any review, the round fails and
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
 
@@ -372,7 +372,7 @@ default branch moved on meanwhile (GitHub runs none on a conflicting pull reques
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
 otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
 setting to change. On `escalate`, five failed rounds or
-an error it can't fix, it comments on the issue with the question (redacted like a follow-up) and marks the item escalated; the branch
+an error it can't fix, it comments on the issue with the question (redacted like a follow-up: the factory home, repository and home folder named, tokens hidden, mentions made inert, code fences made plain text so the frame after a quote never renders as code) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
 `run.escalated`, plus a `run.follow_up` (`error` `not filed: ...`, never an issue) for each review finding the change landed without. Before an escalation Mestari's arbiter
@@ -469,17 +469,22 @@ recommended.
   (`RUST_LOG='debug'`): bash runs a word with a quote before its `=` as a program, so the hook refuses it and says to
   quote only the value. A value with a `~` is refused, since bash expands it after the `=` or a `:`.
 - **Listed programs.** `.paja/commands`, read from the default branch like `.paja/checks` and never from the branch
-  under review, names the programs agents may run besides local `git`: one per line, `#` comments allowed (`npm`, `node`,
-  `pytest`, `go`). A line `review <program>` lets reviewers run it too; the other lines are for the builder (build and fix
-  roles) only. A missing file lists `cargo` for every role, so a repository without one behaves as before. Mestari reads
-  the file and passes the role's list as `--programs` (comma-terminated, `,` for none); a file it can't read or parse
-  stops the agent, and a hook started without the list blocks every call. A listed program runs under the shape rules
-  above and the generic checks: it must start in the worktree, and any word that names a path (also after `--flag=`
-  or glued to a short flag, as in `-o./out`) must stay inside it and obey the write rules; a short-flag cluster with a
-  path inside it (`-xvf/tmp/a`, `-xC..`) or a `~` glued to the flag is refused, with the fix of putting a space before
-  the value, and each dot name inside a cluster (`.git` in `-xf.git`) is checked like a path. A program not
-  on the list is refused with a message naming `.paja/commands` on the default branch as the fix. Only `cargo` and
-  `git` have per-subcommand flag lists.
+  under review, names the programs agents may run besides local `git`: one per line, `#` comments allowed (`npm`,
+  `node`, `pytest`, `go`). A line `review <program>` lets reviewers run it too; the other lines are for the builder
+  (build and fix roles) only. A missing file lists `cargo` for every role, so a repository without one behaves as
+  before. Mestari reads the file and passes the role's list as `--programs` (comma-terminated, `,` for none); a file it
+  can't read or parse stops the agent, and a hook started without the list blocks every call. A listed program runs
+  under the shape rules above and the generic checks: it must start in the worktree, and any word that names a path
+  (also after `--flag=` or glued to a short flag, as in `-o./out`) must stay inside it and obey the write rules; a
+  short-flag cluster with a path inside it (`-xvf/tmp/a`, `-xC..`, `-x.C/tmp/a`: a glued `.` starts a path only as `.`,
+  `..`, `./` or `../` (or with `\`)), a letter before a `:` (a drive, as in `-xfC:x`; `-p8080:80` is fine,
+  `-plocalhost:80` needs a space) or a `~` glued to the flag is refused, with the fix of putting a space before the
+  value, and each dot name inside a cluster (`.git` in `-xf.git`) is checked like a path, as is what follows any `=`
+  (`out=/tmp/x`, `out=clippy.toml`). Protected names compare in Unicode's upper case, as NTFS folds them
+  (`ruſtfmt.toml`), without trailing dots and spaces or a `:` stream (`clippy.toml.`, `clippy.toml::$DATA`). Windows 8.3
+  short names of protected names count too, also the hashed form NTFS falls back to (`GI3F2A~1`, `GI3F2~10`: two
+  letters, then hex digits, eight characters with the counter). A program not on the list is refused with a message
+  naming `.paja/commands` on the default branch as the fix. Only `cargo` and `git` have per-subcommand flag lists.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first
@@ -487,10 +492,11 @@ recommended.
   checkout shares. Its revisions and paths must stay inside the worktree. `cargo fmt` takes options only with
   `--check`, since `--all` and `-p` can reach path dependencies outside the worktree.
 - **Writes** stay in the environment: file edits and git's paths must resolve inside the root, with symlinks followed,
-  and never into a `.git`, `.cargo`, `.github` or `.claude` directory, a `rust-toolchain` or `.gitattributes` file or
-  a rustfmt or clippy configuration file at any depth, in any letter case (reading them is fine). A file tool path may
-  not hold `..`. `git rm` takes plain files only, and `git commit` needs `-m`. These rules cover paths an agent names;
-  a file its code writes can still be staged by `git add -A`, and then makes the change high risk.
+  and never into a `.git`, `.cargo`, `.github` or `.claude` directory, a `rust-toolchain` or `.gitattributes` file or a
+  rustfmt or clippy configuration file at any depth, in any letter case, Unicode's included, and on every platform also
+  as Windows would open them: with trailing dots or spaces, a `:` stream, or an 8.3 short name (reading them is fine). A
+  file tool path may not hold `..`. `git rm` takes plain files only, and `git commit` needs `-m`. These rules cover
+  paths an agent names; a file its code writes can still be staged by `git add -A`, and then makes the change high risk.
 - **Reads** of single files outside the worktree are limited to `/usr` and dependency sources (`$CARGO_HOME/registry`,
   `$CARGO_HOME/git` and `$RUSTUP_HOME`, from the hook's own environment); never `/proc`, `/sys`, `/dev`, other hidden
   directories or the factory home. Searches (`Glob`, `Grep`, `LS`) recurse, so they stay inside the worktree, symlinks
