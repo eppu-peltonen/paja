@@ -25,8 +25,9 @@ pub struct Plan {
     pub error: Option<String>,
 }
 
-/// The paths a spec's `Touches:` line names, comma- or space-separated, quotes and backticks
-/// dropped. None without such a line.
+/// The paths a spec's `Touches:` line names, comma- or space-separated, quotes, backticks and
+/// trailing punctuation dropped, and the words `and`, `or`, `none` and `nothing` skipped. None
+/// without such a line, or when it names no path.
 pub fn touches_line(body: &str) -> Option<Vec<String>> {
     let line = body.lines().find_map(|line| {
         let line = line.trim().trim_start_matches(['-', '*', ' ']);
@@ -38,25 +39,61 @@ pub fn touches_line(body: &str) -> Option<Vec<String>> {
     })?;
     let paths: Vec<String> = line
         .split([',', ' ', '\t'])
-        .map(|p| clean(p.trim_matches(['`', '"', '\'', '*'])))
-        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let p = p.trim_matches(['`', '"', '\'', '*', '(', ')', ';', ':']);
+            // A sentence's full stop, but not `.` itself (the whole repository).
+            if p.len() > 1 && p.ends_with('.') && !p.ends_with("..") {
+                &p[..p.len() - 1]
+            } else {
+                p
+            }
+        })
+        .map(|p| p.trim_matches(['`', '"', '\'', '*', '(', ')', ';', ':']))
+        .filter(|p| {
+            !p.is_empty()
+                && !["and", "or", "&", "+", "none", "nothing"]
+                    .iter()
+                    .any(|word| p.eq_ignore_ascii_case(word))
+        })
+        .map(clean)
         .collect();
     (!paths.is_empty()).then_some(paths)
 }
 
-/// A path as plans compare it: `/`-separated, no leading `./` or `/`.
+/// The path plans use for the whole repository, which overlaps every other.
+pub const WHOLE: &str = "./";
+
+/// A path as plans compare it: `/`-separated, no leading `/`, no empty or `.` parts, and a
+/// trailing `/` kept for a directory. `.`, and any path with a `..` part (which could leave
+/// the directory it names), is the whole repository ([`WHOLE`]).
 fn clean(path: &str) -> String {
     let path = path.trim().replace('\\', "/");
-    let path = path.trim_start_matches("./").trim_start_matches('/');
-    path.to_string()
+    if path.is_empty() {
+        return String::new();
+    }
+    let dir = path.ends_with('/');
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return WHOLE.to_string();
+    }
+    let mut clean = parts.join("/");
+    if dir {
+        clean.push('/');
+    }
+    clean
 }
 
 /// Whether two paths overlap: the same file, or one a directory holding the other.
 pub fn overlap(a: &str, b: &str) -> bool {
+    let whole = |p: &str| p.trim_end_matches('/').trim_end_matches('.').is_empty();
+    if whole(a) || whole(b) {
+        return true;
+    }
     let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
     a == b
-        || a.is_empty()
-        || b.is_empty()
         || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
         || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
 }
@@ -281,6 +318,28 @@ mod tests {
         );
         assert_eq!(touches_line("Nothing here.\nTouches:"), None);
         assert_eq!(touches_line("It touches: nothing"), None);
+        // Words and punctuation of a sentence aren't paths.
+        assert_eq!(
+            touches_line("Touches: src/a.rs and docs/ (maybe src/b.rs)."),
+            Some(vec![
+                "src/a.rs".into(),
+                "docs/".into(),
+                "maybe".into(),
+                "src/b.rs".into()
+            ])
+        );
+        assert_eq!(touches_line("Touches: none"), None);
+        assert_eq!(touches_line("Touches: `.`"), Some(vec![WHOLE.into()]));
+    }
+
+    #[test]
+    fn a_path_is_cleaned_and_one_leaving_its_folder_is_everything() {
+        assert_eq!(clean("./src//a/./b.rs"), "src/a/b.rs");
+        assert_eq!(clean("\\docs\\"), "docs/");
+        assert_eq!(clean("src/../../etc"), WHOLE);
+        assert_eq!(clean("."), WHOLE);
+        assert!(overlap(WHOLE, "src/a.rs"));
+        assert!(overlap("docs/x.md", WHOLE));
     }
 
     #[test]
