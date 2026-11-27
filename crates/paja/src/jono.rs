@@ -1555,39 +1555,102 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
     Ok(())
 }
 
-/// Take the claimed label off `number`'s issue, so any runner may take the item. A failure is
-/// reported on stderr and nothing more, since the item's status is already recorded.
+/// Whose live claim comments freeing an item deletes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freeing {
+    /// Every runner's: the person put the item back (`paja work set N queued`), which overrides
+    /// whichever runner held it.
+    Every,
+    /// Only this runner's: a run gives back an item it claimed but won't build (the person
+    /// declined, or a gate put it back). Another runner's live claim stands, label included.
+    Own,
+}
+
+/// Take the claimed label off `number`'s issue and try to delete every live claim comment, so
+/// any runner may take the item: the person put it back. A failure is reported on stderr and
+/// nothing more, since the item's status is already recorded.
 pub fn release_claim(home: &Home, checkout: &Path, number: u64) {
+    free_claim(home, checkout, number, Freeing::Every);
+}
+
+/// Take this runner's own live claim comments off `number`'s issue, and the claimed label
+/// unless another runner's live claim is still there: a run gives back an item it claimed.
+/// A failure is reported on stderr and nothing more.
+pub fn release_own_claim(home: &Home, checkout: &Path, number: u64) {
+    free_claim(home, checkout, number, Freeing::Own);
+}
+
+/// What freeing does with an issue's live claim comments, oldest first: the ids to delete and
+/// the claim that stays, if any, which keeps the item that runner's, label included. With `me`
+/// None every claim goes. With `me`, this runner's own go, and so does every other runner's
+/// posted after its first one: those lost the race (the first live claim wins), and one left
+/// behind would win every later runner's race check while nobody builds the item. A claim
+/// posted before this runner's first stays; the latest of those holds the item.
+fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>) {
+    let first_mine = match me {
+        None => 0,
+        Some(me) => live
+            .iter()
+            .position(|c| c.runner == me)
+            .unwrap_or(live.len()),
+    };
+    let (ahead, rest) = live.split_at(first_mine);
+    let delete = rest.iter().filter_map(|c| c.id).collect();
+    let stays = ahead.last().map(|c| Claim {
+        runner: c.runner.clone(),
+        stale_after: Some(c.stale_after.clone()),
+    });
+    (delete, stays)
+}
+
+fn free_claim(home: &Home, checkout: &Path, number: u64, freeing: Freeing) {
+    use std::io::Write as _;
+    let mut failures = Vec::new();
     let result = (|| -> Result<()> {
         let ok = crate::ahjo::untampered(home, checkout)?;
         let labels = Labels::of_default_branch(&ok)?;
+        let me = match freeing {
+            Freeing::Every => None,
+            Freeing::Own => Some(runner_id(home)?),
+        };
         // Looked at first: the label may be gone already, or this repository may never have
         // had it, and removing a label that doesn't exist is an error.
         let view = view_issue(&ok, number)?;
         // The live claim comments go too: left behind, one would win every other runner's race
         // check until it went stale.
         let now = now_secs();
-        for comment in view.claims().into_iter().filter(|c| !c.is_stale(now)) {
-            if let Some(id) = comment.id {
-                let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
-                gh(&ok, &["api", "-X", "DELETE", &path])?;
+        let live: Vec<ClaimComment> = view
+            .claims()
+            .into_iter()
+            .filter(|c| !c.is_stale(now))
+            .collect();
+        let (delete, stays) = to_free(&live, me.as_deref());
+        for id in delete {
+            let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+            // Carry on past a delete that fails (another account's comment answers 403), so
+            // the label still comes off and the rest still go.
+            if let Err(err) = gh(&ok, &["api", "-X", "DELETE", &path]) {
+                failures.push(format!("deleting claim comment {id}: {err:#}"));
             }
         }
-        if view.has_label(&labels.claimed()) {
+        let name = name_of(&ok)?;
+        if stays.is_none() && view.has_label(&labels.claimed()) {
             remove_label(&ok, number, &labels.claimed())?;
         }
-        let name = name_of(&ok)?;
         let lock = home.lock()?;
         home.events()
-            .append(&lock, EV_CLAIM, claim_event(&name, number, None))?;
+            .append(&lock, EV_CLAIM, claim_event(&name, number, stays.as_ref()))?;
         Ok(())
     })();
     if let Err(err) = result {
-        use std::io::Write as _;
+        failures.push(format!("{err:#}"));
+    }
+    if !failures.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "paja: couldn't free #{number}'s claim on GitHub: {err:#}; remove its claimed label \
-             by hand so other runners can take it"
+            "paja: couldn't free #{number}'s claim on GitHub: {}; remove its claimed label and \
+             any live `Claimed by runner` comment by hand so other runners can take it",
+            failures.join("; ")
         );
     }
 }
@@ -2372,6 +2435,29 @@ mod tests {
         assert!(claim.is_stale(1_785_000_000 + CLAIM_SECS));
         assert!(parse_claim_comment("Claimed by someone", url).is_none());
         assert!(parse_claim_comment("hello", url).is_none());
+    }
+
+    #[test]
+    fn freeing_deletes_every_live_claim_or_only_this_runners() {
+        let comment = |runner: &str, id: u64| {
+            let url = format!("https://github.com/a/b/issues/5#issuecomment-{id}");
+            parse_claim_comment(&claim_text(runner, 1_785_000_000), &url).unwrap()
+        };
+        let live = [comment("bbbb", 1), comment("aaaa", 2), comment("cccc", 3)];
+        // The person put the item back: every claim goes, and nothing stays.
+        assert_eq!(to_free(&live, None), (vec![1, 2, 3], None));
+        // A run gives back its own: runner bbbb's earlier claim stays, and with it the label;
+        // cccc's later one lost the race to aaaa and goes with it.
+        let (delete, stays) = to_free(&live, Some("aaaa"));
+        assert_eq!(delete, vec![2, 3]);
+        assert_eq!(stays.unwrap().runner, "bbbb");
+        // With no earlier claim, nothing stays and the label comes off too.
+        let (delete, stays) = to_free(&live[1..], Some("aaaa"));
+        assert_eq!((delete, stays), (vec![2, 3], None));
+        // A runner with no live claim of its own deletes nothing; the latest claim holds.
+        let (delete, stays) = to_free(&live, Some("dddd"));
+        assert!(delete.is_empty());
+        assert_eq!(stays.unwrap().runner, "cccc");
     }
 
     #[test]

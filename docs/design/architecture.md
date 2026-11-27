@@ -96,12 +96,15 @@ labels, and for each issue that carries it the latest claim comment, and records
 (`runner`, `stale_after`; `runner` is null once the label is gone). An item whose label names another runner is
 skipped by `paja run` and by `paja run --workers` until that claim is stale; `paja work list|show` show the holder as
 `claim`, and `paja pool status` gives "claimed by runner <id> on GitHub" as why the item waits. A label with no claim
-comment (put there by hand) holds the item until a person removes it. A run renews its claim at each round by
-editing its claim comment's times (and putting the label back if it was taken off). `paja work set N queued`, and a
-run the person declines at the confirmation, delete the live claim comments and take the label off, so another runner
-can take the item at once; an escalated item keeps it, and its claim can't go
-stale while it carries the needs-answer label. `paja work answer` renews the claim, so the runner that escalated the
-item runs it next.
+comment (put there by hand) holds the item until a person removes it. A run renews its claim at each round by editing
+its claim comment's times (and putting the label back if it was taken off). `paja work set N queued` deletes every live
+claim comment, whichever runner wrote it, and takes the label off: the person put the item back, which overrides the
+holder. A run that gives back an item it claimed (the person declined at the confirmation, or a gate put it back)
+deletes its own runner's live claim comments and the later ones that lost the race to it, and takes the label off unless
+an earlier runner's live claim remains. Either way a claim comment GitHub refuses to delete (another account wrote it)
+doesn't stop the rest: the label still comes off (or stays, as above), and stderr names the comment to delete by hand.
+An escalated item keeps its claim, which can't go stale while it carries the needs-answer label. `paja work answer`
+renews the claim, so the runner that escalated the item runs it next.
 
 When no work item is ready, Jono takes follow-ups. A sync also imports the open issues with the follow-up label as items
 whose `priority` is `follow-up` (recorded in `work.imported` and `work.changed`; every other item has priority `work`).

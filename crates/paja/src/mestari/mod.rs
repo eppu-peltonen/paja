@@ -476,8 +476,9 @@ fn confirmed() -> Result<bool> {
 fn unclaim(home: &Home, repo: &Path, item: &WorkItem, resumed: bool) -> Result<()> {
     if !resumed {
         jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
-        // And off GitHub too, where other runners look.
-        jono::release_claim(home, repo, item.number);
+        // And off GitHub too, where other runners look: this runner's claim only, so another
+        // runner's live claim on the item stands.
+        jono::release_own_claim(home, repo, item.number);
     }
     Ok(())
 }
