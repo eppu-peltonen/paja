@@ -7832,6 +7832,103 @@ fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its
     assert!(!log.contains("app.git"), "{log}");
 }
 
+/// Run `program args` in `dir`; `None` when the program isn't installed.
+fn try_run(dir: &Path, program: &str, args: &[&str]) -> Option<std::process::Output> {
+    let program = if cfg!(windows) && matches!(program, "npm" | "npx") {
+        format!("{program}.cmd")
+    } else {
+        program.to_string()
+    };
+    Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()
+}
+
+#[test]
+fn init_new_node_and_python_skeletons_pass_their_own_checks_when_the_tools_are_installed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             \"repo create\") echo \"https://github.com/acme/$3\" ;;\n\
+             \"repo clone\") git clone -q {d}/origin-$(basename \"$3\").git \"$4\" ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let identity = [
+        ("GIT_AUTHOR_NAME", Path::new("test")),
+        ("GIT_AUTHOR_EMAIL", Path::new("test@example.com")),
+        ("GIT_COMMITTER_NAME", Path::new("test")),
+        ("GIT_COMMITTER_EMAIL", Path::new("test@example.com")),
+        ("PAJA_GH", gh.as_path()),
+    ];
+    for (name, stack) in [("nodecheck", "node"), ("pycheck", "python")] {
+        let origin = tmp.path().join(format!("origin-{name}.git"));
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        let (ok, out) = paja_with(
+            &home,
+            &work,
+            &["init", "--new", name, "--stack", stack],
+            &identity,
+        );
+        assert!(ok, "{out}");
+        let dir = work.join(name);
+
+        // The tools and packages the checks need; without them the test has nothing to run.
+        if stack == "node" {
+            match try_run(&dir, "npm", &["install", "--no-audit", "--no-fund"]) {
+                Some(o) if o.status.success() => {}
+                _ => {
+                    eprintln!("skipping the node skeleton's checks: `npm install` is unavailable");
+                    continue;
+                }
+            }
+        } else if !try_run(&dir, "ruff", &["--version"]).is_some_and(|o| o.status.success())
+            || !try_run(&dir, "pytest", &["--version"]).is_some_and(|o| o.status.success())
+        {
+            eprintln!("skipping the python skeleton's checks: ruff or pytest is not installed");
+            continue;
+        }
+
+        let checks = std::fs::read_to_string(dir.join(".paja/checks")).unwrap();
+        for check in checks
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let mut words = check.split_whitespace();
+            let program = words.next().unwrap();
+            let args: Vec<&str> = words.collect();
+            let output = try_run(&dir, program, &args).unwrap_or_else(|| {
+                panic!("`{check}` could not be started in the {stack} skeleton")
+            });
+            assert!(
+                output.status.success(),
+                "`{check}` failed in the {stack} skeleton: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
 /// `paja init --new zippy --stack zig`, a stack with no built-in skeleton, against a fake `gh` and
 /// a fake `claude` that answers the three sessions (the programs, the skeleton, the detection)
 /// by what the prompt says. The detection names `check` as the one check. Returns the temp dir, the

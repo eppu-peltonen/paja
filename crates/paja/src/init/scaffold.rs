@@ -339,7 +339,8 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
     };
     let after_create = |err: anyhow::Error| {
         err.context(format!(
-            "the repository {url} was created; finish by hand in {} or delete it on GitHub",
+            "the repository {url} was created; finish by hand in {} or delete it on GitHub \
+             (`gh repo delete {repo}`) before running `paja init --new` again with the same name",
             dir.display()
         ))
     };
