@@ -7595,6 +7595,92 @@ fn init_sets_a_node_repository_up_in_a_pull_request_and_is_refused_twice() {
 }
 
 #[test]
+fn init_force_rewrites_the_branch_without_a_tracking_ref_and_adds_no_second_section() {
+    let (tmp, repo, home, gh) = init_fixture(&[
+        ("requirements.txt", "pytest\n"),
+        ("ruff.toml", ""),
+        (
+            "CLAUDE.md",
+            "# App\n\n## Working with Paja\n\nAlready here.\n",
+        ),
+    ]);
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci", "--no-agent"], &vars);
+    assert!(ok, "{out}");
+    let workflow = show(&repo, "paja/init", ".github/workflows/paja.yml");
+    assert!(
+        workflow.contains("pip install -r requirements.txt pytest ruff"),
+        "{workflow}"
+    );
+    assert!(workflow.contains("run: ruff check ."), "{workflow}");
+    assert!(
+        !out["files"].to_string().contains("CLAUDE.md"),
+        "the section is already there: {out}"
+    );
+
+    // Without --force the second run fails at the push, and says what to do.
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "more"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let (ok, out) = paja_with(&home, &repo, &["init", "--ci", "--no-agent"], &vars);
+    assert!(!ok, "{out}");
+    assert!(out["error"].as_str().unwrap().contains("--force"), "{out}");
+
+    // With --force and no local tracking ref for origin/paja/init, the push still lands.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["update-ref", "-d", "refs/remotes/origin/paja/init"])
+        .status();
+    let (ok, out) = paja_with(
+        &home,
+        &repo,
+        &["init", "--ci", "--no-agent", "--force"],
+        &vars,
+    );
+    assert!(ok, "{out}");
+    let origin = tmp.path().join("origin.git");
+    let tip = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args(["rev-list", "--count", "main..paja/init"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), "1");
+    let claude = show(&repo, "paja/init", "CLAUDE.md");
+    assert_eq!(claude.matches("## Working with Paja").count(), 1);
+}
+
+#[test]
+fn init_reports_an_open_pull_request_when_creating_one_fails_and_says_how_to_recover_otherwise() {
+    let (tmp, repo, home, _) = init_fixture(&[("go.mod", "module x\n")]);
+    let d = slash(tmp.path());
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/gh.log\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             \"pr create\") echo 'HTTP 422' >&2; exit 1 ;;\n\
+             \"pr list\") if [ -f {d}/open-pr ]; then echo '[{{\"url\": \"https://example.com/pull/9\"}}]'; else echo '[]'; fi ;;\n\
+             *) ;;\nesac\n"
+        ),
+    );
+    let vars = [("PAJA_GH", gh.as_path())];
+    let (ok, out) = paja_with(&home, &repo, &["init", "--no-agent"], &vars);
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("by hand") && error.contains("--force"),
+        "{error}"
+    );
+
+    std::fs::write(tmp.path().join("open-pr"), "").unwrap();
+    let (ok, out) = paja_with(&home, &repo, &["init", "--no-agent", "--force"], &vars);
+    assert!(ok, "{out}");
+    assert_eq!(out["pull_request"], "https://example.com/pull/9");
+}
+
+#[test]
 fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let d = slash(tmp.path());
