@@ -1008,6 +1008,7 @@ fn github_default_branch(ok: &Untampered) -> Option<String> {
 fn branch_like(name: &str) -> bool {
     !name.is_empty()
         && name != "@"
+        && name != "HEAD"
         && !name.starts_with(BRANCH_PREFIX)
         && !name.starts_with(['-', '/', '.'])
         && !name.ends_with(['/', '.'])
