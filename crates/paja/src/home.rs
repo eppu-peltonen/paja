@@ -111,6 +111,23 @@ impl Home {
         self.try_runs_lock(repo, "pool")
     }
 
+    /// Take the lock Posti holds for `repo` while it decides which skipped-role notices are new
+    /// and sends them, waiting up to `limit`. None when another process still holds it then, so
+    /// a pool's lanes starting together send each notice once. It orders processes and stores
+    /// nothing: whether a role was told is read from the log.
+    pub fn posti_lock_within(&self, repo: &str, limit: Duration) -> Result<Option<RunLock>> {
+        let started = Instant::now();
+        loop {
+            if let Some(lock) = self.try_runs_lock(repo, "posti")? {
+                return Ok(Some(lock));
+            }
+            if started.elapsed() > limit {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Take the lock a run holds while it lands a change in `repo`, without waiting. None when
     /// another live run is landing there, so one change lands at a time and each lands on the
     /// one before it.

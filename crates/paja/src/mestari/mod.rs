@@ -560,6 +560,15 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         jono::repo_name(home, &repo)?
     };
     let config = read_config(&repo, &base, target)?;
+    // A skipped `.paja/models` line is only a warning on stderr, which nobody reads at an
+    // unattended runner, so Posti tells of each skipped role once.
+    crate::posti::skipped_roles(
+        home,
+        &repo,
+        &name,
+        &config.target.branch,
+        &config.models.skipped,
+    );
     // A new item starts with a build, which a nearly used window would cut off, so it isn't
     // claimed at all (no status events) and the pass waits. A resumed item goes on to its round,
     // which makes the same check for each build.
