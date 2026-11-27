@@ -10265,54 +10265,71 @@ fn init_agent_gets_read_only_tools_and_hook() {
 
 #[test]
 fn init_check_lines_for_a_subdirectory_run_there_and_an_unsafe_dir_is_dropped() {
-    // A monorepo proposal: one stack in `svc`, one in a directory whose name would be a second
-    // command if it reached `cd <dir> && ...` unquoted. The second is dropped, and the line
-    // written for the first runs in its directory when the checks file is run as written.
+    // A monorepo proposal: one stack in `apps/svc` (named the loose way, `./apps/svc/`), one in
+    // a directory whose name would be a second command if it reached `cd <dir> && ...`
+    // unquoted. The second is dropped, and the line written for the first runs in its
+    // directory when the checks file is run as written.
     let evil = "evil;touch pwned";
     let script = "echo ok > ran\n";
-    let answer = serde_json::json!({"stacks": [
-        {"name": "svc", "dir": "svc", "file": "svc/check.sh",
-         "checks": [{"command": "sh check.sh", "file": "svc/check.sh"}], "commands": ["sh"]},
-        {"name": "evil", "dir": evil, "file": format!("{evil}/check.sh"),
-         "checks": [{"command": "sh check.sh", "file": format!("{evil}/check.sh")}],
-         "commands": ["sh"]}
-    ]});
     let evil_script = format!("{evil}/check.sh");
+    let answer = serde_json::json!({"stacks": [
+        {"name": "svc", "dir": "./apps/svc/", "file": "apps/svc/check.sh",
+         "checks": [{"command": "sh check.sh", "file": "apps/svc/check.sh"}], "commands": ["sh"],
+         "setup": [{"run": "sh check.sh", "file": "apps/svc/check.sh"}]},
+        {"name": "evil", "dir": evil, "file": evil_script,
+         "checks": [{"command": "sh check.sh", "file": evil_script}], "commands": ["sh"],
+         "setup": [{"run": "sh check.sh", "file": evil_script}]}
+    ]});
     let (_tmp, repo, ok, out) = init_with_agent(
-        &[("svc/check.sh", script), (evil_script.as_str(), script)],
+        &[
+            ("apps/svc/check.sh", script),
+            (evil_script.as_str(), script),
+        ],
         &answer,
         &["--ci"],
     );
     assert!(ok, "{out}");
-    let dropped = out["detected"]["dropped"].to_string();
-    assert!(dropped.contains("stack `evil"), "{out}");
+    let dropped = out["detected"]["dropped"].as_array().unwrap();
+    assert!(
+        dropped
+            .iter()
+            .any(|d| d["item"].as_str().unwrap().contains("stack `evil")
+                && d["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("is not a directory on the default branch")),
+        "{out}"
+    );
     let checks = show(&repo, "paja/init", ".paja/checks");
     let lines: Vec<&str> = checks
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
-    assert_eq!(lines, ["cd svc && sh check.sh"], "{checks}");
-    // The CI workflow runs the same line, and nothing of the dropped stack.
+    assert_eq!(lines, ["cd apps/svc && sh check.sh"], "{checks}");
+    // The CI workflow runs the setup step in the stack's directory and the same check line,
+    // and nothing of the dropped stack.
     let workflow = show(&repo, "paja/init", ".github/workflows/paja.yml");
     assert!(
-        workflow.contains("- run: 'cd svc && sh check.sh'\n") && !workflow.contains("evil"),
+        workflow.contains("      - run: sh check.sh\n        working-directory: apps/svc\n"),
         "{workflow}"
     );
-    // Run as written, from the repository's root, as Vasara runs each line.
+    assert!(
+        workflow.contains("cd apps/svc && sh check.sh") && !workflow.contains("evil"),
+        "{workflow}"
+    );
+    // Run as written, from the repository's root, with the shell Vasara runs each line in.
     git(&repo, &["checkout", "-q", "paja/init"]);
     for line in &lines {
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(line)
+        let status = paja::platform::shell(line)
+            .unwrap()
             .current_dir(&repo)
             .status()
             .unwrap();
         assert!(status.success(), "{line}");
     }
-    assert!(repo.join("svc/ran").is_file());
+    assert!(repo.join("apps/svc/ran").is_file());
     assert!(!repo.join("ran").exists() && !repo.join("pwned").exists());
-    assert!(!repo.join(evil).join("ran").exists());
 }
 
 #[test]

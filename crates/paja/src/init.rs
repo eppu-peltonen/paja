@@ -408,11 +408,14 @@ fn workflow_file(stacks: &[Stack], d: &Detected) -> String {
     text
 }
 
-/// A plain YAML scalar when it is safe, else a single-quoted one.
+/// A plain YAML scalar when it is safe, else a single-quoted one. A leading `~` would read as
+/// null.
 fn yaml_scalar(text: &str) -> String {
-    if text.contains([
-        ':', '#', '\'', '"', '{', '}', '[', ']', '&', '*', '!', '|', '>', '%', '@', '`',
-    ]) {
+    if text.starts_with('~')
+        || text.contains([
+            ':', '#', '\'', '"', '{', '}', '[', ']', '&', '*', '!', '|', '>', '%', '@', '`',
+        ])
+    {
         format!("'{}'", text.replace('\'', "''"))
     } else {
         text.to_string()
@@ -889,6 +892,20 @@ fn prepare_and_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_working_directory_yaml_would_misread_is_quoted() {
+        let step = detect::Step {
+            uses: String::new(),
+            with: Vec::new(),
+            run: "npm ci".to_string(),
+        };
+        let at = |dir: &str| detect::render_setup(std::slice::from_ref(&step), dir, &yaml_scalar);
+        assert!(at("@scope/pkg").contains("working-directory: '@scope/pkg'\n"));
+        assert!(at("apps/web").contains("working-directory: apps/web\n"));
+        assert_eq!(yaml_scalar("~x"), "'~x'");
+        assert_eq!(yaml_scalar("a~b"), "a~b");
+    }
 
     #[test]
     fn node_checks_follow_the_scripts_and_the_lockfile() {
