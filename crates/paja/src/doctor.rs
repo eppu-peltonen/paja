@@ -453,15 +453,25 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     // `ahjo::show_on_default_branch`, so a default branch with another name is found too.
     // Resolved once, by exact ref name: every file below is read from that one commit, and
     // messages name the branch by its short name.
-    let Some((commit, rev)) = crate::ahjo::DEFAULT_REFS
-        .into_iter()
-        .find_map(|(full, short)| {
-            crate::ahjo::ref_commit(proof.path(), full)
-                .ok()
-                .flatten()
-                .map(|commit| (commit, short))
-        })
-    else {
+    let mut found = None;
+    for (full, short) in crate::ahjo::DEFAULT_REFS {
+        match crate::ahjo::ref_commit(proof.path(), full) {
+            Ok(Some(commit)) => {
+                found = Some((commit, short));
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                checks.push(failed(
+                    "default branch",
+                    format!("looking up {short}: {err:#}"),
+                    "run `git fsck` in this checkout and check that `git` runs",
+                ));
+                return;
+            }
+        }
+    }
+    let Some((commit, rev)) = found else {
         checks.push(failed(
             "default branch",
             "none of origin/HEAD, origin/main or main exists in this checkout",

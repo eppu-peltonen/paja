@@ -2704,6 +2704,8 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     let models = checks.iter().find(|c| c["name"] == "models").unwrap();
     assert_eq!(models["status"], "warning", "{report}");
     let detail = models["detail"].as_str().unwrap();
+    // The branch is named by its short name, the ref doctor read it from.
+    assert!(detail.contains("on origin/HEAD"), "{report}");
     assert!(
         detail.contains(": \"reveiw\"") && detail.matches("reveiw").count() == 1,
         "{report}"
