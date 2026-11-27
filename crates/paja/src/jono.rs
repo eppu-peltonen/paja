@@ -231,7 +231,8 @@ pub const CLAIM_SECS: u64 = 6 * 60 * 60;
 /// Who holds an item on GitHub: the claimed label, and the runner in its latest claim comment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
-    /// The runner id in the latest claim comment; `unknown` when the label has no comment.
+    /// The runner id in the first live claim comment (else the latest); `unknown` when the label
+    /// has no comment.
     pub runner: String,
     /// The UTC time after which another runner may take the item. None when the claim can't go
     /// stale: the item is escalated and waits on a person, or the label has no comment.
@@ -1498,7 +1499,8 @@ fn delete_comment(ok: &Untampered, id: u64) -> Result<()> {
 
 /// Undo a claim that failed part way: delete this runner's comment (`own`, when it was posted),
 /// then take the shared claimed label off unless another runner's live claim is on the issue,
-/// whose label it is. When the issue can't be read the label comes off, so a failure never
+/// whose label it is. With `own` known, only a claim posted before it counts: a later one lost
+/// the race to this runner's comment and is about to delete itself. When the issue can't be read the label comes off, so a failure never
 /// leaves an item looking claimed by nobody in particular. Best effort: the caller reports the
 /// failure that brought it here.
 fn take_back(ok: &Untampered, claimed: &str, number: u64, me: &str, own: Option<u64>) {
@@ -1507,9 +1509,11 @@ fn take_back(ok: &Untampered, claimed: &str, number: u64, me: &str, own: Option<
     }
     let now = now_secs();
     let other = view_issue(ok, number).is_ok_and(|view| {
-        view.claims()
-            .iter()
-            .any(|c| c.runner != me && !c.is_stale(now))
+        view.claims().iter().any(|c| {
+            c.runner != me
+                && !c.is_stale(now)
+                && own.is_none_or(|own| c.id.is_none_or(|id| id < own))
+        })
     });
     if !other {
         let _ = remove_label(ok, number, claimed);
@@ -1656,7 +1660,8 @@ pub fn release_own_claim(home: &Home, checkout: &Path, number: u64) {
 /// None every claim goes. With `me`, this runner's own go, and so does every other runner's
 /// posted after its first one: those lost the race (the first live claim wins), and one left
 /// behind would win every later runner's race check while nobody builds the item. A claim
-/// posted before this runner's first stays; the latest of those holds the item.
+/// posted before this runner's first stays; the first of those (the race's winner) holds the
+/// item.
 fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>) {
     let first_mine = match me {
         None => 0,
@@ -1667,7 +1672,7 @@ fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>)
     };
     let (ahead, rest) = live.split_at(first_mine);
     let delete = rest.iter().filter_map(|c| c.id).collect();
-    let stays = ahead.last().map(|c| Claim {
+    let stays = ahead.first().map(|c| Claim {
         runner: c.runner.clone(),
         stale_after: Some(c.stale_after.clone()),
     });
@@ -2620,10 +2625,16 @@ mod tests {
         // With no earlier claim, nothing stays and the label comes off too.
         let (delete, stays) = to_free(&live[1..], Some("aaaa"));
         assert_eq!((delete, stays), (vec![2, 3], None));
-        // A runner with no live claim of its own deletes nothing; the latest claim holds.
+        // A runner with no live claim of its own deletes nothing; the race's winner holds.
         let (delete, stays) = to_free(&live, Some("dddd"));
         assert!(delete.is_empty());
-        assert_eq!(stays.unwrap().runner, "cccc");
+        assert_eq!(stays.unwrap().runner, "bbbb");
+        // Two claims ahead of this runner's (cccc lost to bbbb, its comment left behind): the
+        // earlier one holds the item.
+        let raced = [comment("bbbb", 1), comment("cccc", 2), comment("aaaa", 3)];
+        let (delete, stays) = to_free(&raced, Some("aaaa"));
+        assert_eq!(delete, vec![3]);
+        assert_eq!(stays.unwrap().runner, "bbbb");
     }
 
     #[test]
