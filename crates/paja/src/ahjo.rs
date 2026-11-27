@@ -547,8 +547,8 @@ pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<Strin
         ));
     }
     let commit = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
-    if path.contains('\0') {
-        bail!("reading {spec}: the path holds a NUL character");
+    if path.is_empty() || path.starts_with('/') || path.ends_with('/') || path.contains('\0') {
+        bail!("reading {spec}: name a file from the top of the tree, such as .paja/checks");
     }
     let mut path = path.to_string();
     // A symbolic link inside the tree (a CLAUDE.md that links to AGENTS.md, say) is followed
@@ -752,6 +752,14 @@ fn git_failed(spec: &str, repo: &Path, what: &str, output: &std::process::Output
     )
 }
 
+/// The refs that name the default branch, in the order Paja tries them, each with the short name
+/// messages use.
+pub(crate) const DEFAULT_REFS: [(&str, &str); 3] = [
+    ("refs/remotes/origin/HEAD", "origin/HEAD"),
+    ("refs/remotes/origin/main", "origin/main"),
+    ("refs/heads/main", "main"),
+];
+
 /// A file as it is on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
 /// remote's default branch, whatever its name), else `origin/main`, else a local `main`. None
 /// when the file isn't there, or when there is none of these. Never the branch checked out,
@@ -795,17 +803,18 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
         show_at(ok.path(), commit, path)
             .with_context(|| format!("reading {path} from {rev}, the default branch"))
     };
-    for rev in ["origin/HEAD", "origin/main", "main"] {
-        if let Some(commit) = resolves(rev)? {
+    // Full ref names: a short one such as `origin/main` would let a tag or branch of that name
+    // (`refs/tags/origin/main`) stand in for the default branch.
+    for (full, rev) in DEFAULT_REFS {
+        if let Some(commit) = resolves(full)? {
             return at(rev, &commit);
         }
     }
     // No origin/HEAD and no main: ask GitHub for the default branch's name, as `RepoSettings`
     // does, and read it from the remote-tracking ref.
     if let Some(name) = github_default_branch(ok) {
-        let rev = format!("origin/{name}");
-        if let Some(commit) = resolves(&rev)? {
-            return at(&rev, &commit);
+        if let Some(commit) = resolves(&format!("refs/remotes/origin/{name}"))? {
+            return at(&format!("origin/{name}"), &commit);
         }
     }
     let has_origin = git_command()
@@ -1037,6 +1046,10 @@ mod tests {
         }
         // A folder that isn't there at all still means the file is missing.
         assert_eq!(show_at(repo, "HEAD", "nowhere/checks").unwrap(), None);
+        for path in ["", "/kept.txt", "kept.txt/"] {
+            let err = show_at(repo, "HEAD", path).unwrap_err().to_string();
+            assert!(err.contains("name a file from the top"), "{err}");
+        }
         for name in [
             "outside",
             "loop",
@@ -1114,6 +1127,29 @@ mod tests {
                 .as_deref(),
             Some("work x\n")
         );
+        // A tag named like the default branch doesn't stand in for it.
+        std::fs::write(repo.join("other"), "").unwrap();
+        git_unchecked(repo, &["add", "-A"]).unwrap();
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "other"]);
+        git_unchecked(repo, &args).unwrap();
+        git_unchecked(repo, &["rm", "-q", "--cached", ".paja/labels"]).unwrap();
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "no labels"]);
+        git_unchecked(repo, &args).unwrap();
+        git_unchecked(repo, &["tag", "origin/HEAD"]).unwrap();
+        assert_eq!(
+            show_on_default_branch(&ok, ".paja/labels")
+                .unwrap()
+                .as_deref(),
+            Some("work x\n")
+        );
+        git_unchecked(repo, &["tag", "-d", "origin/HEAD"]).unwrap();
+        git_unchecked(
+            repo,
+            &["checkout", "-q", "refs/remotes/origin/trunk", "--", "."],
+        )
+        .unwrap();
         // An error reading it names the default branch it came from.
         std::fs::remove_file(repo.join(".paja/labels")).unwrap();
         std::fs::create_dir_all(repo.join(".paja/labels")).unwrap();

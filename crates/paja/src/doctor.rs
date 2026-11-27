@@ -451,8 +451,9 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
 
     // What `paja run` reads, from the default branch: the same refs, in the same order, as
     // `ahjo::show_on_default_branch`, so a default branch with another name is found too.
-    let Some(rev) = ["origin/HEAD", "origin/main", "main"]
+    let Some(rev) = crate::ahjo::DEFAULT_REFS
         .into_iter()
+        .map(|(full, _)| full)
         .find(|rev| {
             git(&["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")])
                 .is_ok_and(|out| out.status.success())
