@@ -462,3 +462,15 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
         ],
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+
+    #[test]
+    fn render_gives_lf_endings_even_from_a_crlf_template() {
+        let out = render("{\r\n  \"name\": \"{{name}}\"\r\n}\r\n", "My_App");
+        assert_eq!(out, "{\n  \"name\": \"my-app\"\n}\n");
+        assert!(!out.contains('\r'));
+    }
+}
