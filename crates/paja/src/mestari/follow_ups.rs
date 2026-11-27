@@ -297,21 +297,47 @@ fn match_at(text: &str, needle: &str, fold: bool) -> Option<usize> {
 
 /// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
 /// `label`. With `fold`, the path matches in any letter case, as Windows itself does.
+///
+/// Its cost is linear in the text for a path spelled in ASCII, case folded or not: matches are
+/// found with `str::find`, in a lowercased copy when folding (ASCII lowercasing keeps every
+/// byte offset). Only a folded path with other letters (a home like `C:\Users\Jöhn`) is matched
+/// char by char at each place its first letter matches.
 fn replace_path(text: &str, path: &str, label: &str, fold: bool) -> String {
+    let lowered;
+    let (haystack, needle) = if fold && path.is_ascii() {
+        lowered = (text.to_ascii_lowercase(), path.to_ascii_lowercase());
+        (lowered.0.as_str(), Some(lowered.1.as_str()))
+    } else if fold {
+        (text, None)
+    } else {
+        (text, Some(path))
+    };
+    // The next match at or after `at`: its start and its length in `text`.
+    let next = |at: usize| -> Option<(usize, usize)> {
+        if let Some(needle) = needle {
+            return haystack[at..].find(needle).map(|i| (at + i, needle.len()));
+        }
+        let first = path.chars().next()?;
+        text[at..].char_indices().find_map(|(i, c)| {
+            let starts = c == first || c.to_lowercase().eq(first.to_lowercase());
+            starts
+                .then(|| match_at(&text[at + i..], path, true).map(|len| (at + i, len)))
+                .flatten()
+        })
+    };
     let mut out = String::with_capacity(text.len());
     let mut from = 0;
     let mut at = 0;
     while at < text.len() {
-        let Some(len) = match_at(&text[at..], path, fold) else {
-            at += text[at..].chars().next().map_or(1, char::len_utf8);
-            continue;
+        let Some((start, len)) = next(at) else {
+            break;
         };
-        let end = at + len;
+        let end = start + len;
         // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
         // around the path, so a path before one is still redacted.
         let ends = !text[end..].starts_with(char::is_alphanumeric);
-        out.push_str(&text[from..at]);
-        out.push_str(if ends { label } else { &text[at..end] });
+        out.push_str(&text[from..start]);
+        out.push_str(if ends { label } else { &text[start..end] });
         from = end;
         at = end;
     }
@@ -389,6 +415,20 @@ fn ends_lead(gap: &str) -> bool {
     })
 }
 
+/// Whether `rest`, after `gap`, is the info string of a code fence opening on its own line: the
+/// gap's last line is three or more backticks (after spaces) and the line's rest holds no
+/// backtick (else it is a code span), or the line starts with three or more tildes.
+fn opens_fence(gap: &str, rest: &str) -> bool {
+    let Some(at) = gap.rfind('\n') else {
+        return false;
+    };
+    let tail = gap[at + 1..].trim_start_matches(' ');
+    let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+    let backticks = tail.len() >= 3 && tail.chars().all(|c| c == '`') && !line.contains('`');
+    let tildes = tail.is_empty() && line.starts_with("~~~");
+    backticks || tildes
+}
+
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
 /// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole; after
 /// a lead it runs to the next space, quote, backtick, comma or backslash, so symbols stay inside.
@@ -424,6 +464,16 @@ fn redact_tokens(text: &str) -> String {
         rest = &rest[start..];
         if rest.is_empty() {
             break;
+        }
+        // A fence opened after a lead: its info string (```` ```text ````, `~~~ sh`) names the
+        // language, not the value, which is on the lines after it. The info line is scanned on
+        // its own, so a token in it still goes, and the lead carries on past it.
+        if led.is_some() && opens_fence(gap, rest) {
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            out.push_str(&redact_tokens(&rest[..line_end]));
+            rest = &rest[line_end..];
+            delimited = true;
+            continue;
         }
         if let Some(strong) = led {
             // Only a lead starts this scan, and a redacted value is skipped, so each character
@@ -738,6 +788,29 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_info_string_after_a_lead_is_not_the_value() {
+        let short = "hunter2x";
+        let text = format!(
+            "password:\n```text\n{short}\n```\nsecret:\n  ~~~ sh\n{short}\n~~~\ntoken:\n```\n{short}\n```"
+        );
+        assert_eq!(
+            redact_tokens(&text),
+            "password:\n```text\n<redacted>\n```\nsecret:\n  ~~~ sh\n<redacted>\n~~~\ntoken:\n```\n\
+             <redacted>\n```"
+        );
+        // A token in the info line still goes; a one-line code span is the value itself.
+        let gh = format!("{}{}", "ghp_", "a".repeat(36));
+        assert_eq!(
+            redact_tokens(&format!("password:\n```{gh}\n{short}\n```")),
+            "password:\n```<redacted>\n<redacted>\n```"
+        );
+        assert_eq!(
+            redact_tokens(&format!("password:\n```{short}```")),
+            "password:\n```<redacted>```"
+        );
+    }
+
+    #[test]
     fn redacting_a_long_finding_stays_fast() {
         let text = "word ".repeat(200_000);
         let started = std::time::Instant::now();
@@ -747,6 +820,27 @@ mod tests {
         assert_eq!(redact_tokens(&dotted), "token <redacted>.");
         // A scan that re-read the text for every word would take minutes here.
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn redacting_paths_in_a_long_text_stays_fast() {
+        // Near misses at every place: a scan that compared the whole path at each character
+        // would read this text once per character of the path.
+        let path = format!("/home/me/{}", "a".repeat(200));
+        let near = format!("/home/me/{}b ", "a".repeat(199));
+        let text = format!("{near}{path}/x ").repeat(2000);
+        let started = std::time::Instant::now();
+        let shown = replace_path(&text, &path, "<home>", false);
+        assert_eq!(shown.matches("<home>/x").count(), 2000);
+        let windows = text.replace('/', "\\").to_uppercase();
+        let shown = replace_path(&windows, &path.replace('/', "\\"), "<home>", true);
+        assert_eq!(shown.matches("<home>\\X").count(), 2000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // A folded path with other letters still matches in any case.
+        assert_eq!(
+            replace_path(r"C:\USERS\JÖHN\x", r"C:\Users\Jöhn", "<home>", true),
+            r"<home>\x"
+        );
     }
 
     #[test]
