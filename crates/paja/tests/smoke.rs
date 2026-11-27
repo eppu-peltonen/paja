@@ -1843,6 +1843,34 @@ fn work_list_names_the_event_of_a_step_it_cannot_read() {
 }
 
 #[test]
+fn work_show_says_claimed_for_an_item_claimed_by_hand_since_its_last_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    // A run claimed the item and started a step, the item went back to the queue, and then
+    // it was claimed by hand.
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.status","data":{"number":3,"status":"active","note":null,"run":true}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"run.started","data":{"number":3,"env":"app-3"}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":4000,"kind":"run.step","data":{"number":3,"round":1,"role":"build","model":"opus"}}"#,
+        r#"{"v":1,"seq":5,"ts_ms":5000,"kind":"work.status","data":{"number":3,"status":"queued","note":null}}"#,
+        // What `paja work claim` records: active, with no `run` flag.
+        r#"{"v":1,"seq":6,"ts_ms":6000,"kind":"work.status","data":{"number":3,"status":"active","note":null}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let (ok, item) = paja(&home, &repo, &["work", "show", "3"]);
+    assert!(ok, "{item}");
+    let run = &item["run"];
+    // No `paja run` resumes a hand claim, and the earlier run's steps aren't this claim's.
+    assert_eq!(run["state"], "claimed", "{item}");
+    assert_eq!(run["step"], Value::Null, "{run}");
+    assert_eq!(run["steps"], serde_json::json!([]), "{run}");
+    assert_eq!(run["round"], 0, "{run}");
+}
+
+#[test]
 fn work_show_tells_where_an_active_items_run_is_and_that_it_stopped() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
