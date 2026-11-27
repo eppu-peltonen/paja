@@ -143,8 +143,8 @@ landed, or escalated with a question.
 ## 6. When Paja asks
 
 When a run can't decide something (reviewers disagree, three rounds weren't enough, or the issue needs a decision),
-Paja escalates: it asks on the issue, labels it so it stands out, and Posti tells you: a desktop notification by
-default, or a program of your own (`PAJA_NOTIFIER`) or a push URL such as an ntfy topic for your phone (`PAJA_NOTIFY`
+Paja escalates: it asks on the issue, labels it so it stands out, and Posti tells you: a desktop notification when
+`paja` runs in a terminal (`PAJA_NOTIFIER=desktop` gets one without), or a program of your own (`PAJA_NOTIFIER`) or a push URL such as an ntfy topic for your phone (`PAJA_NOTIFY`
 or `.paja/notify`); see [Notifications](./setup.md#notifications). Answer in any of three ways, and the item goes back
 in the queue with your answer:
 
