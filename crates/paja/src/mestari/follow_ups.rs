@@ -358,7 +358,14 @@ fn ends_lead(gap: &str) -> bool {
             && (i == 0 || chars[i - 1] != q)
             && (chars[i + 2].is_whitespace() || matches!(chars[i + 2], ',' | ';'))
     });
-    empty_value || gap.split('\n').count() > 2
+    // A blank line: a line between two breaks with nothing but spaces on it. A line holding a
+    // Markdown fence or a `:` is not blank, so a fenced value after `password:` still goes.
+    let lines: Vec<&str> = gap.split('\n').collect();
+    let blank = lines.len() > 2
+        && lines[1..lines.len() - 1]
+            .iter()
+            .any(|l| l.trim().is_empty());
+    empty_value || blank
 }
 
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
@@ -626,6 +633,12 @@ mod tests {
             redact_tokens(&text),
             "password = \"\"\"<redacted>\"\"\" and password: ``<redacted>`` and password: `` \
              <redacted> `` x"
+        );
+        // A fenced value after a lead still goes: a fence line is not a blank line.
+        let text = format!("Set the password:\n```\n{short}\n```");
+        assert_eq!(
+            redact_tokens(&text),
+            "Set the password:\n```\n<redacted>\n```"
         );
         // A line break alone doesn't end a lead: a shell line continuation, or a value on the
         // next line, still goes. After an empty value or a blank line a long value still goes.
