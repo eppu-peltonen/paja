@@ -4593,7 +4593,10 @@ fn the_arbiter_answers_a_reviewer_escalation_and_the_item_is_queued_again() {
     );
     assert!(gh.contains("issue comment 5 --body-file"), "{gh}");
     assert!(
-        gh.contains("see <factory home>/envs and @\u{200b}octocat"),
+        gh.contains(&format!(
+            "see <factory home>{}envs and @\u{200b}octocat",
+            std::path::MAIN_SEPARATOR
+        )),
         "{gh}"
     );
     assert!(!gh.contains("and @octocat"), "{gh}");
