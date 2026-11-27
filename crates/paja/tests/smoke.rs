@@ -2738,6 +2738,162 @@ fn make_private(dir: &Path) {
 }
 
 #[test]
+fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    // A pushed review branch with labels of its own, and origin/HEAD moved to it, as code in
+    // a worktree could.
+    git(&repo, &["checkout", "-q", "-b", "paja/app-1"]);
+    std::fs::write(repo.join(".paja/labels"), "work evil\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "labels"]);
+    git(&repo, &["push", "-q", "origin", "paja/app-1"]);
+    git(&repo, &["checkout", "-q", "trunk"]);
+    git(&repo, &["remote", "set-head", "origin", "paja/app-1"]);
+    let doctor = |view: &str| {
+        let gh = program(
+            tmp.path(),
+            "gh",
+            &format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n\
+                 \"repo view\") echo '{view}' ;;\n\
+                 \"label list\") echo '[{{\"name\": \"game\"}}]' ;;\n\
+                 \"workflow list\") echo 'CI\tactive\t1' ;;\nesac\n"
+            ),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        report
+    };
+    let named = |report: &Value, name: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .cloned()
+    };
+    // GitHub names trunk: the labels come from origin/trunk, not the review branch.
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "trunk"}}"#);
+    assert!(named(&report, "default branch").is_none(), "{report}");
+    let label = named(&report, "work label").unwrap();
+    assert_eq!(label["status"], "ok", "{report}");
+    assert!(
+        label["detail"].as_str().unwrap().contains("`game`"),
+        "{report}"
+    );
+    // GitHub can't say: origin/HEAD pointing at one of Paja's own branches is refused.
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("one of Paja's own branches"),
+        "{report}"
+    );
+    // Nor is one that isn't a symbolic ref.
+    git(
+        &repo,
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    );
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "--no-deref",
+            "refs/remotes/origin/HEAD",
+            "paja/app-1",
+        ],
+    );
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("is not a symbolic ref"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_default_branch_github_names_is_read_without_origin_head_or_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    let log = tmp.path().join("gh.log");
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\", \"defaultBranchRef\": {{\"name\": \"trunk\"}}}}' ;;\n\
+             \"issue list\") echo '[]' ;;\nesac\n",
+            slash(tmp.path().join("gh.log").as_path())
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["--json", "work", "sync"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The work label came from origin/trunk.
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.starts_with("issue list") && l.contains("game")),
+        "{calls}"
+    );
+}
+
+#[test]
 fn doctor_reads_a_default_branch_that_is_not_main() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
