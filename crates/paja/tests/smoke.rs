@@ -926,6 +926,28 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
         .filter(|e| e["kind"] == "work.checkout")
         .count();
     assert_eq!(checkouts, 1, "{events}");
+    // So is a `--repo` spelled with `..` and `.` parts, run from somewhere else.
+    let roundabout = sub.join("..").join(".").join("src");
+    let (ok, again) = paja_with(
+        &home,
+        tmp.path(),
+        &["work", "sync", "--repo", roundabout.to_str().unwrap()],
+        &with_gh,
+    );
+    assert!(ok, "{again}");
+    let (_, events) = paja(&home, &repo, &["log"]);
+    let checkouts: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .collect();
+    assert_eq!(checkouts.len(), 1, "{events}");
+    assert_eq!(
+        checkouts[0]["data"]["path"],
+        serde_json::json!(repo),
+        "{events}"
+    );
 
     let (ok, next) = paja(&home, &repo, &["work", "next"]);
     assert!(ok);
