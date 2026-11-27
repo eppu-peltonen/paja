@@ -47,7 +47,9 @@ read in full over a few passes. The verdicts:
 - `already_fixed`: the default branch already fixes it, with a commit on that branch or a file there that shows it.
 - `not_worth_doing`: valid but not worth the effort, with the reason.
 
-Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. "Not worth doing"
+Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. A duplicate's
+original also gets a comment naming the closed issue, so if the original is later closed without being done, the
+duplicate's finding can be found and reopened. "Not worth doing"
 is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
 is left out.
 
@@ -57,9 +59,11 @@ so each repository has its own and an environment a person made is never reused 
 repository at a time: a pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is
 held and says to wait, and `paja run --every` and an idle pool skip their pass then. Its word is not enough to close anything: Paja closes a duplicate only when the
 original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
-named commit must be on the default branch and committed after the issue was opened, and a named file must exist there
-and be named in the issue's title or body (its whole path, or its file name when that has an extension). Otherwise the
-issue is kept. Issue text reaches the agent as data to judge.
+named commit must be on the default branch, committed after the issue was opened, and change a file the issue names
+(a merge against its first parent), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
+a longer or shorter one ending in it at a `/`), and a bare file name with an extension names any file of that name;
+paths use `/` whichever way the agent wrote them. Otherwise the issue is kept. Each issue reaches the agent with when
+it was opened. Issue text reaches the agent as data to judge.
 
 `--json` prints `{repo, base, items, closed, not_worth_doing}`; each item has its `verdict`, `reason`, `duplicate_of` or
 `evidence` when it has one, and `closed` (or the `error` that stopped a close). Each pass is recorded as `triage.ran`

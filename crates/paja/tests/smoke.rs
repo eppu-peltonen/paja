@@ -4741,6 +4741,12 @@ fn triage_closes_a_duplicate_and_an_already_fixed_issue_and_reports_all_three() 
     );
     let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
     assert!(log.contains("issue close 12 --comment"), "{log}");
+    // The original, which stays open, notes the duplicate so its finding isn't lost.
+    assert!(
+        log.contains("issue comment 11 --body **Paja triage closed #12 (Tidy the helper, again)"),
+        "{log}"
+    );
+    assert!(!log.contains("issue comment 13"), "{log}");
     assert!(log.contains("issue close 13 --comment"), "{log}");
     assert!(!log.contains("issue close 11"), "{log}");
     assert!(
@@ -4862,14 +4868,22 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
         let reason = report["items"][kept]["reason"].as_str().unwrap();
         assert!(reason.contains("after the issue was opened"), "{reason}");
     }
-    // The same commit counts for an issue opened before it.
+    // The same commit counts for an issue opened before it that names a file the commit
+    // changes, and not for one that names none.
     std::fs::write(
         dir.join("followups.json"),
-        format!("[{}]", issue(11, "Fix the helper", "2020-01-01T00:00:00Z")),
+        format!(
+            "[{}, {}]",
+            issue(11, "Fix the helper in .paja/checks", "2020-01-01T00:00:00Z"),
+            issue(12, "Fix the helper", "2020-01-01T00:00:00Z")
+        ),
     )
     .unwrap();
     let answer = format!(
-        r#"{{"issues": [{{"number": 11, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}}]}}"#
+        r#"{{"issues": [
+            {{"number": 11, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}},
+            {{"number": 12, "verdict": "already_fixed", "commit": "{head}", "reason": "Fixed."}}
+        ]}}"#
     );
     std::fs::write(
         dir.join("answer.json"),
