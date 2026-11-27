@@ -450,13 +450,19 @@ impl WorkItem {
 
 /// See [`WorkItem::env_name`].
 pub fn env_name(repo: &str, number: u64) -> String {
+    env_name_for(repo, &format!("work-{number}"))
+}
+
+/// An Ahjo environment name of `repo` for `what` (`work-5`, `triage`): the repository's name,
+/// a short hash of `owner/name` and `what`, at most 40 characters as long as `what` leaves room.
+pub fn env_name_for(repo: &str, what: &str) -> String {
     let name = repo.rsplit('/').next().unwrap_or(repo).to_ascii_lowercase();
     let name: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    // What is left of the 40 after the hash, `-work-<number>` and the dash after the name.
-    let room = 40usize.saturating_sub(6 + 6 + number.to_string().len() + 1);
+    // What is left of the 40 after the hash, `-<what>` and the dash after the name.
+    let room = 40usize.saturating_sub(6 + 1 + what.len() + 1);
     let name: String = name.chars().take(room.min(14)).collect();
     let name = name.trim_matches('-');
     // FNV-1a, which is stable across releases and platforms (unlike the std hasher).
@@ -468,7 +474,7 @@ pub fn env_name(repo: &str, number: u64) -> String {
     } else {
         format!("{name}-")
     };
-    format!("{head}{:06x}-work-{number}", hash & 0xff_ffff)
+    format!("{head}{:06x}-{what}", hash & 0xff_ffff)
 }
 
 /// A person's answer to a question Paja asked about an item.
@@ -2654,11 +2660,16 @@ mod tests {
         let b = env_name("other/app", 5);
         assert_ne!(a, b);
         assert!(a.starts_with("app-") && a.ends_with("-work-5"), "{a}");
+        // Other environments of a repository share its name and hash, and differ by what.
+        let triage = env_name_for("acme/app", "triage");
+        assert_eq!(triage, a.replace("-work-5", "-triage"));
         for name in [
             a,
             b,
             env_name("Some-Owner/A_Very.Long-Repository-Name", u64::MAX),
             env_name("o/___", 1),
+            env_name_for("acme/app", "triage"),
+            env_name_for("Some-Owner/A_Very.Long-Repository-Name", "triage"),
         ] {
             assert!(name.len() <= 40, "{name}");
             assert!(
