@@ -40,6 +40,10 @@ fn paja(home: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
     paja_with(home, cwd, args, &[("PAJA_GH", gh.as_path())])
 }
 
+/// What `PAJA_CLAUDE_LATEST` names in every test that doesn't set its own: a file that isn't there,
+/// so `paja doctor` never asks the npm registry for the latest Claude Code release.
+const NO_LATEST: &str = "no-latest-claude-release";
+
 /// A GitHub-token-shaped string for redaction tests, built at run time so the source holds no
 /// literal token for secret scanners to flag.
 fn fake_token() -> String {
@@ -51,6 +55,7 @@ fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> 
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(cwd)
         .env("PAJA_HOME", home)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
         .envs(vars.iter().copied())
         .arg("--json")
         .args(args)
@@ -473,6 +478,7 @@ impl Mcp {
             .arg("mcp")
             .current_dir(repo)
             .env("PAJA_HOME", home)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
             .envs(env.iter().map(|(k, v)| (*k, *v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -2250,6 +2256,7 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
         .env("PAJA_GH", &gh)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
         .args(["--json", "doctor"])
         .output()
         .unwrap();
@@ -2285,6 +2292,7 @@ fn doctor_checks_that_the_sandbox_program_works() {
             .current_dir(tmp.path())
             .env("PAJA_HOME", &home)
             .env("PAJA_SBX", sbx)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
             .args(["--json", "doctor"])
             .output()
             .unwrap();
