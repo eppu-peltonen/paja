@@ -960,6 +960,10 @@ fn describe_run(report: &mestari::RunReport) -> String {
         } => format!(
             "#{number} escalated:\n{question}\n  answer: paja work answer {number} \"<your answer>\""
         ),
+        mestari::RunReport::Arbitrated { number, answer, .. } => format!(
+            "#{number} answered by the arbiter and queued again: {answer}\n  override: paja work \
+             answer {number} \"<your answer>\""
+        ),
         mestari::RunReport::Stopped { number, .. } => {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
         }
@@ -1117,6 +1121,15 @@ fn describe_item(item: &jono::WorkItem) -> String {
         line.push_str(&format!("\n  claimed by runner {}", claim.runner));
         if let Some(until) = &claim.stale_after {
             line.push_str(&format!(", stale after {until}"));
+        }
+    }
+    if let Some(last) = item.answers.last().filter(|a| a.by_arbiter()) {
+        line.push_str(&format!("\n  answered by arbiter: {}", last.answer));
+        if item.status == jono::Status::Queued {
+            line.push_str(&format!(
+                "\n  override: paja work answer {} \"<your answer>\"",
+                item.number
+            ));
         }
     }
     if item.status == jono::Status::Escalated {

@@ -61,11 +61,40 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   repository's turn to land, merges in whatever landed meanwhile, and lands only if Vasara's checks pass again on
   that merge. A conflict, or checks that fail there, is a round for the builder like any other.
 
+## Escalate, don't wait
+
+When Mestari would escalate an item (a builder's question, a reviewer's `escalate`, a high-risk split, a third failed
+round, a second turn-limit hit), it first starts one fresh read-only session of the `arbiter` role in `.paja/models`
+(the `review` model when there is no line). The arbiter runs under the reviewers' hook and tools, so it changes no
+file and writes nothing to GitHub. Its prompt holds the issue, the escalation, what led to it (the reviewers'
+verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns `answer` or `escalate`.
+
+- **`answer`** is for a reviewer split whose blocker the diff and the issue settle, a scope or wording call the
+  repository's rules already decide (`Part of` versus `Closes` for a bundle issue), a builder question the issue, the
+  code or `CLAUDE.md` answers, or one more round after a failure that can be retried. Mestari records the text as the
+  item's answer, marked `by: arbiter`, queues the item again and comments once on the issue with what was decided and
+  why. Posti sends nothing and the issue gets no needs-answer label. `paja work show` and Paja Desk say `answered by
+  arbiter`, and `paja work answer N "..."` overrides the answer until the item runs again; the later answer comes last
+  in the agents' prompts.
+- **`escalate`** goes to the person as before, but the arbiter's question replaces the raw one: what is undecided,
+  two to four options and a recommendation, so one line answers it.
+- **Always escalated, enforced in code:** an answer is overruled to `escalate` when the item already has an arbiter
+  answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk` or the
+  deny-list hook, or when the escalation or the answer is about weakening a check (editing the failing test, those
+  files, the hook's rules). The person then gets the raw question and the reason. The prompt also tells the arbiter
+  to escalate anything that changes the issue's intent or scope, secrets, actions outside the repository and any
+  question that asks for the person's preference.
+- An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not
+  decisions (a usage limit, an error Mestari can't fix, landing, CI and merge problems) skip the arbiter.
+
+Each pass is recorded as `run.arbitrated` (`number`, `verdict`, `answer` or `question`, `model`, `overruled` when
+Mestari overruled an answer, and the arbiter's step under `steps`, which `paja usage` counts as its own role).
+
 ## When a person is asked
 
-A person hears about a chunk only through Posti, and only when:
+A person hears about a chunk only through Posti, after the arbiter has had its look, and only when:
 
-- reviewer agents disagree, or a check can't reach a verdict;
+- reviewer agents disagree, or a check can't reach a verdict, and the arbiter can't settle it;
 - a fix loop hits its cap of three rounds and a rethink didn't help;
 - a change would weaken a check (loosen a rule, drop a scenario, lower the eval pass rate). That is a question about
   intent, not code, so it is asked as one, with options and a recommendation.
