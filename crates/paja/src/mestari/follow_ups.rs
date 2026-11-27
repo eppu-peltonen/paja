@@ -598,11 +598,13 @@ mod tests {
 
     #[test]
     fn a_lead_before_prose_or_an_empty_value_redacts_nothing() {
+        // Built at run time, so secret scanners don't take the test's fake values for real ones.
         let long = "f6".repeat(10);
+        let (short, mixed) = (["Abc", "12"].concat(), ["My", "Pass"].concat());
         let text = format!(
             "the password field is empty; secret scanners flag it; \"password\": \"\", \"user\": \
-             \"bob\"; a secret\nmanager; the password.\n\nNext paragraph; password: Abc12; \
-             secret MyPass; api_key:\n  {long}"
+             \"bob\"; a secret\nmanager; the password.\n\nNext paragraph; password: {short}; \
+             secret {mixed}; api_key:\n  {long}"
         );
         assert_eq!(
             redact_tokens(&text),
