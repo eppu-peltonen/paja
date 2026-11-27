@@ -2317,6 +2317,60 @@ fn doctor_checks_that_the_sandbox_program_works() {
 }
 
 #[test]
+fn doctor_warns_when_claude_code_is_out_of_date() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let claude = program(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\ncase \"$1 $2\" in\n\
+         \"auth status\") echo '{\"loggedIn\": true}' ;;\n\
+         *) echo '2.0.0 (Claude Code)' ;;\nesac\n",
+    );
+    let latest = tmp.path().join("latest.json");
+    std::fs::write(&latest, "{\"version\": \"2.1.4\"}").unwrap();
+    let missing = tmp.path().join("no-such-file");
+    let current = tmp.path().join("current.txt");
+    std::fs::write(&current, "2.0.0\n").unwrap();
+    let claude_check = |source: &Path| -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(tmp.path())
+            .env("PAJA_HOME", &home)
+            .env("PAJA_CLAUDE", &claude)
+            .env("PAJA_CLAUDE_LATEST", source)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "claude")
+            .unwrap_or_else(|| panic!("no claude check in {report}"))
+            .clone()
+    };
+    let old = claude_check(&latest);
+    assert_eq!(old["status"], "warning", "{old}");
+    assert!(old["detail"].as_str().unwrap().contains("2.1.4"), "{old}");
+    assert!(old["fix"].as_str().unwrap().contains("update"), "{old}");
+    // A lookup that fails never fails doctor.
+    let unknown = claude_check(&missing);
+    assert_eq!(unknown["status"], "ok", "{unknown}");
+    assert!(
+        unknown["detail"]
+            .as_str()
+            .unwrap()
+            .contains("could not check"),
+        "{unknown}"
+    );
+    let same = claude_check(&current);
+    assert_eq!(same["status"], "ok", "{same}");
+}
+
+#[test]
 fn doctor_reports_each_check_and_the_fix_for_a_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home, d) = (
@@ -2365,12 +2419,16 @@ fn doctor_reports_each_check_and_the_fix_for_a_failure() {
          \"auth status\") echo '{\"loggedIn\": true}' ;;\n\
          *) echo '2.0.0 (Claude Code)' ;;\nesac\n",
     );
+    let latest = tmp.path().join("latest.txt");
+    std::fs::write(&latest, "2.0.0\n").unwrap();
     let doctor = || {
         let output = Command::new(env!("CARGO_BIN_EXE_paja"))
             .current_dir(&repo)
             .env("PAJA_HOME", &home)
             .env("PAJA_GH", &gh)
             .env("PAJA_CLAUDE", &claude)
+            // Not the network: a file that says the installed version is the latest.
+            .env("PAJA_CLAUDE_LATEST", &latest)
             .env_remove("PAJA_SBX")
             .args(["--json", "doctor"])
             .output()

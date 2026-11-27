@@ -161,7 +161,10 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
 - `git` runs; on Windows, Git for Windows' `sh` is found.
 - `gh` runs, is signed in (`gh auth status`), and the account can push and merge in the repository (`viewerPermission`
   is `WRITE`, `MAINTAIN` or `ADMIN`).
-- `claude` runs and is signed in (`claude auth status`).
+- `claude` runs and is signed in (`claude auth status`). It is a warning when Claude Code is older than the latest
+  release (`claude update` fixes it): agents get Anthropic's safety updates only through Claude Code updates. The
+  lookup takes a few seconds at most; when it fails (offline), the check says so and stays ok. `PAJA_CLAUDE_LATEST`
+  names another source: an `http(s)` URL or a file holding the version.
 - The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
 - The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
   branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
