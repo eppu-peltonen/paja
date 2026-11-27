@@ -50,12 +50,14 @@ fn fake_token() -> String {
     ["ghp", "ABCDEFGHIJKLMNOPQRSTuvwx"].join("_")
 }
 
-/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
+/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`. A
+/// sandbox the developer's shell names is left out unless `vars` names one.
 fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(cwd)
         .env("PAJA_HOME", home)
         .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .env_remove("PAJA_SBX")
         .envs(vars.iter().copied())
         .arg("--json")
         .args(args)
@@ -9539,6 +9541,9 @@ fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
 /// `paja init` with the given `files` committed and a fake `claude` that answers with `answer`
 /// (the agent's `structured_output`) and logs each call in `claude-calls` next to the repository.
 /// Returns the temp directory (the fakes' logs are in it), the repository and the result.
+/// `paja init` with a fake `claude` that answers `answer`. The fake records its arguments one per
+/// line in `claude-args`, so an argument with a newline in it (a harness from a committed
+/// `CLAUDE.md`) would be split; the fixtures here have none.
 fn init_with_agent(
     files: &[(&str, &str)],
     answer: &Value,
@@ -9890,51 +9895,53 @@ fn init_falls_back_to_the_table_without_the_agents_environment() {
 }
 
 #[test]
-fn the_init_agent_gets_read_only_tools_and_hook() {
+fn init_agent_gets_read_only_tools_and_hook() {
     let answer = serde_json::json!({"stacks": [{"name": "go", "dir": ".", "file": "go.mod",
         "checks": [{"command": "go test ./...", "file": "go.mod"}], "commands": ["go"]}]});
     let (tmp, _repo, ok, out) = init_with_agent(&[("go.mod", "module x\n")], &answer, &[]);
     assert!(ok, "{out}");
     let args = std::fs::read_to_string(tmp.path().join("claude-args")).unwrap();
     let args: Vec<&str> = args.lines().collect();
-    let after = |flag: &str| {
-        let at = args.iter().position(|a| *a == flag);
-        at.and_then(|at| args.get(at + 1))
-            .copied()
+    let at = |flag: &str| {
+        args.iter()
+            .position(|a| *a == flag)
             .unwrap_or_else(|| panic!("no {flag}: {args:?}"))
     };
-    // Only reading tools are defined at all, and only reading ones are allowed.
-    assert_eq!(after("--tools"), "Read,Glob,Grep,Bash", "{args:?}");
-    let allowed = &args[args.iter().position(|a| *a == "--allowedTools").unwrap() + 1..];
-    let allowed: Vec<&str> = allowed
+    // Only reading tools are defined at all, and only these reading ones are allowed.
+    assert_eq!(args[at("--tools") + 1], "Read,Glob,Grep,Bash", "{args:?}");
+    let allowed: Vec<&str> = args[at("--allowedTools") + 1..]
         .iter()
         .take_while(|a| !a.starts_with("--"))
         .copied()
         .collect();
-    assert!(allowed.contains(&"Read"), "{allowed:?}");
-    for write in ["Edit", "Write", "NotebookEdit"] {
-        assert!(!allowed.iter().any(|a| a.starts_with(write)), "{allowed:?}");
-    }
-    assert!(
-        allowed.iter().all(|a| !a.starts_with("Bash(")
-            || a.starts_with("Bash(git ")
-            || [
-                "Bash(tail *)",
-                "Bash(head *)",
-                "Bash(grep *)",
-                "Bash(wc *)",
-                "Bash(pwd)"
-            ]
-            .contains(a)),
-        "{allowed:?}"
+    assert_eq!(
+        allowed,
+        [
+            "Read",
+            "Glob",
+            "Grep",
+            "Bash(git status*)",
+            "Bash(git diff*)",
+            "Bash(git log*)",
+            "Bash(git show*)",
+            "Bash(tail *)",
+            "Bash(head *)",
+            "Bash(grep *)",
+            "Bash(wc *)",
+            "Bash(pwd)",
+        ],
+        "{args:?}"
     );
-    // The deny-list hook runs in its read-only mode.
-    let settings = after("--settings");
+    // The deny-list hook runs before every tool, in its read-only mode.
+    let settings: Value = serde_json::from_str(args[at("--settings") + 1]).unwrap();
+    let pre = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(pre["matcher"], "*", "{settings}");
+    let command = pre["hooks"][0]["command"].as_str().unwrap();
     assert!(
-        settings.contains("hook") && settings.contains("--read-only"),
-        "{settings}"
+        command.contains(" hook ") && command.contains("--read-only"),
+        "{command}"
     );
-    assert_eq!(after("--permission-mode"), "auto", "{args:?}");
+    assert_eq!(args[at("--permission-mode") + 1], "auto", "{args:?}");
 }
 
 #[test]
