@@ -10254,6 +10254,7 @@ fn a_failed_merge_github_does_not_explain_is_parked_as_an_error() {
     .unwrap();
     let (_, report) = f.run();
     // Parked on the error, with gh's message, not asked as a merge-setting question.
+    assert_eq!(report["outcome"], "escalated", "{report}");
     let question = report["question"].as_str().unwrap();
     assert!(
         question.starts_with("Paja's run stopped with an error"),
@@ -10264,6 +10265,7 @@ fn a_failed_merge_github_does_not_explain_is_parked_as_an_error() {
         "{question}"
     );
     assert!(!question.contains("GitHub refused to merge"), "{question}");
+    assert!(question.contains("protection rules"), "{question}");
 }
 
 #[test]

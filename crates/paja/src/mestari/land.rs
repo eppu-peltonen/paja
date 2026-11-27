@@ -206,7 +206,14 @@ pub(super) fn land(
                 )
             });
         }
-        return Err(err).with_context(|| format!("{gh} pr merge {pr}"));
+        return Err(err).with_context(|| {
+            format!(
+                "{gh} pr merge {pr} failed, and GitHub's settings for {} don't say why: check \
+                 that the token `{gh} auth status` shows may write there, and the default \
+                 branch's protection rules, then answer what you fixed",
+                item.repo
+            )
+        });
     }
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, &item.repo, item.number, Status::Landed, Some(&pr));
