@@ -450,20 +450,21 @@ recommended.
   (`RUST_LOG='debug'`): bash runs a word with a quote before its `=` as a program, so the hook refuses it and says to
   quote only the value. A value with a `~` is refused, since bash expands it after the `=` or a `:`.
 - **Listed programs.** `.paja/commands`, read from the default branch like `.paja/checks` and never from the branch
-  under review, names the programs agents may run besides local `git`: one per line, `#` comments allowed (`npm`, `node`,
-  `pytest`, `go`). A line `review <program>` lets reviewers run it too; the other lines are for the builder (build and fix
-  roles) only. A missing file lists `cargo` for every role, so a repository without one behaves as before. Mestari reads
-  the file and passes the role's list as `--programs` (comma-terminated, `,` for none); a file it can't read or parse
-  stops the agent, and a hook started without the list blocks every call. A listed program runs under the shape rules
-  above and the generic checks: it must start in the worktree, and any word that names a path (also after `--flag=`
-  or glued to a short flag, as in `-o./out`) must stay inside it and obey the write rules; a short-flag cluster with a
-  path inside it (`-xvf/tmp/a`, `-xC..`, `-x.C/tmp/a`: a glued `.` starts a path only as `.`, `..`, `./` or `../`), a
-  letter before a `:` (a drive, as in `-xfC:x`; `-p8080:80` is fine) or a `~` glued to the flag is refused, with the fix
-  of putting a space before the value, and each dot name inside a cluster (`.git` in `-xf.git`) is checked like a
-  path, as is a protected name after any `=` (`out=clippy.toml`). Windows 8.3 short names of protected names count
-  too, also the hashed form NTFS falls back to (`GI3F2A~1`: two letters, four hex digits). A program not
-  on the list is refused with a message naming `.paja/commands` on the default branch as the fix. Only `cargo` and
-  `git` have per-subcommand flag lists.
+  under review, names the programs agents may run besides local `git`: one per line, `#` comments allowed (`npm`,
+  `node`, `pytest`, `go`). A line `review <program>` lets reviewers run it too; the other lines are for the builder
+  (build and fix roles) only. A missing file lists `cargo` for every role, so a repository without one behaves as
+  before. Mestari reads the file and passes the role's list as `--programs` (comma-terminated, `,` for none); a file it
+  can't read or parse stops the agent, and a hook started without the list blocks every call. A listed program runs
+  under the shape rules above and the generic checks: it must start in the worktree, and any word that names a path
+  (also after `--flag=` or glued to a short flag, as in `-o./out`) must stay inside it and obey the write rules; a
+  short-flag cluster with a path inside it (`-xvf/tmp/a`, `-xC..`, `-x.C/tmp/a`: a glued `.` starts a path only as `.`,
+  `..`, `./` or `../`), a letter before a `:` (a drive, as in `-xfC:x`; `-p8080:80` is fine, `-plocalhost:80` needs a
+  space) or a `~` glued to the flag is refused, with the fix of putting a space before the value, and each dot name
+  inside a cluster (`.git` in `-xf.git`) is checked like a path, as is what follows any `=` (`out=/tmp/x`,
+  `out=clippy.toml`). Protected names compare in Unicode's upper case, as NTFS folds them (`ruſtfmt.toml`). Windows 8.3
+  short names of protected names count too, also the hashed form NTFS falls back to (`GI3F2A~1`: two letters, four hex
+  digits). A program not on the list is refused with a message naming `.paja/commands` on the default branch as the fix.
+  Only `cargo` and `git` have per-subcommand flag lists.
 - **Cargo and git flags** come from a list per subcommand, and anything not on it is blocked, so no spelling of an
   option can load other configuration, run a program or reach another file. Cargo runs build, check, test, fmt,
   clippy, run and doc, with plain names for packages, targets, test filters and lints. Git's subcommand comes first

@@ -725,12 +725,14 @@ fn short_name_of_protected(word: &str) -> bool {
     })
 }
 
-/// A word that is, or could be shorthand for, a protected name.
+/// A word that is, or could be shorthand for, a protected name: compared with Unicode's upper
+/// case, as NTFS folds names (`ruſtfmt.toml` is `rustfmt.toml` there).
 fn is_protected_word(word: &str) -> bool {
+    let upper = word.to_uppercase();
     short_name_of_protected(word)
         || PROTECTED_NAMES
             .iter()
-            .any(|name| name.eq_ignore_ascii_case(word))
+            .any(|name| name.to_uppercase() == upper)
 }
 
 /// `path` must be inside the worktree, and not git's link to the repository.
@@ -1185,15 +1187,18 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
             Some(rest) => {
                 let glued = rest.char_indices().nth(1).map_or("", |(at, _)| &rest[at..]);
                 // A glued `.` starts a path only as `.`, `..`, `./` or `../`: in `-x.C/tmp/a`
-                // the `.` could be one more flag letter, before `C` and `/tmp/a`.
+                // the `.` could be one more flag letter, before `C` and `/tmp/a`. `-o./out`
+                // stays a path (a `.` flag taking `/out` would need a non-letter flag, which
+                // option parsers don't use).
                 let dot_path = matches!(glued, "." | "..")
                     || ["./", ".\\", "../", "..\\"]
                         .iter()
                         .any(|start| glued.starts_with(start));
                 let starts_as_path =
                     glued.starts_with(['/', '\\', '~']) || dot_path || has_drive(glued);
-                // A letter before a `:` could be a drive (`-xfC:x`); a port (`-p8080:80`)
-                // can't.
+                // A letter before a `:` could be a drive (`-xfC:x`); a digit (`-p8080:80`)
+                // can't. `-plocalhost:80` looks the same as a drive and is refused; a space
+                // after the flag lets it through.
                 let drive_inside = glued
                     .as_bytes()
                     .windows(2)
@@ -1245,18 +1250,14 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
             }
             None => values.push(arg),
         }
-        // A protected name after any `=` (`out=clippy.toml`, `--cfg=a=rustfmt.toml`) is checked
-        // as a path of its own.
+        // What follows any `=` (`out=/tmp/x`, `--cfg=a=rustfmt.toml`) is checked as a path of
+        // its own; a plain value (`1.2.3`, `on`) is skipped below like any other word.
         let after_equals: Vec<&str> = values
             .iter()
             .flat_map(|value| {
                 value
                     .match_indices('=')
                     .map(move |(at, _)| &value[at + 1..])
-            })
-            .filter(|rest| {
-                rest.split(['/', '\\'])
-                    .any(|part| is_protected_word(part.split('=').next().unwrap_or(part)))
             })
             .collect();
         values.extend(after_equals);
@@ -1841,7 +1842,20 @@ mod program_tests {
             "npm test RU12AB~1/x",
             "npm test out=clippy.toml",
             "npm test --cfg=a=rustfmt.toml",
-            "npm test -Da=b=.git",
+            "npm test -Da=b=clippy.toml",
+            "npm test out=/tmp/x",
+            "npm test out=../x",
+            "npm test --cfg=a=/tmp/x",
+            "npm test --cfg=a=../../x",
+            "npm test 'out=ruſtfmt.toml'",
+            "npm test '--a=b=ruſtfmt.toml'",
+            "npm test 'ruſtfmt.toml'",
+            "npm test '-xfruſtfmt.toml'",
+            "npm test CAFE00~1",
+            "npm test -x..C",
+            "npm test -.C/tmp/a",
+            "npm test -xf.Git",
+            "npm test -plocalhost:80",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -1868,6 +1882,10 @@ mod program_tests {
         ok("npm test -o../work-1/x");
         ok("npm test out=file.txt");
         ok("npm test AB12CD~1");
+        ok("npm test GI3F2~1");
+        ok("npm test GIXYZW~1");
+        ok("npm test -Dkey=a=b");
+        ok("npm test -p localhost:80");
     }
 }
 
