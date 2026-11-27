@@ -1,11 +1,10 @@
 //! What a step spent, and what the usage window looked like afterwards.
 //!
-//! The window: `claude -p --output-format json` is read as one JSON result. Claude Code reports
-//! the account's rate-limit state as a `rate_limit_event` message in `--output-format
-//! stream-json`, whose `rate_limit_info` holds `status` (`allowed`, `allowed_warning` or
-//! `rejected`), `utilization` (the share used, 0 to 1) and `resetsAt` (epoch seconds). Paja still
-//! reads the single JSON result, so it takes the same `rate_limit_info` object from the result
-//! when one is there, and records `status`, the used percent and the reset time on the step
+//! The window: `claude -p --output-format stream-json --verbose` prints the account's rate-limit
+//! state as `rate_limit_event` messages, whose `rate_limit_info` holds `status` (`allowed`,
+//! `allowed_warning` or `rejected`), `utilization` (the share used, 0 to 1) and `resetsAt` (epoch
+//! seconds). `agent::fold_stream` reduces the stream to the final `result` message and adds the
+//! latest event's `rate_limit_info` to it unless the result has one. Paja records `status`, the used percent and the reset time on the step
 //! (`window_status`, `window_used_percent`, `window_resets_at`). A Claude Code whose result has no
 //! `rate_limit_info` leaves all three `None`, and then nothing is held back: the window is only
 //! ever judged on what was reported.

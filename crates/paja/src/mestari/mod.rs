@@ -489,13 +489,34 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
              {CI_FILE} on the default branch to land on Vasara's checks and the reviewers alone"
         );
     }
+    // A new item starts with a build, which a nearly used window would cut off, so it isn't
+    // claimed at all (no status events) and the pass waits. A resumed item goes on to its round,
+    // which makes the same check for each build.
+    let nearly = window_nearly_used(
+        &home.events().read_all()?,
+        crate::events::now_ms(),
+        config.models.window_percent(),
+    );
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
         lock: _working,
         resumed,
-    }) = jono::claim_for_run_item(home, &name, opts.item)?
+    }) = jono::claim_for_run_item(home, &name, opts.item, nearly.is_none())?
     else {
+        if let Some(resets_at) = nearly {
+            let ready = jono::runnable(home, &name)?
+                .iter()
+                .any(|i| opts.item.is_none_or(|n| n == i.number));
+            if ready {
+                progress(&format!(
+                    "the usage window is nearly used up, so no new item was started; `paja run` \
+                     can run again at {}",
+                    format_utc(resets_at)
+                ));
+                return Ok(RunReport::Paused { resets_at });
+            }
+        }
         if let Some(number) = opts.item {
             bail!(
                 "work item #{number} is not queued (or another run holds it); see \
@@ -507,24 +528,6 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
-    // A new item starts with a build, which a nearly used window would cut off: put it back and
-    // wait. A resumed item goes on to its round, which makes the same check for each build.
-    if !resumed {
-        if let Some(resets_at) = window_nearly_used(
-            &home.events().read_all()?,
-            crate::events::now_ms(),
-            config.models.window_percent(),
-        ) {
-            jono::set_status(home, &item.repo, item.number, Status::Queued, None)?;
-            progress(&format!(
-                "the usage window is nearly used up, so #{} wasn't started; `paja run` can run \
-                 again at {}",
-                item.number,
-                format_utc(resets_at)
-            ));
-            return Ok(RunReport::Paused { resets_at });
-        }
-    }
     summary(
         &item,
         &config.target,

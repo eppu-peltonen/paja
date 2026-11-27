@@ -4481,6 +4481,42 @@ fn a_nearly_used_window_holds_back_the_next_build_but_not_the_review() {
 }
 
 #[test]
+fn a_nearly_used_window_claims_no_new_item() {
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    // The first item lands, and its build recorded the nearly used window.
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    // A second, new item is queued.
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 6, "title": "Another", "body": "Please.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+    let statuses = |f: &Factory| {
+        let (_, log) = paja(&f.home, &f.repo, &["log"]);
+        log.as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "work.status")
+            .count()
+    };
+    paja(&f.home, &f.repo, &["work", "sync"]);
+    let (events, calls) = (statuses(&f), f.claude_calls().len());
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "paused", "{again}\n{stderr}");
+    assert_eq!(again["resets_at"], resets * 1000, "{again}");
+    assert!(stderr.contains("no new item was started"), "{stderr}");
+    // Checked before the claim: no status event, no agent, and the item is still queued.
+    assert_eq!(statuses(&f), events, "no claim and no put-back");
+    assert_eq!(f.claude_calls().len(), calls, "no agent started");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "6"]);
+    assert_eq!(item["status"], "queued", "{item}");
+}
+
+#[test]
 fn a_usage_limit_in_a_review_keeps_the_work_and_waits_for_the_reset() {
     let f = Factory::new("true\n", "land");
     let resets = epoch_secs_in(3600);
@@ -5139,7 +5175,10 @@ fn agents_and_checks_run_through_the_sandbox() {
     // check and the reviewer all went through `exec`.
     assert_eq!(log.matches("create --name paja claude").count(), 1, "{log}");
     assert!(log.contains("test -f feature.txt"), "{log}");
-    assert!(log.matches("--output-format json").count() >= 2, "{log}");
+    assert!(
+        log.matches("--output-format stream-json").count() >= 2,
+        "{log}"
+    );
     // The agents run in the sandbox's own permission mode, never the image's default, and
     // without the host-only deny-list hook.
     for call in f.claude_calls() {
