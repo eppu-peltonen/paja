@@ -554,10 +554,11 @@ next run creates it again. Toolchain setup waits (about five minutes) for apt's 
 while it starts.
 
 - **What the code can reach.** Only what is mounted: the factory's `envs/` directory (the worktrees) and the
-  repository's own `.git` directory, which commits in a worktree need. The owner's `HOME`, its credential files, git's
-  global and system configuration, the factory's event log, the hook's copy of the binary and the stamp are not in the
-  sandbox. Code in it gets a throwaway `PAJA_HOME` in the sandbox's own `/tmp` and the same stripped git environment as
-  on the host, and none of the host's environment variables.
+  repository's own `.git` directory, which commits in a worktree need (unless it is already under `envs/`, as an `init`
+  agent's scratch repository is, which is then reached through that mount). The owner's `HOME`, its credential files,
+  git's global and system configuration, the factory's event log, the hook's copy of the binary and the stamp are not in
+  the sandbox. Code in it gets a throwaway `PAJA_HOME` in the sandbox's own `/tmp` and the same stripped git environment
+  as on the host, and none of the host's environment variables.
 - **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If `PAJA_SBX` is
   set and the sandbox can't start, it stops with an error that says what to install or set up. It never falls back to
   running on the host. Without `PAJA_SBX`, `paja run` says on stderr that there is no sandbox, and runs as described
