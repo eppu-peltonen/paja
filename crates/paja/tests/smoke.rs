@@ -2237,11 +2237,13 @@ impl Factory {
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  echo https://example.com/pull/1 ;;\n\
-                 \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
+                 \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
+                 if [ -f {d}/view-down-after-claim ]; then touch {d}/view-down; fi; echo https://example.com/acme/app/issues/$3#issuecomment-88 ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi\n\
                  if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi ;;\n\
                  \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; rm -f {d}/view-5.json; fi ;;\n\
-                 \"issue view\") if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
+                 \"issue view\") if [ -f {d}/view-down ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
+                 if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
                  *) ;;\nesac\n"
             ),
         );
@@ -6021,9 +6023,13 @@ fn two_claims_racing_resolve_to_the_earlier_one() {
         log.contains("issue edit 5 --add-label factory-claimed"),
         "{log}"
     );
+    // The run deletes its own claim comment, not the winner's, and the shared label stays: it
+    // marks the winner's claim now.
+    assert!(log.contains("/issues/comments/88"), "{log}");
+    assert!(!log.contains("/issues/comments/77"), "{log}");
     assert!(
-        log.contains("issue edit 5 --remove-label factory-claimed"),
-        "{log}"
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "the winner's label is left on: {log}"
     );
     assert!(!log.contains("pr create"), "{log}");
     assert!(
@@ -6056,6 +6062,50 @@ fn an_item_is_not_taken_when_its_claim_cannot_be_written() {
         "the label is taken back off: {}",
         f.gh_log()
     );
+}
+
+#[test]
+fn a_claim_that_cannot_be_checked_is_taken_back_off() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    // The claim comment is posted, then GitHub stops answering, so the run can't see whether
+    // it won.
+    std::fs::write(f.tmp.path().join("view-down-after-claim"), "").unwrap();
+    let (ok, err) = f.run();
+    assert!(!ok, "{err}");
+    let error = err["error"].as_str().unwrap();
+    assert!(error.contains("claiming #5 on GitHub failed"), "{error}");
+    let log = f.gh_log();
+    // Its comment goes, or it would win every other runner's race check while nobody builds
+    // the item; with the issue unreadable the label comes off too.
+    assert!(
+        log.contains("api -X DELETE") && log.contains("/issues/comments/88"),
+        "{log}"
+    );
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "{log}"
+    );
+    assert!(
+        !f.tmp.path().join("claude-args.log").exists(),
+        "no agent ran"
+    );
+}
+
+#[test]
+fn a_failed_claim_keeps_another_runners_label() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    // Another runner's live claim lands while this one's comment fails to post: the label is
+    // that runner's now, so it stays.
+    f.claimed_by_other(false, "2999-01-01T00:00:00Z");
+    std::fs::write(f.tmp.path().join("claim-down"), "").unwrap();
+    let (ok, err) = f.run();
+    assert!(!ok, "{err}");
+    let log = f.gh_log();
+    assert!(
+        !log.contains("issue edit 5 --remove-label factory-claimed"),
+        "{log}"
+    );
+    assert!(!log.contains("api -X DELETE"), "{log}");
 }
 
 #[test]
