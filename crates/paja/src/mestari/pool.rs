@@ -719,7 +719,9 @@ fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
-                eprintln!("plan #{number}: {line}");
+                // Not `eprintln!`: on a closed stderr it panics, this thread stops reading,
+                // and the child blocks once its stderr pipe is full.
+                let _ = writeln!(std::io::stderr(), "plan #{number}: {line}");
             }
         });
     }
@@ -752,7 +754,9 @@ fn spawn(
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
-                eprintln!("lane {lane} #{number}: {line}");
+                // Not `eprintln!`: on a closed stderr it panics, this thread stops reading,
+                // and the child blocks once its stderr pipe is full.
+                let _ = writeln!(std::io::stderr(), "lane {lane} #{number}: {line}");
             }
         });
     }
