@@ -40,7 +40,10 @@ Follow-up issues go stale: later changes fix them, repeat them or make them moot
 cheapest model; a repository with no line runs it on the account's default) reads the open issues with the follow-up
 label, up to 60, and sorts each into one of the verdicts below. Each issue gets a turn: a pass reads first the issues no
 pass has read (oldest first), then those whose last read (in `triage.ran`) is longest ago, so a list longer than 60 is
-read in full over a few passes. The verdicts:
+read in full over a few passes. The next 200 open follow-ups past the 60 are listed too, by number and title only, so an
+issue of the pass can be called a duplicate of one a later pass reads. Issue text is data in the prompt: its angle
+brackets become `‹` and `›`, so it can't open or close one of the prompt's tags, and invisible format characters
+(zero-width, bidi overrides) are dropped. The verdicts:
 
 - `keep`: still valid. Also what anything Paja can't back up becomes.
 - `duplicate`: the same as another open follow-up issue, which it names.
@@ -65,9 +68,10 @@ repository at a time: a pass holds a lock for its whole life, a second `paja tri
 held and says to wait, and `paja run --every` and an idle pool skip their pass then. Its word is not enough to close anything: Paja closes a duplicate only when the
 original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
 named commit must be on the default branch, committed after the issue was opened, and change a file the issue names
-(a merge against its first parent), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
+(a merge against its first parent; in a shallow clone a commit with no parent there is not taken), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
 a longer or shorter one ending in it at a `/`), and a bare file name with an extension names any file of that name;
-paths use `/` whichever way the agent wrote them. Otherwise the issue is kept. Each issue reaches the agent with when
+paths use `/` whichever way the agent wrote them. A link to one of the repository's own files on GitHub
+(`.../<owner>/<name>/blob/<ref>/<path>`) names that path; any other link names nothing. Otherwise the issue is kept. Each issue reaches the agent with when
 it was opened. Issue text reaches the agent as data to judge.
 
 `--json` prints `{repo, base, items, closed, not_worth_doing}`, and `retried_notes` when a pass tried earlier notes

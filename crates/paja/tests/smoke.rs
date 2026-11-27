@@ -926,6 +926,28 @@ fn work_sync_imports_labelled_issues_and_next_picks_the_oldest() {
         .filter(|e| e["kind"] == "work.checkout")
         .count();
     assert_eq!(checkouts, 1, "{events}");
+    // So is a `--repo` spelled with `..` and `.` parts, run from somewhere else.
+    let roundabout = sub.join("..").join(".").join("src");
+    let (ok, again) = paja_with(
+        &home,
+        tmp.path(),
+        &["work", "sync", "--repo", roundabout.to_str().unwrap()],
+        &with_gh,
+    );
+    assert!(ok, "{again}");
+    let (_, events) = paja(&home, &repo, &["log"]);
+    let checkouts: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "work.checkout")
+        .collect();
+    assert_eq!(checkouts.len(), 1, "{events}");
+    assert_eq!(
+        checkouts[0]["data"]["path"],
+        serde_json::json!(repo),
+        "{events}"
+    );
 
     let (ok, next) = paja(&home, &repo, &["work", "next"]);
     assert!(ok);
@@ -1295,7 +1317,8 @@ fn queue_gh(dir: &std::path::Path) -> std::path::PathBuf {
              *\"--label factory-follow-up \"*) echo '[{{\"number\": 2, \"title\": \"Tidy\", \"body\": \"\", \"url\": \"https://example.com/2\"}}]' ;; \
              *\"--label factory \"*) echo '[{{\"number\": 4, \"title\": \"Build\", \"body\": \"\", \"url\": \"https://example.com/4\"}}]' ;; \
              *) echo '[]' ;; esac ;;\n\
-             \"api \"*) if [ -f {d}/closed-on-github ]; then echo closed; fi ;;\n\
+             \"api \"*) case \"$2\" in *events) if [ -f {d}/reopened-on-github ]; then cat {d}/reopened-on-github; fi ;; \
+             *) if [ -f {d}/closed-on-github ]; then echo closed; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
     )
@@ -1407,6 +1430,78 @@ fn a_landed_follow_up_github_closed_while_follow_ups_were_off_is_queued_when_it_
     assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
     let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
     assert_eq!(item["status"], "queued", "{item}");
+}
+
+#[test]
+fn a_landed_follow_up_github_reopened_while_hidden_by_follow_ups_off_is_queued_when_they_come_back()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let queue = |text: &str| {
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/queue"), text).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "queue"]);
+    };
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (_, set) = paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    assert_eq!(set["status"], "landed", "{set}");
+    // Follow-ups go off while #2 is still open on GitHub: the rule hides it.
+    queue("follow-ups = off\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["closed"], serde_json::json!([2]), "{report}");
+    // Meanwhile GitHub closes #2 and reopens it (a revert, say); follow-ups come back on.
+    std::fs::write(
+        tmp.path().join("reopened-on-github"),
+        "2020-01-01T00:00:00Z\n2099-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    queue("follow-ups = on\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["status"], "queued", "{item}");
+    // It was asked about once; the next sync doesn't ask again.
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert_eq!(log.matches("issues/2/events").count(), 1, "{log}");
+    let (ok, _) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok);
+    let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
+    assert_eq!(log.matches("issues/2/events").count(), 1, "{log}");
+}
+
+#[test]
+fn a_follow_up_hidden_by_follow_ups_off_and_reopened_only_before_stays_landed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = queue_gh(tmp.path());
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let queue = |text: &str| {
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/queue"), text).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "queue"]);
+    };
+    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    paja_with(&home, &repo, &["work", "set", "2", "landed"], &with_gh);
+    queue("follow-ups = off\n");
+    paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    // GitHub's only reopen of #2 is older than the hiding.
+    std::fs::write(
+        tmp.path().join("reopened-on-github"),
+        "2020-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    queue("follow-ups = on\n");
+    let (_, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert_eq!(report["reopened"], serde_json::json!([2]), "{report}");
+    let (_, item) = paja_with(&home, &repo, &["work", "show", "2"], &with_gh);
+    assert_eq!(item["status"], "landed", "{item}");
 }
 
 #[test]
@@ -2082,7 +2177,8 @@ impl Factory {
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
-                 \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
+                 \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi\n\
+                 if [ -f {d}/label-down ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi ;;\n\
                  \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; rm -f {d}/view-5.json; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
                  *) ;;\nesac\n"
@@ -4446,6 +4542,24 @@ fn an_arbiter_that_cant_run_leaves_the_escalation_with_the_person() {
 }
 
 #[test]
+fn a_label_that_fails_for_another_reason_is_not_created() {
+    let f = Factory::new("true\n", "escalate");
+    // GitHub is down rather than missing the label: Paja must not try to make one.
+    std::fs::write(f.tmp.path().join("label-down"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let log = f.gh_log();
+    assert_eq!(
+        log.matches("issue edit 5 --add-label factory-needs-answer")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("label create"), "{log}");
+}
+
+#[test]
 fn an_escalated_issue_is_labelled_until_it_is_answered() {
     let f = Factory::new("true\n", "escalate");
     // The repository doesn't have the label yet, so Paja creates it.
@@ -4931,6 +5045,110 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
     assert_eq!(report["closed"], serde_json::json!([11]), "{report}");
     let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
     assert!(log.contains("createdAt"), "{log}");
+}
+
+#[test]
+fn triage_closes_a_duplicate_of_a_follow_up_a_later_pass_reads() {
+    let (f, dir) = triage_factory(r#"{"issues": []}"#);
+    let issues: Vec<String> = (1..=62)
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "title": "Issue {n}", "body": "details of {n}.", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issues.join(", ")),
+    )
+    .unwrap();
+    // #1 says the same as #62, which this pass doesn't judge; the rest stay.
+    let mut entries = vec![
+        r#"{"number": 1, "verdict": "duplicate", "duplicate_of": 62, "reason": "Same."}"#
+            .to_string(),
+    ];
+    entries.extend(
+        (2..=60).map(|n| format!(r#"{{"number": {n}, "verdict": "keep", "reason": "open"}}"#)),
+    );
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(
+            r#"{{"is_error": false, "num_turns": 1, "structured_output": {{"issues": [{}]}}}}"#,
+            entries.join(", ")
+        ),
+    )
+    .unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([1]), "{report}");
+    assert_eq!(report["items"][0]["duplicate_of"], 62, "{report}");
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    // The issues past the 60 are listed by number and title only.
+    assert!(
+        prompt.contains("#61: Issue 61\n#62: Issue 62\n"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("details of 61."), "{prompt}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issue close 1 --comment"), "{log}");
+    assert!(log.contains("a duplicate of #62"), "{log}");
+    assert!(!log.contains("issue close 62"), "{log}");
+}
+
+#[test]
+fn triage_lists_at_most_two_hundred_later_follow_ups_and_keeps_a_duplicate_of_one_past_them() {
+    let (f, dir) = triage_factory(r#"{"issues": []}"#);
+    let issues: Vec<String> = (1..=262)
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "title": "Issue {n}", "body": "details of {n}.", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issues.join(", ")),
+    )
+    .unwrap();
+    // #1 names #260, the last one listed; #2 names #261, which the prompt doesn't show.
+    let mut entries = vec![
+        r#"{"number": 1, "verdict": "duplicate", "duplicate_of": 260, "reason": "Same."}"#
+            .to_string(),
+        r#"{"number": 2, "verdict": "duplicate", "duplicate_of": 261, "reason": "Same."}"#
+            .to_string(),
+    ];
+    entries.extend(
+        (3..=60).map(|n| format!(r#"{{"number": {n}, "verdict": "keep", "reason": "open"}}"#)),
+    );
+    std::fs::write(
+        dir.join("answer.json"),
+        format!(
+            r#"{{"is_error": false, "num_turns": 1, "structured_output": {{"issues": [{}]}}}}"#,
+            entries.join(", ")
+        ),
+    )
+    .unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([1]), "{report}");
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    assert!(
+        prompt.contains("#260: Issue 260\n</other-issues>"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("#261:"), "{prompt}");
+    // The pass's record keeps only issues it judged: none it merely listed.
+    let ran = events_of(&f, "triage.ran");
+    let kept: Vec<u64> = ran[0]["data"]["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_u64().unwrap())
+        .collect();
+    assert_eq!(kept, (2..=60).collect::<Vec<u64>>(), "{ran:?}");
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issue close 1 --comment"), "{log}");
+    assert!(!log.contains("issue close 2 "), "{log}");
 }
 
 #[test]
