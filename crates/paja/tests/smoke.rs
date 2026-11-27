@@ -5273,8 +5273,22 @@ fn init_new_pushes_a_walking_skeleton_for_each_stack_and_the_rust_one_passes_its
         .as_str()
         .unwrap()
         .contains("not a usable project name"));
+    // So is a name ending in `.git`, which GitHub would drop from the repository's name.
+    let (ok, out) = paja_with(
+        &home,
+        &work,
+        &["init", "--new", "app.git", "--stack", "rust"],
+        &identity,
+    );
+    assert!(!ok, "{out}");
+    let error = out["error"].as_str().unwrap();
+    assert!(
+        error.contains("ends in `.git`") && error.contains("use \"app\""),
+        "{error}"
+    );
     let log = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap();
     assert!(!log.contains("bad name"), "{log}");
+    assert!(!log.contains("app.git"), "{log}");
 }
 
 #[test]
