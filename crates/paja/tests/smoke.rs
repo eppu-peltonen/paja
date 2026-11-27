@@ -9540,10 +9540,9 @@ fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
 
 /// `paja init` with the given `files` committed and a fake `claude` that answers with `answer`
 /// (the agent's `structured_output`) and logs each call in `claude-calls` next to the repository.
-/// Returns the temp directory (the fakes' logs are in it), the repository and the result.
-/// `paja init` with a fake `claude` that answers `answer`. The fake records its arguments one per
-/// line in `claude-args`, so an argument with a newline in it (a harness from a committed
-/// `CLAUDE.md`) would be split; the fixtures here have none.
+/// Returns the temp directory (the fakes' logs are in it), the repository and the result. The
+/// fake records its arguments one per line in `claude-args`, so an argument with a newline in it
+/// (a harness from a committed `CLAUDE.md`) would be split; the fixtures here have none.
 fn init_with_agent(
     files: &[(&str, &str)],
     answer: &Value,
