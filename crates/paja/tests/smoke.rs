@@ -4472,11 +4472,16 @@ fn a_second_review_judges_only_the_fix() {
     assert_eq!(report["rounds"], 2, "{report}");
     let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
     // Each logged call starts with `-p`; the reviewer's carries `--json-schema`.
-    let rereview = args
+    let reviews: Vec<&str> = args
         .split("\n-p ")
         .filter(|call| call.contains("--json-schema"))
-        .nth(1)
-        .unwrap_or_default();
+        .collect();
+    // The first review reads the whole change, and has its diff in the prompt too.
+    let first = reviews.first().copied().unwrap_or_default();
+    assert!(first.contains("Diff stat for `"), "{args}");
+    assert!(first.contains("...HEAD`"), "{args}");
+    assert!(first.contains("+++ b/feature.txt"), "{args}");
+    let rereview = reviews.get(1).copied().unwrap_or_default();
     assert!(rereview.contains("found these blockers"), "{args}");
     assert!(rereview.contains("add more"), "{args}");
     assert!(

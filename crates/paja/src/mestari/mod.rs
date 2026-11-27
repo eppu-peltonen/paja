@@ -944,6 +944,7 @@ fn run_item(
                 earlier.as_ref(),
                 steps,
                 &commands.builder,
+                &checks,
             )
         });
         let built = match built {
@@ -1862,10 +1863,16 @@ fn program_tools(programs: &[String]) -> Vec<String> {
 }
 
 /// What the builder is asked. `programs` are the ones `.paja/commands` lets it run.
-fn builder_prompt(item: &WorkItem, programs: &[String]) -> String {
+fn builder_prompt(item: &WorkItem, programs: &[String], checks: &[String]) -> String {
+    let checks = checks
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "You are Paja's builder. Implement this GitHub issue in the current checkout, following \
-         CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists, \
+         CLAUDE.md. Keep the change small and focused on the issue. Run the checks CLAUDE.md lists \
+         (Vasara's checks, every command in `.paja/checks` on the default branch: {checks}), \
          and commit your work on the current branch (never push, never switch branches). Commit \
          with `git add -A && git commit -m '<message>'`, the message one single-quoted argument \
          that ends with `Closes #{number}`. Read and change files with the file tools; Bash is \
@@ -1902,8 +1909,9 @@ fn build(
     carried: Option<&Carried>,
     spent: &mut Vec<StepUsage>,
     programs: &[String],
+    checks: &[String],
 ) -> Result<Built> {
-    let mut prompt = builder_prompt(item, programs);
+    let mut prompt = builder_prompt(item, programs, checks);
     let again = format!(
         "This is another round on the same branch (based on {base}). Address this first:\n\n{feedback}\n"
     );
@@ -2083,16 +2091,22 @@ fn review_prompt(
          (so never copy secrets, environment details or run output into them) and never files \
          nits. They never hold the change up.\n\n\
          Vasara's checks (every command in `.paja/checks` on the default branch: {checks}) already passed at \
-         {checked}, the commit you are judging, so don't run them again. To probe a behaviour, \
-         run one named test or the project itself, with Bash limited to {programs} and long \
-         output piped through `tail -n 80` or `grep`. Read-only git is fine; you can't change \
-         files.\n",
+         {checked}, the commit you are judging, so don't run them again. {probe}Read-only git \
+         is fine; you can't change files.\n",
+        probe = if programs.is_empty() {
+            "Bash is limited to local git, so read the code to judge a behaviour. ".to_string()
+        } else {
+            format!(
+                "To probe a behaviour, run one named test or the project itself, with Bash \
+                 limited to {} and long output piped through `tail -n 80` or `grep`. ",
+                programs_prose(programs)
+            )
+        },
         checks = checks
             .iter()
             .map(|c| format!("`{c}`"))
             .collect::<Vec<_>>()
             .join(", "),
-        programs = programs_prose(programs),
         number = item.number,
         title = item.title,
         body = item.body,
@@ -2121,8 +2135,14 @@ fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
         text.push_str(&format!("The diff:\n\n{full}"));
         return Ok(text);
     }
+    // The names come from git itself (`-z`: no quoting, any character in a path), in the order
+    // the diff lists its files.
+    let names = run(&["--name-only", "-z"])?;
+    let names: Vec<&str> = names.split('\0').filter(|n| !n.is_empty()).collect();
     let mut shown = String::new();
+    let mut used = 0usize;
     let mut skipped = Vec::new();
+    let mut cut = None;
     let mut files: Vec<String> = Vec::new();
     for line in full.lines() {
         if line.starts_with("diff --git ") || files.is_empty() {
@@ -2133,26 +2153,35 @@ fn review_diff(dir: &Path, range: &str, cap: usize) -> Result<String> {
         last.push('\n');
     }
     let mut full_so_far = false;
-    for file in files {
-        let name = file
-            .lines()
-            .next()
-            .and_then(|l| l.rsplit_once(" b/"))
-            .map_or("(unknown file)", |(_, n)| n)
-            .to_string();
-        if !full_so_far && shown.chars().count() + file.chars().count() <= cap {
-            shown.push_str(&file);
+    for (index, file) in files.iter().enumerate() {
+        let name = names.get(index).copied().unwrap_or("(unknown file)");
+        let size = file.chars().count();
+        if !full_so_far && used + size <= cap {
+            shown.push_str(file);
+            used += size;
         } else {
             // Once one file doesn't fit, the later ones are left out too, so the diff shown
             // is a prefix of the whole.
+            if !full_so_far && shown.is_empty() {
+                // The first file alone is over the cap: show its head, cut at the cap.
+                shown = file.chars().take(cap).collect();
+                cut = Some(name);
+            }
             full_so_far = true;
-            skipped.push(name);
+            skipped.push(format!("{name} ({} lines)", file.lines().count()));
         }
     }
+    let note = match cut {
+        Some(name) => format!(
+            "The first file, {name}, is over the cap by itself, so only its first {cap} \
+             characters are here. "
+        ),
+        None => String::new(),
+    };
     text.push_str(&format!(
-        "The diff is over {cap} characters, so only its first files are here:\n\n{shown}\n\
-         Not shown, because of the size cap; you must read these files yourself (`git diff \
-         {range} -- <file>`): {}\n",
+        "The diff is over {cap} characters, so only its first files are here. {note}\n\n{shown}\n\
+         Not shown (or cut), because of the size cap; you must read these files yourself (`git \
+         diff {range} -- <file>`): {}\n",
         skipped.join(", ")
     ));
     Ok(text)
@@ -3029,7 +3058,14 @@ mod tests {
             prompt.contains("Bash limited to local git and `cargo`"),
             "{prompt}"
         );
-        assert!(super::builder_prompt(&item, &cargo).contains("only for local git and `cargo`"));
+        let builder = super::builder_prompt(&item, &cargo, &checks);
+        assert!(builder.contains("only for local git and `cargo`"));
+        assert!(builder.contains("`cargo fmt --all --check`, `cargo test`"));
+        // No review programs: the reviewer is not told to run anything.
+        let bare = super::review_prompt(&item, "base1", "abc123", None, "D", &checks, &[]);
+        assert!(!bare.contains("run one named test"), "{bare}");
+        assert!(bare.contains("limited to local git"), "{bare}");
+        assert!(bare.contains("Read-only git is fine"), "{bare}");
 
         // Another project: neither prompt mentions cargo or Paja as the project.
         let npm = vec!["npm".to_string(), "node".to_string()];
@@ -3042,7 +3078,7 @@ mod tests {
             &["npm test".to_string()],
             &npm,
         );
-        let build = super::builder_prompt(&item, &npm);
+        let build = super::builder_prompt(&item, &npm, &["npm test".to_string()]);
         for text in [&js, &build] {
             assert!(!text.contains("cargo"), "{text}");
             assert!(!text.contains("reviewer for Paja"), "{text}");
@@ -3113,5 +3149,126 @@ mod tests {
             "{capped}"
         );
         assert!(capped.contains("b.txt"), "{capped}");
+        assert!(capped.contains("b.txt ("), "{capped}");
+    }
+
+    #[test]
+    fn the_review_diff_shows_the_head_of_a_first_file_over_the_cap_and_reads_names_from_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("keep.txt"), "one\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["tag", "base"]);
+        // A first file (in path order) far over the cap, then one whose path has ` b/` in it.
+        std::fs::create_dir(dir.join("x b")).unwrap();
+        std::fs::write(dir.join("a.txt"), "y".repeat(900)).unwrap();
+        std::fs::write(dir.join("x b").join("z.txt"), "later\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "change"]);
+        let capped = super::review_diff(dir, "base...HEAD", 300).unwrap();
+        assert!(
+            capped.contains("The first file, a.txt, is over the cap"),
+            "{capped}"
+        );
+        assert!(capped.contains("yyyyyyyy"), "{capped}");
+        assert!(!capped.contains(&"y".repeat(400)), "{capped}");
+        assert!(capped.contains("x b/z.txt ("), "{capped}");
+        assert!(!capped.contains("(unknown file)"), "{capped}");
+    }
+
+    #[test]
+    fn the_prompts_fit_this_repositorys_own_checks_and_commands() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let checks = super::lines(&std::fs::read_to_string(root.join(".paja/checks")).unwrap());
+        let commands = crate::hook::Commands::parse(
+            std::fs::read_to_string(root.join(".paja/commands"))
+                .ok()
+                .as_deref(),
+        )
+        .unwrap();
+        assert!(!checks.is_empty());
+        let item = crate::jono::WorkItem {
+            repo: "acme/app".into(),
+            number: 9,
+            title: "T".into(),
+            body: "B".into(),
+            url: String::new(),
+            open: true,
+            status: crate::jono::Status::Active,
+            note: None,
+            usage: None,
+            answers: Vec::new(),
+            waiting_on: Vec::new(),
+            priority: Default::default(),
+            claim: None,
+        };
+        let review = super::review_prompt(
+            &item,
+            "base1",
+            "abc123",
+            None,
+            "D",
+            &checks,
+            &commands.reviewer,
+        );
+        let build = super::builder_prompt(&item, &commands.builder, &checks);
+        for check in &checks {
+            assert!(review.contains(&format!("`{check}`")), "{check}: {review}");
+            assert!(build.contains(&format!("`{check}`")), "{check}: {build}");
+        }
+        for program in &commands.builder {
+            assert!(
+                build.contains(&format!("`{program}`")),
+                "{program}: {build}"
+            );
+        }
+        for program in &commands.reviewer {
+            assert!(
+                review.contains(&format!("`{program}`")),
+                "{program}: {review}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_source_file_is_high_risk_or_reviewed_as_standard_risk_on_purpose() {
+        // A new module has to be placed in `.paja/high-risk` or in this list, so it can't land
+        // at standard risk by being forgotten.
+        const STANDARD: &[&str] = &[
+            "doctor.rs",
+            "home.rs",
+            "init.rs",
+            "jono.rs",
+            "mcp.rs",
+            "posti.rs",
+            "usage.rs",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let prefixes =
+            super::lines(&std::fs::read_to_string(root.join(".paja/high-risk")).unwrap());
+        for entry in std::fs::read_dir(root.join("crates/paja/src")).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            let path = format!("crates/paja/src/{name}");
+            assert!(
+                super::is_high_risk(&path, &prefixes) || STANDARD.contains(&name.as_str()),
+                "{path} is neither in .paja/high-risk nor in this test's standard-risk list; \
+                 decide which it is"
+            );
+        }
     }
 }
