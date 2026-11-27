@@ -146,8 +146,8 @@ A unit test keeps the three high-risk files on the list.
 `paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
 and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, or `none` for a
-repository without CI; with `required` a repository with no GitHub Actions workflow stops the run after it claims an item, which goes back to
-the queue, and with `none`
+repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims anything, once an item
+is ready to take, so nothing is claimed on GitHub; with `none`
 landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
 creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
 `owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch

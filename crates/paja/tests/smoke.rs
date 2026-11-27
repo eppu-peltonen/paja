@@ -1952,9 +1952,11 @@ impl Factory {
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && cat \"$a\" >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
                  \"repo view\") echo '{view}' ;;\n\
-                 \"workflow list\") if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
+                 \"workflow list\") if [ -f {d}/workflows-down ]; then echo 'HTTP 403: Resource not accessible' >&2; exit 1; fi\n\
+                 if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
                  \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi\n\
+                 if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
                  \"pr checks\") while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
@@ -2333,10 +2335,50 @@ fn a_repository_without_workflows_stops_before_claiming() {
         error.contains("add a workflow") && error.contains(".paja/ci") && error.contains("none"),
         "{error}"
     );
-    // Nothing was claimed and no agent ran.
+    // Nothing was claimed, here or on GitHub, and no agent ran.
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "queued", "{item}");
+    let log = f.gh_log();
+    assert!(!log.contains("Claimed by runner"), "{log}");
+    assert!(!log.contains("paja-claimed"), "{log}");
     assert!(!f.tmp.path().join("claude-args.log").exists());
+}
+
+#[test]
+fn a_failed_workflow_listing_names_the_sign_in_and_the_way_round() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("workflows-down"), "").unwrap();
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap();
+    assert!(
+        error.contains("listing the repository's workflows failed")
+            && error.contains("`workflow`")
+            && error.contains(".paja/ci")
+            && error.contains("HTTP 403"),
+        "{error}"
+    );
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert!(!f.gh_log().contains("Claimed by runner"), "{}", f.gh_log());
+}
+
+#[test]
+fn a_none_mode_merge_refused_for_status_checks_names_the_ci_file() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("no-workflows"), "").unwrap();
+    std::fs::write(f.tmp.path().join("checks-required"), "").unwrap();
+    f.on_main(".paja/ci", "none\n");
+    let (_, report) = f.run();
+    let log = f.gh_log();
+    assert!(log.contains("pr merge"), "{log}");
+    let text = format!("{report}\n{log}");
+    assert!(
+        text.contains(
+            "is `none`, but the default branch's protection still requires status checks"
+        ) && text.contains("put `required` in"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -3787,6 +3829,49 @@ fn run_item_names_the_way_out_when_the_item_is_not_queued() {
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "queued", "{item}");
     assert!(!f.tmp.path().join("claude-args.log").exists());
+}
+
+#[test]
+fn run_item_says_when_it_skips_an_item_left_active() {
+    let f = Factory::new("true\n", "land");
+    two_items(&f);
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("hang"), "").unwrap();
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env_remove("PAJA_SBX")
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Stop the run mid-build of #5, so it stays active.
+    let started = std::time::Instant::now();
+    while !dir.join("hanging").exists() {
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the builder never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    run.kill().unwrap();
+    run.wait().unwrap();
+    std::fs::remove_file(dir.join("hang")).unwrap();
+
+    let (ok, report, stderr) = run_args(&f, &["--item", "6"], None);
+    assert!(ok, "{report}\n{stderr}");
+    assert_eq!(report["number"], 6, "{report}");
+    assert!(
+        stderr.contains("#5 was left active by an earlier run and is not resumed with --item")
+            && stderr.contains("`paja run` without --item resumes it"),
+        "{stderr}"
+    );
+    let (_, left) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(left["status"], "active", "{left}");
 }
 
 #[test]

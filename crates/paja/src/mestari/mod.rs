@@ -540,6 +540,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         crate::events::now_ms(),
         config.models.window_percent(),
     );
+    // Before the claim, so a repository without a workflow never has an item claimed and given
+    // back on GitHub at every pass; only when something could be taken, so an idle pass never
+    // calls GitHub for it; and before the build, because waiting for CI that will never run
+    // fails after the whole build.
+    if config.ci == CiMode::Required
+        && jono::runnable(home, &name)?
+            .iter()
+            .any(|i| opts.item.is_none_or(|n| n == i.number))
+    {
+        require_workflow(&repo)?;
+    }
     // The claim's lock is held until this pass is done with the item, however it ends.
     let Some(jono::RunClaim {
         item,
@@ -571,14 +582,6 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         }
         return Ok(RunReport::Idle);
     };
-    // After the claim, so an idle pass never calls GitHub for it; before the build, because
-    // waiting for CI that will never run fails after the whole build.
-    if config.ci == CiMode::Required {
-        if let Err(err) = require_workflow(&repo) {
-            unclaim(home, &repo, &item, resumed)?;
-            return Err(err);
-        }
-    }
     if let Some(number) = opts.item {
         if let Some(other) = jono::left_active(home, &name)?
             .into_iter()
