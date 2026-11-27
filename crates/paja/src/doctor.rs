@@ -490,7 +490,14 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
                 format!(
                     "{models_file} on {rev} names role(s) this Paja doesn't know, so their lines \
                      are skipped and the roles run on the default model or turn cap: {}",
-                    models.skipped.join(", ")
+                    // Quoted and escaped as the run's own warning shows them, so a control
+                    // character in the file never reaches the terminal.
+                    models
+                        .skipped
+                        .iter()
+                        .map(|role| format!("{role:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
                 format!(
                     "if a role is new, install the newer Paja; if it is a typo, fix it in \

@@ -2534,7 +2534,7 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     // A typo in a role, which a pass only mentions on stderr.
     std::fs::write(
         repo.join(".paja/models"),
-        "build sonnet\nreveiw opus\nmax-turns reveiw 5\n",
+        "build sonnet\nreveiw opus\nmax-turns reveiw 5\nbu\u{1b}[31mild opus\n",
     )
     .unwrap();
     git(&repo, &["add", "."]);
@@ -2574,9 +2574,12 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     assert_eq!(models["status"], "warning", "{report}");
     let detail = models["detail"].as_str().unwrap();
     assert!(
-        detail.contains(": reveiw") && detail.matches("reveiw").count() == 1,
+        detail.contains(": \"reveiw\"") && detail.matches("reveiw").count() == 1,
         "{report}"
     );
+    // A control character in a role word is escaped, never passed to the terminal.
+    assert!(detail.contains(r#""bu\u{1b}[31mild""#), "{report}");
+    assert!(!detail.contains('\u{1b}'), "{report}");
     // The labels came from `trunk`: its work label is `game`, which the repository has.
     let label = checks.iter().find(|c| c["name"] == "work label").unwrap();
     assert_eq!(label["status"], "ok", "{report}");
