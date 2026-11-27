@@ -27,11 +27,20 @@ $v = (irm https://api.github.com/repos/eppu-peltonen/paja/releases/latest).tag_n
 $name = "paja-$($v.TrimStart('v'))-x86_64-pc-windows-msvc"
 $dir = Join-Path $env:LOCALAPPDATA "Programs\paja"
 irm "https://github.com/eppu-peltonen/paja/releases/download/$v/$name.zip" -OutFile "$env:TEMP\$name.zip"
-Expand-Archive "$env:TEMP\$name.zip" $env:TEMP -Force
-New-Item -ItemType Directory $dir -Force | Out-Null
-Copy-Item "$env:TEMP\$name\paja.exe" $dir
-[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+irm "https://github.com/eppu-peltonen/paja/releases/download/$v/SHA256SUMS" -OutFile "$env:TEMP\SHA256SUMS"
+$want = ((Get-Content "$env:TEMP\SHA256SUMS" | Where-Object { $_ -like "* $name.zip" }) -split '\s+')[0]
+$got = (Get-FileHash "$env:TEMP\$name.zip" -Algorithm SHA256).Hash
+if ($want -and $got -eq $want) {
+  Expand-Archive "$env:TEMP\$name.zip" $env:TEMP -Force
+  New-Item -ItemType Directory $dir -Force | Out-Null
+  Copy-Item "$env:TEMP\$name\paja.exe" $dir
+  $path = [Environment]::GetEnvironmentVariable("Path", "User")
+  if (($path -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable("Path", "$path;$dir", "User") }
+} else { Write-Error "$name.zip doesn't match SHA256SUMS; download it again, and don't install it" }
 ```
+
+The `if` block installs `paja.exe` only when the archive's checksum matches the release's `SHA256SUMS`, and adds its
+folder to your `PATH` only once, so an update can run the same lines.
 
 On macOS or Linux, install Git, the GitHub CLI and Claude Code, then (with the archive for your machine):
 
