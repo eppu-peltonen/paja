@@ -66,7 +66,9 @@ repository. `.paja/labels`, read from the default branch like `.paja/checks` and
 has up to three lines: `work <label>`, which Jono imports, `follow-up <label>`, which Mestari files non-blocking
 findings with, and `needs-answer <label>`, which marks an escalated item's issue until `paja work answer` requeues it.
 Without the file they are `factory`, `factory-follow-up` and `factory-needs-answer`; this repository keeps `paja` and
-`paja-follow-up`. The three must differ.
+`paja-follow-up`. The three must differ. A file that doesn't read stops a sync with an error that names the line;
+`paja work answer` still records and posts the answer, removes the default `factory-needs-answer` and says on stderr
+that it did.
 Changing the work label closes the queue as it was: the next sync no longer sees issues with the old label and closes
 every item it imported with it, so relabel the open issues to the new label in the same change.
 `paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`

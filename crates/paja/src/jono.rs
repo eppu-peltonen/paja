@@ -1332,9 +1332,19 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
     };
     // The item no longer waits on the person. An issue escalated before Paja labelled
     // escalations has no label to remove, so a failure here only says so.
+    // A `.paja/labels` that doesn't read leaves the default label to try, and says so: the
+    // configured one then stays on the issue until the file is fixed.
     let needs_answer = Labels::of_default_branch(&ok)
         .map(|labels| labels.needs_answer)
-        .unwrap_or_else(|_| Labels::default().needs_answer);
+        .unwrap_or_else(|err| {
+            let fallback = Labels::default().needs_answer;
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "paja: {err:#}; removing the default `{fallback}` label from #{number} instead"
+            );
+            fallback
+        });
     if let Err(err) = gh(
         &ok,
         &[
