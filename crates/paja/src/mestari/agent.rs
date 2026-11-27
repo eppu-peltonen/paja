@@ -103,15 +103,61 @@ impl std::fmt::Display for ClaudeFailed {
 
 impl std::error::Error for ClaudeFailed {}
 
+/// A step stopped at the usage or rate limit (`api_error_status` 429). Its work is kept and the
+/// item resumes after the window resets.
+#[derive(Debug, Clone)]
+pub(super) struct UsageLimit {
+    /// Claude Code's failed result, which still says what the step spent.
+    pub(super) result: Option<Value>,
+    /// When the window resets, in milliseconds since the epoch, if Claude Code said so.
+    pub(super) resets_at: Option<u64>,
+}
+
+/// The usage limit behind `err`, if that is what stopped the step.
+pub(super) fn usage_limit(err: &anyhow::Error) -> Option<UsageLimit> {
+    let ClaudeFailed(text, result) = err.chain().find_map(|e| e.downcast_ref::<ClaudeFailed>())?;
+    let limited = match result {
+        Some(out) => out["api_error_status"].as_u64() == Some(429),
+        None => false,
+    };
+    limited.then(|| UsageLimit {
+        resets_at: reset_time(result.as_ref(), text),
+        result: result.clone(),
+    })
+}
+
+/// When the window resets, from Claude Code's result: a `resets_at` field (seconds or
+/// milliseconds), else the epoch seconds after the `|` in its "usage limit reached|<seconds>"
+/// text, in the result or the error text.
+pub(super) fn reset_time(result: Option<&Value>, text: &str) -> Option<u64> {
+    let as_ms = |n: u64| if n < 100_000_000_000 { n * 1000 } else { n };
+    if let Some(n) = result.and_then(|r| r["resets_at"].as_u64()) {
+        return Some(as_ms(n));
+    }
+    let from_text = |text: &str| {
+        let (_, after) = text.rsplit_once('|')?;
+        let digits: String = after
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        // Ten digits or more: an epoch, not a stray number.
+        (digits.len() >= 10)
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+    };
+    result
+        .and_then(|r| r["result"].as_str())
+        .and_then(from_text)
+        .or_else(|| from_text(text))
+        .map(as_ms)
+}
+
 /// Why a failed `claude -p` result must not be retried as a fresh session, and what the person
-/// does about it: a usage or rate limit, or a sign-in that no longer works, fails a new session
-/// the same way.
+/// does about it: a sign-in that no longer works fails a new session the same way. (A usage
+/// limit does too, but it is not for the person: see [`usage_limit`].)
 pub(super) fn not_retried(out: &Value) -> Option<&'static str> {
     match out["api_error_status"].as_u64() {
-        Some(429) => Some(
-            "Claude Code hit a usage or rate limit; wait until it resets, then answer the item to \
-             run it again",
-        ),
         Some(401 | 403) => Some(
             "Claude Code's sign-in was refused; run `claude` and sign in again (or check \
              ANTHROPIC_API_KEY), then answer the item to run it again",
