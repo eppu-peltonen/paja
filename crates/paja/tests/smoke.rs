@@ -3306,8 +3306,17 @@ fn interrupt_run(f: &Factory, marker: &str) {
         .spawn()
         .unwrap();
     let started = std::time::Instant::now();
+    // Generous: on a loaded Windows runner the whole suite runs for minutes, and a run can take
+    // a minute to reach its step. A run that already exited fails at once instead of waiting.
     while !dir.join(marker).exists() {
-        assert!(started.elapsed().as_secs() < 60, "no step reached {marker}");
+        if let Some(status) = run.try_wait().unwrap() {
+            panic!("`paja run` exited ({status}) before any step reached {marker}");
+        }
+        if started.elapsed().as_secs() >= 300 {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("no step reached {marker} within 300s");
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     run.kill().unwrap();
