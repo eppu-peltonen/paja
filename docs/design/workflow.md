@@ -61,9 +61,10 @@ repository at a time: a pass holds a lock for its whole life, a second `paja tri
 held and says to wait, and `paja run --every` and an idle pool skip their pass then. Its word is not enough to close anything: Paja closes a duplicate only when the
 original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
 named commit must be on the default branch, committed after the issue was opened, and change a file the issue names
-(a merge against its first parent), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
+(a merge against its first parent; in a shallow clone a commit with no parent there is not taken), and a named file must exist there and be named in the issue's title or body. A path the issue gives names that path (or
 a longer or shorter one ending in it at a `/`), and a bare file name with an extension names any file of that name;
-paths use `/` whichever way the agent wrote them. Otherwise the issue is kept. Each issue reaches the agent with when
+paths use `/` whichever way the agent wrote them. A link to one of the repository's own files on GitHub
+(`.../<owner>/<name>/blob/<ref>/<path>`) names that path; any other link names nothing. Otherwise the issue is kept. Each issue reaches the agent with when
 it was opened. Issue text reaches the agent as data to judge.
 
 `--json` prints `{repo, base, items, closed, not_worth_doing}`; each item has its `verdict`, `reason`, `duplicate_of` or
