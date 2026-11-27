@@ -4960,7 +4960,11 @@ fn triage_factory(answer: &str) -> (Factory, std::path::PathBuf) {
              \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
              \"workflow list\") echo 'CI	active	1' ;;\n\
              \"issue list\") case \"$*\" in *\"--label factory-follow-up \"*) cat {d}/followups.json ;; *) echo '[]' ;; esac ;;\n\
-             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi ;;\n\
+             \"issue comment\") if [ -f {d}/comment-fails ]; then echo 'comment refused' >&2; exit 1; fi; \
+             if [ -f {d}/comment-posts-then-fails ]; then n=$3; shift 3; echo \"$2\" | head -n 1 >> {d}/posted-$n; echo 'connection reset' >&2; exit 1; fi ;;\n\
+             \"api user\") if [ -f {d}/user-fails ]; then echo 'HTTP 403' >&2; exit 1; fi; echo paja-bot ;;\n\
+             \"api \"*) case \"$2\" in *comments) if [ -f {d}/comments-fail ]; then echo 'HTTP 502' >&2; exit 1; fi; \
+             n=${{2#*issues/}}; n=${{n%%/*}}; if [ -f {d}/posted-$n ]; then cat {d}/posted-$n; fi ;; esac ;;\n\
              *) ;;\nesac\n"
         ),
     );
@@ -5492,6 +5496,162 @@ fn a_duplicate_note_that_fails_is_reported_and_tried_again_next_pass() {
     // A pass after that has nothing left to retry.
     let (_, report) = triage(&f, &dir);
     assert!(report.get("retried_notes").is_none(), "{report}");
+}
+
+#[test]
+fn a_duplicate_note_github_took_though_gh_failed_is_not_posted_again() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    // GitHub takes the note on #11, but gh exits non-zero, so the pass records it as failed.
+    std::fs::write(dir.join("comment-posts-then-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let ran = events_of(&f, "triage.ran");
+    assert_eq!(
+        ran[0]["data"]["note_failed"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{ran:?}"
+    );
+    let posted = std::fs::read_to_string(dir.join("posted-11")).unwrap();
+    assert!(posted.starts_with("**Paja triage closed #12 ("), "{posted}");
+    // The next pass finds the note on #11 and records it as noted without posting it again.
+    std::fs::remove_file(dir.join("comment-posts-then-fails")).unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(
+        report["retried_notes"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("issues/11/comments"), "{log}");
+    // Only the account gh comments as counts.
+    assert!(log.contains("api user --jq .login"), "{log}");
+    assert!(
+        log.contains(r#"select(.user.login == "paja-bot")"#),
+        "{log}"
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        1,
+        "{log}"
+    );
+    let notes = events_of(&f, "triage.notes");
+    assert_eq!(
+        notes.last().unwrap()["data"]["noted"],
+        serde_json::json!([{"number": 12, "on": 11}]),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn a_retried_note_github_took_is_found_and_an_unreadable_listing_posts_the_note() {
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    let comments = || {
+        std::fs::read_to_string(dir.join("gh.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count()
+    };
+    // The first note fails outright; the retry's short form is taken though gh fails.
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("comment-posts-then-fails"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(report["retried_notes"][0]["error"].is_string(), "{report}");
+    let posted = std::fs::read_to_string(dir.join("posted-11")).unwrap();
+    assert_eq!(
+        posted.trim(),
+        "**Paja triage closed #12 as a duplicate of this issue.**"
+    );
+    assert_eq!(comments(), 2);
+    // The third pass finds the short form and posts nothing.
+    std::fs::remove_file(dir.join("comment-posts-then-fails")).unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    assert_eq!(comments(), 2);
+    // With the note gone and the comments unreadable, a pending note is posted as before.
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("comments-fail"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        2,
+        "{log}"
+    );
+    // Nor when gh can't say who it comments as (an app token can't read /user): no listing is
+    // read, and the pending note is posted.
+    let (f, dir) = triage_factory(
+        r#"{"issues": [
+            {"number": 11, "verdict": "keep", "reason": "still open"},
+            {"number": 12, "verdict": "duplicate", "duplicate_of": 11, "reason": "Same."},
+            {"number": 13, "verdict": "keep", "reason": "still open"}
+        ]}"#,
+    );
+    std::fs::write(dir.join("comment-fails"), "").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    std::fs::remove_file(dir.join("comment-fails")).unwrap();
+    std::fs::write(dir.join("user-fails"), "").unwrap();
+    std::fs::write(dir.join("followups.json"), "[]").unwrap();
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert!(
+        report["retried_notes"][0].get("error").is_none(),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    assert!(log.contains("api user"), "{log}");
+    assert!(!log.contains("/comments"), "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("issue comment 11"))
+            .count(),
+        2,
+        "{log}"
+    );
 }
 
 #[test]
