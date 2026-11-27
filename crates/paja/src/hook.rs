@@ -80,6 +80,7 @@ impl Commands {
             });
         };
         let (mut builder, mut reviewer) = (Vec::new(), Vec::new());
+        let mut seen = std::collections::HashSet::new();
         for line in text.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -98,6 +99,18 @@ impl Commands {
                 bail!(
                     "{COMMANDS_FILE} names `{name}`, which is not a plain program name (letters, \
                      digits, `_`, `-`, `.` or `+`); fix it on the default branch"
+                );
+            }
+            if ["git", "cd", "pwd"].contains(&name) {
+                bail!(
+                    "{COMMANDS_FILE} line `{line}` has no effect: the hook has its own rules for \
+                     `{name}`; remove the line from the default branch"
+                );
+            }
+            if !seen.insert((review, name)) {
+                bail!(
+                    "{COMMANDS_FILE} line `{line}` is listed twice; remove the repeat from the \
+                     default branch"
                 );
             }
             builder.push(name.to_string());
@@ -1587,10 +1600,17 @@ mod commands_tests {
             "a;b",
             "review a b",
             "$(x)",
+            "git",
+            "cd",
+            "review pwd",
+            "npm\nnpm",
+            "review node\nreview node",
         ] {
             let why = Commands::parse(Some(bad)).unwrap_err().to_string();
             assert!(why.contains(".paja/commands"), "{bad}: {why}");
         }
+        // The same program for the builder and again for reviewers is two different lines.
+        assert!(Commands::parse(Some("node\nreview node")).is_ok());
     }
 
     #[test]

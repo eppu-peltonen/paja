@@ -163,5 +163,8 @@ Desk does the same with **Repositories**, then **Keep running**, and shows the q
 what waits on you. Ctrl-C once stops after the current step; twice stops at once.
 
 `paja work list` shows each item's status and what its runs spent, and `/paja:status` in Claude Code summarises the
-queue. Before leaving Paja running on its own, read [`safety.md`](./safety.md) again, and see
+queue, with today's usage. `paja usage` (`--item <number>`, `--since <YYYY-MM-DD>`, `--json`; MCP tool `usage`) reads
+the recorded steps back: per item the rounds, steps by role and model, tokens, turns, wall time and outcome, totals
+per day and overall, and the median and 90th percentile per landed item. Steps whose usage couldn't be read are
+counted as unknown, never as zero. Before leaving Paja running on its own, read [`safety.md`](./safety.md) again, and see
 [`troubleshooting.md`](./troubleshooting.md) when something goes wrong.

@@ -192,6 +192,7 @@ impl Pool<'_> {
         let mut last_sync = Instant::now();
         let mut need_sync = false;
         let mut said_idle = false;
+        let mut said_paused: Option<u64> = None;
         let mut forwarded = 0;
         let mut fatal: Option<anyhow::Error> = None;
         let mut told_fatal = false;
@@ -245,7 +246,16 @@ impl Pool<'_> {
             if !stopping {
                 let target = target_lanes(&events, self.name).unwrap_or(self.opts.lanes);
                 let free = (target as usize).saturating_sub(self.lanes.len());
-                if free > 0 {
+                // The usage window is the account's: until it resets, no lane or planner starts.
+                let paused = super::usage_pause(&events, crate::events::now_ms());
+                if let (Some(ms), true) = (paused, said_paused != paused) {
+                    progress(&format!(
+                        "Claude Code's usage limit hasn't reset; starting nothing until {}",
+                        super::format_utc(ms)
+                    ));
+                }
+                said_paused = paused;
+                if free > 0 && paused.is_none() {
                     let timed = last_sync.elapsed() >= every;
                     if need_sync || timed {
                         need_sync = false;

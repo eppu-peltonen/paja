@@ -40,6 +40,10 @@ fn paja(home: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
     paja_with(home, cwd, args, &[("PAJA_GH", gh.as_path())])
 }
 
+/// What `PAJA_CLAUDE_LATEST` names in every test that doesn't set its own: a file that isn't there,
+/// so `paja doctor` never asks the npm registry for the latest Claude Code release.
+const NO_LATEST: &str = "no-latest-claude-release";
+
 /// A GitHub-token-shaped string for redaction tests, built at run time so the source holds no
 /// literal token for secret scanners to flag.
 fn fake_token() -> String {
@@ -51,6 +55,7 @@ fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> 
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(cwd)
         .env("PAJA_HOME", home)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
         .envs(vars.iter().copied())
         .arg("--json")
         .args(args)
@@ -473,6 +478,7 @@ impl Mcp {
             .arg("mcp")
             .current_dir(repo)
             .env("PAJA_HOME", home)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
             .envs(env.iter().map(|(k, v)| (*k, *v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1559,6 +1565,163 @@ fn run_never_claims_another_repositorys_item() {
 }
 
 #[test]
+fn usage_sums_recorded_steps_per_item_and_day_and_counts_unknown_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    // 2026-03-01 and 2026-03-02, UTC.
+    let (day1, day2) = (1_772_323_200_000u64, 1_772_409_600_000u64);
+    let step = |role: &str, i: u64, o: u64, turns: u64, ms: u64| {
+        serde_json::json!({"step": "build", "role": role, "model": "opus",
+            "input_tokens": i, "output_tokens": o, "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 10, "num_turns": turns, "duration_ms": ms})
+    };
+    // A step whose result had no usage: unknown, not zero.
+    let unknown = serde_json::json!({"step": "review", "role": "review", "model": "opus",
+        "input_tokens": null, "output_tokens": null, "cache_read_input_tokens": null,
+        "cache_creation_input_tokens": null, "num_turns": null, "duration_ms": null});
+    let event = |kind: &str, ts: u64, data: Value| {
+        serde_json::json!({"v": 1, "seq": 0, "ts_ms": ts, "kind": kind, "data": data}).to_string()
+    };
+    let round = |number: u64, round: u64, verdict: &str, steps: Vec<Value>| {
+        serde_json::json!({"repo": "acme/app", "number": number, "round": round,
+            "verdict": verdict, "detail": "", "steps": steps})
+    };
+    let imported = |number: u64, title: &str| {
+        serde_json::json!({"repo": "acme/app", "number": number, "title": title,
+            "body": "", "url": "https://example.com/x"})
+    };
+    let mut lines = vec![
+        event("work.imported", day1, imported(1, "Lands at once")),
+        event("work.imported", day1, imported(2, "Needs a person")),
+        event(
+            "run.round",
+            day1,
+            round(
+                1,
+                1,
+                "approve",
+                vec![
+                    step("build", 10, 20, 3, 60_000),
+                    step("review", 1, 2, 1, 5_000),
+                ],
+            ),
+        ),
+        event(
+            "run.landed",
+            day1 + 1,
+            serde_json::json!({"repo": "acme/app", "number": 1, "pr": "p", "rounds": 1}),
+        ),
+    ];
+    for (n, verdict) in [(1, "changes"), (2, "changes"), (3, "changes")] {
+        let steps = if n == 3 {
+            vec![step("fix", 5, 5, 2, 1_000), unknown.clone()]
+        } else {
+            vec![step("build", 5, 5, 2, 1_000)]
+        };
+        lines.push(event("run.round", day2, round(2, n, verdict, steps)));
+    }
+    lines.push(event(
+        "run.escalated",
+        day2 + 1,
+        serde_json::json!({"repo": "acme/app", "number": 2, "rounds": 3}),
+    ));
+    std::fs::write(home.join("events.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let (ok, report) = paja(&home, &repo, &["usage"]);
+    assert!(ok, "{report}");
+    let items = report["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{report}");
+    let (one, two) = (&items[0], &items[1]);
+    assert_eq!(
+        (one["number"].as_u64(), one["outcome"].as_str()),
+        (Some(1), Some("landed"))
+    );
+    assert_eq!(one["title"], "Lands at once");
+    assert_eq!(one["rounds"], 1);
+    assert_eq!(
+        (one["steps"].as_u64(), one["unknown_steps"].as_u64()),
+        (Some(2), Some(0))
+    );
+    assert_eq!(one["input_tokens"], 11);
+    assert_eq!(one["output_tokens"], 22);
+    assert_eq!(one["cache_read_input_tokens"], 200);
+    assert_eq!(one["cache_creation_input_tokens"], 20);
+    assert_eq!(
+        (one["turns"].as_u64(), one["wall_ms"].as_u64()),
+        (Some(4), Some(65_000))
+    );
+    assert_eq!(one["by_role"].as_array().unwrap().len(), 2, "{one}");
+    assert_eq!(two["outcome"], "escalated");
+    assert_eq!(two["rounds"], 3);
+    assert_eq!(
+        (two["steps"].as_u64(), two["unknown_steps"].as_u64()),
+        (Some(4), Some(1))
+    );
+    assert_eq!(two["input_tokens"], 15);
+    assert_eq!(two["output_tokens"], 15);
+    assert_eq!(two["turns"], 6);
+    // Days and the overall total: the unknown step is counted, and adds nothing.
+    let days = report["days"].as_array().unwrap();
+    assert_eq!(days.len(), 2, "{report}");
+    assert_eq!(days[0]["date"], "2026-03-01");
+    assert_eq!(days[0]["steps"], 2);
+    assert_eq!(days[1]["date"], "2026-03-02");
+    assert_eq!(
+        (days[1]["steps"].as_u64(), days[1]["unknown_steps"].as_u64()),
+        (Some(4), Some(1))
+    );
+    assert_eq!(report["total"]["steps"], 6);
+    assert_eq!(report["total"]["unknown_steps"], 1);
+    assert_eq!(report["total"]["input_tokens"], 26);
+    assert_eq!(report["total"]["output_tokens"], 37);
+    // Per landed item: one item, so the median and 90th percentile are its own.
+    assert_eq!(report["landed"]["items"], 1);
+    assert_eq!(report["landed"]["rounds"]["median"], 1);
+    assert_eq!(report["landed"]["tokens"]["p90"], 11 + 22 + 200 + 20);
+    // The text says unknown out loud.
+    let gh = program(
+        tmp.path(),
+        "gh",
+        "#!/bin/sh\necho '{\"nameWithOwner\": \"acme/app\"}'\n",
+    );
+    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .arg("usage")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("1 unknown"), "{text}");
+
+    let (ok, only) = paja(&home, &repo, &["usage", "--item", "2"]);
+    assert!(ok, "{only}");
+    assert_eq!(only["items"].as_array().unwrap().len(), 1);
+    assert_eq!(only["total"]["steps"], 4);
+    let (ok, since) = paja(&home, &repo, &["usage", "--since", "2026-03-02"]);
+    assert!(ok, "{since}");
+    assert_eq!(since["items"].as_array().unwrap().len(), 1, "{since}");
+    assert_eq!(since["total"]["steps"], 4);
+    assert_eq!(since["since"], "2026-03-02");
+    let (ok, bad) = paja(&home, &repo, &["usage", "--since", "soon"]);
+    assert!(!ok);
+    assert!(
+        bad["error"].as_str().unwrap().contains("YYYY-MM-DD"),
+        "{bad}"
+    );
+
+    // The MCP tool gives the same JSON.
+    let mut mcp = Mcp::start(&home, &repo, &[("PAJA_GH", gh.as_path())]);
+    mcp.initialize();
+    let (ok, by_mcp) = mcp.call("usage", serde_json::json!({}));
+    assert!(ok, "{by_mcp}");
+    assert_eq!(by_mcp, report);
+}
+
+#[test]
 fn work_list_all_needs_no_checkout_once_the_log_names_its_repositories() {
     let tmp = tempfile::tempdir().unwrap();
     let (elsewhere, home) = (tmp.path().join("elsewhere"), tmp.path().join("home"));
@@ -1818,6 +1981,7 @@ impl Factory {
                  *PAJA-PLAN*) p='\"feature.txt\"'; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) p=\"\\\"$t.txt\\\"\" ;; esac; done\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"paths\\\": [$p]}}}}\" ;;\n\
                  *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
+                 if [ -f {d}/review-429 ]; then echo \"{{\\\"is_error\\\": true, \\\"api_error_status\\\": 429, \\\"result\\\": \\\"Claude usage limit reached|$(cat {d}/reset-at 2>/dev/null)\\\", \\\"session_id\\\": \\\"r-1\\\", \\\"total_cost_usd\\\": 0.07}}\"; exit 1; fi\n\
                  if [ -f {d}/review-limit ]; then echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 1}}'; exit 1; fi\n\
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
@@ -1837,6 +2001,7 @@ impl Factory {
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
                  if [ ! -f {d}/unhooked ] && [ -n \"$stamp\" ]; then : > \"$stamp\"; fi\n\
+                 if [ -f {d}/build-429 ]; then echo \"{{\\\"is_error\\\": true, \\\"api_error_status\\\": 429, \\\"result\\\": \\\"Claude usage limit reached|$(cat {d}/reset-at 2>/dev/null)\\\", \\\"session_id\\\": \\\"s-1\\\", \\\"total_cost_usd\\\": 0.3}}\"; exit 1; fi\n\
                  if [ -f {d}/ask ]; then printf '%s\\n' '{{\"is_error\": false, \"result\": \"I need a decision.\\nPAJA-QUESTION: Which API, A or B? I recommend A.\"}}'; git checkout -q -- . ; exit 0; fi\n\
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
@@ -1844,6 +2009,7 @@ impl Factory {
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add $file\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
+                 if [ -f {d}/window-warning ]; then echo \"{{\\\"is_error\\\": false, \\\"result\\\": \\\"done\\\", \\\"session_id\\\": \\\"s-1\\\", \\\"total_cost_usd\\\": 0.25, \\\"rate_limit_info\\\": {{\\\"status\\\": \\\"allowed_warning\\\", \\\"utilization\\\": 0.93, \\\"resetsAt\\\": $(cat {d}/reset-at)}}}}\"; exit 0; fi\n\
                  if [ -f {d}/no-session ]; then echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi\n\
                  echo '{{\"is_error\": false, \"result\": \"done\", \"num_turns\": 4, \"duration_ms\": 900, \"session_id\": \"s-1\", \"total_cost_usd\": 0.25, \"usage\": {{\"input_tokens\": 100, \"output_tokens\": 20, \"cache_read_input_tokens\": 3000, \"cache_creation_input_tokens\": 400}}, \"modelUsage\": {{\"claude-test\": {{\"inputTokens\": 100, \"outputTokens\": 20, \"cacheReadInputTokens\": 3000, \"cacheCreationInputTokens\": 400, \"costUSD\": 0.25}}}}}}' ;;\nesac\n"
             ),
@@ -2232,6 +2398,12 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     std::fs::create_dir_all(repo.join(".paja")).unwrap();
     std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
     std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    // A typo in a role, which a pass only mentions on stderr.
+    std::fs::write(
+        repo.join(".paja/models"),
+        "build sonnet\nreveiw opus\nmax-turns reveiw 5\n",
+    )
+    .unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "checks"]);
     git(
@@ -2252,6 +2424,7 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
         .env("PAJA_GH", &gh)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
         .args(["--json", "doctor"])
         .output()
         .unwrap();
@@ -2261,6 +2434,14 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     let checks = report["checks"].as_array().unwrap();
     assert!(
         !checks.iter().any(|c| c["name"] == "default branch"),
+        "{report}"
+    );
+    // Doctor names the skipped role, once, as a warning with the fix.
+    let models = checks.iter().find(|c| c["name"] == "models").unwrap();
+    assert_eq!(models["status"], "warning", "{report}");
+    let detail = models["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(": reveiw") && detail.matches("reveiw").count() == 1,
         "{report}"
     );
     // The labels came from `trunk`: its work label is `game`, which the repository has.
@@ -2287,6 +2468,7 @@ fn doctor_checks_that_the_sandbox_program_works() {
             .current_dir(tmp.path())
             .env("PAJA_HOME", &home)
             .env("PAJA_SBX", sbx)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
             .args(["--json", "doctor"])
             .output()
             .unwrap();
@@ -4385,12 +4567,10 @@ fn a_resume_at_a_usage_limit_stops_instead_of_starting_fresh() {
     std::fs::write(f.tmp.path().join("resume-limited"), "").unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
-    assert_eq!(report["outcome"], "escalated", "{report}");
-    let question = report["question"].as_str().unwrap();
-    assert!(
-        question.contains("usage or rate limit") && question.contains("wait until it resets"),
-        "{question}"
-    );
+    // Not parked: the item stays active and resumes once the window has reset.
+    assert_eq!(report["outcome"], "usage_limit", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
     // One fresh build, one review, one resume that hit the limit: no fresh session after it.
     let calls = f.claude_calls();
     let builds: Vec<&String> = calls
@@ -4412,6 +4592,238 @@ fn a_resume_at_a_usage_limit_stops_instead_of_starting_fresh() {
     assert_eq!(builds.len(), 2, "{steps:?}");
     let cost = builds[1]["cost_usd"].as_f64().unwrap();
     assert!((cost - 0.15).abs() < 1e-9, "{steps:?}");
+}
+
+/// Seconds since the epoch, `ahead` from now.
+fn epoch_secs_in(ahead: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + ahead
+}
+
+/// The `run.round` events of the log.
+fn round_events(f: &Factory) -> Vec<Value> {
+    let (_, log) = paja(&f.home, &f.repo, &["log"]);
+    log.as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "run.round")
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_usage_limit_in_a_fresh_build_keeps_the_work_and_waits_for_the_reset() {
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    assert_eq!(report["resets_at"], resets * 1000, "{report}");
+    // The item stays active, and the builder's uncommitted file is still in its worktree.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    let path = envs[0]["path"].as_str().expect("the environment is kept");
+    let kept = std::fs::read_to_string(Path::new(path).join("feature.txt")).unwrap();
+    assert!(kept.contains("built"), "{kept}");
+    // The round has its own verdict and the failed step's spend.
+    let rounds = round_events(&f);
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["verdict"], "usage_limit", "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["resets_at"], resets * 1000, "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["steps"][0]["cost_usd"], 0.3, "{rounds:?}");
+    // Before the reset a second run claims nothing, and says when it can run.
+    let calls = f.claude_calls().len();
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "paused", "{again}\n{stderr}");
+    assert_eq!(again["resets_at"], resets * 1000, "{again}");
+    assert!(stderr.contains("can run again at"), "{stderr}");
+    assert_eq!(f.claude_calls().len(), calls, "no agent started");
+}
+
+#[test]
+fn a_nearly_used_window_holds_back_the_next_build_but_not_the_review() {
+    let f = Factory::new("true\n", "changes");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    assert_eq!(report["resets_at"], resets * 1000, "{report}");
+    assert!(stderr.contains("nearly used up"), "{stderr}");
+    assert!(stderr.contains("resumes it from"), "{stderr}");
+    // The item stays active with its worktree; the one build was reviewed, and no fix started.
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    let calls = f.claude_calls();
+    let reviews = calls.iter().filter(|c| c.contains("--json-schema")).count();
+    assert_eq!(calls.len() - reviews, 1, "one build only: {calls:?}");
+    assert_eq!(reviews, 1, "{calls:?}");
+    // The step recorded the window it was told about.
+    let rounds = round_events(&f);
+    let build = &rounds[0]["data"]["steps"][0];
+    assert_eq!(build["window_status"], "allowed_warning", "{build}");
+    assert_eq!(build["window_resets_at"], resets * 1000, "{build}");
+    assert_eq!(rounds.last().unwrap()["data"]["verdict"], "usage_limit");
+}
+
+#[test]
+fn a_nearly_used_window_claims_no_new_item() {
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    // The first item lands, and its build recorded the nearly used window.
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    // A second, new item is queued.
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 6, "title": "Another", "body": "Please.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+    let statuses = |f: &Factory| {
+        let (_, log) = paja(&f.home, &f.repo, &["log"]);
+        log.as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "work.status")
+            .count()
+    };
+    paja(&f.home, &f.repo, &["work", "sync"]);
+    let (events, calls) = (statuses(&f), f.claude_calls().len());
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "paused", "{again}\n{stderr}");
+    assert_eq!(again["resets_at"], resets * 1000, "{again}");
+    assert!(stderr.contains("no new item was started"), "{stderr}");
+    // Checked before the claim: no status event, no agent, and the item is still queued.
+    assert_eq!(statuses(&f), events, "no claim and no put-back");
+    assert_eq!(f.claude_calls().len(), calls, "no agent started");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "6"]);
+    assert_eq!(item["status"], "queued", "{item}");
+}
+
+#[test]
+fn a_usage_limit_in_a_review_keeps_the_work_and_waits_for_the_reset() {
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("review-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
+    let rounds = round_events(&f);
+    assert_eq!(rounds.len(), 1, "{rounds:?}");
+    assert_eq!(rounds[0]["data"]["verdict"], "usage_limit", "{rounds:?}");
+    let steps = rounds[0]["data"]["steps"].as_array().unwrap();
+    // The build that finished and the review that hit the limit both spent something.
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert_eq!(steps[1]["step"], "review", "{steps:?}");
+    assert_eq!(steps[1]["cost_usd"], 0.07, "{steps:?}");
+}
+
+#[test]
+fn a_run_after_the_reset_resumes_the_kept_round_without_building_again() {
+    let f = Factory::new("true\n", "land");
+    // A reset a moment ahead; the review of the finished build hits the limit.
+    let resets = epoch_secs_in(2);
+    std::fs::write(f.tmp.path().join("review-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
+    // Let the window reset, and the limit go away.
+    while epoch_secs_in(0) <= resets {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::fs::remove_file(f.tmp.path().join("review-429")).unwrap();
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "landed", "{again}\n{stderr}");
+    assert!(stderr.contains("resuming"), "{stderr}");
+    // The build was not repeated: one build, and the review that hit the limit ran again.
+    let calls = f.claude_calls();
+    let reviews = calls.iter().filter(|c| c.contains("--json-schema")).count();
+    assert_eq!(calls.len() - reviews, 1, "one build only: {calls:?}");
+    assert_eq!(reviews, 2, "{calls:?}");
+    // The same round as the one the limit stopped.
+    let rounds = round_events(&f);
+    assert!(rounds.iter().all(|r| r["data"]["round"] == 1), "{rounds:?}");
+}
+
+#[test]
+fn run_every_waits_for_the_reset_instead_of_polling() {
+    use std::io::{BufRead, BufReader};
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run", "--every", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let waiting = BufReader::new(every.stderr.take().unwrap())
+        .lines()
+        .map(|line| line.unwrap())
+        .find(|line| {
+            line.contains("waiting until it resets at") || line.contains("checking again in")
+        });
+    // Long enough for a busy loop to show itself as repeated passes.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let still_running = every.try_wait().unwrap().is_none();
+    every.kill().unwrap();
+    every.wait().unwrap();
+    let waiting = waiting.expect("no wait line before stderr closed");
+    assert!(
+        waiting.contains("waiting until it resets at"),
+        "polling instead of waiting for the reset: {waiting}"
+    );
+    assert!(still_running, "the loop stopped by itself");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut every.stdout.take().unwrap(), &mut stdout).unwrap();
+    let reports: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 1, "one pass, then the wait: {reports:?}");
+    assert_eq!(reports[0]["outcome"], "usage_limit", "{reports:?}");
+    assert_eq!(reports[0]["resets_at"], resets * 1000, "{reports:?}");
+}
+
+#[test]
+fn a_second_usage_limit_without_a_reset_time_parks_the_item() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
+    // No reset time: the first stop leaves the item for the next run to try again.
+    let (first, stderr) = f.run_with_stderr();
+    assert_eq!(first["outcome"], "usage_limit", "{first}\n{stderr}");
+    assert!(first["resets_at"].is_null(), "{first}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    // The second in a row is a question for the person, not a loop.
+    let (second, stderr) = f.run_with_stderr();
+    assert_eq!(second["outcome"], "escalated", "{second}\n{stderr}");
+    let question = second["question"].as_str().unwrap();
+    assert!(question.contains("Wait until it resets"), "{question}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
+    // Parked, but the worktree and the builder's edits in it are kept.
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs.as_array().map(Vec::len), Some(1), "{envs}");
 }
 
 #[test]
@@ -4962,7 +5374,10 @@ fn agents_and_checks_run_through_the_sandbox() {
     // check and the reviewer all went through `exec`.
     assert_eq!(log.matches("create --name paja claude").count(), 1, "{log}");
     assert!(log.contains("test -f feature.txt"), "{log}");
-    assert!(log.matches("--output-format json").count() >= 2, "{log}");
+    assert!(
+        log.matches("--output-format stream-json").count() >= 2,
+        "{log}"
+    );
     // The agents run in the sandbox's own permission mode, never the image's default, and
     // without the host-only deny-list hook.
     for call in f.claude_calls() {
@@ -4977,6 +5392,37 @@ fn agents_and_checks_run_through_the_sandbox() {
             || l == "/tmp/paja-home"
             || l.ends_with("Temp/paja-home")),
         "{homes}"
+    );
+}
+
+#[test]
+fn paja_sbx_name_names_the_sandbox_paja_creates_and_runs_in() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx(f.tmp.path());
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+            ("PAJA_SBX_NAME", Path::new("paja-test")),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    // The named sandbox is the one created and used; the default `paja` is never touched.
+    assert_eq!(
+        log.matches("create --name paja-test claude").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains(" paja-test -- "), "{log}");
+    assert!(
+        !log.contains(" paja -- ") && !log.contains("--name paja "),
+        "{log}"
     );
 }
 
@@ -5137,33 +5583,38 @@ fn a_real_sandbox_hides_the_owners_files() {
         eprintln!("skipped: set PAJA_SBX_TEST to the `sbx` program to run this");
         return;
     };
-    /// Removes the sandbox `paja` when dropped, pass or fail, and once up front in case an
-    /// earlier run left one whose mounts no longer exist. Each removal is verified with
-    /// `sbx ls`: if the sandbox is still listed, the test fails (or, while already failing,
-    /// says so on stderr).
-    struct RemoveSandbox(std::ffi::OsString);
+    /// Removes the test's own sandbox (never the factory's `paja`) when dropped, pass or fail,
+    /// and once up front in case an earlier run left one whose mounts no longer exist. Each
+    /// removal is verified with `sbx ls`: if the sandbox is still listed, or `sbx ls` fails, the
+    /// test fails (or, while already failing, says so on stderr).
+    struct RemoveSandbox(std::ffi::OsString, String);
     impl RemoveSandbox {
-        fn listed(&self) -> bool {
+        /// Whether `sbx ls` lists the sandbox by name (its first column); `None` when `sbx ls`
+        /// can't say.
+        fn listed(&self) -> Option<bool> {
             let out = Command::new(&self.0)
                 .arg("ls")
                 .stdin(std::process::Stdio::null())
-                .output();
-            match out {
-                Ok(out) => String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .any(|word| word == "paja"),
-                Err(_) => false,
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
             }
+            Some(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(self.1.as_str())),
+            )
         }
         /// Try the ways `sbx rm` is spelled (some ask for confirmation) until it is gone.
         fn remove(&self) -> bool {
             use std::io::Write;
             for args in [
-                &["rm", "--force", "paja"][..],
-                &["rm", "-f", "paja"][..],
-                &["rm", "paja"][..],
+                &["rm", "--force", self.1.as_str()][..],
+                &["rm", "-f", self.1.as_str()][..],
+                &["rm", self.1.as_str()][..],
             ] {
-                if !self.listed() {
+                if self.listed() == Some(false) {
                     return true;
                 }
                 let child = Command::new(&self.0)
@@ -5176,16 +5627,27 @@ fn a_real_sandbox_hides_the_owners_files() {
                     if let Some(mut stdin) = child.stdin.take() {
                         let _ = stdin.write_all(b"y\n");
                     }
-                    let _ = child.wait_with_output();
+                    match child.wait_with_output() {
+                        Ok(out) if out.status.success() => {}
+                        Ok(out) => eprintln!(
+                            "warning: `sbx {}` failed: {}",
+                            args.join(" "),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ),
+                        Err(err) => eprintln!("warning: `sbx {}` failed: {err}", args.join(" ")),
+                    }
                 }
             }
-            !self.listed()
+            self.listed() == Some(false)
         }
     }
     impl Drop for RemoveSandbox {
         fn drop(&mut self) {
             if !self.remove() {
-                let message = "the test's sandbox `paja` is still listed by `sbx ls`; remove it with `sbx rm paja`";
+                let message = format!(
+                    "the test's sandbox `{0}` is still listed by `sbx ls` (or `sbx ls` failed); remove it with `sbx rm {0}`",
+                    self.1
+                );
                 if std::thread::panicking() {
                     eprintln!("{message}");
                 } else {
@@ -5194,10 +5656,12 @@ fn a_real_sandbox_hides_the_owners_files() {
             }
         }
     }
-    let cleanup = RemoveSandbox(sbx.clone());
+    // The test's own sandbox, so a person's `paja` sandbox is never touched.
+    let name = format!("paja-test-{}", std::process::id());
+    let cleanup = RemoveSandbox(sbx.clone(), name.clone());
     assert!(
         cleanup.remove(),
-        "an earlier sandbox `paja` can't be removed; run `sbx rm paja`"
+        "an earlier sandbox `{name}` can't be removed; run `sbx rm {name}`"
     );
     let secrets = tempfile::tempdir().unwrap();
     let planted = secrets.path().join(".netrc");
@@ -5206,9 +5670,11 @@ fn a_real_sandbox_hides_the_owners_files() {
     // The sandbox is Linux: the checks name these host files the way it spells them, and they
     // are in no mount.
     let spell = |p: &Path| paja::sandbox::in_sandbox_path(p).unwrap();
-    // The write outside must fail without failing the check; the host is asserted below.
+    // The write outside must fail without failing the check; the host is asserted below. The
+    // marker, written after it into the repository's mounted `.git` (a marker in the worktree
+    // would count as a change the checks made), shows the check ran that far.
     let checks = format!(
-        "test ! -e {}\ntouch {} || true\n",
+        "test ! -e {}\ntouch {} || true\ntouch \"$(git rev-parse --git-common-dir)/paja-check-ran\"\n",
         spell(&planted),
         spell(&outside)
     );
@@ -5245,10 +5711,15 @@ fn a_real_sandbox_hides_the_owners_files() {
             ("PAJA_GH", f.gh.as_path()),
             ("PAJA_CLAUDE", claude_in_sandbox.as_path()),
             ("PAJA_SBX", sbx.as_path()),
+            ("PAJA_SBX_NAME", std::path::Path::new(&name)),
         ],
     );
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
+    assert!(
+        f.repo.join(".git").join("paja-check-ran").exists(),
+        "the check never reached its marker"
+    );
     assert!(!outside.exists(), "a check wrote outside its sandbox");
     assert!(planted.exists(), "the planted file should be untouched");
 }
@@ -5944,6 +6415,33 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
         );
     }
     assert_eq!(events_of(&f, "pool.stopped").len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
+    let f = pool_factory(false);
+    let dir = f.tmp.path();
+    for t in ["Alpha", "Beta", "Gamma"] {
+        std::fs::remove_file(dir.join("holds").join(t)).unwrap();
+    }
+    let resets = epoch_secs_in(3600);
+    std::fs::write(dir.join("build-429"), "").unwrap();
+    std::fs::write(dir.join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
+    let calls = f.claude_calls().len();
+    let admitted = events_of(&f, "pool.admitted").len();
+    let pool = start_pool(&f, "2");
+    // Several ticks of the pool, which would have admitted lanes without the pause.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    assert_eq!(events_of(&f, "pool.admitted").len(), admitted);
+    assert!(events_of(&f, "pool.planning").is_empty());
+    assert_eq!(f.claude_calls().len(), calls, "no agent started");
+    let reports = stop_pool(&f, pool);
+    assert!(reports.is_empty(), "{reports:?}");
+    let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
+    assert!(err.contains("starting nothing until"), "{err}");
 }
 
 #[cfg(unix)]

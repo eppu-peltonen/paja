@@ -244,9 +244,10 @@ Then, for at most three rounds:
    come off Claude Code's running totals, or none do when none were recorded. When
    there is no session to resume or resuming fails, it starts a
    fresh session with the whole issue and says so in a progress line; the failed attempt's spend is recorded as a
-   step of its own. A resume that fails on a usage or rate limit (`api_error_status` 429) or a refused sign-in (401,
-   403) is not retried, since a fresh session would fail the same way: the run stops with an error that says what to
-   do, and that attempt's spend is recorded too. Reviewers never resume: each review is a fresh session reading cold.
+   step of its own. A resume that fails on a refused sign-in (401, 403) is not retried, since a fresh session would
+   fail the same way: the run stops with an error that says what to do, and that attempt's spend is recorded too. A
+   usage or rate limit (`api_error_status` 429) is handled the same for every step, build, resume or review: see
+   "Usage limit" below. Reviewers never resume: each review is a fresh session reading cold.
    A resumed step records `resumed: true` and only its own share of the session's running `total_cost_usd` and
    `modelUsage`. When the issue leaves a decision only the person can make, the builder commits
    nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
@@ -276,7 +277,8 @@ the fix), `review-2` (the second high-risk reviewer), `triage` (`paja triage`, t
 planner). Mestari passes `--model` and, when given, `--effort`; a role
 with no line passes neither and runs on the account's default. A `fallback <model>` line adds `--fallback-model`
 (left out where it is the role's own model), so a busy model doesn't fail the round. A line naming a role this Paja
-doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going; an
+doesn't know is skipped with a warning on stderr, so a runner whose binary is older than main's file keeps going, and
+`paja doctor` names each skipped role as a `models` warning, where an unattended runner's stderr would not; an
 unknown effort or a malformed line stops the run with an error naming the line. Each recorded step names its `role` and `model`, and the
 `fallback` it was given; `fell_back: true` marks a step the fallback model spent something in (its name, or an alias
 such as `sonnet`, matches a model in `modelUsage`), so a report can tell when a role didn't run only on its model.
@@ -289,6 +291,29 @@ limit first runs once more in the same round, in a fresh session told to stay fo
 finished verdict is kept. If it hits the limit again, its worktree is put back as after any review, the round fails and
 the builder is told to make the change easier to review. The same kind of step (build or review) failing a round on
 its limit a second time in a run escalates with a question that says so, instead of using another round.
+
+Agents run with `--output-format stream-json --verbose`; Mestari folds the stream back into its final `result`
+message, with the latest `rate_limit_event`'s `rate_limit_info` added when the result has none of its own. A step
+records the usage window when that object is there (`window_status`,
+`window_used_percent`, `window_resets_at`; all absent for a Claude Code that reports nothing). Before a `build` or
+`fix` session, and before a new item is claimed, Mestari reads the latest recorded state: if it is a warning (or
+rejected) status, or at least `window <percent>` of the window (a line in `.paja/models`, default 90) is used, and its
+reset time is still ahead, the step isn't started. The round is recorded as `usage_limit`, as when Claude Code stops
+at the limit, so the item stays active with its worktree and `paja run` resumes it after the reset, and stderr says
+when. A new item isn't claimed at all (no status event) and the pass reports `paused`; an item to resume is let through. Reviews still start, so a built change isn't left unreviewed.
+
+**Usage limit.** When any agent step (a fresh or resumed build, either reviewer) fails on the usage window
+(`api_error_status` 429), nothing needs deciding: the window only has to reset. Mestari records the step's spend from
+the failed result and the round with the verdict `usage_limit`, adding `resets_at` (milliseconds since the epoch) when
+Claude Code says when the window resets (a `resets_at` field, or the epoch seconds after the `|` in its "usage limit
+reached" text). It keeps the environment, so the builder's uncommitted edits survive, and leaves the item active: the
+run reports `usage_limit` and the next `paja run` resumes the item in the round that was cut off, like after Ctrl-C.
+Before a recorded `resets_at` (the window is the account's, so any item's counts) `paja run` claims and resumes
+nothing: it reports `paused` with `resets_at` and says on stderr when it can run again, and `paja run --every` waits
+until then instead of polling the queue; `paja run --workers` likewise starts no lane and no planner until then. When
+no reset time is known the next run may try again, but a second stop in a row without one parks the item with a
+question to wait until the window resets, so a broken sign-in or account can't loop. The parked item keeps its
+environment, so the builder's uncommitted edits survive the question. A 401 or 403 stays an error that parks the item and asks the person to sign in again.
 
 Before Vasara's checks in every round, Mestari fetches the default branch and merges it into the environment's branch
 when the branch doesn't hold its tip yet, so the checks, the reviewers and CI judge the change as it would land, and a
@@ -507,7 +532,9 @@ while it starts.
 - **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If `PAJA_SBX` is
   set and the sandbox can't start, it stops with an error that says what to install or set up. It never falls back to
   running on the host. Without `PAJA_SBX`, `paja run` says on stderr that there is no sandbox, and runs as described
-  above, behind the deny-list hook only. Detection is optional by design: Paja has no Docker dependency, and its tests
+  above, behind the deny-list hook only. The sandbox is named `paja`; `PAJA_SBX_NAME` names another one (the real-`sbx`
+  test uses it, so it never removes the person's own). `.paja/setup` runs with stderr merged into stdout, so a failure's
+  last lines keep their order, and writes a progress line to stderr while it runs. Detection is optional by design: Paja has no Docker dependency, and its tests
   use a fake `sbx`.
 - **Permissions.** Claude Code is always started with `--permission-mode auto`, with or without a sandbox; the sandbox
   image's default, `bypassPermissions`, and every weaker mode are never used. Auto mode is an extra layer, not a

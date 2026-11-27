@@ -207,7 +207,16 @@ mod tests {
         // The run is gone but its file is left behind: free again.
         drop(lock);
         assert!(home.runs_lock_path(repo, "7").exists());
-        assert!(!home.run_held(repo, 7).unwrap());
+        // A child another test forked in the instant before the drop shares the lock until it
+        // execs, so the lock may be let go a moment later.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while home.run_held(repo, 7).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "the dropped run lock is still held"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(home.try_run_lock(repo, 7).unwrap().is_some());
     }
 }

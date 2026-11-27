@@ -103,15 +103,65 @@ impl std::fmt::Display for ClaudeFailed {
 
 impl std::error::Error for ClaudeFailed {}
 
+/// A step stopped at the usage or rate limit (`api_error_status` 429). Its work is kept and the
+/// item resumes after the window resets.
+#[derive(Debug, Clone)]
+pub(super) struct UsageLimit {
+    /// Claude Code's failed result, which still says what the step spent.
+    pub(super) result: Option<Value>,
+    /// When the window resets, in milliseconds since the epoch, if Claude Code said so.
+    pub(super) resets_at: Option<u64>,
+    /// Not a stop Claude Code made: the recorded window was nearly used up, so the step was
+    /// never started.
+    pub(super) nearly: bool,
+}
+
+/// The usage limit behind `err`, if that is what stopped the step.
+pub(super) fn usage_limit(err: &anyhow::Error) -> Option<UsageLimit> {
+    let ClaudeFailed(text, result) = err.chain().find_map(|e| e.downcast_ref::<ClaudeFailed>())?;
+    let limited = match result {
+        Some(out) => out["api_error_status"].as_u64() == Some(429),
+        None => false,
+    };
+    limited.then(|| UsageLimit {
+        resets_at: reset_time(result.as_ref(), text),
+        result: result.clone(),
+        nearly: false,
+    })
+}
+
+/// When the window resets, from Claude Code's result: a `resets_at` field (seconds or
+/// milliseconds), else the epoch seconds after the `|` in its "usage limit reached|<seconds>"
+/// text, in the result or the error text.
+pub(super) fn reset_time(result: Option<&Value>, text: &str) -> Option<u64> {
+    let as_ms = |n: u64| if n < 100_000_000_000 { n * 1000 } else { n };
+    if let Some(n) = result.and_then(|r| r["resets_at"].as_u64()) {
+        return Some(as_ms(n));
+    }
+    let from_text = |text: &str| {
+        let (_, after) = text.rsplit_once('|')?;
+        let digits: String = after
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        // Ten digits or more: an epoch, not a stray number.
+        (digits.len() >= 10)
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+    };
+    result
+        .and_then(|r| r["result"].as_str())
+        .and_then(from_text)
+        .or_else(|| from_text(text))
+        .map(as_ms)
+}
+
 /// Why a failed `claude -p` result must not be retried as a fresh session, and what the person
-/// does about it: a usage or rate limit, or a sign-in that no longer works, fails a new session
-/// the same way.
+/// does about it: a sign-in that no longer works fails a new session the same way. (A usage
+/// limit does too, but it is not for the person: see [`usage_limit`].)
 pub(super) fn not_retried(out: &Value) -> Option<&'static str> {
     match out["api_error_status"].as_u64() {
-        Some(429) => Some(
-            "Claude Code hit a usage or rate limit; wait until it resets, then answer the item to \
-             run it again",
-        ),
         Some(401 | 403) => Some(
             "Claude Code's sign-in was refused; run `claude` and sign in again (or check \
              ANTHROPIC_API_KEY), then answer the item to run it again",
@@ -131,16 +181,24 @@ fn claude_args(
     tools: &[&str],
     schema: Option<&Value>,
 ) -> Vec<String> {
-    let mut args: Vec<String> = ["-p", "--output-format", "json", "--permission-mode"]
-        .into_iter()
-        .map(String::from)
-        // Auto mode, Anthropic's own safety checks, as an extra layer beside the hook. Never
-        // bypassPermissions (the sandbox image's default) and never a weaker mode.
-        .chain(["auto".to_string()])
-        // No settings files at all, only the deny-list hook: neither the owner's settings nor
-        // a settings file on the branch can loosen or switch it off.
-        .chain(["--setting-sources".to_string(), String::new()])
-        .collect();
+    // stream-json (which needs `--verbose`) carries the `rate_limit_event` messages the usage
+    // window is read from; [`fold_stream`] turns the stream back into the one final result.
+    let mut args: Vec<String> = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+    ]
+    .into_iter()
+    .map(String::from)
+    // Auto mode, Anthropic's own safety checks, as an extra layer beside the hook. Never
+    // bypassPermissions (the sandbox image's default) and never a weaker mode.
+    .chain(["auto".to_string()])
+    // No settings files at all, only the deny-list hook: neither the owner's settings nor
+    // a settings file on the branch can loosen or switch it off.
+    .chain(["--setting-sources".to_string(), String::new()])
+    .collect();
     if let Some(settings) = settings {
         args.extend(["--settings".to_string(), settings]);
     }
@@ -167,6 +225,49 @@ fn claude_args(
     args
 }
 
+/// The single result JSON of a `claude -p --output-format stream-json` run: the last message of
+/// type `result`, with the latest `rate_limit_event`'s `rate_limit_info` added when the result
+/// has none of its own. Output that is already one JSON value (an older Claude Code, a fake in
+/// tests) is returned as it is, and so is output with no `result` message (a crash), so the
+/// callers' errors still show what Claude Code printed.
+pub(super) fn fold_stream(stdout: &[u8]) -> Vec<u8> {
+    if serde_json::from_slice::<Value>(stdout).is_ok() {
+        return stdout.to_vec();
+    }
+    let mut result: Option<Value> = None;
+    let mut window: Option<Value> = None;
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match message["type"].as_str() {
+            Some("result") => result = Some(message),
+            Some("rate_limit_event") if message["rate_limit_info"].is_object() => {
+                window = Some(message["rate_limit_info"].clone());
+            }
+            _ => {}
+        }
+    }
+    let Some(mut result) = result else {
+        return stdout.to_vec();
+    };
+    if let (Some(info), Some(map)) = (window, result.as_object_mut()) {
+        map.entry("rate_limit_info").or_insert(info);
+    }
+    serde_json::to_vec(&result).unwrap_or_else(|_| stdout.to_vec())
+}
+
+/// A host scratch directory (if any) that is removed when this is dropped.
+struct Scratch(Option<PathBuf>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 /// The most characters a `claude` command line may hold: well under Windows' 32,767, since
 /// the harness (`CLAUDE.md`), the hook settings and the schema all travel on it.
 pub(super) const COMMAND_LINE_BUDGET: usize = 30_000;
@@ -191,9 +292,15 @@ pub(super) fn claude(
     let git_identity = git_identity(&env.path);
     let guard = GitGuard::new(&env.path)?;
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
-    let scratch = tempfile_dir(&env.path)?;
-    // In the sandbox the deny-list hook (a host program) doesn't run; the sandbox is the guard.
+    // The sandbox keeps its own (`sandbox::SCRATCH`), so none is made on the host then. The guard
+    // removes it on every way out, an early error included.
     let sbx = crate::sandbox::active();
+    let scratch = Scratch(if sbx.is_none() {
+        Some(tempfile_dir(&env.path)?)
+    } else {
+        None
+    });
+    // In the sandbox the deny-list hook (a host program) doesn't run; the sandbox is the guard.
     let (settings, stamp, exe) = if sbx.is_some() {
         (String::new(), PathBuf::new(), PathBuf::new())
     } else {
@@ -202,13 +309,7 @@ pub(super) fn claude(
         let listed = read_from_base(&env.path, base, crate::hook::COMMANDS_FILE)
             .and_then(|text| crate::hook::Commands::parse(text.as_deref()));
         let programs = listed.map(|c| if read_only { c.reviewer } else { c.builder });
-        match programs.and_then(|programs| hook_settings(&env.path, home, read_only, &programs)) {
-            Ok(made) => made,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&scratch);
-                return Err(err);
-            }
-        }
+        programs.and_then(|programs| hook_settings(&env.path, home, read_only, &programs))?
     };
     // The prompt goes on stdin, not the command line: a review prompt holds the diff, and
     // Windows refuses a command line over 32,767 characters (os error 206).
@@ -227,7 +328,10 @@ pub(super) fn claude(
             .max_by_key(|arg| arg.len())
             .cloned()
             .unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_file(&stamp);
+        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
+            let _ = std::fs::remove_dir(dir);
+        }
         bail!(
             "the `claude` command line would be {line} characters, over Paja's budget of \
              {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
@@ -246,7 +350,11 @@ pub(super) fn claude(
         None => {
             let mut cmd = Command::new(&program);
             cmd.current_dir(&env.path);
-            without_credentials(&mut cmd, &scratch, git_identity);
+            without_credentials(
+                &mut cmd,
+                scratch.0.as_deref().unwrap_or(&env.path),
+                git_identity,
+            );
             cmd.args(&args);
             cmd
         }
@@ -256,8 +364,12 @@ pub(super) fn claude(
     let output = crate::platform::output_until_stopped_with_input(
         &mut cmd,
         Some(prompt.as_bytes().to_vec()),
-    );
-    let _ = std::fs::remove_dir_all(&scratch);
+    )
+    .map(|mut out| {
+        out.stdout = fold_stream(&out.stdout);
+        out
+    });
+    drop(scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
     if let Some(dir) = stamp.parent() {
@@ -502,14 +614,23 @@ pub(super) fn hook_settings(
     // Test the very command Claude Code will run, with a throwaway stamp of its own, so a
     // path the shell reads differently fails here and not on every tool call.
     let trial = private.join("self-test");
-    let tested = hook_command(&exe, root, home.root(), &trial, read_only, programs)
-        .and_then(|command| self_test_hook(&command, root, read_only));
+    // The shipped command is built once; the trial differs from it in the stamp word only.
+    let command = hook_command(&exe, root, home.root(), &stamp, read_only, programs)?;
+    let tested = crate::platform::quote_hook_word(&stamp)
+        .and_then(|real| Ok((real, crate::platform::quote_hook_word(&trial)?)))
+        .and_then(|(real, fake)| {
+            let swapped =
+                command.replacen(&format!("--stamp {real}"), &format!("--stamp {fake}"), 1);
+            if swapped == command {
+                bail!("the hook command `{command}` has no stamp word to test with");
+            }
+            self_test_hook(&swapped, root, read_only)
+        });
     let _ = std::fs::remove_file(&trial);
     if let Err(err) = tested {
         let _ = std::fs::remove_dir(&private);
         return Err(err);
     }
-    let command = hook_command(&exe, root, home.root(), &stamp, read_only, programs)?;
     // Claude Code's timeout also counts as "allow", so leave the hook's own deadline room.
     let timeout = crate::hook::HOOK_DEADLINE_SECS * 3;
     let settings = json!({
@@ -1284,6 +1405,30 @@ impl GitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_folds_into_its_result_with_the_latest_window() {
+        let stream = [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","utilization":0.5,"resetsAt":1}}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","utilization":0.9,"resetsAt":2}}"#,
+            r#"{"type":"result","is_error":false,"result":"done","num_turns":3}"#,
+        ]
+        .join("\n");
+        let folded: Value = serde_json::from_slice(&fold_stream(stream.as_bytes())).unwrap();
+        assert_eq!(folded["result"], "done");
+        assert_eq!(folded["rate_limit_info"]["utilization"], 0.9);
+        // A result's own object wins; a single JSON value and a stream with no result stay as is.
+        let own = r#"{"type":"result","rate_limit_info":{"status":"allowed"}}"#;
+        let both = format!(
+            "{}\n{own}",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#
+        );
+        let folded: Value = serde_json::from_slice(&fold_stream(both.as_bytes())).unwrap();
+        assert_eq!(folded["rate_limit_info"]["status"], "allowed");
+        assert_eq!(fold_stream(own.as_bytes()), own.as_bytes());
+        assert_eq!(fold_stream(b"a\nb"), b"a\nb");
+    }
 
     #[test]
     fn agents_always_run_in_auto_mode_and_never_bypass_permissions() {

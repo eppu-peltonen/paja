@@ -165,6 +165,20 @@ enum Command {
     /// stdout carries the MCP protocol, so this is the one command that never prints a
     /// result of its own; its errors go to stderr.
     Mcp,
+    /// What each work item and each day spent: rounds, steps by role and model, tokens, turns,
+    /// wall time and outcome per item; totals per day and overall; the median and 90th
+    /// percentile per landed item. Steps whose usage couldn't be read are counted as unknown.
+    Usage {
+        /// Any path inside the repository's checkout (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Only this work item.
+        #[arg(long, value_name = "NUMBER")]
+        item: Option<u64>,
+        /// Only steps recorded on or after this UTC date (YYYY-MM-DD).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+    },
     /// Show the event log, newest last.
     Log {
         /// Only the last N events.
@@ -546,13 +560,28 @@ fn run(cli: &Cli) -> Result<()> {
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
                 let mut idle = false;
+                // A usage limit waits for its reset instead of polling the queue.
+                let mut reset: Option<u64> = None;
                 let wait = match outcome {
                     Ok(report) => {
                         failures.passed();
                         emit(cli, run_json(&report)?, || describe_run(&report));
                         idle = matches!(report, mestari::RunReport::Idle);
-                        matches!(report, mestari::RunReport::Idle)
-                            .then_some("nothing to do right now")
+                        reset = match &report {
+                            mestari::RunReport::Paused { resets_at } => Some(*resets_at),
+                            mestari::RunReport::UsageLimit { resets_at, .. } => *resets_at,
+                            _ => None,
+                        };
+                        match &report {
+                            mestari::RunReport::Idle => Some("nothing to do right now"),
+                            mestari::RunReport::Paused { .. } => {
+                                Some("Claude Code's usage limit hasn't reset")
+                            }
+                            mestari::RunReport::UsageLimit { .. } => {
+                                Some("Claude Code's usage limit was hit")
+                            }
+                            _ => None,
+                        }
                     }
                     // Except when git's configuration was tampered with (running git again is the
                     // danger) or no later pass could start either: the loop stops for a person.
@@ -595,12 +624,24 @@ fn run(cli: &Cli) -> Result<()> {
                     }
                 }
                 if let Some(why) = wait {
-                    mestari::progress(&format!(
-                        "{why}; checking again in {minutes} minute{} (Ctrl+C stops)",
-                        if *minutes == 1 { "" } else { "s" }
-                    ));
-                    let until = std::time::Instant::now()
-                        + std::time::Duration::from_secs(minutes.saturating_mul(60));
+                    let until = match reset {
+                        Some(ms) => {
+                            let ahead = ms.saturating_sub(paja::events::now_ms());
+                            mestari::progress(&format!(
+                                "{why}; waiting until it resets at {} (Ctrl+C stops)",
+                                mestari::format_utc(ms)
+                            ));
+                            std::time::Instant::now() + std::time::Duration::from_millis(ahead)
+                        }
+                        None => {
+                            mestari::progress(&format!(
+                                "{why}; checking again in {minutes} minute{} (Ctrl+C stops)",
+                                if *minutes == 1 { "" } else { "s" }
+                            ));
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(minutes.saturating_mul(60))
+                        }
+                    };
                     while std::time::Instant::now() < until && paja::platform::interrupts() == 0 {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
@@ -743,6 +784,13 @@ fn run(cli: &Cli) -> Result<()> {
                 });
             }
         },
+        Command::Usage { repo, item, since } => {
+            let name = jono::repo_name(&home, &std::path::absolute(repo)?)?;
+            let report = paja::usage::report(&home, &name, *item, since.as_deref())?;
+            emit(cli, paja::usage::to_json(&report)?, || {
+                paja::usage::describe(&report)
+            });
+        }
         Command::Log { limit } => {
             let events = home.events().tail(*limit)?;
             emit(cli, serde_json::to_value(&events)?, || {
@@ -856,6 +904,19 @@ fn describe_run(report: &mestari::RunReport) -> String {
         mestari::RunReport::Stopped { number, .. } => {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
         }
+        mestari::RunReport::UsageLimit {
+            number, resets_at, ..
+        } => match resets_at {
+            Some(ms) => format!(
+                "usage limit; #{number} resumes on the next `paja run` after {}",
+                mestari::format_utc(*ms)
+            ),
+            None => format!("usage limit; #{number} resumes on the next `paja run`"),
+        },
+        mestari::RunReport::Paused { resets_at } => format!(
+            "usage limit not reset; `paja run` can run again at {}",
+            mestari::format_utc(*resets_at)
+        ),
     }
 }
 

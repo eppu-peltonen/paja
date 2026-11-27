@@ -241,6 +241,18 @@ fn parse_version(text: &str) -> Option<Vec<u64>> {
         })
 }
 
+/// Whether version `a` comes before `b`, a missing part counting as 0, so `2.0` and `2.0.0` are
+/// the same release.
+fn older(a: &[u64], b: &[u64]) -> bool {
+    let len = a.len().max(b.len());
+    let padded = |v: &[u64]| {
+        (0..len)
+            .map(|i| v.get(i).copied().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    padded(a) < padded(b)
+}
+
 /// The latest released version, or why it couldn't be found. Never waits more than a few seconds.
 fn latest_version() -> std::result::Result<Vec<u64>, String> {
     let source = std::env::var(LATEST_VAR).unwrap_or_else(|_| LATEST_URL.to_string());
@@ -275,7 +287,7 @@ fn claude_version(claude: &str, installed_text: String) -> Check {
         return ok("claude", installed_text);
     };
     match latest_version() {
-        Ok(latest) if installed < latest => {
+        Ok(latest) if older(&installed, &latest) => {
             let latest = latest
                 .iter()
                 .map(u64::to_string)
@@ -459,6 +471,46 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             "check that the repository is intact (`git status`)",
         )),
     }
+    // The model per role: a role this Paja doesn't know is skipped on every pass, which only
+    // stderr would otherwise say.
+    let models_file = crate::mestari::MODELS_FILE;
+    match show(proof.path(), rev, models_file) {
+        Ok(None) => checks.push(ok(
+            "models",
+            format!("no {models_file} on {rev}: every role runs on the account's default model"),
+        )),
+        Ok(Some(text)) => match crate::mestari::Models::parse_on(&text, rev) {
+            Err(err) => checks.push(failed(
+                "models",
+                format!("{err:#}"),
+                format!("fix {models_file} on {rev}"),
+            )),
+            Ok(models) if !models.skipped.is_empty() => checks.push(warning(
+                "models",
+                format!(
+                    "{models_file} on {rev} names role(s) this Paja doesn't know, so their lines \
+                     are skipped and the roles run on the default model or turn cap: {}",
+                    models.skipped.join(", ")
+                ),
+                format!(
+                    "if a role is new, install the newer Paja; if it is a typo, fix it in \
+                     {models_file} on {rev}"
+                ),
+            )),
+            Ok(models) => checks.push(ok(
+                "models",
+                format!(
+                    "{} role(s) set in {models_file} on {rev}",
+                    models.roles.len()
+                ),
+            )),
+        },
+        Err(err) => checks.push(failed(
+            "models",
+            format!("reading {models_file} on {rev}: {err}"),
+            "check that the repository is intact (`git status`)",
+        )),
+    }
     // CI.
     let ci_file = crate::mestari::CI_FILE;
     let mode = show(proof.path(), rev, ci_file).map(|t| lines(&t.unwrap_or_default()));
@@ -522,5 +574,19 @@ fn sandbox(checks: &mut Vec<Check>) {
             format!("{var} is not set, so agents and checks run as this user, with your files and sign-ins"),
             format!("install `sbx` and set {var} to it for a sandbox (see docs/setup.md)"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_of_different_lengths_compare_by_their_numbers() {
+        assert!(!older(&[2, 0], &[2, 0, 0]));
+        assert!(!older(&[2, 0, 0], &[2, 0]));
+        assert!(older(&[2, 0], &[2, 0, 1]));
+        assert!(older(&[1, 9, 9], &[2, 0]));
+        assert!(!older(&[2, 1], &[2, 0, 9]));
     }
 }

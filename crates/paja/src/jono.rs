@@ -1124,11 +1124,17 @@ pub struct RunClaim {
 /// first, so it is resumed instead of being skipped for good. Otherwise the next queued item is
 /// claimed. Items a person or another worker claimed with `paja work claim` are never taken.
 pub fn claim_for_run(home: &Home, repo: &str) -> Result<Option<RunClaim>> {
-    claim_for_run_item(home, repo, None)
+    claim_for_run_item(home, repo, None, true)
 }
 
-/// [`claim_for_run`], taking only item `only` when one is named (`paja run --item`).
-pub fn claim_for_run_item(home: &Home, repo: &str, only: Option<u64>) -> Result<Option<RunClaim>> {
+/// [`claim_for_run`], taking only item `only` when one is named (`paja run --item`). With
+/// `new` false only an item to resume is taken: a queued one stays queued, with no status event.
+pub fn claim_for_run_item(
+    home: &Home,
+    repo: &str,
+    only: Option<u64>,
+    new: bool,
+) -> Result<Option<RunClaim>> {
     let wanted = |item: &WorkItem| only.is_none_or(|n| n == item.number);
     let lock = home.lock()?;
     let log = home.events();
@@ -1143,7 +1149,7 @@ pub fn claim_for_run_item(home: &Home, repo: &str, only: Option<u64>) -> Result<
             }));
         }
     }
-    for item in ready.into_iter().filter(wanted) {
+    for item in ready.into_iter().filter(wanted).filter(|_| new) {
         // A queued item a live run still holds (set back by hand mid-run) waits for that run.
         let Some(run_lock) = home.try_run_lock(repo, item.number)? else {
             continue;
@@ -1196,12 +1202,14 @@ fn runner_id_locked(lock: &crate::home::HomeLock, log: &crate::events::EventLog)
 /// taken, its claim is written on the issue (the claimed label and a claim comment), and the
 /// issue is read again to see that no other runner's claim came first. An item that lost the
 /// race is left to the winner and the next one is tried. When GitHub can't be reached nothing is
-/// taken, and the error says why. `checkout` is where `gh` runs.
+/// taken, and the error says why. `checkout` is where `gh` runs. With `new` false only an item
+/// to resume is taken, and nothing is claimed on GitHub.
 pub fn claim_for_run_on(
     home: &Home,
     checkout: &Path,
     repo: &str,
     only: Option<u64>,
+    new: bool,
 ) -> Result<Option<RunClaim>> {
     let wanted = |item: &WorkItem| only.is_none_or(|n| n == item.number);
     let ok = crate::ahjo::untampered(home, checkout)?;
@@ -1224,7 +1232,7 @@ pub fn claim_for_run_on(
         }
         (me, ready)
     };
-    for item in ready.into_iter().filter(wanted) {
+    for item in ready.into_iter().filter(wanted).filter(|_| new) {
         let run_lock = {
             let _lock = home.lock()?;
             home.try_run_lock(repo, item.number)?
