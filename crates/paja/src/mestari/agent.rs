@@ -167,6 +167,17 @@ fn claude_args(
     args
 }
 
+/// A host scratch directory (if any) that is removed when this is dropped.
+struct Scratch(Option<PathBuf>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 /// The most characters a `claude` command line may hold: well under Windows' 32,767, since
 /// the harness (`CLAUDE.md`), the hook settings and the schema all travel on it.
 pub(super) const COMMAND_LINE_BUDGET: usize = 30_000;
@@ -191,9 +202,15 @@ pub(super) fn claude(
     let git_identity = git_identity(&env.path);
     let guard = GitGuard::new(&env.path)?;
     // Agents get a throwaway PAJA_HOME, so trying the CLI never touches the factory's state.
-    let scratch = tempfile_dir(&env.path)?;
-    // In the sandbox the deny-list hook (a host program) doesn't run; the sandbox is the guard.
+    // The sandbox keeps its own (`sandbox::SCRATCH`), so none is made on the host then. The guard
+    // removes it on every way out, an early error included.
     let sbx = crate::sandbox::active();
+    let scratch = Scratch(if sbx.is_none() {
+        Some(tempfile_dir(&env.path)?)
+    } else {
+        None
+    });
+    // In the sandbox the deny-list hook (a host program) doesn't run; the sandbox is the guard.
     let (settings, stamp, exe) = if sbx.is_some() {
         (String::new(), PathBuf::new(), PathBuf::new())
     } else {
@@ -202,13 +219,7 @@ pub(super) fn claude(
         let listed = read_from_base(&env.path, base, crate::hook::COMMANDS_FILE)
             .and_then(|text| crate::hook::Commands::parse(text.as_deref()));
         let programs = listed.map(|c| if read_only { c.reviewer } else { c.builder });
-        match programs.and_then(|programs| hook_settings(&env.path, home, read_only, &programs)) {
-            Ok(made) => made,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&scratch);
-                return Err(err);
-            }
-        }
+        programs.and_then(|programs| hook_settings(&env.path, home, read_only, &programs))?
     };
     // The prompt goes on stdin, not the command line: a review prompt holds the diff, and
     // Windows refuses a command line over 32,767 characters (os error 206).
@@ -227,7 +238,10 @@ pub(super) fn claude(
             .max_by_key(|arg| arg.len())
             .cloned()
             .unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_file(&stamp);
+        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
+            let _ = std::fs::remove_dir(dir);
+        }
         bail!(
             "the `claude` command line would be {line} characters, over Paja's budget of \
              {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
@@ -246,7 +260,11 @@ pub(super) fn claude(
         None => {
             let mut cmd = Command::new(&program);
             cmd.current_dir(&env.path);
-            without_credentials(&mut cmd, &scratch, git_identity);
+            without_credentials(
+                &mut cmd,
+                scratch.0.as_deref().unwrap_or(&env.path),
+                git_identity,
+            );
             cmd.args(&args);
             cmd
         }
@@ -257,7 +275,7 @@ pub(super) fn claude(
         &mut cmd,
         Some(prompt.as_bytes().to_vec()),
     );
-    let _ = std::fs::remove_dir_all(&scratch);
+    drop(scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
     if let Some(dir) = stamp.parent() {

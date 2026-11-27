@@ -4938,33 +4938,38 @@ fn a_real_sandbox_hides_the_owners_files() {
         eprintln!("skipped: set PAJA_SBX_TEST to the `sbx` program to run this");
         return;
     };
-    /// Removes the sandbox `paja` when dropped, pass or fail, and once up front in case an
-    /// earlier run left one whose mounts no longer exist. Each removal is verified with
-    /// `sbx ls`: if the sandbox is still listed, the test fails (or, while already failing,
-    /// says so on stderr).
-    struct RemoveSandbox(std::ffi::OsString);
+    /// Removes the test's own sandbox (never the factory's `paja`) when dropped, pass or fail,
+    /// and once up front in case an earlier run left one whose mounts no longer exist. Each
+    /// removal is verified with `sbx ls`: if the sandbox is still listed, or `sbx ls` fails, the
+    /// test fails (or, while already failing, says so on stderr).
+    struct RemoveSandbox(std::ffi::OsString, String);
     impl RemoveSandbox {
-        fn listed(&self) -> bool {
+        /// Whether `sbx ls` lists the sandbox by name (its first column); `None` when `sbx ls`
+        /// can't say.
+        fn listed(&self) -> Option<bool> {
             let out = Command::new(&self.0)
                 .arg("ls")
                 .stdin(std::process::Stdio::null())
-                .output();
-            match out {
-                Ok(out) => String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .any(|word| word == "paja"),
-                Err(_) => false,
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
             }
+            Some(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(self.1.as_str())),
+            )
         }
         /// Try the ways `sbx rm` is spelled (some ask for confirmation) until it is gone.
         fn remove(&self) -> bool {
             use std::io::Write;
             for args in [
-                &["rm", "--force", "paja"][..],
-                &["rm", "-f", "paja"][..],
-                &["rm", "paja"][..],
+                &["rm", "--force", self.1.as_str()][..],
+                &["rm", "-f", self.1.as_str()][..],
+                &["rm", self.1.as_str()][..],
             ] {
-                if !self.listed() {
+                if self.listed() == Some(false) {
                     return true;
                 }
                 let child = Command::new(&self.0)
@@ -4977,16 +4982,27 @@ fn a_real_sandbox_hides_the_owners_files() {
                     if let Some(mut stdin) = child.stdin.take() {
                         let _ = stdin.write_all(b"y\n");
                     }
-                    let _ = child.wait_with_output();
+                    match child.wait_with_output() {
+                        Ok(out) if out.status.success() => {}
+                        Ok(out) => eprintln!(
+                            "warning: `sbx {}` failed: {}",
+                            args.join(" "),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ),
+                        Err(err) => eprintln!("warning: `sbx {}` failed: {err}", args.join(" ")),
+                    }
                 }
             }
-            !self.listed()
+            self.listed() == Some(false)
         }
     }
     impl Drop for RemoveSandbox {
         fn drop(&mut self) {
             if !self.remove() {
-                let message = "the test's sandbox `paja` is still listed by `sbx ls`; remove it with `sbx rm paja`";
+                let message = format!(
+                    "the test's sandbox `{0}` is still listed by `sbx ls` (or `sbx ls` failed); remove it with `sbx rm {0}`",
+                    self.1
+                );
                 if std::thread::panicking() {
                     eprintln!("{message}");
                 } else {
@@ -4995,10 +5011,12 @@ fn a_real_sandbox_hides_the_owners_files() {
             }
         }
     }
-    let cleanup = RemoveSandbox(sbx.clone());
+    // The test's own sandbox, so a person's `paja` sandbox is never touched.
+    let name = format!("paja-test-{}", std::process::id());
+    let cleanup = RemoveSandbox(sbx.clone(), name.clone());
     assert!(
         cleanup.remove(),
-        "an earlier sandbox `paja` can't be removed; run `sbx rm paja`"
+        "an earlier sandbox `{name}` can't be removed; run `sbx rm {name}`"
     );
     let secrets = tempfile::tempdir().unwrap();
     let planted = secrets.path().join(".netrc");
@@ -5007,9 +5025,11 @@ fn a_real_sandbox_hides_the_owners_files() {
     // The sandbox is Linux: the checks name these host files the way it spells them, and they
     // are in no mount.
     let spell = |p: &Path| paja::sandbox::in_sandbox_path(p).unwrap();
-    // The write outside must fail without failing the check; the host is asserted below.
+    // The write outside must fail without failing the check; the host is asserted below. The
+    // marker, written after it into the repository's mounted `.git` (a marker in the worktree
+    // would count as a change the checks made), shows the check ran that far.
     let checks = format!(
-        "test ! -e {}\ntouch {} || true\n",
+        "test ! -e {}\ntouch {} || true\ntouch \"$(git rev-parse --git-common-dir)/paja-check-ran\"\n",
         spell(&planted),
         spell(&outside)
     );
@@ -5046,10 +5066,15 @@ fn a_real_sandbox_hides_the_owners_files() {
             ("PAJA_GH", f.gh.as_path()),
             ("PAJA_CLAUDE", claude_in_sandbox.as_path()),
             ("PAJA_SBX", sbx.as_path()),
+            ("PAJA_SBX_NAME", std::path::Path::new(&name)),
         ],
     );
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
+    assert!(
+        f.repo.join(".git").join("paja-check-ran").exists(),
+        "the check never reached its marker"
+    );
     assert!(!outside.exists(), "a check wrote outside its sandbox");
     assert!(planted.exists(), "the planted file should be untouched");
 }

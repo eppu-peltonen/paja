@@ -21,6 +21,10 @@ pub const PROGRAM_VAR: &str = "PAJA_SBX";
 /// The sandbox's name. One per machine; it is reused by every run.
 const NAME: &str = "paja";
 
+/// Names another sandbox than `paja`. Tests that run a real `sbx` set it, so they never touch
+/// the sandbox the person works in.
+pub const NAME_VAR: &str = "PAJA_SBX_NAME";
+
 /// Where code in the sandbox keeps its throwaway `PAJA_HOME`: the sandbox's own `/tmp`, never a
 /// path on the host.
 pub const SCRATCH: &str = "/tmp/paja-home";
@@ -101,19 +105,27 @@ fn redirect_from(root: &str, dot_git: &str) -> Result<Option<(String, String)>> 
 /// A shell function that runs a command (an `apt-get`), retrying while apt's lists or dpkg lock
 /// is held. A fresh sandbox runs its own `apt-get` just after it starts. It tries
 /// `$PAJA_APT_TRIES` times (default 60) `$PAJA_APT_INTERVAL` seconds apart (default 5), about
-/// five minutes, then fails with apt's message, which names the lock. Tests override both.
+/// five minutes, then fails with apt's message, which names the lock. The output streams to
+/// stdout as the command writes it. Tests override both variables.
 const APT_RETRY: &str = r#"apt_retry() {
   tries=0
   max="${PAJA_APT_TRIES:-60}"
+  log=$(mktemp) || return 1
   while :; do
-    if out=$("$@" 2>&1); then
-      printf '%s\n' "$out"
+    rm -f "$log.rc"
+    # The output streams as it comes and is kept in the log; the status goes in a file, since
+    # a pipe hides it.
+    { "$@" 2>&1 || echo "$?" > "$log.rc"; } | tee "$log"
+    if [ ! -e "$log.rc" ]; then
+      rm -f "$log"
       return 0
     fi
+    out=$(cat "$log")
     case "$out" in
       *"Could not get lock"*|*"Unable to lock"*)
         tries=$((tries + 1))
         if [ "$tries" -ge "$max" ]; then
+          rm -f "$log" "$log.rc"
           printf '%s\n' "$out" >&2
           echo "apt's lock is still held after $tries tries (the lock is named above); wait for the other apt-get or dpkg to finish and run again" >&2
           return 1
@@ -121,6 +133,7 @@ const APT_RETRY: &str = r#"apt_retry() {
         sleep "${PAJA_APT_INTERVAL:-5}"
         ;;
       *)
+        rm -f "$log" "$log.rc"
         printf '%s\n' "$out" >&2
         return 1
         ;;
@@ -205,7 +218,11 @@ pub fn start(mounts: &[PathBuf], setup: Option<&str>) -> Result<Option<Sbx>> {
     };
     let sbx = Sbx {
         program,
-        name: NAME.to_string(),
+        name: std::env::var(NAME_VAR)
+            .ok()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| NAME.to_string()),
     };
     if sbx.exec_ok("true").is_err() {
         let mut create = Command::new(&sbx.program);
@@ -322,6 +339,11 @@ fn windows_spelling(path: &str) -> Result<String> {
     Ok(path.replace('\\', "/"))
 }
 
+/// The script that succeeds when Claude Code's transcript of session `id` is in the home.
+fn transcript_script(id: &str) -> String {
+    format!("ls \"$HOME\"/.claude/projects/*/{id}.jsonl >/dev/null 2>&1")
+}
+
 /// Make an `sbx exec` command from [`Sbx::command`] pass Paja's stdin to the program in the
 /// sandbox (`exec -i`), for a prompt written there. Any other command is left as it is.
 pub fn keep_stdin(cmd: &mut Command) {
@@ -402,11 +424,7 @@ impl Sbx {
     /// needs. Only a plain id (letters, digits, `-`) is looked for; anything else says no.
     pub fn has_transcript(&self, id: &str) -> bool {
         id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            && self
-                .exec_ok(&format!(
-                    "ls \"$HOME\"/.claude/projects/*/{id}.jsonl >/dev/null 2>&1"
-                ))
-                .is_ok()
+            && self.exec_ok(&transcript_script(id)).is_ok()
     }
 
     fn exec_ok(&self, script: &str) -> Result<()> {
@@ -443,12 +461,15 @@ impl Sbx {
                 format!("installing a C toolchain in the sandbox `{}`", self.name)
             })?;
         }
-        let out = self
-            .exec_output(None, None, script)
-            .with_context(|| self.unavailable())?;
+        eprintln!(
+            "running {SETUP_FILE} in the sandbox `{}` (a first run can take minutes)",
+            self.name
+        );
+        // Stderr goes into stdout inside the sandbox, so the tail keeps the order they came in.
+        // Same line, so the script's line numbers are unchanged.
+        let out = self.exec_output(None, None, &format!("exec 2>&1; {script}"))?;
         if !out.status.success() {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
             let lines: Vec<&str> = text.lines().collect();
             let tail = lines[lines.len().saturating_sub(SETUP_TAIL_LINES)..].join("\n");
             bail!(
@@ -784,6 +805,24 @@ mod tests {
             stderr.contains("/var/lib/apt/lists/lock") && stderr.contains("still held"),
             "{stderr}"
         );
+    }
+
+    #[test]
+    fn the_transcript_script_finds_a_session_under_any_project() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude").join("projects").join("-work");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("abc-123.jsonl"), "{}\n").unwrap();
+        let found = |id: &str| {
+            Command::new("sh")
+                .args(["-c", &transcript_script(id)])
+                .env("HOME", home.path())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(found("abc-123"));
+        assert!(!found("other-id"));
     }
 
     #[test]
