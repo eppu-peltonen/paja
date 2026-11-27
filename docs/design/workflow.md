@@ -54,8 +54,10 @@ read-only tools, like a reviewer. The checkout is an Ahjo environment named like
 so each repository has its own and an environment a person made is never reused or removed. One pass runs per
 repository at a time: a pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is
 held and says to wait, and `paja run --every` and an idle pool skip their pass then. Its word is not enough to close anything: Paja closes a duplicate only when the
-original is another open issue that stays open, and an already-fixed issue only when the named commit is on the default
-branch or the named file exists there; otherwise the issue is kept. Issue text reaches the agent as data to judge.
+original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
+named commit must be on the default branch and committed after the issue was opened, and a named file must exist there
+and be named in the issue's title or body (its whole path, or its file name when that has an extension). Otherwise the
+issue is kept. Issue text reaches the agent as data to judge.
 
 `--json` prints `{repo, base, items, closed, not_worth_doing}`; each item has its `verdict`, `reason`, `duplicate_of` or
 `evidence` when it has one, and `closed` (or the `error` that stopped a close). Each pass is recorded as `triage.ran`
