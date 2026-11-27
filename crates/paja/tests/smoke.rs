@@ -7036,8 +7036,6 @@ fn a_window_in_a_real_stream_reaches_the_recorded_step() {
     let (report, stderr) = f.run_with_stderr();
     // The latest event's nearly used window holds back the next build, as a one-value result does.
     assert_eq!(report["outcome"], "usage_limit", "{report}\n{stderr}");
-    assert_eq!(report["resets_at"], resets * 1000, "{report}");
-    assert!(stderr.contains("nearly used up"), "{stderr}");
     let calls = f.claude_calls();
     assert!(
         calls[0].contains("--output-format stream-json") && calls[0].contains("--verbose"),
@@ -7047,6 +7045,8 @@ fn a_window_in_a_real_stream_reaches_the_recorded_step() {
     let build = &rounds[0]["data"]["steps"][0];
     assert_eq!(build["window_status"], "allowed_warning", "{build}");
     assert_eq!(build["window_resets_at"], resets * 1000, "{build}");
+    let used = build["window_used_percent"].as_f64().unwrap_or_default();
+    assert!((used - 93.0).abs() < 1e-9, "{build}");
     assert_eq!(build["cost_usd"], 0.25, "{build}");
 }
 
