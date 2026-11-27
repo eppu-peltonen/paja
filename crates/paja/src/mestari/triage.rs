@@ -28,7 +28,7 @@ const MAX_NOTE_TRIES: u32 = 3;
 /// The Ahjo environment the triage agent runs in for `repo` (`owner/name`): a checkout of the
 /// default branch, named like a work item's environment (the repository's name and a hash of
 /// `owner/name`), so each repository has its own and a person's `paja env create triage` is
-/// never reused or removed.
+/// never reused or removed. Two clones of one repository share it; see [`ask`].
 pub fn env_name(repo: &str) -> String {
     jono::env_name_for(repo, "triage")
 }
@@ -612,7 +612,7 @@ pub fn triage(home: &Home, repo: &Path) -> Result<TriageReport> {
              `paja run --every`); wait for it to finish, then run `paja triage` again"
         );
     };
-    triage_holding(home, &repo, &name, lock)
+    triage_holding(home, &repo, &name, &lock)
 }
 
 /// [`triage`], holding `repo`'s triage lock.
@@ -620,7 +620,7 @@ fn triage_holding(
     home: &Home,
     repo: &Path,
     name: &str,
-    _lock: crate::home::RunLock,
+    _lock: &crate::home::RunLock,
 ) -> Result<TriageReport> {
     let repo = repo.to_path_buf();
     let name = name.to_string();
@@ -836,7 +836,20 @@ fn ask(
     let env_name = env_name(name);
     // A checkout left behind by a pass that was killed is reused, put back on the default branch.
     let env = match ahjo::get(home, &env_name) {
-        Ok(env) => env,
+        Ok(env) => {
+            // Another clone of the same repository shares the name: leave its checkout alone.
+            if !ahjo::belongs_to(home, &env, repo)? {
+                bail!(
+                    "environment {env_name} belongs to the repository at {}, not {}: it was \
+                     made by another clone of {name} (or one that has moved). Run `paja triage` \
+                     from that clone, or remove the environment with `paja env remove --force \
+                     {env_name}` if it is stale",
+                    env.repo.display(),
+                    repo.display()
+                );
+            }
+            env
+        }
         Err(_) => {
             let branch = format!("refs/heads/paja/{env_name}");
             let resume = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
@@ -969,14 +982,26 @@ fn triaged_today(events: &[crate::events::Event], repo: &str, now_ms: u64) -> bo
 /// repository in the last day. A failed pass is recorded as the day's attempt and returned.
 pub fn triage_if_due(home: &Home, repo: &Path) -> Result<Option<TriageReport>> {
     let name = jono::repo_name(home, &std::path::absolute(repo)?)?;
-    if triaged_today(&home.events().read_all()?, &name, crate::events::now_ms()) {
+    let due = || -> Result<bool> {
+        Ok(!triaged_today(
+            &home.events().read_all()?,
+            &name,
+            crate::events::now_ms(),
+        ))
+    };
+    if !due()? {
         return Ok(None);
     }
     // A pass already running (a `paja triage` by hand, say) is this one's: skip it, unrecorded.
     let Some(lock) = home.try_triage_lock(&name)? else {
         return Ok(None);
     };
-    match triage_holding(home, &std::path::absolute(repo)?, &name, lock) {
+    // Asked again under the lock: a pass that finished in between was today's.
+    if !due()? {
+        return Ok(None);
+    }
+    // The lock is held until a failure is recorded too, so no other pass sees the day as due.
+    match triage_holding(home, &std::path::absolute(repo)?, &name, &lock) {
         Ok(report) => Ok(Some(report)),
         Err(err) => {
             if !is_fatal(&err) {

@@ -457,7 +457,8 @@ pub fn env_name(repo: &str, number: u64) -> String {
 }
 
 /// An Ahjo environment name of `repo` for `what` (`work-5`, `triage`): the repository's name,
-/// a short hash of `owner/name` and `what`, at most 40 characters as long as `what` leaves room.
+/// a short hash of `owner/name`, and `what`; at most 40 characters as long as `what` leaves
+/// room. Two clones of one repository get the same names.
 pub fn env_name_for(repo: &str, what: &str) -> String {
     let name = repo.rsplit('/').next().unwrap_or(repo).to_ascii_lowercase();
     let name: String = name
