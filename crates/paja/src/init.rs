@@ -416,7 +416,8 @@ fn yaml_scalar(text: &str) -> String {
         || text.starts_with(['~', '-', '?', ',', ' '])
         || text.ends_with(' ')
         || reserved.contains(&text.to_ascii_lowercase().as_str())
-        || text.parse::<f64>().is_ok()
+        || text.replace('_', "").parse::<f64>().is_ok()
+        || text.starts_with(['.', '0']) && text.len() > 1 && !text.contains(' ')
         || text.contains([
             ':', '#', '\'', '"', '{', '}', '[', ']', '&', '*', '!', '|', '>', '%', '@', '`',
         ])
@@ -910,7 +911,10 @@ mod tests {
         assert!(at("apps/web").contains("working-directory: apps/web\n"));
         assert_eq!(yaml_scalar("~x"), "'~x'");
         assert_eq!(yaml_scalar("a~b"), "a~b");
-        for misread in ["-x", "?x", ",x", "true", "Null", "off", "2024", "1.5", ""] {
+        for misread in [
+            "-x", "?x", ",x", "true", "Null", "off", "2024", "1.5", "", "1_000", "0x10", "0o7",
+            ".inf",
+        ] {
             assert_eq!(yaml_scalar(misread), format!("'{misread}'"), "{misread}");
         }
         assert_eq!(yaml_scalar("npm ci"), "npm ci");
