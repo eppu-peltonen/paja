@@ -21,7 +21,7 @@
 //!
 //! It fails closed. [`run`] exits 2 (block) when a rule matches and also when anything goes
 //! wrong while deciding, including a panic. Mestari runs a self-test before each agent and
-//! refuses to start one unless the hook both blocks a push and allows a build.
+//! refuses to start one unless the hook both blocks a push and allows `git status`.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;

@@ -655,12 +655,13 @@ pub fn item_events<'a>(
 
 /// Before the first event of a repository is written to a log that holds older, unkeyed ones,
 /// record which repository those belong to (see [`legacy_repo`]), so a later write from another
-/// checkout can't move them. Every writer calls this under the home lock.
+/// checkout can't move them. Every writer calls this under the home lock. Returns the log as it
+/// is after, so the caller doesn't read it a second time.
 fn pin_legacy(
     lock: &crate::home::HomeLock,
     log: &crate::events::EventLog,
     repo: &str,
-) -> Result<()> {
+) -> Result<Vec<Event>> {
     let events = log.read_all()?;
     let unkeyed = events
         .iter()
@@ -670,8 +671,9 @@ fn pin_legacy(
         .any(|e| e.kind.starts_with("work.") && e.data["repo"].as_str().is_some());
     if unkeyed && !pinned {
         log.append(lock, EV_SYNCED, json!({ "repo": repo }))?;
+        return log.read_all();
     }
-    Ok(())
+    Ok(events)
 }
 
 /// The queue of one repository, derived by replaying the event log.
@@ -1132,8 +1134,8 @@ pub fn next(home: &Home, repo: &str) -> Result<Option<WorkItem>> {
 pub fn claim(home: &Home, repo: &str) -> Result<Option<WorkItem>> {
     let lock = home.lock()?;
     let log = home.events();
-    pin_legacy(&lock, &log, repo)?;
-    let mut items: Vec<WorkItem> = replay_repo(&log.read_all()?, repo)?.into_values().collect();
+    let events = pin_legacy(&lock, &log, repo)?;
+    let mut items: Vec<WorkItem> = replay_repo(&events, repo)?.into_values().collect();
     queue_order(&mut items);
     let Some(mut item) = items.into_iter().find(is_ready) else {
         return Ok(None);
@@ -1175,8 +1177,8 @@ pub fn claim_for_run_item(
     let wanted = |item: &WorkItem| only.is_none_or(|n| n == item.number);
     let lock = home.lock()?;
     let log = home.events();
-    pin_legacy(&lock, &log, repo)?;
-    let (left, ready) = run_candidates(&log.read_all()?, repo)?;
+    let events = pin_legacy(&lock, &log, repo)?;
+    let (left, ready) = run_candidates(&events, repo)?;
     for item in left.into_iter().filter(wanted) {
         if let Some(run_lock) = home.try_run_lock(repo, item.number)? {
             return Ok(Some(RunClaim {
@@ -1254,9 +1256,9 @@ pub fn claim_for_run_on(
     let (me, ready) = {
         let lock = home.lock()?;
         let log = home.events();
-        pin_legacy(&lock, &log, repo)?;
+        let events = pin_legacy(&lock, &log, repo)?;
         let me = runner_id_locked(&lock, &log)?;
-        let (left, ready) = run_candidates(&log.read_all()?, repo)?;
+        let (left, ready) = run_candidates(&events, repo)?;
         // An item this runner left active keeps its claim, which each round renews.
         for item in left.into_iter().filter(wanted) {
             if let Some(run_lock) = home.try_run_lock(repo, item.number)? {
@@ -1661,8 +1663,8 @@ fn free_claim(home: &Home, checkout: &Path, number: u64, freeing: Freeing) {
 pub fn runnable(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
     let lock = home.lock()?;
     let log = home.events();
-    pin_legacy(&lock, &log, repo)?;
-    let (left, ready) = run_candidates(&log.read_all()?, repo)?;
+    let events = pin_legacy(&lock, &log, repo)?;
+    let (left, ready) = run_candidates(&events, repo)?;
     let mut free = Vec::new();
     for item in left.into_iter().chain(ready) {
         // Probed under the home lock, under which runs claim, so a claim never meets the probe.
@@ -1678,8 +1680,8 @@ pub fn runnable(home: &Home, repo: &str) -> Result<Vec<WorkItem>> {
 pub fn left_active(home: &Home, repo: &str) -> Result<Vec<u64>> {
     let lock = home.lock()?;
     let log = home.events();
-    pin_legacy(&lock, &log, repo)?;
-    let (left, _) = run_candidates(&log.read_all()?, repo)?;
+    let events = pin_legacy(&lock, &log, repo)?;
+    let (left, _) = run_candidates(&events, repo)?;
     let mut free = Vec::new();
     for item in left {
         if home.try_run_lock(repo, item.number)?.is_some() {
@@ -1744,8 +1746,8 @@ pub fn set_status(
 ) -> Result<WorkItem> {
     let lock = home.lock()?;
     let log = home.events();
-    pin_legacy(&lock, &log, repo)?;
-    let mut item = replay_repo(&log.read_all()?, repo)?
+    let events = pin_legacy(&lock, &log, repo)?;
+    let mut item = replay_repo(&events, repo)?
         .remove(&number)
         .with_context(|| no_item(repo, number))?;
     if item.status == Status::Escalated && status == Status::Queued {
@@ -1920,8 +1922,7 @@ fn apply_listed(
 ) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
-    pin_legacy(&lock, &log, repo)?;
-    let events = log.read_all()?;
+    let events = pin_legacy(&lock, &log, repo)?;
     let items = replay_repo(&events, repo)?;
     let back_from_rules = closed_by_rules(&events, repo);
     let recorded: BTreeSet<u64> = waiting_recorded(&events, legacy_repo(&events, repo))
@@ -2108,8 +2109,8 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
     let item = {
         let lock = home.lock()?;
         let log = home.events();
-        pin_legacy(&lock, &log, &name)?;
-        let mut item = replay_repo(&log.read_all()?, &name)?
+        let events = pin_legacy(&lock, &log, &name)?;
+        let mut item = replay_repo(&events, &name)?
             .remove(&number)
             .with_context(|| no_item(&name, number))?;
         // A queued item whose last answer is the arbiter's hasn't run since: a person may

@@ -144,9 +144,13 @@ escape hatch for an item that needs no answer.
 Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/high-risk` lists only what decides
 what lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review
 prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue,
-`GitGuard`) and `land.rs` (landing, waiting for CI, escalation). Usage counting (`usage.rs`), stderr progress text
-(`progress.rs`), follow-ups (`follow_ups.rs`) and the builder's question and answers (`builder.rs`) are normal risk.
-A unit test keeps the three high-risk files on the list.
+`GitGuard`), `arbiter.rs` (the arbiter that settles an escalation, and the rules that overrule it), `land.rs`
+(landing, waiting for CI, escalation), `triage.rs` (`paja triage`) and `detect.rs` (the `init` agents' sandboxes and
+tool lists). Outside the module, `init/generate.rs` (the programs a generated skeleton's agent may run) is high risk
+too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`), follow-ups (`follow_ups.rs`), the builder's
+question and answers (`builder.rs`), where a run is (`live.rs`), the pool (`pool.rs`, `plan.rs`) and the rest of
+`init/` are normal risk. A unit test walks every source file and fails on one that is neither on the list nor named
+as normal risk on purpose.
 
 `paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
@@ -156,7 +160,10 @@ is ready to take, so nothing is claimed on GitHub; with `none`
 landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
 creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
 `owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch
-(resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it claims anything,
+(resuming the branch an earlier run kept). An item started before environments carried the repository's name
+resumes its old `work-<issue>` environment when that was made in this checkout; one that belongs to another
+repository is never taken, and a hashed name found to belong to another repository stops the run with the
+`paja env remove <name>` fix. A mistake in that configuration stops the pass before it claims anything,
 with an error naming the file and line, so one fix on the default branch is all it takes. That holds even when the
 queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
 While it works on an item the run holds an OS file lock,

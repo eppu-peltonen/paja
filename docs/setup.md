@@ -197,8 +197,8 @@ repository so you can finish by hand or delete it. `--json` prints the repositor
 For one with no template, an agent on the `init` role writes the skeleton instead, in the fresh clone:
 
 1. A first session, with no repository and no tools, names the programs the stack's build, formatter, linter and test
-   runner run. Paja keeps plain program names and drops shells, network tools and the like, with or without an
-   extension (`bash.exe` and `cmd.bat` are dropped too).
+   runner run. Paja keeps plain program names and drops shells, programs that run another command (`nohup`, `wsl`,
+   `busybox`), network tools and the like, with or without an extension (`bash.exe` and `cmd.bat` are dropped too).
 2. A second session writes a minimal app, one passing test, the formatter's and linter's configuration and a
    `.gitignore`, and runs the formatter, linter and test until they pass. It runs under the deny-list hook, and the
    only programs it may run besides local git are the ones from step 1. It can't write `.github/` (the hook refuses CI

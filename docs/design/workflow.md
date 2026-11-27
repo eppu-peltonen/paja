@@ -38,7 +38,9 @@ follow-up at the next pick. `follow-ups = off` in `.paja/queue` on the default b
 Follow-up issues go stale: later changes fix them, repeat them or make them moot. `paja triage` (and the MCP tool
 `triage`, which returns the same JSON) keeps the list short. One agent on the `triage` role in `.paja/models` (the
 cheapest model; a repository with no line runs it on the account's default) reads the open issues with the follow-up
-label, up to 60, oldest first, and sorts each into one of:
+label, up to 60, and sorts each into one of the verdicts below. Each issue gets a turn: a pass reads first the issues no
+pass has read (oldest first), then those whose last read (in `triage.ran`) is longest ago, so a list longer than 60 is
+read in full over a few passes. The verdicts:
 
 - `keep`: still valid. Also what anything Paja can't back up becomes.
 - `duplicate`: the same as another open follow-up issue, which it names.

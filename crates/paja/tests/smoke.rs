@@ -2590,6 +2590,32 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
 }
 
 #[test]
+fn doctor_points_to_the_troubleshooting_guide_in_both_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let run = |json: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+        cmd.current_dir(tmp.path())
+            .env("PAJA_HOME", &home)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST);
+        if json {
+            cmd.arg("--json");
+        }
+        String::from_utf8_lossy(&cmd.arg("doctor").output().unwrap().stdout).into_owned()
+    };
+    let report: Value = serde_json::from_str(run(true).trim()).unwrap();
+    let help = report["help"].as_str().unwrap();
+    assert!(help.ends_with("/docs/troubleshooting.md"), "{report}");
+    let text = run(false);
+    assert!(
+        text.lines()
+            .last()
+            .is_some_and(|l| l.ends_with(help) && l.starts_with("more on errors")),
+        "{text}"
+    );
+}
+
+#[test]
 fn doctor_checks_that_the_sandbox_program_works() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -4805,6 +4831,56 @@ fn triage_takes_only_evidence_that_has_to_do_with_the_issue() {
 }
 
 #[test]
+fn triage_gives_every_follow_up_a_turn_past_the_first_sixty() {
+    let (f, dir) = triage_factory(r#"{"issues": []}"#);
+    let issues: Vec<String> = (1..=62)
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "title": "Issue {n}", "body": "details of {n}.", "createdAt": "2020-01-01T00:00:00Z", "labels": [{{"name": "factory-follow-up"}}]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("followups.json"),
+        format!("[{}]", issues.join(", ")),
+    )
+    .unwrap();
+    let keep = |numbers: std::ops::RangeInclusive<u64>| {
+        let entries: Vec<String> = numbers
+            .map(|n| format!(r#"{{"number": {n}, "verdict": "keep", "reason": "open"}}"#))
+            .collect();
+        std::fs::write(
+            dir.join("answer.json"),
+            format!(
+                r#"{{"is_error": false, "num_turns": 1, "structured_output": {{"issues": [{}]}}}}"#,
+                entries.join(", ")
+            ),
+        )
+        .unwrap();
+    };
+    let prompt = || std::fs::read_to_string(dir.join("prompt.txt")).unwrap();
+    // The first pass reads the oldest 60.
+    keep(1..=60);
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    assert_eq!(report["items"].as_array().unwrap().len(), 60, "{report}");
+    assert!(prompt().contains("details of 60.") && !prompt().contains("details of 61."));
+    // The next starts with the two no pass has read, then those read longest ago.
+    keep(1..=62);
+    let (ok, report) = triage(&f, &dir);
+    assert!(ok, "{report}");
+    let numbers: Vec<u64> = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(&numbers[..3], [61, 62, 1], "{report}");
+    assert_eq!(numbers.len(), 60, "{report}");
+    assert!(prompt().contains("details of 62."), "{}", prompt());
+}
+
+#[test]
 fn triage_never_closes_not_worth_doing_or_what_it_cannot_back_up() {
     let (f, dir) = triage_factory(
         r#"{"issues": [
@@ -6976,6 +7052,7 @@ fn init_new_says_so_when_the_skeleton_agent_writes_nothing() {
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent wrote no files for the zig skeleton")
+            && error.contains("delete the new repository on GitHub")
             && error.contains("paja init --new"),
         "{error}"
     );
@@ -7006,6 +7083,7 @@ fn init_new_refuses_a_skeleton_the_agent_committed() {
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent committed or switched branches")
+            && error.contains("delete the new repository on GitHub")
             && error.contains("paja init --new"),
         "{error}"
     );
