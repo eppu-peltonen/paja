@@ -330,7 +330,9 @@ nothing: it reports `paused` with `resets_at` and says on stderr when it can run
 until then instead of polling the queue; `paja run --workers` likewise starts no lane and no planner until then. When
 no reset time is known the next run may try again, but a second stop in a row without one parks the item with a
 question to wait until the window resets, so a broken sign-in or account can't loop. The parked item keeps its
-environment, so the builder's uncommitted edits survive the question. A 401 or 403 stays an error that parks the item and asks the person to sign in again.
+environment, so the builder's uncommitted edits survive the question; nothing removes it when the issue is closed
+instead of answered, so `paja doctor` warns of an environment whose item is closed and names the command that frees
+it. A 401 or 403 stays an error that parks the item and asks the person to sign in again.
 
 Before Vasara's checks in every round, Mestari fetches the default branch and merges it into the environment's branch
 when the branch doesn't hold its tip yet, so the checks, the reviewers and CI judge the change as it would land, and a

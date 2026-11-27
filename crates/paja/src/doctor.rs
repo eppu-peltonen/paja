@@ -234,6 +234,55 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             checks.push(failed("home folder", why, fix));
         }
     }
+    checks.push(left_over_environments(home));
+}
+
+/// Environments whose work item's issue was closed: a parked item keeps its environment (so the
+/// builder's edits survive the question), and nothing removes it if the issue is closed instead
+/// of answered.
+fn left_over_environments(home: &Home) -> Check {
+    let name = "environments";
+    let found = (|| -> Result<Vec<String>> {
+        let events = home.events().read_all()?;
+        let envs = ahjo::replay(&events)?;
+        let mut left: Vec<String> = jono::replay(&events, "")?
+            .values()
+            .filter(|item| !item.open && item.status != jono::Status::Active)
+            .map(|item| item.env_name())
+            .filter(|env| envs.contains_key(env))
+            .collect();
+        left.sort();
+        left.dedup();
+        Ok(left)
+    })();
+    match found {
+        Ok(left) if left.is_empty() => ok(name, "none is left over from a closed item"),
+        Ok(left) => warning(
+            name,
+            format!(
+                "{} left over from closed items, still holding worktrees and ports: {}",
+                if left.len() == 1 {
+                    "1 environment is"
+                } else {
+                    "environments are"
+                },
+                left.join(", ")
+            ),
+            format!(
+                "if the work isn't needed, run {}; it keeps the branch, and refuses while the \
+                 worktree has uncommitted changes (add --force to discard them)",
+                left.iter()
+                    .map(|env| format!("`paja env remove {env}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
+        Err(err) => warning(
+            name,
+            format!("couldn't read the event log: {err:#}"),
+            format!("check {}", home.root().display()),
+        ),
+    }
 }
 
 /// Where the latest Claude Code release is looked up: an `http(s)` URL (fetched with `curl`) or a
