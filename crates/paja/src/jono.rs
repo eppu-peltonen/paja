@@ -228,7 +228,8 @@ pub const EV_CLAIM: &str = "work.claim";
 /// How long a claim lasts without being renewed. A run renews it at each round.
 pub const CLAIM_SECS: u64 = 6 * 60 * 60;
 
-/// Who holds an item on GitHub: the claimed label, and the runner in its latest claim comment.
+/// Who holds an item on GitHub: the claimed label, and the runner in its first live claim comment
+/// (else the latest).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     /// The runner id in the first live claim comment (else the latest); `unknown` when the label
@@ -1499,25 +1500,29 @@ fn delete_comment(ok: &Untampered, id: u64) -> Result<()> {
 
 /// Undo a claim that failed part way: delete this runner's comment (`own`, when it was posted),
 /// then take the shared claimed label off unless another runner's live claim is on the issue,
-/// whose label it is. With `own` known, only a claim posted before it counts: a later one lost
-/// the race to this runner's comment and is about to delete itself. When the issue can't be read the label comes off, so a failure never
-/// leaves an item looking claimed by nobody in particular. Best effort: the caller reports the
-/// failure that brought it here.
+/// whose label it is (see `label_is_another_runners`). When the issue can't be read the label
+/// comes off, so a failure never leaves an item looking claimed by nobody in particular. Best
+/// effort: the caller reports the failure that brought it here.
 fn take_back(ok: &Untampered, claimed: &str, number: u64, me: &str, own: Option<u64>) {
     if let Some(id) = own {
         let _ = delete_comment(ok, id);
     }
     let now = now_secs();
-    let other = view_issue(ok, number).is_ok_and(|view| {
-        view.claims().iter().any(|c| {
-            c.runner != me
-                && !c.is_stale(now)
-                && own.is_none_or(|own| c.id.is_none_or(|id| id < own))
-        })
-    });
+    let other = view_issue(ok, number)
+        .is_ok_and(|view| label_is_another_runners(&view.claims(), me, own, now));
     if !other {
         let _ = remove_label(ok, number, claimed);
     }
+}
+
+/// Whether another runner's live claim holds the claimed label, so taking back this runner's
+/// claim leaves it on. With `own` (this runner's comment id) known, only a claim posted before
+/// it counts: a later one lost the race to this runner's comment and is about to delete itself.
+/// A claim whose id can't be read counts, which keeps the label.
+fn label_is_another_runners(claims: &[ClaimComment], me: &str, own: Option<u64>, now: u64) -> bool {
+    claims.iter().any(|c| {
+        c.runner != me && !c.is_stale(now) && own.is_none_or(|own| c.id.is_none_or(|id| id < own))
+    })
 }
 
 fn add_label(
@@ -2635,6 +2640,35 @@ mod tests {
         let (delete, stays) = to_free(&raced, Some("aaaa"));
         assert_eq!(delete, vec![3]);
         assert_eq!(stays.unwrap().runner, "bbbb");
+    }
+
+    #[test]
+    fn taking_back_a_claim_keeps_only_an_earlier_runners_label() {
+        let comment = |runner: &str, id: u64| {
+            let url = format!("https://github.com/a/b/issues/5#issuecomment-{id}");
+            parse_claim_comment(&claim_text(runner, 1_785_000_000), &url).unwrap()
+        };
+        let now = 1_785_000_001;
+        let earlier = [comment("bbbb", 1), comment("aaaa", 2)];
+        assert!(label_is_another_runners(&earlier, "aaaa", Some(2), now));
+        // A later claim lost the race to this runner's comment.
+        let later = [comment("aaaa", 2), comment("cccc", 3)];
+        assert!(!label_is_another_runners(&later, "aaaa", Some(2), now));
+        // With no comment of its own to order against, any other live claim keeps the label.
+        assert!(label_is_another_runners(&later, "aaaa", None, now));
+        // A stale claim holds nothing.
+        assert!(!label_is_another_runners(
+            &earlier,
+            "aaaa",
+            Some(2),
+            now + CLAIM_SECS
+        ));
+        assert!(!label_is_another_runners(
+            &[comment("aaaa", 2)],
+            "aaaa",
+            None,
+            now
+        ));
     }
 
     #[test]
