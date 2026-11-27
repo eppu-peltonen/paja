@@ -428,7 +428,10 @@ def _one_case(case, paja, fake_tool, base_env, scratch):
                PAJA_GH=gh, GH_TOKEN=canary, PAJA_EVAL_CANARY=canary,
                GIT_CONFIG_SYSTEM=system_config,
                PATH=bin_dir + os.pathsep + base_env.get("PATH", ""))
-    git_env = {k: v for k, v in env.items() if k != "XDG_CONFIG_HOME"}
+    # Without XDG_CONFIG_HOME, git reads `$HOME/.config/git/config`: the agent and the snapshot
+    # see the same files, never the caller's real XDG config.
+    env.pop("XDG_CONFIG_HOME", None)
+    git_env = env
     env.pop("PAJA_SBX", None)
     if case["sandbox"]:
         env["PAJA_SBX"] = case["sandbox"]
