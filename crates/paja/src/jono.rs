@@ -1134,13 +1134,33 @@ pub fn sync_with(
 
 /// The top level of the checkout `path` is in (the nearest folder holding `.git`), so a sync
 /// from a subdirectory names the same checkout as one from its root. Found from the path's own
-/// spelling, not from git, so it compares equal to the path an environment records.
+/// spelling, not from git, so it compares equal to the path an environment records; `..` parts
+/// are folded first, so `/a/b/../c` is `/a/c`.
 fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
-    let path = std::path::absolute(path)?;
+    let path = fold_parents(&std::path::absolute(path)?);
     Ok(path
         .ancestors()
         .find(|dir| dir.join(".git").exists())
         .map_or_else(|| path.clone(), Path::to_path_buf))
+}
+
+/// `path` with each `..` part taking away the part before it, as a shell's `cd` does, without
+/// asking the file system. A `..` at the root stays at the root.
+fn fold_parents(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut folded = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                if matches!(folded.components().next_back(), Some(Component::Normal(_))) {
+                    folded.pop();
+                }
+            }
+            Component::CurDir => {}
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 /// Record that `path` is a checkout of `repo`, unless it is already the last one recorded. A
@@ -1573,6 +1593,42 @@ mod tests {
         assert_eq!(Labels::default().needs_answer, "factory-needs-answer");
         let waiting = Labels::parse("needs-answer waiting on you\n").unwrap();
         assert_eq!(waiting.needs_answer, "waiting on you");
+    }
+
+    #[test]
+    fn a_checkout_top_folds_parents_and_finds_the_nearest_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::path::absolute(dir.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        // A `..` part is folded away, so the top is spelled as an environment records it.
+        let roundabout = repo.join("src").join("..").join(".").join("src");
+        assert_eq!(checkout_top(&roundabout).unwrap(), repo);
+        // A linked worktree's `.git` is a file.
+        let linked = root.join("linked");
+        std::fs::create_dir_all(linked.join("deep")).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(checkout_top(&linked.join("deep")).unwrap(), linked);
+        // No `.git` above it: the path itself.
+        let bare = root.join("bare").join("x");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(checkout_top(&bare.join("..").join("x")).unwrap(), bare);
+    }
+
+    #[test]
+    fn fold_parents_takes_away_the_part_before_each_dot_dot() {
+        let path = |parts: &[&str]| parts.iter().collect::<std::path::PathBuf>();
+        let top = std::path::absolute("/").unwrap();
+        assert_eq!(
+            fold_parents(&top.join(path(&["a", "b", "..", "c"]))),
+            top.join(path(&["a", "c"]))
+        );
+        assert_eq!(fold_parents(&top.join(path(&["..", "a"]))), top.join("a"));
+        assert_eq!(
+            fold_parents(&top.join(path(&["a", ".", "b"]))),
+            top.join(path(&["a", "b"]))
+        );
     }
 
     #[cfg(unix)]
