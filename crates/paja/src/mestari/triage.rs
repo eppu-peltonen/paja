@@ -524,7 +524,9 @@ fn is_file_on(repo: &Path, base: &str, file: &str) -> bool {
 }
 
 /// Whether `issue`'s title or body names `file`: the whole path, or its file name when that
-/// has an extension (`triage.rs`), so a file the issue never mentions can't close it.
+/// has an extension (`triage.rs`), so a file the issue never mentions can't close it. A link
+/// names exactly the file it links to in this repository ([`link_names`]); the path rules below
+/// apply only to the text outside links.
 fn names_file(issue: &Open, file: &str) -> bool {
     let file = file.replace('\\', "/");
     let file = file.trim_start_matches("./");
@@ -535,73 +537,36 @@ fn names_file(issue: &Open, file: &str) -> bool {
     }
     let text = format!("{}\n{}", issue.title, issue.body).replace('\\', "/");
     let name = file.rsplit('/').next().unwrap_or(file);
-    // The words of the text that could be paths, without quotes or trailing punctuation.
-    // `:`, `@` and `%` stay in a word, so a link keeps its scheme, user and port, and an encoded
-    // name (`a.rs%20old`) isn't read as another file.
-    let words: Vec<&str> = text
-        .split(|c: char| !(c.is_alphanumeric() || "/._-:@%".contains(c)))
-        .map(|word| word.trim_end_matches('.').trim_start_matches("./"))
-        .filter(|word| !word.is_empty())
-        .collect();
-    // A link (a `scheme://` word, or a GitHub host written without a scheme, also after a `:`
-    // or `@` in the word) names exactly the file it links to in this repository, and nothing
-    // else; a `:line` or `:line:column` after it, or a trailing `:`, is left out.
-    let link = |word: &str| -> Option<String> {
-        let whole = if let Some(at) = word.find("//") {
-            word[at..].to_string()
-        } else {
-            let host = word.split('/').next().unwrap_or(word).to_ascii_lowercase();
-            let host = host.rsplit('@').next().unwrap_or(&host);
-            let host = host.split(':').next().unwrap_or(host);
-            if !matches!(
-                host,
-                "github.com" | "www.github.com" | "raw.githubusercontent.com"
-            ) {
-                return None;
-            }
-            format!("//{word}")
-        };
-        let mut to = whole.as_str();
-        while let Some((before, after)) = to.rsplit_once(':') {
-            if !after.chars().all(|c| c.is_ascii_digit()) {
-                break;
-            }
-            to = before;
-        }
-        Some(to.to_string())
-    };
-    // The plain part of each word: all of it, or what comes before the link in it
-    // (`Ref:github.com/...`), so no piece of a link is read as a path.
+    // Each run of text between spaces, quotes and brackets is split into the text before a link
+    // in it and the link, which runs to the run's end.
     let mut plain = Vec::new();
-    let mut linked = false;
-    for word in words {
-        let starts = std::iter::once(0).chain(word.match_indices([':', '@']).map(|(at, _)| at + 1));
-        match starts
-            .into_iter()
-            .find_map(|at| link(&word[at..]).map(|to| (at, to)))
-        {
-            Some((at, to)) => {
-                linked |= link_names(&to, &issue.repo, file);
-                plain.push(&word[..at]);
+    for run in text.split(|c: char| c.is_whitespace() || "<>()[]{}\"'`".contains(c)) {
+        match link_in(run) {
+            Some((at, link)) => {
+                if link_names(&link, &issue.repo, file) {
+                    return true;
+                }
+                plain.push(&run[..at]);
             }
-            None => plain.push(word),
+            None => plain.push(run),
         }
-    }
-    if linked {
-        return true;
     }
     // A path the issue gives is matched as a path: the same path, or one of the two ending in
     // the other at a `/` (`mestari/mod.rs` names `crates/paja/src/mestari/mod.rs`). A bare file
     // name with an extension (`triage.rs`) names any file of that name, but a path's last part
-    // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`).
+    // doesn't (`mestari/mod.rs` doesn't name `init/mod.rs`). `:` and `@` end a word, so
+    // `hook.rs:42`, `C:/.../hook.rs` and `@CLAUDE.md` name their file; `%` doesn't, so an
+    // encoded name (`a.rs%20old`) isn't read as another file.
     let suffix = |long: &str, short: &str| long.ends_with(&format!("/{short}"));
     let named_name = name.contains('.') && name.len() > 3;
-    // Outside a link, `:` and `@` split a word again, so `hook.rs:42`, `C:/.../hook.rs` and
-    // `@CLAUDE.md` name their file.
     plain
         .into_iter()
-        .flat_map(|word| word.split([':', '@']))
-        .map(|word| word.trim_end_matches(['.', '%']).trim_start_matches("./"))
+        .flat_map(|text| text.split(|c: char| !(c.is_alphanumeric() || "/._-%".contains(c))))
+        .map(|word| {
+            word.trim_matches('%')
+                .trim_end_matches('.')
+                .trim_start_matches("./")
+        })
         .filter(|word| !word.is_empty())
         .any(|word| {
             word == file
@@ -611,13 +576,60 @@ fn names_file(issue: &Open, file: &str) -> bool {
         })
 }
 
-/// Whether `link` (a word from `//` on, without a `#` or `?` part) links to `file` in `repo`
+/// The link in `run` (text without spaces, quotes or brackets), if there is one: where it
+/// starts, and the link from its host on, as `//host/path`, without a `?` or `#` part, a
+/// `:line` or `:line:column`, or trailing punctuation. A link is a `scheme://` one, or one whose
+/// host (written without a scheme, after any `/`, `:` or `@`) is `github.com` or a GitHub
+/// subdomain, or `githubusercontent.com`'s. Everything from it to the run's end is the link.
+fn link_in(run: &str) -> Option<(usize, String)> {
+    let (at, link) = if let Some(at) = run.find("//") {
+        // `scheme://host/...`, or `//host/...` at the start; a `//` inside other text
+        // (`evil.com//github.com/...`) makes the whole run a link to its first host.
+        if at == 0 || run[..at].ends_with(':') {
+            (at, run[at..].to_string())
+        } else {
+            (0, format!("//{run}"))
+        }
+    } else {
+        let host_part = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-';
+        let lower = run.to_ascii_lowercase();
+        let found = lower.match_indices("github").find_map(|(i, _)| {
+            let start = run[..i]
+                .char_indices()
+                .rev()
+                .take_while(|&(_, c)| host_part(c))
+                .last()
+                .map_or(i, |(at, _)| at);
+            let host = lower[start..].split(['/', ':', '@']).next().unwrap_or("");
+            let github = ["github.com", "githubusercontent.com"]
+                .iter()
+                .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")));
+            github.then_some(start)
+        })?;
+        (found, format!("//{}", &run[found..]))
+    };
+    let mut to = link.split(['?', '#']).next().unwrap_or(&link);
+    loop {
+        let trimmed = to.trim_end_matches(['.', ',', ';', '!']);
+        let trimmed = match trimmed.rsplit_once(':') {
+            Some((before, after)) if after.chars().all(|c| c.is_ascii_digit()) => before,
+            _ => trimmed,
+        };
+        if trimmed == to {
+            break;
+        }
+        to = trimmed;
+    }
+    Some((at, to.to_string()))
+}
+
+/// Whether `link` (from [`link_in`]) links to `file` in `repo`
 /// (`owner/name`) on GitHub: `//github.com/<repo>/{blob,tree,blame,raw}/<ref>/<file>` or
 /// `//raw.githubusercontent.com/<repo>/<ref>/<file>`, host and repository in any case. The ref
 /// is read as one part (a branch, tag or commit), since a branch with a `/` in its name can't
 /// be told from a path here: `blob/feature/x/a.rs` names `x/a.rs`, never `a.rs`. A file whose
-/// path starts with the rest of such a branch's name is rare, and its commit must still touch
-/// it.
+/// path starts with the rest of such a branch's name is rare, and the file must still exist on
+/// the base (and a named commit must touch it).
 fn link_names(link: &str, repo: &str, file: &str) -> bool {
     if repo.is_empty() {
         return false;
@@ -1258,6 +1270,9 @@ mod tests {
             "See hook.rs: the check.",
             "Read @./crates/paja/src/hook.rs first.",
             "Up 50% in crates/paja/src/hook.rs%",
+            "Was %crates/paja/src/hook.rs",
+            "crates/paja/src/hook.rs:github.com/x",
+            "crates/paja/src/hook.rs:https://example.com",
         ] {
             let issue = Open {
                 number: 1,
@@ -1360,6 +1375,23 @@ mod tests {
             "https:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
             "evil.com:github.com/other/repo/blob/main/crates/paja/src/hook.rs",
             "Ref:github.com:443/other/repo/blob/main/crates/paja/src/hook.rs",
+            "https://github.com/search?q=crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/README.md#crates/paja/src/hook.rs",
+            "https://example.com/r?to=crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/x~crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/x+crates/paja/src/hook.rs",
+            "https://github.com/other/repo/blob/main/x,crates/paja/src/hook.rs",
+            "https:/github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "Ref:/github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "/github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "http:\\github.com\\other\\repo\\blob\\main\\crates\\paja\\src\\hook.rs",
+            "x/y@github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "raw.githubusercontent.com/other/repo/main/crates/paja/src/hook.rs",
+            "www.github.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "gist.github.com/other/crates/paja/src/hook.rs",
+            "api.github.com/repos/other/repo/contents/crates/paja/src/hook.rs",
+            "github.com@evil.com/other/repo/blob/main/crates/paja/src/hook.rs",
+            "evil.com//github.com/acme/app/blob/main/crates/paja/src/hook.rs",
         ] {
             assert!(
                 !names_file(&linked(body), "crates/paja/src/hook.rs"),
@@ -1373,6 +1405,8 @@ mod tests {
             "raw.githubusercontent.com/acme/app/main/crates/paja/src/hook.rs",
             "https://u@github.com/acme/app/blob/main/crates/paja/src/hook.rs",
             "Ref:github.com/acme/app/blob/main/crates/paja/src/hook.rs",
+            "See https://github.com/acme/app/blob/main/crates/paja/src/hook.rs, and more.",
+            "(https://github.com/acme/app/blob/main/crates/paja/src/hook.rs#L3)",
         ] {
             assert!(
                 names_file(&linked(body), "crates/paja/src/hook.rs"),
@@ -1430,6 +1464,27 @@ mod tests {
         // against nothing, seem to add a.txt too; `git_command` turns grafts off, so HEAD keeps
         // its parent and changes only b.txt.
         std::fs::write(dir.join(".git/info/grafts"), format!("{head}\n")).unwrap();
+        let old = "2020-01-01T00:00:00Z";
+        let shown = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &head, "");
+        assert_eq!(shown, None);
+        let shown = check_evidence(dir, "HEAD", &issue_naming("Fix b.txt", old), &head, "");
+        assert!(shown.is_some());
+    }
+
+    #[test]
+    fn a_replace_object_is_ignored_so_a_commit_keeps_its_real_parent() {
+        let (tmp, head) = evidence_repo();
+        let dir = tmp.path();
+        // A replacement for HEAD with no parent. Were it used, HEAD would be a root and seem
+        // to add a.txt too; `git_command` turns replace objects off.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(["replace", "--graft", &head])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
         let old = "2020-01-01T00:00:00Z";
         let shown = check_evidence(dir, "HEAD", &issue_naming("Fix a.txt", old), &head, "");
         assert_eq!(shown, None);
