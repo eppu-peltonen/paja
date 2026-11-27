@@ -237,8 +237,9 @@ fn generated(
     )?;
     if git(dir, &["status", "--porcelain"])?.is_empty() {
         bail!(
-            "the init agent wrote no files for the {stack} skeleton; run `paja init --new` again, \
-             or use a stack with a built-in skeleton (rust, node, python)"
+            "the init agent wrote no files for the {stack} skeleton; delete the new repository on \
+             GitHub (`gh repo delete`) and the folder, then run `paja init --new` again, or use a \
+             stack with a built-in skeleton (rust, node, python)"
         );
     }
     // Paja writes these from what it finds; the agent's own copies would only disagree.

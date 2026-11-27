@@ -96,12 +96,15 @@ labels, and for each issue that carries it the latest claim comment, and records
 (`runner`, `stale_after`; `runner` is null once the label is gone). An item whose label names another runner is
 skipped by `paja run` and by `paja run --workers` until that claim is stale; `paja work list|show` show the holder as
 `claim`, and `paja pool status` gives "claimed by runner <id> on GitHub" as why the item waits. A label with no claim
-comment (put there by hand) holds the item until a person removes it. A run renews its claim at each round by
-editing its claim comment's times (and putting the label back if it was taken off). `paja work set N queued`, and a
-run the person declines at the confirmation, delete the live claim comments and take the label off, so another runner
-can take the item at once; an escalated item keeps it, and its claim can't go
-stale while it carries the needs-answer label. `paja work answer` renews the claim, so the runner that escalated the
-item runs it next.
+comment (put there by hand) holds the item until a person removes it. A run renews its claim at each round by editing
+its claim comment's times (and putting the label back if it was taken off). `paja work set N queued` deletes every live
+claim comment, whichever runner wrote it, and takes the label off: the person put the item back, which overrides the
+holder. A run that gives back an item it claimed (the person declined at the confirmation, or a gate put it back)
+deletes its own runner's live claim comments and the later ones that lost the race to it, and takes the label off unless
+an earlier runner's live claim remains. Either way a claim comment GitHub refuses to delete (another account wrote it)
+doesn't stop the rest: the label still comes off (or stays, as above), and stderr names the comment to delete by hand.
+An escalated item keeps its claim, which can't go stale while it carries the needs-answer label. `paja work answer`
+renews the claim, so the runner that escalated the item runs it next.
 
 When no work item is ready, Jono takes follow-ups. A sync also imports the open issues with the follow-up label as items
 whose `priority` is `follow-up` (recorded in `work.imported` and `work.changed`; every other item has priority `work`).
@@ -141,9 +144,13 @@ escape hatch for an item that needs no answer.
 Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/high-risk` lists only what decides
 what lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review
 prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue,
-`GitGuard`) and `land.rs` (landing, waiting for CI, escalation). Usage counting (`usage.rs`), stderr progress text
-(`progress.rs`), follow-ups (`follow_ups.rs`) and the builder's question and answers (`builder.rs`) are normal risk.
-A unit test keeps the three high-risk files on the list.
+`GitGuard`), `arbiter.rs` (the arbiter that settles an escalation, and the rules that overrule it), `land.rs`
+(landing, waiting for CI, escalation), `triage.rs` (`paja triage`) and `detect.rs` (the `init` agents' sandboxes and
+tool lists). Outside the module, `init/generate.rs` (the programs a generated skeleton's agent may run) is high risk
+too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`), follow-ups (`follow_ups.rs`), the builder's
+question and answers (`builder.rs`), where a run is (`live.rs`), the pool (`pool.rs`, `plan.rs`) and the rest of
+`init/` are normal risk. A unit test walks every source file and fails on one that is neither on the list nor named
+as normal risk on purpose.
 
 `paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
@@ -153,7 +160,10 @@ is ready to take, so nothing is claimed on GitHub; with `none`
 landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
 creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
 `owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch
-(resuming the branch an earlier run kept). A mistake in that configuration stops the pass before it claims anything,
+(resuming the branch an earlier run kept). An item started before environments carried the repository's name
+resumes its old `work-<issue>` environment when that was made in this checkout; one that belongs to another
+repository is never taken, and a hashed name found to belong to another repository stops the run with the
+`paja env remove <name>` fix. A mistake in that configuration stops the pass before it claims anything,
 with an error naming the file and line, so one fix on the default branch is all it takes. That holds even when the
 queue is empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
 While it works on an item the run holds an OS file lock,

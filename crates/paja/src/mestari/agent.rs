@@ -613,7 +613,7 @@ pub(super) fn discard(env: &Env, to: &str) -> Result<()> {
 pub(super) static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Claude Code settings that run every tool call through `paja hook`, bounded to `root`.
-/// Before handing them out, check that the hook really blocks a push and allows a build; an
+/// Before handing them out, check that the hook really blocks a push and allows `git status`; an
 /// agent never starts under a hook that doesn't.
 pub(super) fn hook_settings(
     root: &Path,

@@ -2048,7 +2048,7 @@ impl Factory {
                  echo https://example.com/pull/1 ;;\n\
                  \"issue comment\") case \"$5\" in Claimed*) if [ -f {d}/claim-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;; *) if [ -f {d}/gh-down ]; then exit 1; fi ;; esac ;;\n\
                  \"issue edit\") if [ -f {d}/no-label ] && case \"$*\" in *needs-answer*) true ;; *) false ;; esac; then rm {d}/no-label; echo \"could not add label: 'x' not found\" >&2; exit 1; fi ;;\n\
-                 \"api -X\") if [ \"$3\" = DELETE ]; then rm -f {d}/view-5.json; fi ;;\n\
+                 \"api -X\") if [ \"$3\" = DELETE ]; then if [ -f {d}/delete-refused ]; then echo 'HTTP 403: Must have admin rights to Repository.' >&2; exit 1; fi; rm -f {d}/view-5.json; fi ;;\n\
                  \"issue view\") if [ -f {d}/view-$3.json ]; then cat {d}/view-$3.json; else echo '{{\"labels\": [], \"comments\": []}}'; fi ;;\n\
                  *) ;;\nesac\n"
             ),
@@ -2586,6 +2586,32 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
     assert!(
         label["detail"].as_str().unwrap().contains("`game`"),
         "{report}"
+    );
+}
+
+#[test]
+fn doctor_points_to_the_troubleshooting_guide_in_both_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let run = |json: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+        cmd.current_dir(tmp.path())
+            .env("PAJA_HOME", &home)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST);
+        if json {
+            cmd.arg("--json");
+        }
+        String::from_utf8_lossy(&cmd.arg("doctor").output().unwrap().stdout).into_owned()
+    };
+    let report: Value = serde_json::from_str(run(true).trim()).unwrap();
+    let help = report["help"].as_str().unwrap();
+    assert!(help.ends_with("/docs/troubleshooting.md"), "{report}");
+    let text = run(false);
+    assert!(
+        text.lines()
+            .last()
+            .is_some_and(|l| l.ends_with(help) && l.starts_with("more on errors")),
+        "{text}"
     );
 }
 
@@ -5158,6 +5184,36 @@ fn work_set_queued_frees_the_claimed_label() {
 }
 
 #[test]
+fn freeing_takes_the_label_off_even_when_a_claim_comment_cannot_be_deleted() {
+    let f = Factory::new("true\n", "land");
+    let (ok, synced) = f.with_gh(&["work", "sync"]);
+    assert!(ok, "{synced}");
+    // Another account wrote the claim comment, so GitHub refuses to delete it.
+    f.claimed_by_other(true, "2999-01-01T00:00:00Z");
+    std::fs::write(f.tmp.path().join("delete-refused"), "").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .args(["--json", "work", "set", "5", "queued"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let log = f.gh_log();
+    assert!(log.contains("api -X DELETE"), "{log}");
+    assert!(
+        log.contains("issue edit 5 --remove-label factory-claimed"),
+        "the label comes off past the failed delete: {log}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deleting claim comment 77") && stderr.contains("HTTP 403"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_freed_claim_leaves_no_comment_so_another_runner_takes_the_item_at_once() {
     let f = Factory::new("test -f feature.txt\n", "land");
     let (ok, synced) = f.with_gh(&["work", "sync"]);
@@ -7002,6 +7058,7 @@ fn init_new_says_so_when_the_skeleton_agent_writes_nothing() {
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent wrote no files for the zig skeleton")
+            && error.contains("delete the new repository on GitHub")
             && error.contains("paja init --new"),
         "{error}"
     );
@@ -7032,6 +7089,7 @@ fn init_new_refuses_a_skeleton_the_agent_committed() {
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent committed or switched branches")
+            && error.contains("delete the new repository on GitHub")
             && error.contains("paja init --new"),
         "{error}"
     );
