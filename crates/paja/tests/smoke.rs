@@ -3223,7 +3223,7 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
 
 #[test]
 fn rounds_spent_count_toward_the_cap_when_the_environment_is_lost() {
-    let f = Factory::new("true\n", "fix");
+    let f = Factory::new("true\n", "changes");
     let dir = f.tmp.path();
     // Round 1 builds and is told to fix; round 2's fix is cut off.
     std::fs::write(dir.join("hang-fix"), "").unwrap();
@@ -4846,6 +4846,29 @@ fn a_push_url_that_is_not_a_url_is_recorded_and_the_run_carries_on() {
         1,
         "{stderr}"
     );
+    let failed = events_of(&f, "notify.failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["data"]["channel"], "push");
+    assert!(events_of(&f, "notify.sent").is_empty());
+}
+
+#[test]
+fn a_plain_http_push_url_to_another_machine_is_refused() {
+    let f = Factory::new("true\n", "escalate");
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PAJA_NOTIFIER", "none")
+        .env("PAJA_NOTIFY", "http://ntfy.example/paja")
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("http:// only for this machine"), "{stderr}");
     let failed = events_of(&f, "notify.failed");
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!(failed[0]["data"]["channel"], "push");

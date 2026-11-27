@@ -402,10 +402,16 @@ shows escalated items first, each with its answer command. A notice goes to two 
   through `platform.rs`); `none` turns it off. Unset, it is a desktop notification only when stderr is a terminal, so
   scripts and tests never show one.
 - **Push.** `PAJA_NOTIFY`, else the first line of `.paja/notify` on the default branch that isn't empty or a `#`
-  comment, names an `https://` (or `http://`) URL, such as an ntfy topic. Paja POSTs the title and text there with
-  `curl`. The texts hold no question, error or local path, since a push leaves the machine; the question stays on the
-  issue and the error in the terminal. The issue's title is included, so pick a private topic for a private
-  repository. A repository the tamper lock holds isn't read for the URL.
+  comment, names an `https://` URL, such as an ntfy topic. Plain `http://` is only for this machine (`localhost`,
+  `127.x.x.x` or `[::1]`), since a notice crosses the network, and then goes past any configured proxy. Paja POSTs
+  the title and text there with `curl`. The texts hold no question, error or local path, since a push leaves the
+  machine; the question stays on the issue and the error in the terminal. The issue's title is included, so pick a
+  private topic for a private repository. A repository the tamper lock holds isn't read for the URL.
+
+Unlike the settings `paja run` reads from the default branch's tip as fetched, `.paja/notify`, `.paja/labels` and
+`.paja/queue` are read from the local refs (`origin/HEAD`, `origin/main`, `main`), which an agent with local git in a
+worktree could move. That could send the notice's text to a URL it picks, or change the work and follow-up labels and
+whether Jono takes follow-ups, for the passes that read them.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `pass_failed` or
 `stopped`, `channel`, and the `error`), so Paja Desk can show the same inbox. A notice that can't be delivered never
