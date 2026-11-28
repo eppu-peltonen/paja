@@ -232,6 +232,11 @@ enum PoolCommand {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Read `stop now` lines on stdin, as a pool's planner does: the planning agent is
+        /// ended with every process it started, and no plan is recorded. Stdin closing stops it
+        /// the same way.
+        #[arg(long)]
+        stop_on_stdin: bool,
     },
     /// The pool: running or stopped, its lanes (item, stage, step, time in step, spend, files),
     /// the items waiting and why, and the latest landings.
@@ -572,7 +577,11 @@ fn run(cli: &Cli) -> Result<()> {
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
             if *stop_on_stdin {
-                paja::platform::stop_on_stdin(*lane);
+                paja::platform::stop_on_stdin(if *lane {
+                    paja::platform::StopFrom::Pool
+                } else {
+                    paja::platform::StopFrom::Program
+                });
             }
             if let (Some(lanes), Some(minutes)) = (workers, every) {
                 let pool = mestari::pool::run(
@@ -819,7 +828,19 @@ fn run(cli: &Cli) -> Result<()> {
                     format!("pool of {}: {count} ({state})", report.repo)
                 });
             }
-            PoolCommand::Plan { number, repo } => {
+            PoolCommand::Plan {
+                number,
+                repo,
+                stop_on_stdin,
+            } => {
+                if *stop_on_stdin {
+                    // Caught, a signal or console event (a Ctrl-Break on Windows, a hangup) stops
+                    // the planner as `stop now` does, ending its agent, instead of killing the
+                    // planner and leaving the agent going. The hint is set first, so even the
+                    // first one stops it now.
+                    paja::platform::stop_on_stdin(paja::platform::StopFrom::PoolPlanner);
+                    paja::platform::catch_interrupts()?;
+                }
                 let plan = mestari::plan::plan(&home, repo, *number)?;
                 emit(cli, serde_json::to_value(&plan)?, || {
                     format!(

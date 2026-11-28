@@ -250,7 +250,7 @@ the item's `Touches:` line names the paths when it has one (`source: spec`; the 
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
-`error`; a planner still going after 10 minutes is ended and fails) overlaps everything, so its item runs only in an otherwise idle pool,
+`error`) overlaps everything, so its item runs only in an otherwise idle pool,
 unless it is planned again: after the next timed sync, once per pool run. The pool takes items in queue order and
 admits one only once every item before it has a plan, so a plan that finishes first never puts a later item ahead;
 it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording `pool.admitted` (`repo`,
@@ -258,6 +258,14 @@ it skips one that overlaps a busy lane's plan, or one admitted in the same tick,
 when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`, `admitted`), so the planner's
 accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows each lane's `paths` and each
 waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning which files it touches`).
+
+A planner runs in a process group of its own, so a terminal's Ctrl-C reaches only the pool, and any interrupt a
+planner does get (a Ctrl-Break on Windows, a hangup) stops it at once. One still going after 10 minutes is ended and
+its plan fails. Then, and on every planner when the pool stops, the pool writes `stop now` to the planner's `paja
+pool plan --stop-on-stdin`. That ends the planning agent with every process it started and records no plan, so the
+pool's own reason stands. If a planner is still running 5 seconds later, the pool kills it (on Windows with every
+process it started), and it never waits on one while it runs lanes. A planner whose stdin closes, because its pool
+is gone, stops the same way.
 
 `paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
 from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
