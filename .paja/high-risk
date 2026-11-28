@@ -5,8 +5,11 @@
 crates/paja/src/events.rs
 crates/paja/src/mestari/mod.rs
 crates/paja/src/mestari/agent.rs
+crates/paja/src/mestari/arbiter.rs
 crates/paja/src/mestari/land.rs
 crates/paja/src/mestari/triage.rs
+crates/paja/src/mestari/detect.rs
+crates/paja/src/init/generate.rs
 crates/paja/src/hook.rs
 crates/paja/src/main.rs
 .paja/

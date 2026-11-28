@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::events::Event;
 use crate::home::Home;
 use crate::jono;
-use crate::mestari::{StepUsage, EV_ESCALATED, EV_LANDED, EV_ROUND};
+use crate::mestari::{StepUsage, EV_ARBITRATED, EV_ESCALATED, EV_LANDED, EV_ROUND};
 
 const DAY_MS: u64 = 86_400_000;
 
@@ -206,8 +206,10 @@ pub fn summarise(
     let mut items: BTreeMap<u64, Acc> = BTreeMap::new();
     let mut days: BTreeMap<String, Spend> = BTreeMap::new();
     for event in events {
-        if !matches!(event.kind.as_str(), EV_ROUND | EV_LANDED | EV_ESCALATED)
-            || jono::event_repo(event, legacy) != repo
+        if !matches!(
+            event.kind.as_str(),
+            EV_ROUND | EV_ARBITRATED | EV_LANDED | EV_ESCALATED
+        ) || jono::event_repo(event, legacy) != repo
         {
             continue;
         }
@@ -219,11 +221,14 @@ pub fn summarise(
         }
         let acc = items.entry(number).or_default();
         match event.kind.as_str() {
-            EV_ROUND => {
-                acc.rounds = acc.rounds.max(event.data["round"].as_u64().unwrap_or(0));
-                acc.last_verdict_error = event.data["verdict"] == "error";
-                // A round after an outcome is the item running again.
-                acc.outcome = None;
+            // The arbiter's step is spend of its own: it is neither a round nor an outcome.
+            EV_ROUND | EV_ARBITRATED => {
+                if event.kind == EV_ROUND {
+                    acc.rounds = acc.rounds.max(event.data["round"].as_u64().unwrap_or(0));
+                    acc.last_verdict_error = event.data["verdict"] == "error";
+                    // A round after an outcome is the item running again.
+                    acc.outcome = None;
+                }
                 if since_ms.is_some_and(|since| event.ts_ms < since) {
                     continue;
                 }
@@ -400,15 +405,19 @@ pub fn describe(report: &UsageReport) -> String {
     lines.push(format!("total: {}", figure(&report.total)));
     let landed = &report.landed;
     if let (Some(rounds), Some(tokens)) = (&landed.rounds, &landed.tokens) {
-        let wall_ms = landed.wall_ms.as_ref().map_or(0, |w| w.median);
+        let (wall_median, wall_p90) = landed
+            .wall_ms
+            .as_ref()
+            .map_or((0, 0), |w| (w.median, w.p90));
         lines.push(format!(
-            "per landed item ({}): rounds median {} p90 {}, tokens median {} p90 {}, wall median {}{}",
+            "per landed item ({}): rounds median {} p90 {}, tokens median {} p90 {}, wall median {} p90 {}{}",
             landed.items,
             rounds.median,
             rounds.p90,
             tokens.median,
             tokens.p90,
-            wall(wall_ms),
+            wall(wall_median),
+            wall(wall_p90),
             if landed.left_out_unknown > 0 {
                 format!(
                     "; {} left out of tokens and wall time: unknown steps",

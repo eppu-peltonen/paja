@@ -11,7 +11,7 @@ Measured on 2026-11-27 with `paja usage` on Paja's own event log (a Rust project
 | --- | --- | --- |
 | Review rounds | 1 | 2 |
 | Tokens (input, output, cache read and cache write) | 781,385 | 3,523,605 |
-| Wall time | 4 min 34 s | not reported |
+| Wall time | 4 min 34 s | not measured yet |
 
 These are Paja's own numbers. Other projects, with other sizes and slower checks, will differ; run `paja usage` after a
 few items to get yours. Most of the tokens are cache reads, which a session pays each turn it re-reads its context.
@@ -37,7 +37,9 @@ window is used. Expect cheaper items that sometimes need more rounds; if it does
 
 When a step stops because the plan's usage limit is reached, the run stops, keeps the work and resumes after the
 reset. When the recorded usage window is nearly used up (90% by default, `window <percent>` in `.paja/models`),
-Mestari starts no build or claim until the reset; reviews still start.
+Mestari starts no build or claim until the reset; reviews still start. The used share is the fullest of the plan's
+windows (five-hour, seven-day), and while Claude Code warns, the one it warns of. `paja doctor` warns when none of the
+latest five steps reported a window.
 
 ## Watching spend
 

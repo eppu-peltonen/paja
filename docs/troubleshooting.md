@@ -96,7 +96,7 @@ code. Paja stops and runs no git or gh in that repository, not even to clean up.
 
 ```text
 #<number> escalated:
-Paja tried 3 rounds and the change still isn't ready. Last feedback:
+Paja tried 5 rounds and the change still isn't ready. Last feedback:
 
 <the reviewers' feedback>
 
@@ -104,7 +104,7 @@ Answer with what should change, or what is out of scope.
   answer: paja work answer <number> "<your answer>"
 ```
 
-Three rounds is the most Paja spends on one change. Read the feedback, then answer with `paja work answer <number>
+Five rounds is the most Paja spends on one change. Read the feedback, then answer with `paja work answer <number>
 "<your answer>"` (or `/paja:answer` in Claude Code). The answer is posted on the issue, the item is queued again and its
 next run gets the answer.
 

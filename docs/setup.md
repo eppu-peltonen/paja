@@ -27,11 +27,20 @@ $v = (irm https://api.github.com/repos/eppu-peltonen/paja/releases/latest).tag_n
 $name = "paja-$($v.TrimStart('v'))-x86_64-pc-windows-msvc"
 $dir = Join-Path $env:LOCALAPPDATA "Programs\paja"
 irm "https://github.com/eppu-peltonen/paja/releases/download/$v/$name.zip" -OutFile "$env:TEMP\$name.zip"
-Expand-Archive "$env:TEMP\$name.zip" $env:TEMP -Force
-New-Item -ItemType Directory $dir -Force | Out-Null
-Copy-Item "$env:TEMP\$name\paja.exe" $dir
-[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+irm "https://github.com/eppu-peltonen/paja/releases/download/$v/SHA256SUMS" -OutFile "$env:TEMP\SHA256SUMS"
+$want = ((Get-Content "$env:TEMP\SHA256SUMS" | Where-Object { $_ -like "* $name.zip" }) -split '\s+')[0]
+$got = (Get-FileHash "$env:TEMP\$name.zip" -Algorithm SHA256).Hash
+if ($want -and $got -eq $want) {
+  Expand-Archive "$env:TEMP\$name.zip" $env:TEMP -Force
+  New-Item -ItemType Directory $dir -Force | Out-Null
+  Copy-Item "$env:TEMP\$name\paja.exe" $dir
+  $path = [Environment]::GetEnvironmentVariable("Path", "User")
+  if (($path -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable("Path", "$path;$dir", "User") }
+} else { Write-Error "$name.zip doesn't match SHA256SUMS; download it again, and don't install it" }
 ```
+
+The `if` block installs `paja.exe` only when the archive's checksum matches the release's `SHA256SUMS`, and adds its
+folder to your `PATH` only once, so an update can run the same lines.
 
 On macOS or Linux, install Git, the GitHub CLI and Claude Code, then (with the archive for your machine):
 
@@ -128,7 +137,8 @@ A repository with no `init` line in `.paja/models` runs the agent on the account
 skips the agent and uses a small built-in table instead (`Cargo.toml`; `package.json` with its `test` and `lint`
 scripts and the package manager its lockfile shows, npm, pnpm or yarn; `pyproject.toml` or `requirements.txt`; `go.mod`).
 The table is also the fallback when `claude` is missing or not signed in, or when the agent's answer is malformed or
-holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`).
+holds nothing the files back up; `paja init` then says so in its output (`note`, and `detected.fallback` in `--json`),
+and none of the agent's toolchains or services are kept.
 
 `paja init` writes, in one pull request from the branch `paja/init`:
 
@@ -197,11 +207,13 @@ repository so you can finish by hand or delete it. `--json` prints the repositor
 For one with no template, an agent on the `init` role writes the skeleton instead, in the fresh clone:
 
 1. A first session, with no repository and no tools, names the programs the stack's build, formatter, linter and test
-   runner run. Paja keeps plain program names and drops shells, network tools and the like.
+   runner run. Paja keeps plain program names and drops shells, programs that run another command (`nohup`, `wsl`,
+   `busybox`), network tools and the like, in any case and with or without an extension or version (`bash.exe`,
+   `cmd.bat` and `perl5.36.0` are dropped too).
 2. A second session writes a minimal app, one passing test, the formatter's and linter's configuration and a
    `.gitignore`, and runs the formatter, linter and test until they pass. It runs under the deny-list hook, and the
    only programs it may run besides local git are the ones from step 1. It can't write `.github/` (the hook refuses CI
-   configuration), and it doesn't commit.
+   configuration), and it doesn't commit: if it commits or switches branches anyway, Paja stops and pushes nothing.
 3. Paja detects the stacks and checks of the result with the same `init` agent that `paja init` uses, writes `.paja/`,
    `CLAUDE.md` and the workflow in `.github/workflows/paja.yml` from that, and runs every line of `.paja/checks`
    locally.
@@ -209,9 +221,12 @@ For one with no template, an agent on the `init` role writes the skeleton instea
 
 When a check fails, or the detection finds no check, nothing is committed or pushed: the repository exists on GitHub and
 the clone stays with the files, the error names the check that failed (with its output) and says so, and you fix it in
-the clone and commit and push by hand, or delete the repository. The three agent sessions each spend usage on the `init`
-model of `.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox
-(`PAJA_SBX`) the agent and the checks run in it, with the clone mounted.
+the clone and commit and push by hand, or delete the repository (`gh repo delete <owner>/<name>`, after
+`gh auth refresh -s delete_repo`) and the clone. The three agent sessions each spend usage on the `init` model of
+`.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox (`PAJA_SBX`)
+the agent and the checks run in it, with the clone mounted. Set one for a generated skeleton when you can: the stack's
+own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any code they are given, so
+without a sandbox the hook can't keep the agent from running arbitrary code as you.
 
 ## Check the setup
 
@@ -227,6 +242,22 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   lookup takes a few seconds at most; when it fails (offline), the check says so and stays ok. `PAJA_CLAUDE_LATEST`
   names another source: an `http(s)` URL or a file holding the version.
 - The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
+- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it is
+  answered; if its issue is closed on GitHub instead, `paja work sync` (and `paja run`) in the checkout that made it
+  removes it, keeping the branch. It is kept while the issue is still open (its label was removed, say) or `gh` can't
+  say, while a run holds the item, while the worktree has uncommitted changes or untracked files, isn't on its branch or
+  can't be read by git, and when its folder is already gone. The sync lists what it kept and why, and tries again each
+  time, so `paja run` repeats a kept line until the reason is gone. Ignored files in the worktree, such as a local
+  `.env`, go with it. Any environment of a closed item that is still there (kept that way, a queued or landed item's, or
+  one whose run crashed or was killed after its issue was closed) is a warning that names the environment and the
+  `paja env remove <name>` that frees it (the branch is kept). That includes an older release's `work-<n>` one made in
+  this checkout when the log shows the item last ran there (or the log names no repository).
+- Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
+  `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
+  warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it
+  is current, the warning names where to file an issue. Before any step has run, and when `claude auth status` says
+  you are signed in with an API key or through a cloud provider (no window), it is ok. Billed per token some other
+  way (a Console sign-in), there is no window either, and the warning doesn't apply.
 - The repository has an `origin` on GitHub, the work label (`.paja/labels`) exists, `.paja/checks` on the default
   branch has commands, and CI is set up (a workflow exists) or `.paja/ci` says `none`. These read the default branch
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.
@@ -271,8 +302,9 @@ the repository's checkout, because the MCP tools work on the checkout they run i
 
 Paja waits for the pull request's CI before it lands. `.paja/ci`, read from the default branch next to `.paja/checks`,
 says whether the repository has any: `required` (the default when the file is missing) or `none`. With `required`, a
-repository with no active GitHub Actions workflow (`gh workflow list` is empty) stops the run once it has an item to work
-on (a pass with nothing to claim doesn't call GitHub for this), puts the item back, and gives an error that names the
+repository with no active GitHub Actions workflow (`gh workflow list` is empty) stops the run before it claims anything,
+once an item is ready to take (a pass with nothing to take doesn't call GitHub for this, and neither does one that pauses
+because the usage window is nearly used and only new items are ready), and gives an error that names the
 two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the default branch. The
 check only sees that a workflow exists, not that it runs on pull requests: a repository whose workflows run only on push
 or on a schedule passes it and then waits five minutes for checks that never appear. With `none`, Paja lands on Vasara's
@@ -336,14 +368,17 @@ On Linux it needs WebKitGTK's development packages first (on Debian or Ubuntu:
 
 ## Notifications
 
-Paja tells you when an item needs your answer, a pass of `paja run --every` fails, or the loop stops. Run in a terminal,
-it shows a desktop notification; set `PAJA_NOTIFIER=desktop` to get one without a terminal, `PAJA_NOTIFIER=none` to
-turn them off, or point it at a program of your own, which gets the title and the text as two arguments. To hear about
-it on your phone, put an `https://` URL, such as an ntfy topic, in `PAJA_NOTIFY` or as the one line of `.paja/notify`
-on the default branch; Paja POSTs a short text there with `curl`: the repository, the issue's number and title, never
-the question or any local detail. A notice that can't be shown is reported once on stderr and the run carries on. An
-issue waiting for your answer also carries the `needs-answer` label of `.paja/labels` (`factory-needs-answer` by
-default) until you answer, so you can filter or subscribe to it on GitHub.
+Paja tells you when an item needs your answer, a pass of `paja run --every` fails, the loop stops, a change lands
+with review findings still open, listed in its pull request, or `.paja/models` names a role this Paja doesn't know
+(once per role). Run in a terminal, it shows a desktop notification; set `PAJA_NOTIFIER=desktop` to get one without a
+terminal, `PAJA_NOTIFIER=none` to turn them off, or point it at a program of your own, which gets the title and the
+text as two arguments. To hear about it on your phone, put an `https://` URL, such as an ntfy topic, in `PAJA_NOTIFY`
+or as the one line of `.paja/notify` on the default branch; Paja POSTs a short text there with `curl`: the repository,
+the issue's number and title (for a skipped role, the default branch and the role names from `.paja/models`, escaped
+and cut short), never the question or any local detail. A notice that can't be shown is reported once on stderr and
+the run carries on. An issue waiting for your answer also carries the
+`needs-answer` label of `.paja/labels` (`factory-needs-answer` by default) until you answer, so you can filter or
+subscribe to it on GitHub.
 
 ## What happens next
 

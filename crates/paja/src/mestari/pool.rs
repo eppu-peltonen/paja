@@ -56,6 +56,9 @@ const TICK: Duration = Duration::from_millis(500);
 /// ended.
 const STOP_GRACE: Duration = Duration::from_secs(30);
 
+/// How long a planner told to stop now has to end its agent and exit before it is killed.
+const PLANNER_GRACE: Duration = Duration::from_secs(5);
+
 /// How long a `pool plan` may take before the pool ends it and counts the plan as failed, so a
 /// hung planner can't hold up planning and admission.
 const PLAN_LIMIT: Duration = Duration::from_secs(10 * 60);
@@ -143,6 +146,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         opts: &opts,
         lanes: BTreeMap::new(),
         planners: BTreeMap::new(),
+        stopped: Vec::new(),
         since,
         held_back: BTreeSet::new(),
         retry_failed_to: 0,
@@ -153,6 +157,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
     if outcome.is_err() {
         pool.stop_all();
     }
+    pool.end_planners();
     let stopped = match &outcome {
         Ok(()) => json!({ "repo": name }),
         Err(err) => json!({ "repo": name, "error": format!("{err:#}") }),
@@ -172,6 +177,8 @@ struct Pool<'a> {
     lanes: BTreeMap<u32, Lane>,
     /// The `pool plan` runs going, by item, with the seq they started after and when.
     planners: BTreeMap<u64, (Child, u64, Instant)>,
+    /// Planners told `stop now`, with when, until they end or are killed.
+    stopped: Vec<(Child, Instant)>,
     /// The seq of this pool's `pool.started`: plans before it are an earlier pool's.
     since: u64,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
@@ -233,12 +240,14 @@ impl Pool<'_> {
                 }
                 told_fatal = true;
             }
-            self.reap_planners()?;
             let stopping = level > 0 || fatal.is_some();
             if stopping {
-                // A plan is only worth having for a lane that may start.
+                // A plan is only worth having for a lane that may start. Stopped before they
+                // are reaped, so one that the same Ctrl-C ended isn't counted as failed.
                 self.stop_planners();
             }
+            self.reap_planners()?;
+            reap_stopped(&mut self.stopped, PLANNER_GRACE);
             if stopping && self.lanes.is_empty() {
                 return fatal.map_or(Ok(()), Err);
             }
@@ -267,13 +276,13 @@ impl Pool<'_> {
                         }
                         match super::sync_queue(self.home, self.repo) {
                             Ok(_) => {}
-                            Err(err) if super::is_fatal(&err) => {
-                                fatal = Some(err);
-                                continue;
-                            }
+                            // The next tick tells the lanes and stops, after the usual sleep.
+                            Err(err) if super::is_fatal(&err) => fatal = Some(err),
                             Err(err) => self.say_error(&err),
                         }
                     }
+                }
+                if free > 0 && paused.is_none() && fatal.is_none() {
                     let admitted = self.admit(free)?;
                     if admitted == 0
                         && self.lanes.is_empty()
@@ -394,7 +403,13 @@ impl Pool<'_> {
 
     /// Free the plans that ended; one that ended without recording a plan failed.
     fn reap_planners(&mut self) -> Result<()> {
-        for (number, why) in reap(self.home, self.name, &mut self.planners, PLAN_LIMIT)? {
+        for (number, why) in reap(
+            self.home,
+            self.name,
+            &mut self.planners,
+            PLAN_LIMIT,
+            PLANNER_GRACE,
+        )? {
             self.plan_failed(number, &why)?;
         }
         Ok(())
@@ -416,13 +431,27 @@ impl Pool<'_> {
         record(self.home, EV_POOL_PLANNED, serde_json::to_value(&failed)?).map(|_| ())
     }
 
-    /// End the plans going: they are read-only, and an item left unplanned is planned again.
+    /// End the plans going: they are read-only, and an item left unplanned is planned again. Each
+    /// is told `stop now`, which ends its agent and records no plan, and is killed if it still
+    /// runs [`PLANNER_GRACE`] later: on a later tick ([`reap_stopped`]), or when the pool
+    /// ends ([`Pool::end_planners`]), so the pool never waits on one while lanes need it.
     fn stop_planners(&mut self) {
-        for (child, _, _) in self.planners.values_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        for (_, (mut child, _, _)) in std::mem::take(&mut self.planners) {
+            tell_planner(&mut child);
+            self.stopped.push((child, Instant::now()));
         }
-        self.planners.clear();
+    }
+
+    /// Stop every planner and wait for each to end, up to [`PLANNER_GRACE`]: the pool is ending,
+    /// and leaves none running unsupervised.
+    fn end_planners(&mut self) {
+        self.stop_planners();
+        let deadline = Instant::now() + PLANNER_GRACE;
+        while !self.stopped.is_empty() && Instant::now() < deadline {
+            reap_stopped(&mut self.stopped, PLANNER_GRACE);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        reap_stopped(&mut self.stopped, Duration::ZERO);
     }
 
     /// Record each step a busy lane's run started since the last tick.
@@ -473,9 +502,9 @@ impl Pool<'_> {
                 .or_insert(json!(lane.number));
         }
         if self.opts.json {
-            println!("{report}");
+            crate::platform::print_line(format_args!("{report}"));
         } else {
-            println!("{}", describe_report(n, lane.number, &report));
+            crate::platform::print_line(describe_report(n, lane.number, &report));
         }
         Ok(())
     }
@@ -488,18 +517,20 @@ impl Pool<'_> {
         match super::triage_if_due(self.home, self.repo) {
             Ok(Some(report)) => {
                 if self.opts.json {
-                    println!("{}", json!({ "outcome": "triage", "triage": report }));
+                    crate::platform::print_line(json!({ "outcome": "triage", "triage": report }));
                 } else {
-                    println!("triage: {}", serde_json::to_string(&report)?);
+                    crate::platform::print_line(format_args!(
+                        "triage: {}",
+                        serde_json::to_string(&report)?
+                    ));
                 }
             }
             Ok(None) => {}
             Err(err) if super::is_fatal(&err) => return Err(err),
             // Tagged, so a reader of the pool's lines can tell it from a lane's error.
             Err(err) if self.opts.json => {
-                println!(
-                    "{}",
-                    json!({ "outcome": "triage", "error": format!("{err:#}") })
+                crate::platform::print_line(
+                    json!({ "outcome": "triage", "error": format!("{err:#}") }),
                 );
             }
             Err(err) => self.say_error(&err),
@@ -514,10 +545,10 @@ impl Pool<'_> {
 
     /// Stop every lane's run at once and wait for it to end.
     fn stop_all(&mut self) {
-        self.stop_planners();
         for lane in self.lanes.values_mut() {
             lane.tell("stop now");
         }
+        self.stop_planners();
         stop_children(
             self.lanes.values_mut().map(|lane| &mut lane.child),
             STOP_GRACE,
@@ -527,9 +558,9 @@ impl Pool<'_> {
 
     fn say_error(&self, err: &anyhow::Error) {
         if self.opts.json {
-            println!("{}", json!({ "error": format!("{err:#}") }));
+            crate::platform::print_line(json!({ "error": format!("{err:#}") }));
         } else {
-            println!("error: {err:#}");
+            crate::platform::print_line(format_args!("error: {err:#}"));
         }
     }
 }
@@ -552,6 +583,23 @@ fn stop_children<'c>(children: impl Iterator<Item = &'c mut Child>, grace: Durat
     }
 }
 
+/// Forget the stopped planners in `stopped` that ended, and kill ([`crate::platform::kill_tree`])
+/// the ones still going `grace` after they were told to stop. A planner ends its own agent on
+/// `stop now`; this is for one wedged before it could.
+fn reap_stopped(stopped: &mut Vec<(Child, Instant)>, grace: Duration) {
+    stopped.retain_mut(|(child, told)| {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return false;
+        }
+        if told.elapsed() < grace {
+            return true;
+        }
+        crate::platform::kill_tree(child);
+        let _ = child.wait();
+        false
+    });
+}
+
 /// Take out of `planners` the plans that ended, ending first any going longer than `limit`, and
 /// return each that recorded no plan with why. A plan killed for its time may still have
 /// recorded one in the instant before, which counts like any other.
@@ -560,8 +608,9 @@ fn reap(
     repo: &str,
     planners: &mut BTreeMap<u64, (Child, u64, Instant)>,
     limit: Duration,
+    grace: Duration,
 ) -> Result<Vec<(u64, String)>> {
-    let overdue = end_overdue(planners, limit);
+    let overdue = end_overdue(planners, limit, grace);
     let ended: Vec<(u64, u64)> = planners
         .iter_mut()
         .filter_map(|(&n, (child, at, _))| {
@@ -598,15 +647,29 @@ fn reap(
     Ok(failed)
 }
 
-/// End the planners in `planners` that have run longer than `limit`, and return their items.
-/// They stay in the map, for [`reap`] to take out.
-fn end_overdue(planners: &mut BTreeMap<u64, (Child, u64, Instant)>, limit: Duration) -> Vec<u64> {
+/// End the planners in `planners` that have run longer than `limit`, and return their items,
+/// ended or not. One still going is told `stop now` on each tick, and killed once it has run
+/// `grace` past the limit, so the pool never waits on it. They stay in the map, for [`reap`] to
+/// take out once they have ended.
+fn end_overdue(
+    planners: &mut BTreeMap<u64, (Child, u64, Instant)>,
+    limit: Duration,
+    grace: Duration,
+) -> Vec<u64> {
     let mut overdue = Vec::new();
     for (&number, (child, _, started)) in planners.iter_mut() {
-        if started.elapsed() > limit && matches!(child.try_wait(), Ok(None)) {
-            let _ = child.kill();
-            let _ = child.wait();
-            overdue.push(number);
+        let age = started.elapsed();
+        if age <= limit {
+            continue;
+        }
+        overdue.push(number);
+        if matches!(child.try_wait(), Ok(None)) {
+            if age > limit + grace {
+                crate::platform::kill_tree(child);
+                let _ = child.wait();
+            } else {
+                tell_planner(child);
+            }
         }
     }
     overdue
@@ -730,16 +793,30 @@ fn drift(events: &[Event], repo: &str, n: u32, lane: &Lane) -> Option<Value> {
     })
 }
 
-/// `paja pool plan <number>` as a child of the pool; its progress lines go to the pool's stderr.
+/// Tell a planner to stop now: it ends its planning agent, with every process the agent
+/// started, and exits.
+fn tell_planner(child: &mut Child) {
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = writeln!(stdin, "stop now").and_then(|()| stdin.flush());
+    }
+}
+
+/// `paja pool plan <number>` as a child of the pool, reading `stop now` on stdin; its progress
+/// lines go to the pool's stderr.
 fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
     let exe = std::env::current_exe().context("finding the paja program to plan with")?;
-    let mut child = Command::new(exe)
-        .args(["--json", "pool", "plan"])
+    let mut cmd = Command::new(exe);
+    // Only the pool stops a planner: a terminal's Ctrl-C would end it at once and leave its
+    // agent, which runs in a process group of its own, going. A planner whose pool is gone
+    // stops anyway, when its stdin closes.
+    crate::platform::own_process_group(&mut cmd);
+    let mut child = cmd
+        .args(["--json", "pool", "plan", "--stop-on-stdin"])
         .arg(number.to_string())
         .arg("--repo")
         .arg(repo)
         .current_dir(repo)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -969,7 +1046,7 @@ pub struct LaneStatus {
     /// The item's main folder: the longest directory its paths share, else the first path's top
     /// folder; empty without paths.
     pub area: String,
-    /// The review round the item is in, 1 to 3.
+    /// The review round the item is in, 1 up to the most rounds a change gets.
     pub round: u32,
     /// When the lane took the item, in milliseconds since the Unix epoch.
     pub admitted_ms: u64,
@@ -1119,6 +1196,8 @@ enum Why {
     /// Its files overlap this lane's item's, for this reason.
     Overlaps(u64, String),
     Planning,
+    /// Its last lane ended on an error; it waits for the next timed sync.
+    LaneErrored,
     /// Nothing but a busy pool: it is ready.
     NoFreeLane,
 }
@@ -1134,6 +1213,10 @@ impl std::fmt::Display for Why {
             Why::NoPool => f.write_str("no pool is running"),
             Why::Overlaps(other, why) => write!(f, "overlaps #{other}: {why}"),
             Why::Planning => f.write_str("planning which files it touches"),
+            Why::LaneErrored => f.write_str(
+                "its last run ended on an error; it is held back until a timed sync (see --every), \
+                 and may have waited for a free lane since",
+            ),
             Why::NoFreeLane => f.write_str("no free lane"),
         }
     }
@@ -1349,6 +1432,18 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             })
             .is_some_and(|e| e.kind == EV_POOL_PLANNING)
     };
+    // The item's latest lane since the pool started ended on an error: it waits for the next
+    // timed sync, as `--every` waits after a failed pass.
+    let errored = |number: u64| {
+        events
+            .iter()
+            .rev()
+            .take_while(|e| e.seq > since)
+            .find(|e| {
+                e.kind == EV_POOL_LANE && e.data["repo"] == repo && e.data["number"] == number
+            })
+            .is_some_and(|e| e.data["stage"] == "done" && e.data["outcome"] == "error")
+    };
     let admitted: Vec<u64> = lanes.iter().map(|lane| lane.number).collect();
     let (landing, merging) = land_turns(events, repo, &lanes, &begun);
     let why_waiting = |item: &WorkItem| {
@@ -1365,6 +1460,8 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             Why::Overlaps(other, why)
         } else if planning(item.number) {
             Why::Planning
+        } else if errored(item.number) {
+            Why::LaneErrored
         } else {
             Why::NoFreeLane
         }
@@ -1634,7 +1731,15 @@ mod tests {
         planners.insert(5, (sleep(), at, Instant::now()));
         planned(2);
         planned(3);
-        let failed = reap(&home, "acme/app", &mut planners, Duration::from_secs(60)).unwrap();
+        let quick = Duration::from_millis(100);
+        let failed = reap(
+            &home,
+            "acme/app",
+            &mut planners,
+            Duration::from_secs(60),
+            quick,
+        )
+        .unwrap();
         let numbers: Vec<u64> = failed.iter().map(|(n, _)| *n).collect();
         assert_eq!(numbers, [1, 4], "{failed:?}");
         assert!(failed[0].1.contains("took longer than"), "{failed:?}");
@@ -1654,7 +1759,11 @@ mod tests {
         let fresh = Command::new("sleep").arg("60").spawn().unwrap();
         planners.insert(3, (hung, 0, long_ago));
         planners.insert(4, (fresh, 0, Instant::now()));
-        assert_eq!(end_overdue(&mut planners, Duration::from_secs(1)), [3]);
+        let quick = Duration::from_millis(100);
+        assert_eq!(
+            end_overdue(&mut planners, Duration::from_secs(1), quick),
+            [3]
+        );
         assert!(planners
             .get_mut(&3)
             .unwrap()
@@ -1663,6 +1772,71 @@ mod tests {
             .unwrap()
             .is_some());
         let young = &mut planners.get_mut(&4).unwrap().0;
+        assert!(young.try_wait().unwrap().is_none());
+        let _ = young.kill();
+        let _ = young.wait();
+    }
+
+    /// A planner just past its limit is told `stop now` and left to end by itself: the pool
+    /// doesn't wait for it, and once it has ended its plan failed for its time.
+    #[cfg(unix)]
+    #[test]
+    fn an_overdue_planner_is_told_to_stop_without_the_pool_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let at = record(&home, "test.start", json!({})).unwrap().seq;
+        let told = dir.path().join("told");
+        let planner = Command::new("sh")
+            .arg("-c")
+            .arg(format!("read line; echo \"$line\" > '{}'", told.display()))
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut planners = BTreeMap::new();
+        planners.insert(3, (planner, at, Instant::now() - Duration::from_secs(2)));
+        let started = Instant::now();
+        let limit = Duration::from_secs(1);
+        let grace = Duration::from_secs(60);
+        assert!(reap(&home, "acme/app", &mut planners, limit, grace)
+            .unwrap()
+            .is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failed = loop {
+            let failed = reap(&home, "acme/app", &mut planners, limit, grace).unwrap();
+            if !failed.is_empty() || Instant::now() > deadline {
+                break failed;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(std::fs::read_to_string(&told).unwrap().trim(), "stop now");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].1.contains("took longer than"), "{failed:?}");
+        assert!(planners.is_empty());
+    }
+
+    /// A stopped planner is left alone through its grace, then killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_planner_still_going_past_its_grace_is_killed() {
+        let spawn = || {
+            let mut cmd = Command::new("sleep");
+            crate::platform::own_process_group(&mut cmd);
+            cmd.arg("60").stdin(Stdio::piped()).spawn().unwrap()
+        };
+        let mut stopped = vec![
+            (spawn(), Instant::now() - Duration::from_secs(10)),
+            (spawn(), Instant::now()),
+        ];
+        let old = stopped[0].0.id().to_string();
+        reap_stopped(&mut stopped, Duration::from_secs(5));
+        assert_eq!(stopped.len(), 1);
+        let alive = Command::new("kill").args(["-0", &old]).status().unwrap();
+        assert!(
+            !alive.success(),
+            "the planner past its grace is still running"
+        );
+        let (mut young, _) = stopped.pop().unwrap();
         assert!(young.try_wait().unwrap().is_none());
         let _ = young.kill();
         let _ = young.wait();
@@ -1898,6 +2072,25 @@ mod tests {
         let status = from_events(&many, r, true, &items);
         assert_eq!(status.out.len(), 5);
         assert_eq!(status.out[0].number, 17);
+    }
+
+    #[test]
+    fn an_item_whose_lane_errored_says_it_waits_for_the_next_timed_sync() {
+        let mut done = lane(4, 1, 5, "done", None);
+        done.data["outcome"] = json!("error");
+        let events = vec![
+            event(1, EV_POOL_STARTED, json!({"repo": "acme/app", "lanes": 1})),
+            lane(2, 1, 5, "starting", None),
+            lane(3, 1, 5, "build", Some("build")),
+            done,
+        ];
+        let status = from_events(&events, "acme/app", true, &[item(5, &[]), item(6, &[])]);
+        assert!(
+            status.waiting[0].why.contains("timed sync"),
+            "{:?}",
+            status.waiting
+        );
+        assert_eq!(status.waiting[1].why, "no free lane");
     }
 
     #[test]

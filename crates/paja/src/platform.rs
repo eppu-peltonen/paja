@@ -257,9 +257,8 @@ pub fn shell_path(word: &str) -> PathBuf {
 /// which a tool may map to another drive or Git's own directory), names with a trailing dot
 /// or space (`.git.` is `.git`), alternate data streams (`a:stream`), reserved device names (`NUL`, `COM1`) and characters
 /// Windows forbids in names. All are refused rather than interpreted. `revisions` lifts only
-/// the stream and trailing-dot rules, for git's revision forms (`HEAD:path`, `main..`). (An 8.3 short name such
-/// as `GIT~1` only names something that exists, and the hook resolves existing paths to their
-/// long names, so it needs no rule.)
+/// the stream and trailing-dot rules, for git's revision forms (`HEAD:path`, `main..`). (8.3
+/// short names such as `GIT~1` are the hook's to refuse, for protected names only.)
 /// Nothing is refused on Unix.
 pub fn path_problem(text: &str, revisions: bool) -> Option<String> {
     if !cfg!(windows) || text.is_empty() {
@@ -382,6 +381,20 @@ pub fn quote_hook_word(path: &Path) -> Result<String> {
     }
 }
 
+/// Write one line to stdout. Not `println!`, which panics when stdout is closed (the program
+/// that started Paja exited without redirecting it, a broken pipe on Unix, a closed pipe on
+/// Windows): the line is lost then, but the exit code still says how it went.
+pub fn print_line(text: impl std::fmt::Display) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{text}").and_then(|()| out.flush());
+}
+
+/// How the first stop's message says to stop now: 0 a second Ctrl-C, 1 a `stop now` line on
+/// stdin ([`stop_on_stdin`]), 2 not at all (a pool's lane: the pool says it), 3 no message at
+/// all (a pool's planner, which the pool stops without asking anyone).
+static STOP_HINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// How many times the person pressed Ctrl-C since [`catch_interrupts`].
 static INTERRUPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -405,11 +418,18 @@ fn announce(now: u32) {
     let say = |text: &str| {
         let _ = std::io::Write::write_all(&mut std::io::stderr(), text.as_bytes());
     };
-    if before < 1 && now >= 1 {
-        say("paja: stopping after this step; press Ctrl-C again to stop now\n");
+    let hint = STOP_HINT.load(std::sync::atomic::Ordering::SeqCst);
+    if before < 1 && now >= 1 && hint < 3 {
+        say(match hint {
+            0 => "paja: stopping after this step; press Ctrl-C again to stop now\n",
+            1 => "paja: stopping after this step; send `stop now` to stop now\n",
+            _ => "paja: stopping after this step\n",
+        });
     }
     if before < 2 && now >= 2 {
-        say("paja: stopping now\n");
+        if hint < 3 {
+            say("paja: stopping now\n");
+        }
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(10));
             std::process::exit(130);
@@ -418,16 +438,44 @@ fn announce(now: u32) {
 }
 
 fn interrupted() {
-    INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // A pool's planner never waits for a step to end: any interrupt it sees stops it now, before
+    // a git or agent the same Ctrl-Break ended could pass for a failed plan.
+    if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+        INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Who writes the stop requests [`stop_on_stdin`] reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopFrom {
+    /// A program a person drives, such as Paja Desk: the first stop says to send `stop now`.
+    Program,
+    /// A pool, to one of its lanes: the pool, not the lane, says how to stop now.
+    Pool,
+    /// A pool, to one of its planners: nothing is said, and stdin closing stops now, since a
+    /// plan is no use once its pool is gone.
+    PoolPlanner,
 }
 
 /// Read stop requests from stdin, for a `paja run` started by a program instead of a terminal
 /// (Paja Desk): a `stop` line counts as the first Ctrl-C (stop after this step) and `stop now`
 /// as the second. The same on every platform, since a windowed program has no console to send
 /// Ctrl-C through. Other lines are ignored, and stdin closing (the program that started the
-/// run exited) leaves the run going.
-pub fn stop_on_stdin() {
-    std::thread::spawn(|| {
+/// run exited) leaves the run going, except for a pool's planner. A pool's lane reads its stop
+/// requests the same way, but the pool, not the lane, says how to stop now: the pool's own
+/// stdin or a terminal's Ctrl-C, which reaches the lane too.
+pub fn stop_on_stdin(from: StopFrom) {
+    STOP_HINT.store(
+        match from {
+            StopFrom::Program => 1,
+            StopFrom::Pool => 2,
+            StopFrom::PoolPlanner => 3,
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut line = Vec::new();
         loop {
@@ -435,7 +483,13 @@ pub fn stop_on_stdin() {
             // Bytes, not text, so a line that isn't UTF-8 is skipped rather than ending the
             // reader; 0 bytes is stdin closing.
             match std::io::BufRead::read_until(&mut stdin, b'\n', &mut line) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => {
+                    if from == StopFrom::PoolPlanner {
+                        INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+                        interrupts();
+                    }
+                    return;
+                }
                 Ok(_) => {}
             }
             match String::from_utf8_lossy(&line).trim() {
@@ -608,10 +662,12 @@ pub fn output_until_stopped_with_input(
         if interrupts() >= 2 {
             kill_tree(&mut child);
             let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "stopped by a second Ctrl-C",
-            ));
+            let why = if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+                "stopped by its pool"
+            } else {
+                "stopped by a second Ctrl-C"
+            };
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, why));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -625,8 +681,11 @@ pub fn output_until_stopped_with_input(
     })
 }
 
-/// End `child` and every process it started, so a second Ctrl-C leaves nothing running.
-fn kill_tree(child: &mut std::process::Child) {
+/// Kill `child`, which leads a process group of its own ([`own_process_group`]), and the rest of
+/// that group: on Windows every process it started (`taskkill /T`), on Unix the processes still
+/// in its group, not the ones it put in groups of their own. A second Ctrl-C leaves nothing
+/// running, since each of those is ended the same way by its own parent.
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         extern "C" {
@@ -690,6 +749,79 @@ pub fn desktop_notification(title: &str, text: &str) -> Command {
     }
 }
 
+/// What `cmd` printed and how it ended, like [`Command::output`], but stopped once it has run
+/// for `limit`, which is then an error that says so. Its stdin is empty. Start `cmd` in its own
+/// process group ([`own_process_group`]) so that stopping it while it runs stops what it
+/// started too. Once it has exited, Windows can't find what it left behind, which then runs on.
+pub fn output_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let drain = |pipe: Option<Box<dyn Read + Send>>, err: bool| {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = tx.send((err, bytes));
+        });
+    };
+    drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        false,
+    );
+    drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        true,
+    );
+    let stopped = |child: &mut std::process::Child| {
+        kill_tree(child);
+        let _ = child.wait();
+        std::io::Error::other(format!(
+            "it was still running after {limit:?}, so Paja stopped it"
+        ))
+    };
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() > limit {
+            return Err(stopped(&mut child));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    // A process it started can hold a pipe open after it exits: the limit covers that too.
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        match rx.recv_timeout(limit.saturating_sub(start.elapsed())) {
+            Ok((true, bytes)) => stderr = bytes,
+            Ok((false, bytes)) => stdout = bytes,
+            Err(_) => return Err(stopped(&mut child)),
+        }
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Run `cmd` with no input or output, and wait at most `limit` for it: a notifier that hangs
 /// must not hold up the run. An error names what went wrong.
 pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<()> {
@@ -723,6 +855,37 @@ pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_within_gives_the_output_or_stops_the_program_at_the_limit() {
+        let out = output_within(
+            Command::new("git").arg("--version"),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("git version"));
+        #[cfg(unix)]
+        {
+            let started = std::time::Instant::now();
+            let err = output_within(
+                own_process_group(Command::new("sh").args(["-c", "sleep 5; echo late"])),
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Paja stopped it"), "{err}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            // A process it left behind holding the pipe open is stopped at the limit too.
+            let started = std::time::Instant::now();
+            let err = output_within(
+                own_process_group(Command::new("sh").args(["-c", "sleep 5 & echo early"])),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Paja stopped it"), "{err}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        }
+    }
 
     #[test]
     fn open_plain_file_opens_only_plain_files() {

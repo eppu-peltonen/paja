@@ -199,14 +199,14 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed."
+        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed. Names shaped like the ones Paja gives its own environments (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`) are refused."
     )]
     async fn env_create(&self, Parameters(args): Parameters<CreateArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
             // Absolute, so errors name the real directory rather than `.`.
             let repo = std::path::absolute(PathBuf::from(args.repo.unwrap_or_else(|| ".".into())))?;
-            let env = ahjo::create(
+            let env = ahjo::create_by_person(
                 &home,
                 CreateOptions {
                     name: &args.name,
@@ -244,7 +244,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: import open GitHub issues with the repository's work label (.paja/labels on the default branch, factory when missing) into the work queue (uses gh)."
+        description = "Jono: import open GitHub issues with the repository's work label (.paja/labels on the default branch, factory when missing) into the work queue (uses gh). Removes the clean environment (worktree, not branch) of a parked item whose issue was closed, listed under freed; one it keeps is listed under kept with the reason."
     )]
     async fn work_sync(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
         let home = self.home.clone();
@@ -366,19 +366,20 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note. An escalated item can't be set to queued: use work_answer, so the next run gets the answer."
+        description = "Jono: set an item's status (queued, active, landed or escalated), with an optional note. Escalated also labels the GitHub issue as waiting for an answer and sends a Posti notice (uses gh); queued frees its claim. An escalated item can't be set to queued: use work_answer, so the next run gets the answer."
     )]
     async fn work_set(&self, Parameters(args): Parameters<SetArgs>) -> Result<String, String> {
         let home = self.home.clone();
         call(move || {
             let status = jono::parse_status(&args.status)?;
             let checkout = checkout(args.repo)?;
-            let name = jono::repo_name(&home, &checkout)?;
-            let item = jono::set_status(&home, &name, args.number, status, args.note.as_deref())?;
-            if status == jono::Status::Queued {
-                // Queued means any runner may take it: free its claim on GitHub too.
-                jono::release_claim(&home, &checkout, args.number);
-            }
+            let item = crate::mestari::set_status(
+                &home,
+                &checkout,
+                args.number,
+                status,
+                args.note.as_deref(),
+            )?;
             Ok(serde_json::to_value(item)?)
         })
         .await
@@ -494,7 +495,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Triage the open follow-up issues: one cheap agent reading the default branch sorts each into keep, duplicate of #N, already fixed (with the commit or file that shows it) or not worth doing. Duplicates and already-fixed issues are closed with a comment giving the reason and the evidence; not-worth-doing ones are only listed. Returns {repo, base, items: [{number, title, verdict, duplicate_of, evidence, reason, closed, error}], closed, not_worth_doing}."
+        description = "Triage the open follow-up issues: one cheap agent reading the default branch sorts each into keep, duplicate of #N, already fixed (with the commit or file that shows it) or not worth doing. Duplicates and already-fixed issues are closed with a comment giving the reason and the evidence; not-worth-doing ones are only listed. A duplicate's original gets a comment naming it; a note that failed is tried again by later passes. Returns {repo, base, items: [{number, title, verdict, duplicate_of, evidence, reason, closed, error}], closed, not_worth_doing, retried_notes: [{number, on, error}] (left out when empty)}."
     )]
     async fn triage(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
         let home = self.home.clone();

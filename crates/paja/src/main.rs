@@ -232,6 +232,11 @@ enum PoolCommand {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Read `stop now` lines on stdin, as a pool's planner does: the planning agent is
+        /// ended with every process it started, and no plan is recorded. Stdin closing stops it
+        /// the same way.
+        #[arg(long)]
+        stop_on_stdin: bool,
     },
     /// The pool: running or stopped, its lanes (item, stage, step, time in step, spend, files),
     /// the items waiting and why, and the latest landings.
@@ -244,7 +249,8 @@ enum PoolCommand {
 
 #[derive(Subcommand)]
 enum WorkCommand {
-    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`).
+    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`),
+    /// and remove the clean environment of a parked item whose issue was closed (the branch stays).
     Sync {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
@@ -367,7 +373,7 @@ fn main() -> ExitCode {
                 ),
                 _ => (json!({ "error": text }), ExitCode::from(2)),
             };
-            println!("{value}");
+            paja::platform::print_line(format_args!("{value}"));
             return code;
         }
     };
@@ -391,7 +397,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             if cli.json {
-                println!("{}", json!({ "error": format!("{err:#}") }));
+                paja::platform::print_line(json!({ "error": format!("{err:#}") }));
             } else {
                 eprintln!("error: {err:#}");
             }
@@ -500,7 +506,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Env { command } => match command {
             EnvCommand::Create { name, repo, base } => {
-                let env = ahjo::create(
+                let env = ahjo::create_by_person(
                     &home,
                     CreateOptions {
                         name,
@@ -572,7 +578,11 @@ fn run(cli: &Cli) -> Result<()> {
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
             if *stop_on_stdin {
-                paja::platform::stop_on_stdin();
+                paja::platform::stop_on_stdin(if *lane {
+                    paja::platform::StopFrom::Pool
+                } else {
+                    paja::platform::StopFrom::Program
+                });
             }
             if let (Some(lanes), Some(minutes)) = (workers, every) {
                 let pool = mestari::pool::run(
@@ -603,18 +613,19 @@ fn run(cli: &Cli) -> Result<()> {
                     },
                 );
                 let Some(minutes) = every else {
-                    let report = match outcome {
-                        Ok(report) => report,
+                    let pass = match outcome {
+                        Ok(pass) => pass,
                         Err(err) => {
                             if mestari::is_fatal(&err) {
                                 paja::posti::stopped(&home, repo);
-                            } else {
+                            } else if !mestari::is_mistake(&err) {
+                                // A mistake in the command is in front of the person already.
                                 paja::posti::pass_failed(&home, repo, false);
                             }
                             return Err(err);
                         }
                     };
-                    emit(cli, run_json(&report)?, || describe_run(&report));
+                    emit(cli, run_json(&pass)?, || describe_run(&pass.report));
                     break;
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
@@ -622,9 +633,10 @@ fn run(cli: &Cli) -> Result<()> {
                 // A usage limit waits for its reset instead of polling the queue.
                 let mut reset: Option<u64> = None;
                 let wait = match outcome {
-                    Ok(report) => {
+                    Ok(pass) => {
                         failures.passed();
-                        emit(cli, run_json(&report)?, || describe_run(&report));
+                        emit(cli, run_json(&pass)?, || describe_run(&pass.report));
+                        let report = pass.report;
                         idle = matches!(report, mestari::RunReport::Idle);
                         reset = match &report {
                             mestari::RunReport::Paused { resets_at } => Some(*resets_at),
@@ -714,10 +726,17 @@ fn run(cli: &Cli) -> Result<()> {
             WorkCommand::Sync { repo } => {
                 let report = jono::sync(&home, repo)?;
                 emit(cli, serde_json::to_value(&report)?, || {
-                    format!(
+                    let mut text = format!(
                         "imported {:?}, changed {:?}, closed {:?}, reopened {:?}",
                         report.imported, report.changed, report.closed, report.reopened
-                    )
+                    );
+                    if !report.freed.is_empty() {
+                        text.push_str(&format!("\nfreed {}", report.freed.join(", ")));
+                    }
+                    for kept in &report.kept {
+                        text.push_str(&format!("\nkept {}: {}", kept.env, kept.why));
+                    }
+                    text
                 });
             }
             WorkCommand::List { all, repo } => {
@@ -782,12 +801,7 @@ fn run(cli: &Cli) -> Result<()> {
             } => {
                 let status = jono::parse_status(status)?;
                 let checkout = std::path::absolute(repo)?;
-                let name = jono::repo_name(&home, &checkout)?;
-                let item = jono::set_status(&home, &name, *number, status, note.as_deref())?;
-                if status == jono::Status::Queued {
-                    // Queued means any runner may take it: free its claim on GitHub too.
-                    jono::release_claim(&home, &checkout, *number);
-                }
+                let item = mestari::set_status(&home, &checkout, *number, status, note.as_deref())?;
                 emit(cli, serde_json::to_value(&item)?, || describe_item(&item));
             }
             WorkCommand::Answer { number, text, repo } => {
@@ -823,7 +837,19 @@ fn run(cli: &Cli) -> Result<()> {
                     format!("pool of {}: {count} ({state})", report.repo)
                 });
             }
-            PoolCommand::Plan { number, repo } => {
+            PoolCommand::Plan {
+                number,
+                repo,
+                stop_on_stdin,
+            } => {
+                if *stop_on_stdin {
+                    // Caught, a signal or console event (a Ctrl-Break on Windows, a hangup) stops
+                    // the planner as `stop now` does, ending its agent, instead of killing the
+                    // planner and leaving the agent going. The hint is set first, so even the
+                    // first one stops it now.
+                    paja::platform::stop_on_stdin(paja::platform::StopFrom::PoolPlanner);
+                    paja::platform::catch_interrupts()?;
+                }
                 let plan = mestari::plan::plan(&home, repo, *number)?;
                 emit(cli, serde_json::to_value(&plan)?, || {
                     format!(
@@ -866,23 +892,20 @@ fn run(cli: &Cli) -> Result<()> {
 
 fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
     if cli.json {
-        println!("{value}");
+        paja::platform::print_line(format_args!("{value}"));
     } else {
         let text = text();
         if !text.is_empty() {
-            println!("{text}");
+            paja::platform::print_line(format_args!("{text}"));
         }
     }
 }
 
 /// The run's report, with whether a sandbox was in use.
-fn run_json(report: &mestari::RunReport) -> Result<serde_json::Value> {
-    let mut value = serde_json::to_value(report)?;
+fn run_json(pass: &mestari::Pass) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(&pass.report)?;
     if let Some(fields) = value.as_object_mut() {
-        fields.insert(
-            "sandbox".to_string(),
-            json!(paja::sandbox::active().is_some()),
-        );
+        fields.insert("sandbox".to_string(), json!(pass.sandbox));
     }
     Ok(value)
 }
@@ -905,13 +928,26 @@ fn describe_doctor(report: &paja::doctor::Report) -> String {
     } else {
         "not ready: fix the failed checks above, then run `paja doctor` again".to_string()
     });
+    out.push(format!("more on errors and fixes: {}", report.help));
     out.join("\n")
 }
 
 fn describe_triage(report: &mestari::TriageReport) -> String {
     use mestari::Verdict;
+    let notes = report.retried_notes.iter().map(|note| match &note.error {
+        None => format!(
+            "noted on #{} that #{} was closed as its duplicate",
+            note.on, note.number
+        ),
+        Some(error) => format!(
+            "noting on #{} that #{} was closed as its duplicate failed again: {error}",
+            note.on, note.number
+        ),
+    });
     if report.items.is_empty() {
-        return "no open follow-up issues to triage".to_string();
+        let mut lines = vec!["no open follow-up issues to triage".to_string()];
+        lines.extend(notes);
+        return lines.join("\n");
     }
     let mut lines: Vec<String> = report
         .items
@@ -925,7 +961,9 @@ fn describe_triage(report: &mestari::TriageReport) -> String {
                 (Verdict::NotWorthDoing, _) => "not worth doing".to_string(),
             };
             let state = match (&item.error, item.closed) {
-                (Some(error), _) => format!(" (not closed: {error})"),
+                // A closed item's error is its note's, which says it was closed.
+                (Some(error), true) => format!(" ({error})"),
+                (Some(error), false) => format!(" (not closed: {error})"),
                 (None, true) => " (closed)".to_string(),
                 (None, false) => String::new(),
             };
@@ -946,6 +984,7 @@ fn describe_triage(report: &mestari::TriageReport) -> String {
                 .join(", ")
         ));
     }
+    lines.extend(notes);
     lines.join("\n")
 }
 
@@ -959,6 +998,10 @@ fn describe_run(report: &mestari::RunReport) -> String {
             number, question, ..
         } => format!(
             "#{number} escalated:\n{question}\n  answer: paja work answer {number} \"<your answer>\""
+        ),
+        mestari::RunReport::Arbitrated { number, answer, .. } => format!(
+            "#{number} answered by the arbiter and queued again: {answer}\n  override: paja work \
+             answer {number} \"<your answer>\""
         ),
         mestari::RunReport::Stopped { number, .. } => {
             format!("stopped by Ctrl-C; #{number} resumes on the next `paja run`")
@@ -1117,6 +1160,15 @@ fn describe_item(item: &jono::WorkItem) -> String {
         line.push_str(&format!("\n  claimed by runner {}", claim.runner));
         if let Some(until) = &claim.stale_after {
             line.push_str(&format!(", stale after {until}"));
+        }
+    }
+    if let Some(last) = item.answers.last().filter(|a| a.by_arbiter()) {
+        line.push_str(&format!("\n  answered by arbiter: {}", last.answer));
+        if item.status == jono::Status::Queued {
+            line.push_str(&format!(
+                "\n  override: paja work answer {} \"<your answer>\"",
+                item.number
+            ));
         }
     }
     if item.status == jono::Status::Escalated {

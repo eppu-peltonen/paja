@@ -59,6 +59,10 @@ function itemRow(item) {
     row.append(toggle);
     if (open) children.push(runView(item));
   }
+  const last = (item.answers || []).at(-1);
+  if (last && last.by === "arbiter") {
+    children.push(el("div", { className: "note" }, `answered by arbiter: ${last.answer}`));
+  }
   if (item.status === "escalated") {
     if (item.note) children.push(el("div", { className: "note" }, item.note));
     children.push(answerForm(item));
@@ -432,6 +436,7 @@ function repoRow(repo) {
   buttons.push(pool);
   const children = [
     el("div", { className: "row" }, [el("strong", {}, repo.repo), el("span", { className: "muted" }, repo.checkout ?? "checkout unknown: add it below")]),
+    ...(repo.checkout_error ? [el("div", { className: "muted" }, "not confirmed with gh: " + repo.checkout_error)] : []),
     el("div", {}, runLine(repo)),
     el("div", { className: "actions" }, buttons),
   ];
@@ -527,7 +532,7 @@ function poolNote(status, lanes) {
   const busy = status.lanes.map((lane) => lane.lane);
   if (lanes == null || Number.isNaN(lanes) || busy.length <= lanes) return "";
   const names = busy.length === 1 ? `Lane ${busy[0]} is` : `Lanes ${busy.slice(0, -1).join(", ")} and ${busy[busy.length - 1]} are`;
-  const then = lanes === 0 ? "no new lane starts until the count is raised" : `a new lane starts only once fewer than ${lanes} are busy`;
+  const then = lanes === 0 ? "no new lane starts until the count is raised" : `the pool then keeps ${lanes} ${lanes === 1 ? "lane" : "lanes"} busy`;
   return `${names} busy: each finishes its item, and ${then}.`;
 }
 
