@@ -336,18 +336,10 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
         // Made in this checkout: doctor may run from a folder inside it.
         let checkout = jono::checkout_top(repo)?;
         let here = |env: &ahjo::Env| jono::same_dir(&env.repo, &checkout);
-        // The repository the last sync here recorded for this checkout, if any.
-        let here_repo = events
-            .iter()
-            .rev()
-            .find(|e| {
-                e.kind == jono::EV_CHECKOUT
-                    && e.data["path"]
-                        .as_str()
-                        .is_some_and(|path| jono::same_dir(Path::new(path), &checkout))
-            })
-            .and_then(|e| e.data["repo"].as_str());
-        let ours = |repo: &str| repo.is_empty() || here_repo == Some(repo);
+        // A `work-<n>` is the item's only when the log shows the item last ran there.
+        let ours = |item: &jono::WorkItem| {
+            item.repo.is_empty() || crate::mestari::ran_in_work_n(&events, &item.repo, item.number)
+        };
         let mut left = Vec::new();
         for item in jono::replay(&events, "")?.values() {
             if item.open {
@@ -365,11 +357,10 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
                 left.push(item.env_name());
             }
             // Releases before names carried the repository named an item's environment
-            // `work-<n>`: the item's when it was made in this checkout and this checkout is the
-            // item's repository (an item from a log that names none, or the repository the last
-            // sync here recorded).
+            // `work-<n>`: the item's when it was made in this checkout and the log shows the item
+            // last ran there (or the log names no repository).
             let plain = format!("work-{}", item.number);
-            if envs.get(&plain).is_some_and(&here) && ours(&item.repo) {
+            if envs.get(&plain).is_some_and(&here) && ours(item) {
                 left.push(plain);
             }
         }

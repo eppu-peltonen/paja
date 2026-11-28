@@ -2029,7 +2029,8 @@ pub fn sync_with(
 /// parked item keeps its environment so the builder's edits survive the question; once its issue
 /// is closed on GitHub instead of answered, nothing else frees the worktree and port block. The
 /// branch stays, so a reopened item resumes from it, also from the `paja/work-<n>` of the
-/// `work-<n>` environment an older release made, which is freed the same way. An environment
+/// `work-<n>` environment an older release made, which is freed the same way when the log shows
+/// the item last ran there (see [`crate::mestari::ran_in_work_n`]). An environment
 /// is kept, with the reason, when:
 ///
 /// - its issue is still open on GitHub (the item left the queue because its label changed, or
@@ -2060,6 +2061,12 @@ fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<Str
                 ]
             })
             .filter(|(_, name)| envs.get(name).is_some_and(|env| same_dir(&env.repo, top)))
+            // A `work-<n>` carries no repository: it is the item's only when the log shows the
+            // item last ran there.
+            .filter(|(number, name)| {
+                *name != format!("work-{number}")
+                    || crate::mestari::ran_in_work_n(&events, repo, *number)
+            })
             .collect())
     })();
     let found = match found {

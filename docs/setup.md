@@ -249,7 +249,7 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   `.env`, go with it. Any environment of a closed item that is still there (kept that way, a queued or landed item's, or
   one whose run crashed or was killed after its issue was closed) is a warning that names the environment and the
   `paja env remove <name>` that frees it (the branch is kept). That includes an older release's `work-<n>` one made in
-  this checkout, once a sync here has recorded the checkout's repository (or in a log that names none).
+  this checkout when the log shows the item last ran there (or the log names no repository).
 - Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
   `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
   warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it

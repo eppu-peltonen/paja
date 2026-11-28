@@ -3329,6 +3329,19 @@ fn record_env(home: &Path, name: &str, repo: &Path, path: &Path) {
     std::fs::write(&log, format!("{text}{event}\n")).unwrap();
 }
 
+/// Append a `run.started` to the log at `home`, as a run of `repo`'s item `number` in the
+/// environment `env` records.
+fn record_started(home: &Path, repo: &str, number: u64, env: &str) {
+    let log = home.join("events.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let seq = text.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let event = serde_json::json!({
+        "v": 1, "seq": seq, "ts_ms": 1, "kind": "run.started",
+        "data": { "repo": repo, "number": number, "env": env, "base": "main" }
+    });
+    std::fs::write(&log, format!("{text}{event}\n")).unwrap();
+}
+
 #[test]
 fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3415,8 +3428,10 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     tree(&other, "work-17");
     // 12 still has the `work-<n>` environment an older release made, freed the same way.
     let legacy = tree(&repo, "work-12");
-    // 16's is one too, with an untracked file.
+    record_started(&home, "acme/app", 12, "work-12");
+    // 16's is one too, with an untracked file. An older release ran 16 there.
     let legacy_dirty = tree(&repo, "work-16");
+    record_started(&home, "acme/app", 16, "work-16");
     std::fs::write(legacy_dirty.join("draft.txt"), "edit\n").unwrap();
     // 13 has a change to a tracked file.
     let changed = tree(&repo, &env(13));
@@ -3498,7 +3513,7 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     for n in [6, 7, 8, 9, 10, 13, 14, 15] {
         assert!(detail.contains(&env(n)), "{check}");
     }
-    // The sync recorded this checkout as acme/app's, so its `work-<n>` is named too.
+    // The log shows 16 last ran in `work-16`, so that is named too.
     assert!(detail.contains("work-16"), "{check}");
     assert!(!detail.contains(WORK_5), "{check}");
 
@@ -3614,22 +3629,23 @@ fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds()
         "{check}"
     );
 
-    // A log a sync pinned: this checkout was last recorded as acme/fork's, so a closed acme/app
-    // item's `work-<n>` here isn't named, and a closed acme/fork item's is.
+    // A log that names repositories: a closed item's `work-<n>` is named only when the log shows
+    // the item last ran there. acme/app's #7 ran in `work-7`, but acme/fork's #7 ran there since;
+    // acme/fork's #8 ran in `work-8` and nothing ran there after.
     let pinned = tmp.path().join("pinned");
     std::fs::create_dir_all(&pinned).unwrap();
-    let here = serde_json::to_string(tmp.path().to_str().unwrap()).unwrap();
     let events = [
-        format!(r#"{{"v":1,"seq":1,"ts_ms":1,"kind":"work.checkout","data":{{"repo":"acme/app","path":{here}}}}}"#),
-        format!(r#"{{"v":1,"seq":2,"ts_ms":1,"kind":"work.checkout","data":{{"repo":"acme/fork","path":{here}}}}}"#),
-        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":7,"title":"A","body":"","url":"https://example.com/7"}}"#.to_string(),
-        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/fork","number":8,"title":"B","body":"","url":"https://example.com/8"}}"#.to_string(),
-        r#"{"v":1,"seq":5,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":7}}"#.to_string(),
-        r#"{"v":1,"seq":6,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/fork","number":8}}"#.to_string(),
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":7,"title":"A","body":"","url":"https://example.com/7"}}"#.to_string(),
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/fork","number":8,"title":"B","body":"","url":"https://example.com/8"}}"#.to_string(),
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":7}}"#.to_string(),
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/fork","number":8}}"#.to_string(),
     ];
     std::fs::write(pinned.join("events.jsonl"), events.join("\n") + "\n").unwrap();
     record_env(&pinned, "work-7", tmp.path(), &tmp.path().join("tree-7"));
     record_env(&pinned, "work-8", tmp.path(), &tmp.path().join("tree-8"));
+    record_started(&pinned, "acme/app", 7, "work-7");
+    record_started(&pinned, "acme/fork", 7, "work-7");
+    record_started(&pinned, "acme/fork", 8, "work-8");
     let check = doctor(&pinned);
     let detail = check["detail"].as_str().unwrap();
     assert!(
@@ -7446,6 +7462,26 @@ fn a_run_that_errors_frees_the_work_n_environment_it_resumed() {
         &f.repo,
         &["rev-parse", "--verify", "-q", "refs/heads/paja/work-5"],
     );
+    // And it does: the log shows the run in `work-5`, so the branch becomes the item's own.
+    std::fs::remove_file(f.tmp.path().join("gh-down")).unwrap();
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "GitHub is back"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report} {stderr}");
+    let started = events_of(&f, "run.started");
+    assert_eq!(started[1]["data"]["env"], WORK_5, "{started:?}");
+    assert!(!stderr.contains("not resuming"), "{stderr}");
+    let old = Command::new("git")
+        .current_dir(&f.repo)
+        .args(["rev-parse", "--verify", "-q", "refs/heads/paja/work-5"])
+        .output()
+        .unwrap();
+    assert!(!old.status.success(), "paja/work-5 was carried over");
 }
 
 #[test]
