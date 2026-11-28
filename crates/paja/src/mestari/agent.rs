@@ -386,23 +386,6 @@ pub(super) fn claude_with(
         tools,
         schema,
     );
-    let line: usize = args.iter().map(|arg| arg.len() + 3).sum();
-    if line > COMMAND_LINE_BUDGET {
-        let longest = args
-            .iter()
-            .max_by_key(|arg| arg.len())
-            .cloned()
-            .unwrap_or_default();
-        let _ = std::fs::remove_file(&stamp);
-        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
-            let _ = std::fs::remove_dir(dir);
-        }
-        bail!(
-            "the `claude` command line would be {line} characters, over Paja's budget of \
-             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
-            longest.chars().take(60).collect::<String>()
-        );
-    }
     let mut cmd = match &sbx {
         Some(sbx) => {
             let mut argv = vec![program.clone()];
@@ -426,6 +409,27 @@ pub(super) fn claude_with(
             cmd
         }
     };
+    // Measured on the whole command, with the sandbox's wrapping when there is one.
+    let line: usize = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|arg| arg.len() + 3)
+        .sum();
+    if line > COMMAND_LINE_BUDGET {
+        let longest = cmd
+            .get_args()
+            .max_by_key(|arg| arg.len())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&stamp);
+        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
+            let _ = std::fs::remove_dir(dir);
+        }
+        bail!(
+            "the `claude` command line would be {line} characters, over Paja's budget of \
+             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
+            longest.chars().take(60).collect::<String>()
+        );
+    }
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
     let output = crate::platform::output_until_stopped_with_input(

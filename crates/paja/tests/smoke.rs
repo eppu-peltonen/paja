@@ -9541,20 +9541,25 @@ fn paja_sbx_name_names_the_sandbox_paja_creates_and_runs_in() {
 /// with `-i`, and when the program inside exits with some of it unread, it leaves
 /// `stdin-left-unread` (where the real one would never return).
 fn fake_sbx_that_hangs_on_unread_stdin(dir: &Path) -> std::path::PathBuf {
-    let body = "#!/bin/sh\necho \"$*\" >> D/sbx.log\n\
-         case \"$1\" in\ncreate) : > D/created; exit 0 ;;\nexec) shift; keep=\n\
-         [ -f D/created ] || { echo 'no such sandbox' >&2; exit 1; }\n\
-         while [ \"$1\" != \"--\" ]; do case \"$1\" in -i) keep=1; shift ;; -w) cd \"$2\"; shift 2 ;; -e) export \"$2\"; shift 2 ;; *) shift ;; esac; done\n\
-         shift\n\
-         case \"$*\" in *\"cc --version\"*) exit 0 ;; esac\n\
-         [ -n \"$keep\" ] || exec \"$@\" < /dev/null\n\
-         cat > D/sbx-stdin-$$\n\
-         exec 3< D/sbx-stdin-$$\n\
-         \"$@\" <&3; status=$?\n\
-         left=$(wc -c <&3); [ $left -gt 0 ] && : > D/stdin-left-unread\n\
-         rm -f D/sbx-stdin-$$; exit $status ;;\nesac\n"
-        .replace('D', &slash(dir));
-    program(dir, "sbx", &body)
+    let d = slash(dir);
+    program(
+        dir,
+        "sbx",
+        &format!(
+            "#!/bin/sh\necho \"<<sbx>> $*\" >> {d}/sbx.log\n\
+             case \"$1\" in\ncreate) : > {d}/created; exit 0 ;;\nexec) shift; keep=\n\
+             [ -f {d}/created ] || {{ echo 'no such sandbox' >&2; exit 1; }}\n\
+             while [ \"$1\" != \"--\" ]; do case \"$1\" in -i) keep=1; shift ;; -w) cd \"$2\"; shift 2 ;; -e) export \"$2\"; shift 2 ;; *) shift ;; esac; done\n\
+             shift\n\
+             case \"$*\" in *\"cc --version\"*) exit 0 ;; esac\n\
+             [ -n \"$keep\" ] || exec \"$@\" < /dev/null\n\
+             cat > {d}/sbx-stdin-$$\n\
+             exec 3< {d}/sbx-stdin-$$\n\
+             \"$@\" <&3; status=$?\n\
+             left=$(wc -c <&3); [ $left -gt 0 ] && : > {d}/stdin-left-unread\n\
+             rm -f {d}/sbx-stdin-$$; exit $status ;;\nesac\n"
+        ),
+    )
 }
 
 #[test]
@@ -9575,7 +9580,7 @@ fn the_fake_sbx_notices_a_program_that_leaves_stdin_unread() {
 }
 
 #[test]
-fn agents_in_the_sandbox_get_their_prompt_on_stdin_and_sbx_sees_it_read_to_the_end() {
+fn agents_in_the_sandbox_get_their_prompt_on_stdin_through_the_drain() {
     let f = Factory::new("true\n", "land");
     let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
     let (ok, report) = paja_with(
@@ -9597,8 +9602,18 @@ fn agents_in_the_sandbox_get_their_prompt_on_stdin_and_sbx_sees_it_read_to_the_e
     let calls = f.claude_calls();
     assert!(calls.len() >= 2, "{calls:?}");
     assert!(calls.iter().all(|c| c.contains("#5")), "{calls:?}");
-    // The prompt is never written to a file the sandbox can reach.
-    assert!(!f.repo.join(".git").join("paja-prompts").exists());
+    // Each agent's command reads its stdin to the end before the agent starts.
+    let agents: Vec<&str> = log
+        .split("<<sbx>> ")
+        .filter(|c| c.contains("--output-format"))
+        .collect();
+    assert!(agents.len() >= 2, "{log}");
+    assert!(
+        agents
+            .iter()
+            .all(|c| c.starts_with("exec -i") && c.contains("PAJA_PROMPT_END")),
+        "{log}"
+    );
 }
 
 #[test]
@@ -9633,6 +9648,50 @@ fn an_agent_in_the_sandbox_that_exits_without_reading_its_prompt_does_not_hang_s
         !f.tmp.path().join("stdin-left-unread").exists(),
         "{report} {log}"
     );
+}
+
+#[test]
+fn a_sandboxed_agent_whose_whole_command_line_is_too_long_is_refused_before_it_starts() {
+    // The budget counts the sandbox's wrapping too, so Windows never refuses the command.
+    let with_harness = || {
+        let f = Factory::new("true\n", "land");
+        std::fs::write(f.repo.join("CLAUDE.md"), "x".repeat(28_500)).unwrap();
+        git(&f.repo, &["add", "CLAUDE.md"]);
+        git(&f.repo, &["commit", "-qm", "a long harness"]);
+        git(&f.repo, &["push", "-q", "origin", "main"]);
+        f
+    };
+    // On its own, `claude`'s command line fits.
+    let f = with_harness();
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+        ],
+    );
+    assert_eq!(report["outcome"], "landed", "{report}");
+    // Wrapped for the sandbox, it doesn't.
+    let f = with_harness();
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(
+        report.to_string().contains("over Paja's budget"),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap_or_default();
+    assert!(!log.contains("--output-format"), "{log}");
 }
 
 #[test]
