@@ -171,7 +171,8 @@ as normal risk on purpose.
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
 and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, or `none` for a
 repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims anything, once an item
-is ready to take, so nothing is claimed on GitHub; with `none`
+is ready to take, so nothing is claimed on GitHub (with the usage window nearly used, only an item left active to resume
+counts, so a pass that pauses with only new items ready skips the check); with `none`
 landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
 creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
 `owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch
@@ -216,22 +217,25 @@ count, the latest `pool.lanes` event (`repo`, `lanes`), and hands each free lane
 (`jono::runnable`: items a stopped run left active first, then ready ones, never one a live run holds). `paja pool
 lanes <N>` records a new count, which the running pool reads on its next tick: a higher one starts lanes then, and a
 lower one lets running items finish and starts none until the busy lanes are under it. An item whose lane ended on an
-error waits for the next timed sync, as `--every` waits after a failed pass. The pool records `pool.started` (`repo`,
-`lanes`, `pid`), `pool.lane` (`repo`, `lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage`
-is `starting`, `build`, `checks`, `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja
-pool status` and its MCP tool `pool_status` rebuild the pool from them and the lock alone: its `state` is `running`
-only while a live pool holds `runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool
-that was killed, which records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line
-stops admitting and is passed on to every lane's run, which finishes its step as one run does; the pool stops when
-the lanes have. A tamper stop any lane's run records (`run.tampered` for the checkout) is seen on the next tick: every
-lane is told `stop now`, none starts, and the pool ends with the tamper error, as `--every` would. A pool that ends on
-any other error stops its lanes the same way first, and ends a lane's run still going 30 seconds after `stop now`, so
-a stuck run can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
-(`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes;
-`origin/<branch>` is then moved to that tip, as a plain fetch would, also back after a force-push. The fetches in a
-checkout take turns (`paja-fetch.lock` in its git directory), so the last to move it is the newest; a fetch that waited a
-minute for the lock goes ahead without it, and then never moves it back onto a commit it holds. A fetch ref a killed
-run left behind is deleted by the first fetch in that checkout once it is over an hour old.
+error waits for the next timed sync, as `--every` waits after a failed pass; `paja pool status` gives that as the
+item's reason for waiting, and keeps giving it after the sync, since the log doesn't record the sync, so the item may
+then be waiting only for a free lane. The pool records `pool.started` (`repo`, `lanes`, `pid`), `pool.lane` (`repo`,
+`lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage` is `starting`, `build`, `checks`,
+`review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja pool status` and its MCP tool
+`pool_status` rebuild the pool from them and the lock alone: its `state` is `running` only while a live pool holds
+`runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool that was killed, which
+records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line stops admitting and is
+passed on to every lane's run, which finishes its step as one run does; the pool stops when the lanes have. A tamper
+stop any lane's run records (`run.tampered` for the checkout) is seen on the next tick: every lane is told `stop
+now`, none starts, and the pool ends with the tamper error, as `--every` would. A pool that ends on any other error
+stops its lanes the same way first, and ends a lane's run still going 30 seconds after `stop now`, so a stuck run
+can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip
+from a ref of its own fetch (`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or
+`origin/<branch>`, which every fetch there writes; `origin/<branch>` is then moved to that tip, as a plain fetch
+would, also back after a force-push. The fetches in a checkout take turns (`paja-fetch.lock` in its git directory),
+so the last to move it is the newest; a fetch that waited a minute for the lock goes ahead without it, and then never
+moves it back onto a commit it holds. A fetch ref a killed run left behind is deleted by the first fetch in that
+checkout once it is over an hour old.
 
 Changes land one at a time per repository, each on the latest default branch, whether from a pool's lanes or from
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
@@ -665,17 +669,24 @@ while it starts.
 - **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
   which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
-  of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current
-  directory or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not
-  spelling). Git passes the git directory down to every process it starts (hooks, `!` aliases, submodule commands),
-  so the shim clears an inherited `GIT_DIR` and `GIT_WORK_TREE` that name the worktree's git directory for git
-  commands aimed outside the worktree. A caller's own `GIT_DIR`, `--git-dir` or `--work-tree` is left alone, and other
-  git commands run unchanged. The `.git` file on the host is never rewritten. Only the git
-  found on `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses
-  it. The unit tests run the shim against a fake git on the host; the check against real `sbx` is manual. On
-  Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status` and
-  `git -c k=v -C <worktree> log -1` must succeed, `command -v git` must name `$HOME/.paja-shim/git`, and
-  `git -C /tmp status` must not be redirected to the worktree.
+  of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current directory
+  or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not spelling); a
+  caller that chose its own work tree gets only `--git-dir`, and one that chose its own repository gets nothing added. A
+  git directory passed this way reaches the processes git starts as `GIT_DIR` and `GIT_WORK_TREE`, so each is decided on
+  its own, by identity (another spelling, a symlink or a mount path of the same directory counts): an inherited
+  `GIT_DIR` that is the worktree's git directory is cleared for git commands aimed outside the worktree, and an
+  inherited `GIT_WORK_TREE` that is the worktree is cleared for those and for another repository the caller chose, and
+  so is an inherited `GIT_INDEX_FILE` in the worktree's git directory. A value naming any other directory is the
+  caller's own and left alone; one set to the worktree's own, for any of the three, can't be told from git handing it
+  down, so it is treated the same way. Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a
+  git called there usually runs the real git, not the shim. A relative value is read, as git reads it, against the
+  directory after any `-C`; git hands down absolute ones, except the `GIT_WORK_TREE=.` a hook gets, which a hook that
+  runs git in another directory makes its own. The `.git` file on the host is never rewritten. Only the git found on
+  `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses it. The unit
+  tests run the shim against a fake git on the host; the check against real `sbx` is manual. On Windows, in a sandboxed
+  worktree, run through `sbx exec` the way Mestari does: `git status` and `git -c k=v -C <worktree> log -1` must
+  succeed, `command -v git` must name `$HOME/.paja-shim/git`, and `git -C /tmp status` must not be redirected to the
+  worktree.
 - **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
   Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The
   other worktrees under `envs/` are mounted too, so code in one worktree can reach another.
