@@ -193,6 +193,9 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     // Taken before anything is recorded: a plan that finds another one running records nothing,
     // so it never replaces that plan's result.
     let Some(_lock) = plan_lock(home, &name, number)? else {
+        if crate::platform::interrupts() > 0 {
+            bail!("stopped before planning #{number}");
+        }
         bail!(
             "another `paja pool plan {number}` of {name} is running (a pool's planner, or one \
              started by hand); wait for it, then `paja pool status` shows its plan"

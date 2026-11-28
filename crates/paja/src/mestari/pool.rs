@@ -316,36 +316,22 @@ impl Pool<'_> {
             }
         };
         let (home, name) = (self.home, self.name);
-        // Waiting on another plan only while it holds the lock and the item is still queued. A
-        // probe that can't read the lock counts as free: the pool's own planner then says what
-        // is wrong. Probed before the log is read, as `reap` does.
-        self.elsewhere.retain(|&n, _| {
-            next.iter().any(|item| item.number == n) && home.plan_held(name, n).unwrap_or(false)
+        // Probed before the log is read, as `reap` does. A probe that can't read the lock
+        // counts as free: the pool's own planner then says what is wrong.
+        let queued: BTreeSet<u64> = next.iter().map(|item| item.number).collect();
+        keep_waiting(&mut self.elsewhere, &queued, |n| {
+            home.plan_held(name, n).unwrap_or(false)
         });
         let events = self.home.events().read_all()?;
         let mut plans = plans_since(&events, self.name, self.since);
-        let overdue = expired(&mut self.elsewhere, PLAN_LIMIT);
-        let mut gave_up = false;
-        for number in overdue {
-            // The other plan may have recorded its plan just now, before letting go.
-            if plans
-                .get(&number)
-                .is_some_and(|plan| plan.source != "failed")
-            {
-                continue;
-            }
-            self.plan_failed(
-                number,
-                &format!(
-                    "the other `paja pool plan {number}` took longer than {} minutes",
-                    PLAN_LIMIT.as_secs() / 60
-                ),
-            )?;
-            gave_up = true;
-        }
-        // The next tick reads the failed plans, so the items aren't planned again at once.
-        if gave_up {
-            return Ok(0);
+        for number in give_up(&mut self.elsewhere, &plans, PLAN_LIMIT) {
+            let why = format!(
+                "the other `paja pool plan {number}` took longer than {} minutes",
+                PLAN_LIMIT.as_secs() / 60
+            );
+            // Seen by this tick's choice too, so the item isn't planned again at once.
+            let failed = self.plan_failed(number, &why)?;
+            plans.insert(number, failed);
         }
         let retry: BTreeSet<u64> = failed_by(&events, self.name, self.since, self.retry_failed_to)
             .into_iter()
@@ -441,7 +427,6 @@ impl Pool<'_> {
             }
             return Ok(());
         }
-        self.elsewhere.remove(&number);
         let at = {
             let lock = self.home.lock()?;
             let data = json!({ "repo": self.name, "number": number });
@@ -455,7 +440,9 @@ impl Pool<'_> {
             Ok(child) => {
                 self.planners.insert(number, (child, at, Instant::now()));
             }
-            Err(err) => self.plan_failed(number, &format!("{err:#}"))?,
+            Err(err) => {
+                self.plan_failed(number, &format!("{err:#}"))?;
+            }
         }
         Ok(())
     }
@@ -476,7 +463,7 @@ impl Pool<'_> {
     }
 
     /// Record a failed plan, which the pool admits only to an otherwise idle pool.
-    fn plan_failed(&mut self, number: u64, error: &str) -> Result<()> {
+    fn plan_failed(&mut self, number: u64, error: &str) -> Result<Plan> {
         progress(&format!(
             "could not plan #{number} ({error}); it runs only when no other lane is busy"
         ));
@@ -488,7 +475,8 @@ impl Pool<'_> {
             high_risk: false,
             error: Some(error.to_string()),
         };
-        record(self.home, EV_POOL_PLANNED, serde_json::to_value(&failed)?).map(|_| ())
+        record(self.home, EV_POOL_PLANNED, serde_json::to_value(&failed)?)?;
+        Ok(failed)
     }
 
     /// End the plans going: they are read-only, and an item left unplanned is planned again. Each
@@ -660,8 +648,22 @@ fn reap_stopped(stopped: &mut Vec<(Child, Instant)>, grace: Duration) {
     });
 }
 
-/// Take out of `elsewhere` the items waited on for longer than `limit`, and return them.
-fn expired(elsewhere: &mut BTreeMap<u64, Instant>, limit: Duration) -> Vec<u64> {
+/// Keep waiting in `elsewhere` only on items still queued whose other plan still holds its lock.
+fn keep_waiting(
+    elsewhere: &mut BTreeMap<u64, Instant>,
+    queued: &BTreeSet<u64>,
+    held: impl Fn(u64) -> bool,
+) {
+    elsewhere.retain(|&n, _| queued.contains(&n) && held(n));
+}
+
+/// Take out of `elsewhere` the items waited on for longer than `limit`, and return the ones
+/// whose plan failed for it: not one the other plan recorded just now, before letting go.
+fn give_up(
+    elsewhere: &mut BTreeMap<u64, Instant>,
+    plans: &BTreeMap<u64, Plan>,
+    limit: Duration,
+) -> Vec<u64> {
     let gone: Vec<u64> = elsewhere
         .iter()
         .filter(|(_, seen)| seen.elapsed() > limit)
@@ -670,7 +672,9 @@ fn expired(elsewhere: &mut BTreeMap<u64, Instant>, limit: Duration) -> Vec<u64> 
     for number in &gone {
         elsewhere.remove(number);
     }
-    gone
+    gone.into_iter()
+        .filter(|n| !plans.get(n).is_some_and(|plan| plan.source != "failed"))
+        .collect()
 }
 
 /// Take out of `planners` the plans that ended, ending first any going longer than `limit`, and
@@ -1877,16 +1881,35 @@ mod tests {
         assert!(planners.is_empty());
         assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [5, 6]);
         assert!(elsewhere[&5].elapsed() < Duration::from_secs(5));
-        // #5's other plan records its plan and lets go; #6's lets go with none.
-        let plan = json!({"repo": "acme/app", "number": 5, "paths": ["src/"], "source": "plan"});
-        record(&home, EV_POOL_PLANNED, plan).unwrap();
+        // Once the other plans let go, or an item leaves the queue, the wait on it ends.
         drop(other5);
+        // Another test's child forked at that moment holds the lock until it execs.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while home.plan_held("acme/app", 5).unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        keep_waiting(&mut elsewhere, &BTreeSet::from([5, 6, 7]), |n| {
+            home.plan_held("acme/app", n).unwrap_or(false)
+        });
+        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [6]);
+        keep_waiting(&mut elsewhere, &BTreeSet::from([5]), |_| true);
+        assert!(elsewhere.is_empty());
         drop(other6);
-        // Past the limit, the wait ends; one not yet past it stays.
-        elsewhere.insert(7, Instant::now());
-        elsewhere.insert(5, Instant::now() - Duration::from_secs(120));
-        assert_eq!(expired(&mut elsewhere, limit), [5]);
-        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [6, 7]);
+        // Past the limit, the wait ends and the plan fails, unless a plan was recorded just
+        // before; one not yet past it stays.
+        let old = Instant::now() - Duration::from_secs(120);
+        elsewhere.extend([(5, old), (6, old), (7, old), (8, Instant::now())]);
+        let plan = |number: u64, source: &str| Plan {
+            repo: "acme/app".into(),
+            number,
+            paths: vec!["src/".into()],
+            source: source.into(),
+            high_risk: false,
+            error: None,
+        };
+        let plans = BTreeMap::from([(5, plan(5, "plan")), (6, plan(6, "failed"))]);
+        assert_eq!(give_up(&mut elsewhere, &plans, limit), [6, 7]);
+        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [8]);
     }
 
     #[cfg(unix)]
