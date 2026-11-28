@@ -100,7 +100,9 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
   clause's only negator, nothing but a plain object follows it in its clause ("any check", "the failing test"), and
   its sentence neither asks nor hedges ("why", "should", "unless", "except", "only", "much", a closing `?`). So "this
   doesn't weaken any check" is not a request to weaken one, while "don't hesitate to edit the failing test" and
-  "don't skip the test unless it's flaky" are. A mention of `.paja/checks`, `.paja/high-risk`, `hook.rs` or the
+  "don't skip the test unless it's flaky" are. Nor may another weakening act ("disable", "remove", "delete",
+  "ignore", "comment out", ...) follow in the rest of that sentence or the next one, so "don't skip the test, disable
+  it" counts too. A mention of `.paja/checks`, `.paja/high-risk`, `hook.rs` or the
   deny-list always counts, negated or not. The prompt also tells the arbiter to escalate anything that changes the
   issue's intent or scope, secrets, actions outside the repository and any question that asks for the person's
   preference.
