@@ -219,9 +219,9 @@ lower one lets running items finish and starts none until the busy lanes are und
 error waits for the next timed sync, as `--every` waits after a failed pass; `paja pool status` gives that as the
 item's reason for waiting, and keeps giving it after the sync, since the log doesn't record the sync, so the item may
 then be waiting only for a free lane. The pool records `pool.started` (`repo`, `lanes`, `pid`), `pool.lane` (`repo`,
-`lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage` is `starting`, `build`, `checks`, `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja
-pool status` and its MCP tool `pool_status` rebuild the pool from them and the lock alone: its `state` is `running`
-only while a live pool holds `runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool
+`lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage` is `starting`, `build`, `checks`,
+`review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja pool status` and its MCP tool
+`pool_status` rebuild the pool from them and the lock alone: its `state` is `running` only while a live pool holds `runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool
 that was killed, which records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line
 stops admitting and is passed on to every lane's run, which finishes its step as one run does; the pool stops when
 the lanes have. A tamper stop any lane's run records (`run.tampered` for the checkout) is seen on the next tick: every
