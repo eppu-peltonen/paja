@@ -646,6 +646,9 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             ),
+            Err(err) if std::env::var_os("CI").is_some() => panic!(
+                "no node on PATH to run desk/ui/view.test.js ({err}); install Node in the CI job"
+            ),
             Err(err) => eprintln!("skipped: no node on PATH to run desk/ui/view.test.js ({err})"),
         }
     }
