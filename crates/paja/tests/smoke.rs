@@ -50,12 +50,14 @@ fn fake_token() -> String {
     ["ghp", "ABCDEFGHIJKLMNOPQRSTuvwx"].join("_")
 }
 
-/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`.
+/// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`. A
+/// sandbox the developer's shell names is left out unless `vars` names one.
 fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(cwd)
         .env("PAJA_HOME", home)
         .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .env_remove("PAJA_SBX")
         .envs(vars.iter().copied())
         .arg("--json")
         .args(args)
@@ -2397,7 +2399,8 @@ impl Factory {
             format!(
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
-                 \"repo view\") echo '{view}' ;;\n\
+                 \"repo view\") case \"$*\" in *viewerPermission*) if [ -f {d}/settings-after.json ]; then cat {d}/settings-after.json; exit 0; fi ;; esac\n\
+                 echo '{view}' ;;\n\
                  \"workflow list\") if [ -f {d}/workflows-down ]; then echo 'HTTP 403: Resource not accessible' >&2; exit 1; fi\n\
                  if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") if [ -f {d}/pr-open ]; then echo https://example.com/pull/1; else exit 1; fi ;;\n\
@@ -2901,6 +2904,195 @@ fn make_private(dir: &Path) {
             .unwrap();
         assert!(status.success(), "icacls failed");
     }
+}
+
+#[test]
+fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "checks"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    // A pushed review branch with labels of its own, and origin/HEAD moved to it, as code in
+    // a worktree could.
+    git(&repo, &["checkout", "-q", "-b", "paja/app-1"]);
+    std::fs::write(repo.join(".paja/labels"), "work evil\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "labels"]);
+    git(&repo, &["push", "-q", "origin", "paja/app-1"]);
+    git(&repo, &["checkout", "-q", "trunk"]);
+    git(&repo, &["remote", "set-head", "origin", "paja/app-1"]);
+    let doctor = |view: &str| {
+        let gh = program(
+            tmp.path(),
+            "gh",
+            &format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n\
+                 \"repo view\") echo '{view}' ;;\n\
+                 \"label list\") echo '[{{\"name\": \"game\"}}]' ;;\n\
+                 \"workflow list\") echo 'CI\tactive\t1' ;;\nesac\n"
+            ),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&repo)
+            .env("PAJA_HOME", &home)
+            .env("PAJA_GH", &gh)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        report
+    };
+    let named = |report: &Value, name: &str| {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .cloned()
+    };
+    // GitHub names trunk: the labels come from origin/trunk, not the review branch.
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "trunk"}}"#);
+    assert!(named(&report, "default branch").is_none(), "{report}");
+    let label = named(&report, "work label").unwrap();
+    assert_eq!(label["status"], "ok", "{report}");
+    assert!(
+        label["detail"].as_str().unwrap().contains("`game`"),
+        "{report}"
+    );
+    // Doctor still says origin/HEAD was moved, and what it read instead.
+    let head = named(&report, "origin/HEAD").unwrap();
+    assert_eq!(head["status"], "warning", "{report}");
+    assert!(
+        head["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Paja reads origin/trunk instead"),
+        "{report}"
+    );
+    // GitHub can't say: origin/HEAD pointing at one of Paja's own branches is refused.
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("one of Paja's own branches"),
+        "{report}"
+    );
+    // Nor is one that isn't a symbolic ref.
+    git(
+        &repo,
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    );
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "--no-deref",
+            "refs/remotes/origin/HEAD",
+            "paja/app-1",
+        ],
+    );
+    let report = doctor(r#"{"viewerPermission": "ADMIN"}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("is not a symbolic ref"),
+        "{report}"
+    );
+    assert_eq!(branch["status"], "failed", "{report}");
+    // GitHub names a branch that isn't fetched: neither origin/HEAD nor a local main, which
+    // code in a worktree can make, stands in for it.
+    git(&repo, &["branch", "main", "trunk"]);
+    let report = doctor(r#"{"viewerPermission": "ADMIN", "defaultBranchRef": {"name": "gone"}}"#);
+    let branch = named(&report, "default branch").unwrap();
+    assert_eq!(branch["status"], "failed", "{report}");
+    assert!(
+        branch["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no origin/gone; run `git fetch origin gone`"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_default_branch_github_names_is_read_without_origin_head_or_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    let origin = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "trunk"]);
+    init_repo(&repo);
+    git(&repo, &["branch", "-m", "trunk"]);
+    std::fs::create_dir_all(repo.join(".paja")).unwrap();
+    std::fs::write(repo.join(".paja/labels"), "work game\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "labels"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "trunk"]);
+    let log = tmp.path().join("gh.log");
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\", \"defaultBranchRef\": {{\"name\": \"trunk\"}}}}' ;;\n\
+             \"issue list\") echo '[]' ;;\nesac\n",
+            slash(tmp.path().join("gh.log").as_path())
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["--json", "work", "sync"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The work label came from origin/trunk.
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.starts_with("issue list") && l.contains("game")),
+        "{calls}"
+    );
+    // It read two files from the default branch, and asked GitHub for its name once.
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.contains("defaultBranchRef"))
+            .count(),
+        1,
+        "{calls}"
+    );
 }
 
 #[test]
@@ -9669,7 +9861,9 @@ fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
 
 /// `paja init` with the given `files` committed and a fake `claude` that answers with `answer`
 /// (the agent's `structured_output`) and logs each call in `claude-calls` next to the repository.
-/// Returns the temp directory (the fakes' logs are in it), the repository and the result.
+/// Returns the temp directory (the fakes' logs are in it), the repository and the result. The
+/// fake records its arguments one per line in `claude-args`, so an argument with a newline in it
+/// (a harness from a committed `CLAUDE.md`) would be split; the fixtures here have none.
 fn init_with_agent(
     files: &[(&str, &str)],
     answer: &Value,
@@ -9687,7 +9881,7 @@ fn init_with_agent(
         tmp.path(),
         "claude",
         &format!(
-            "#!/bin/sh\ncat > {d}/prompt.txt\necho x >> {d}/claude-calls\ncat {d}/answer.json\n"
+            "#!/bin/sh\ncat > {d}/prompt.txt\necho x >> {d}/claude-calls\nprintf '%s\\n' \"$@\" > {d}/claude-args\ncat {d}/answer.json\n"
         ),
     );
     let mut all = vec!["init"];
@@ -9988,6 +10182,158 @@ fn init_falls_back_to_the_table_and_says_so_when_the_agent_answers_badly() {
 }
 
 #[test]
+fn init_falls_back_to_the_table_without_the_agents_environment() {
+    // No proposed stack is backed by a file, but its toolchain is: the table's stacks are used,
+    // and the environment is theirs alone, not the agent's toolchains beside them.
+    let answer = serde_json::json!({
+        "stacks": [{"name": "ghost", "dir": ".", "file": "ghost.toml",
+            "checks": [{"command": "ghost test", "file": "ghost.toml"}], "commands": ["ghost"]}],
+        "toolchains": [{"name": "go", "version": "1.22", "file": "go.mod"}],
+        "services": [{"name": "postgres", "file": "go.mod"}]
+    });
+    let (_tmp, _repo, ok, out) = init_with_agent(&[("go.mod", "module x\n")], &answer, &[]);
+    assert!(ok, "{out}");
+    let detected = &out["detected"];
+    assert!(
+        detected["fallback"]
+            .as_str()
+            .unwrap()
+            .contains("proposed no stack"),
+        "{out}"
+    );
+    assert_eq!(detected["checks"][0]["source"], "table", "{out}");
+    assert_eq!(
+        detected["environment"]["toolchains"],
+        serde_json::json!([]),
+        "{out}"
+    );
+    assert_eq!(
+        detected["environment"]["services"],
+        serde_json::json!([]),
+        "{out}"
+    );
+}
+
+#[test]
+fn init_agent_gets_read_only_tools_and_hook() {
+    let answer = serde_json::json!({"stacks": [{"name": "go", "dir": ".", "file": "go.mod",
+        "checks": [{"command": "go test ./...", "file": "go.mod"}], "commands": ["go"]}]});
+    let (tmp, _repo, ok, out) = init_with_agent(&[("go.mod", "module x\n")], &answer, &[]);
+    assert!(ok, "{out}");
+    let args = std::fs::read_to_string(tmp.path().join("claude-args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let at = |flag: &str| {
+        args.iter()
+            .position(|a| *a == flag)
+            .unwrap_or_else(|| panic!("no {flag}: {args:?}"))
+    };
+    // Only reading tools are defined at all, and only these reading ones are allowed.
+    assert_eq!(args[at("--tools") + 1], "Read,Glob,Grep,Bash", "{args:?}");
+    let allowed: Vec<&str> = args[at("--allowedTools") + 1..]
+        .iter()
+        .take_while(|a| !a.starts_with("--"))
+        .copied()
+        .collect();
+    assert_eq!(
+        allowed,
+        [
+            "Read",
+            "Glob",
+            "Grep",
+            "Bash(git status*)",
+            "Bash(git diff*)",
+            "Bash(git log*)",
+            "Bash(git show*)",
+            "Bash(tail *)",
+            "Bash(head *)",
+            "Bash(grep *)",
+            "Bash(wc *)",
+            "Bash(pwd)",
+        ],
+        "{args:?}"
+    );
+    // The deny-list hook runs before every tool, in its read-only mode.
+    let settings: Value = serde_json::from_str(args[at("--settings") + 1]).unwrap();
+    let pre = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(pre["matcher"], "*", "{settings}");
+    let command = pre["hooks"][0]["command"].as_str().unwrap();
+    assert!(
+        command.contains(" hook ") && command.contains("--read-only"),
+        "{command}"
+    );
+    assert_eq!(args[at("--permission-mode") + 1], "auto", "{args:?}");
+}
+
+#[test]
+fn init_check_lines_for_a_subdirectory_run_there_and_an_unsafe_dir_is_dropped() {
+    // A monorepo proposal: one stack in `apps/svc` (named the loose way, `./apps/svc/`), one in
+    // a directory whose name would be a second command if it reached `cd <dir> && ...`
+    // unquoted. The second is dropped, and the line written for the first runs in its
+    // directory when the checks file is run as written.
+    let evil = "evil;touch pwned";
+    let script = "echo ok > ran\n";
+    let evil_script = format!("{evil}/check.sh");
+    let answer = serde_json::json!({"stacks": [
+        {"name": "svc", "dir": "./apps/svc/", "file": "apps/svc/check.sh",
+         "checks": [{"command": "sh check.sh", "file": "apps/svc/check.sh"}], "commands": ["sh"],
+         "setup": [{"run": "sh check.sh", "file": "apps/svc/check.sh"}]},
+        {"name": "evil", "dir": evil, "file": evil_script,
+         "checks": [{"command": "sh check.sh", "file": evil_script}], "commands": ["sh"],
+         "setup": [{"run": "sh check.sh", "file": evil_script}]}
+    ]});
+    let (_tmp, repo, ok, out) = init_with_agent(
+        &[
+            ("apps/svc/check.sh", script),
+            (evil_script.as_str(), script),
+        ],
+        &answer,
+        &["--ci"],
+    );
+    assert!(ok, "{out}");
+    let dropped = out["detected"]["dropped"].as_array().unwrap();
+    assert!(
+        dropped
+            .iter()
+            .any(|d| d["item"].as_str().unwrap().contains("stack `evil")
+                && d["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("is not a directory on the default branch")),
+        "{out}"
+    );
+    let checks = show(&repo, "paja/init", ".paja/checks");
+    let lines: Vec<&str> = checks
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(lines, ["cd apps/svc && sh check.sh"], "{checks}");
+    // The CI workflow runs the setup step in the stack's directory and the same check line,
+    // and nothing of the dropped stack.
+    let workflow = show(&repo, "paja/init", ".github/workflows/paja.yml");
+    assert!(
+        workflow.contains("      - run: sh check.sh\n        working-directory: apps/svc\n"),
+        "{workflow}"
+    );
+    assert!(
+        workflow.contains("cd apps/svc && sh check.sh") && !workflow.contains("evil"),
+        "{workflow}"
+    );
+    // Run as written, from the repository's root, with the shell Vasara runs each line in.
+    git(&repo, &["checkout", "-q", "paja/init"]);
+    for line in &lines {
+        let status = paja::platform::shell(line)
+            .unwrap()
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{line}");
+    }
+    assert!(repo.join("apps/svc/ran").is_file());
+    assert!(!repo.join("ran").exists() && !repo.join("pwned").exists());
+}
+
+#[test]
 fn init_falls_back_to_the_table_when_claude_is_missing() {
     let (_tmp, repo, home, gh) = init_fixture(&[("go.mod", "module x\n")]);
     let missing = repo.join("no-such-claude");
@@ -10047,6 +10393,12 @@ fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
 fn a_merge_github_refuses_escalates_naming_the_setting() {
     let f = Factory::new("test -f feature.txt\n", "land");
     std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    // Asked after the refusal, GitHub says squash merging is off.
+    std::fs::write(
+        f.tmp.path().join("settings-after.json"),
+        r#"{"viewerPermission": "ADMIN", "squashMergeAllowed": false, "rebaseMergeAllowed": false, "mergeCommitAllowed": false}"#,
+    )
+    .unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "escalated", "{report}");
@@ -10056,6 +10408,94 @@ fn a_merge_github_refuses_escalates_naming_the_setting() {
         "{question}"
     );
     assert!(question.contains("allow squash merging"), "{question}");
+}
+
+#[test]
+fn a_merge_refused_for_the_account_s_permission_escalates_saying_so() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("settings-after.json"),
+        r#"{"viewerPermission": "READ", "squashMergeAllowed": true}"#,
+    )
+    .unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("has READ permission on acme/app"),
+        "{question}"
+    );
+}
+
+#[test]
+fn a_failed_merge_github_does_not_explain_is_parked_as_an_error() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    // The error reads like a refusal, but GitHub says the account may merge this way.
+    std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("settings-after.json"),
+        r#"{"viewerPermission": "WRITE", "squashMergeAllowed": true}"#,
+    )
+    .unwrap();
+    let (_, report) = f.run();
+    // Parked on the error, with gh's message, not asked as a merge-setting question.
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.starts_with("Paja's run stopped with an error"),
+        "{question}"
+    );
+    assert!(
+        question.contains("Squash merges are not allowed"),
+        "{question}"
+    );
+    assert!(!question.contains("GitHub refused to merge"), "{question}");
+    assert!(question.contains("protection rules"), "{question}");
+}
+
+#[test]
+fn an_answered_merge_refusal_lands_through_the_open_pull_request() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("merge-refused"), "").unwrap();
+    std::fs::write(dir.join("reuse-prs"), "").unwrap();
+    std::fs::write(
+        dir.join("settings-after.json"),
+        r#"{"viewerPermission": "ADMIN", "squashMergeAllowed": false}"#,
+    )
+    .unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    // The person allows squash merging and answers.
+    std::fs::remove_file(dir.join("merge-refused")).unwrap();
+    std::fs::remove_file(dir.join("settings-after.json")).unwrap();
+    let with_gh = [("PAJA_GH", f.gh.as_path())];
+    let (ok, answered) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Squash merging is allowed now"],
+        &with_gh,
+    );
+    assert!(ok, "{answered}");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["pr"], "https://example.com/pull/1", "{report}");
+    // The pull request opened before the question is the one that lands: no second one.
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    let count = |prefix: &str| log.lines().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(count("pr create"), 1, "{log}");
+    assert!(count("pr edit") >= 1, "{log}");
+    assert_eq!(count("pr merge"), 2, "{log}");
+    // The second merge is of the pull request opened in the first run.
+    let merges: Vec<&str> = log.lines().filter(|l| l.starts_with("pr merge")).collect();
+    assert!(
+        merges[1].starts_with("pr merge https://example.com/pull/1 --squash"),
+        "{log}"
+    );
 }
 
 /// A pool's test factory: items #5 Alpha, #6 Beta, #7 Gamma (and #8 Delta with `four`), each

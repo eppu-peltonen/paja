@@ -380,8 +380,11 @@ round, like a failed check, with the failing checks and the end of the first fai
 --log-failed`); the pull request stays open and the next round pushes to it. So do checks that never start because the
 default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
-otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
-setting to change. On `escalate`, five failed rounds or
+otherwise a merge commit; a repository that allows none escalates with the setting to change. When `gh pr merge`
+fails, Mestari asks `gh repo view` why rather than reading the error's wording: an account below write access, or the
+chosen method now off (an answer is enough when another is still on), escalates naming the fix. A refusal those
+settings don't explain, such as a token without write scope or a branch rule, is an error the item is parked on with
+gh's message. Once answered, the next run lands through the pull request already open. On `escalate`, five failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up: the factory home, repository and home folder named, tokens hidden, mentions made inert, code fences made plain text so the frame after a quote never renders as code) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
@@ -437,18 +440,26 @@ A notice goes to two channels:
   private topic for a private repository. A repository the tamper lock holds isn't read for the URL.
 
 Unlike the settings `paja run` reads from the default branch's tip as fetched, `.paja/notify`, `.paja/labels` and
-`.paja/queue` are read from the local refs (`origin/HEAD`, `origin/main`, `main`), which an agent with local git in a
-worktree could move. That could send the notice's text to a URL it picks, or change the work and follow-up labels and
-whether Jono takes follow-ups, for the passes that read them.
+`.paja/queue` are read from local refs, which an agent with local git in a worktree could move. That could send the
+notice's text to a URL it picks, or change the work and follow-up labels and whether Jono takes follow-ups, for the
+passes that read them. The default branch is the one `gh repo view` names, read as `origin/<name>` and nothing else
+(when it isn't fetched, Paja says to run `git fetch origin <name>`), since code in a worktree can point `origin/HEAD` at
+the pushed review branch or make a local `main`. When `gh` can't say (it fails, takes over 15 seconds, or names no
+usable branch) it is `origin/HEAD`, else `origin/main`, else `main`, and an `origin/HEAD` that isn't a symbolic ref, or
+points outside `refs/remotes/origin/` or at one of Paja's own `paja/` branches, is refused with the fix,
+`git remote set-head origin -a`. A name from `gh` is reused for five minutes per repository, so a `work sync` asks once,
+and its failure to say for 30 seconds. `paja doctor` finds the branch the same way, and warns when it skipped an
+`origin/HEAD` it wouldn't trust.
 
 Each attempt appends `notify.sent` or `notify.failed` (`repo`, `number`, `kind`: `escalated`, `left_findings`,
 `pass_failed`, `stopped` or `skipped_role`, `channel`, the `error`, and for `skipped_role` the roles it named as
 `subject`), so Paja Desk can show the same inbox. A notice that can't be delivered never stops the run: it says so on
 stderr once per channel, and every notifier is stopped after 15 seconds. The other waits are 15 seconds too: the
-repository name Jono asks `gh` for (the notice goes without it after that), and the home lock its record waits for (the
-record is skipped after that), and a `gh` stopped while it runs takes what it started with it. With every channel on,
-one notice holds up the run for about a minute and a half at most, and a skipped-role notice up to 15 seconds more for
-Posti's lock; only the local git calls that read `.paja/notify` from the default branch have no limit of their own.
+repository name Jono asks `gh` for (the notice goes without it after that), the default branch's name Posti asks `gh`
+for when it reads `.paja/notify`, and the home lock its record waits for (the record is skipped after that), and a `gh`
+stopped while it runs takes what it started with it. With every channel on, one notice holds up the run for about a
+minute and three quarters at most, and a skipped-role notice up to 15 seconds more for Posti's lock; only the local git
+calls that read `.paja/notify` from the default branch have no limit of their own.
 
 ## The deny-list hook
 

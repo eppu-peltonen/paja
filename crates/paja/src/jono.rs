@@ -2599,7 +2599,11 @@ pub(crate) fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
     gh_within(ok, args, None)
 }
 
-fn gh_within(ok: &Untampered, args: &[&str], limit: Option<std::time::Duration>) -> Result<String> {
+pub(crate) fn gh_within(
+    ok: &Untampered,
+    args: &[&str],
+    limit: Option<std::time::Duration>,
+) -> Result<String> {
     let repo = ok.path();
     if !repo.is_dir() {
         bail!(

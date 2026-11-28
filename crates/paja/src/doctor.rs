@@ -534,37 +534,39 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         )),
     }
 
-    // What `paja run` reads, from the default branch: the same refs, in the same order, as
-    // `ahjo::show_on_default_branch`, so a default branch with another name is found too.
-    // Resolved once, by exact ref name: every file below is read from that one commit, and
-    // messages name the branch by its short name.
-    let mut found = None;
-    for (full, short) in crate::ahjo::DEFAULT_REFS {
-        match crate::ahjo::ref_commit(proof.path(), full) {
-            Ok(Some(commit)) => {
-                found = Some((commit, short));
-                break;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                checks.push(failed(
-                    "default branch",
-                    format!("looking up {short}: {err:#}"),
-                    "run `git fsck` in this checkout and check that `git` runs",
-                ));
-                return;
-            }
+    // What `paja run` reads, from the default branch, found as `ahjo::show_on_default_branch`
+    // finds it, so a default branch with another name is found too. Resolved once: every file
+    // below is read from that one commit, and messages name the branch by its short name.
+    let found = match crate::ahjo::default_branch(&proof) {
+        Ok(found) => found,
+        Err(err) => {
+            checks.push(failed(
+                "default branch",
+                format!("{err:#}"),
+                "run the command the message names; if git itself failed, run `git fsck` here",
+            ));
+            return;
         }
-    }
+    };
     let Some((commit, rev)) = found else {
         checks.push(failed(
             "default branch",
-            "none of origin/HEAD, origin/main or main exists in this checkout",
-            "push the default branch (`git push -u origin main`), then run \
-             `git remote set-head origin -a` so Paja knows its name",
+            "gh can't name the default branch, and none of origin/HEAD, origin/main or main \
+             exists in this checkout",
+            "run `git fetch origin`; if the default branch isn't pushed yet, push it \
+             (`git push -u origin main`), then run `git remote set-head origin -a`",
         ));
         return;
     };
+    // GitHub named the branch, so origin/HEAD went unread: still say when it was moved, since
+    // something in this checkout moved it.
+    if let Err(err) = crate::ahjo::trusted_origin_head(&proof) {
+        checks.push(warning(
+            "origin/HEAD",
+            format!("{err:#}; Paja reads {rev} instead"),
+            "run `git remote set-head origin -a`",
+        ));
+    }
     // The work label.
     let labels = match show(proof.path(), &commit, jono::LABELS_FILE) {
         Ok(text) => jono::Labels::parse(&text.unwrap_or_default()).map_err(|e| format!("{e:#}")),
@@ -637,7 +639,7 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             "models",
             format!("no {models_file} on {rev}: every role runs on the account's default model"),
         )),
-        Ok(Some(text)) => match crate::mestari::Models::parse_on(&text, rev) {
+        Ok(Some(text)) => match crate::mestari::Models::parse_on(&text, &rev) {
             Err(err) => checks.push(failed(
                 "models",
                 format!("{err:#}"),
