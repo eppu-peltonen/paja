@@ -461,8 +461,9 @@ there are none, which a resumed run of that round takes over the earlier ones. A
 carries `approved`: the `reviewed` commit, the `commit` it lands as, how many `reviewers` approved it and all the
 `findings` it lands with, in the change and outside it, so a resumed run lands it without reviewing again. A
 `run.checked` with `landing` true is of Paja's own merge of the default branch into the approved change, which moves the
-approval's `commit` to it; checks on any other commit in that round take the approval back. A round stopped or ended on
-an error has no `noted`, and older events without these fields stay readable. Each `run.round` event also lists the
+approval's `commit` to it; checks on any other commit in that round, or a later review in it that didn't approve, take
+the approval back. A round stopped or ended on an error has no `noted`, and older events without these fields stay
+readable. Each `run.round` event also lists the
 round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
 Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
 `duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
