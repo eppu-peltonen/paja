@@ -7868,6 +7868,10 @@ fn a_nearly_used_window_still_checks_the_workflow_for_an_item_left_active() {
     let (ok, report, stderr) = run_args(&f, &["--item", "6"], None);
     assert!(ok, "{report}\n{stderr}");
     assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    // #6's build recorded the nearly used window, so the next pass takes the window's path.
+    let rounds = round_events(&f);
+    let build = &rounds.last().unwrap()["data"]["steps"][0];
+    assert_eq!(build["window_status"], "allowed_warning", "{build}");
     std::fs::write(dir.join("no-workflows"), "").unwrap();
     let listed = f.gh_log().matches("workflow list").count();
     let calls = f.claude_calls().len();
