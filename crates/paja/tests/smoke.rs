@@ -6157,6 +6157,55 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
 }
 
 #[test]
+fn the_arbiter_answers_when_a_reviewer_only_says_no_check_is_weakened() {
+    let f = Factory::new("true\n", "escalate");
+    // Reviewers often close with this; on its own it is no reason to keep the arbiter out. The
+    // fake puts review-summary into its JSON as it is, so it holds no `"` or `\`.
+    std::fs::write(
+        f.tmp.path().join("review-summary"),
+        "Adds the test. It doesn't weaken any check.",
+    )
+    .unwrap();
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "Use v2.",
+            "reason": "The issue says so.",
+            "weakens_a_check": false
+        }),
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "arbitrated", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["answers"][0]["answer"], "Use v2.", "{item}");
+}
+
+#[test]
+fn the_arbiter_is_overruled_when_its_answer_names_weakening_even_to_deny_it() {
+    let f = Factory::new("true\n", "escalate");
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "One more round. This doesn't weaken any check.",
+            "reason": "A test is missing.",
+            "weakens_a_check": false
+        }),
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("weakening a check"), "{question}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
+    assert!(item["answers"].as_array().unwrap().is_empty(), "{item}");
+}
+
+#[test]
 fn the_arbiter_answers_an_item_only_once() {
     let f = Factory::new("true\n", "escalate");
     arbiter_says(
