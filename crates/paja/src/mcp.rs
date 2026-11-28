@@ -199,7 +199,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed. Names shaped like the ones Paja gives its own environments (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`) are refused."
+        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed. Names shaped like the ones Paja gives its own environments (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-plan-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`) are refused."
     )]
     async fn env_create(&self, Parameters(args): Parameters<CreateArgs>) -> Result<String, String> {
         let home = self.home.clone();

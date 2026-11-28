@@ -3564,7 +3564,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    fn repo_with_commit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    pub(super) fn repo_with_commit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::create_dir_all(&path).unwrap();
         let git = |args: &[&str]| {
@@ -3585,7 +3585,7 @@ mod tests {
         path
     }
 
-    fn work_item(repo: &str, number: u64) -> crate::jono::WorkItem {
+    pub(super) fn work_item(repo: &str, number: u64) -> crate::jono::WorkItem {
         crate::jono::WorkItem {
             repo: repo.into(),
             number,

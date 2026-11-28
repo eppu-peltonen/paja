@@ -90,7 +90,8 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     if is_paja_name(opts.name) {
         bail!(
             "environment name {:?} has the shape Paja gives its own environments \
-             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`, where \
+             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-plan-<n>`, `<repo>-<hash>-triage`, \
+             `work-<n>`, `plan-<n>`, where \
              `<hash>` is any six hex digits), and Paja would reuse, reset and remove it; pick \
              another name",
             opts.name
@@ -100,9 +101,9 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
 }
 
 /// Whether `name` has the shape of a name Paja gives its own environments: what
-/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage` or
-/// `-work-<n>`), a plan's `plan-<n>`, or the `work-<n>` of releases before names carried the
-/// repository.
+/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage`,
+/// `-work-<n>` or a plan's `-plan-<n>`), or the `work-<n>` and `plan-<n>` of releases before
+/// names carried the repository.
 pub fn is_paja_name(name: &str) -> bool {
     let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
     if ["work-", "plan-"]
@@ -113,7 +114,10 @@ pub fn is_paja_name(name: &str) -> bool {
     }
     let head = if let Some(head) = name.strip_suffix("-triage") {
         head
-    } else if let Some((head, n)) = name.rsplit_once("-work-") {
+    } else if let Some((head, n)) = name
+        .rsplit_once("-work-")
+        .or_else(|| name.rsplit_once("-plan-"))
+    {
         if !number(n) {
             return false;
         }
@@ -1581,7 +1585,7 @@ mod tests {
     #[test]
     fn paja_shaped_names_are_told_apart_from_a_persons() {
         for repo in ["acme/app", "acme/a-very-long-repository-name", "acme/---"] {
-            for what in ["triage", "work-7", "work-12345"] {
+            for what in ["triage", "work-7", "work-12345", "plan-7"] {
                 let name = crate::jono::env_name_for(repo, what);
                 assert!(is_paja_name(&name), "{name}");
             }
@@ -1600,6 +1604,8 @@ mod tests {
             "app-abcdef-work-",
             "app-abcdef-work-7a",
             "app-abcdef-worker",
+            "app-abcdef-plan-",
+            "app-abcdef-plan-x",
         ] {
             assert!(!is_paja_name(theirs), "{theirs}");
         }

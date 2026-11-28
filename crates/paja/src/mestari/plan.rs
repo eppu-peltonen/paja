@@ -175,6 +175,14 @@ pub fn blocked_by(plan: &Plan, running: &[&Plan]) -> Option<(u64, String)> {
 pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     let repo = std::path::absolute(repo)?;
     let name = jono::repo_name(home, &repo)?;
+    // Taken before anything is recorded: a plan that finds another one running records nothing,
+    // so it never replaces that plan's result.
+    let Some(_lock) = home.try_plan_lock(&name, number)? else {
+        bail!(
+            "another `paja pool plan {number}` of {name} is running (a pool's planner, or one \
+             started by hand); wait for it, then `paja pool status` shows its plan"
+        );
+    };
     let made = make(home, &repo, &name, number);
     let plan = match made {
         Ok(plan) => plan,
@@ -276,6 +284,14 @@ fn prompt(item: &WorkItem) -> String {
     )
 }
 
+/// Whether two repository paths are the same folder, as the file system resolves them.
+fn same_repo(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Run the planning agent in a checkout of the default branch and read its paths.
 fn ask(
     home: &Home,
@@ -284,11 +300,19 @@ fn ask(
     item: &WorkItem,
     models: &Models,
 ) -> Result<Vec<String>> {
-    let name = format!("plan-{}", item.number);
+    // The repository's name and hash in the name, as an item's environment has, so two
+    // repositories sharing a home never plan their #5 in one checkout.
+    let name = jono::env_name_for(&item.repo, &format!("plan-{}", item.number));
     // A checkout or branch left behind by a plan that was killed is reused; `discard` puts it
     // back on the default branch.
     let branch = format!("refs/heads/paja/{name}");
     let env = match ahjo::get(home, &name) {
+        Ok(env) if !same_repo(&env.repo, repo) => bail!(
+            "environment {name} belongs to the repository at {}, not {}; two repositories got \
+             the same planner name, so remove it with `paja env remove {name}` if it is stale",
+            env.repo.display(),
+            repo.display()
+        ),
         Ok(env) => env,
         Err(_) => {
             let left = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
@@ -348,6 +372,32 @@ fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_planner_checkout_another_repository_holds_is_refused_and_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("home")).unwrap();
+        let (a, b) = (
+            super::super::tests::repo_with_commit(tmp.path(), "a"),
+            super::super::tests::repo_with_commit(tmp.path(), "b"),
+        );
+        let item = super::super::tests::work_item("o/a", 7);
+        let name = jono::env_name_for("o/a", "plan-7");
+        let theirs = ahjo::create(
+            &home,
+            CreateOptions {
+                name: &name,
+                repo: &b,
+                base: None,
+            },
+        )
+        .unwrap();
+        let models = Models::parse_on("", "main").unwrap();
+        let err = format!("{:#}", ask(&home, &a, "HEAD", &item, &models).unwrap_err());
+        assert!(err.contains(&format!("paja env remove {name}")), "{err}");
+        assert!(theirs.path.exists());
+        assert_eq!(ahjo::get(&home, &name).unwrap().repo, theirs.repo);
+    }
 
     #[test]
     fn a_touches_line_names_the_paths() {

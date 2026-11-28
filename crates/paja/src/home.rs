@@ -135,6 +135,13 @@ impl Home {
         self.try_runs_lock(repo, "land")
     }
 
+    /// Take the lock a `paja pool plan` of item `number` of `repo` holds while it plans, without
+    /// waiting. None when another live plan of the item holds it, so a manual plan and a pool's
+    /// never share the planner's checkout or branch.
+    pub fn try_plan_lock(&self, repo: &str, number: u64) -> Result<Option<RunLock>> {
+        self.try_runs_lock(repo, &format!("plan-{number}"))
+    }
+
     /// Take the lock a `paja triage` pass holds for `repo` while it runs, without waiting. None
     /// when another live pass holds it, so two passes never share the triage checkout.
     pub fn try_triage_lock(&self, repo: &str) -> Result<Option<RunLock>> {
