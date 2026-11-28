@@ -661,14 +661,16 @@ while it starts.
   git directory passed this way reaches the processes git starts as `GIT_DIR` and `GIT_WORK_TREE`, so each is decided on
   its own, by identity (another spelling, a symlink or a mount path of the same directory counts): an inherited
   `GIT_DIR` that is the worktree's git directory is cleared for git commands aimed outside the worktree, and an
-  inherited `GIT_WORK_TREE` that is the worktree is cleared for those and for a repository the caller chose. A value
-  naming any other directory is the caller's own and left alone; one set to the worktree's own can't be told from git
-  handing it down, so it is treated the same way. Git puts its own exec directory first on `PATH` for hooks and `!`
-  aliases, so a git called there usually runs the real git, not the shim. The `.git` file on the host is never
-  rewritten. Only the git found on `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own
-  `GIT_DIR`, bypasses it. The unit tests run the shim against a fake git on the host; the check against real `sbx` is
-  manual. On Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status` and
-  `git -c k=v -C <worktree> log -1` must succeed, `command -v git` must name `$HOME/.paja-shim/git`, and
+  inherited `GIT_WORK_TREE` that is the worktree is cleared for those and for another repository the caller chose, and
+  so is an inherited `GIT_INDEX_FILE` in the worktree's git directory. A value naming any other directory is the
+  caller's own and left alone; one set to the worktree's own can't be told from git handing it down, so it is treated
+  the same way. Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a git called there usually
+  runs the real git, not the shim. A relative value is read against the current directory; git hands down absolute ones,
+  except the `GIT_WORK_TREE=.` a hook gets, which a hook that changes directory makes its own. The `.git` file on the
+  host is never rewritten. Only the git found on `PATH` goes through the shim: a tool that calls git by absolute path,
+  or sets its own `GIT_DIR`, bypasses it. The unit tests run the shim against a fake git on the host; the check against
+  real `sbx` is manual. On Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status`
+  and `git -c k=v -C <worktree> log -1` must succeed, `command -v git` must name `$HOME/.paja-shim/git`, and
   `git -C /tmp status` must not be redirected to the worktree.
 - **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
   Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The

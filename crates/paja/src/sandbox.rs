@@ -45,11 +45,15 @@ const WORKTREE_GITDIR_VAR: &str = "PAJA_WT_GITDIR";
 /// `GIT_WORK_TREE`, so a nested git that does reach the shim could inherit the worktree's. Each is
 /// decided on its own: an inherited `GIT_DIR` that is the worktree's git directory is cleared for
 /// a command aimed outside the worktree, and an inherited `GIT_WORK_TREE` that is the worktree is
-/// cleared for a command aimed outside it or at a repository of the caller's choosing. A value
-/// naming any other directory is the caller's own and left alone. A caller that sets either to
+/// cleared for a command aimed outside it or at another repository of the caller's choosing,
+/// and so is an inherited `GIT_INDEX_FILE` in the worktree's git directory. A value naming any
+/// other directory is the caller's own and left alone. A caller that sets either to
 /// the worktree's own can't be told from git handing it down, so it is treated the same way.
 /// Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a git called
-/// there usually runs the real git, not this shim. Paths are compared by identity (`-ef`: each
+/// there usually runs the real git, not this shim. A relative value is read against the
+/// current directory, before any `-C`; git hands down absolute ones, except the `.` it gives a
+/// hook as `GIT_WORK_TREE`, which a hook that changes directory makes the caller's own. Paths
+/// are compared by identity (`-ef`: each
 /// directory from the target up to `/` against the root, and the git directories), not by
 /// spelling, so separators, case, short names (`RUNNER~1`), symlinks and mount spellings don't
 /// matter.
@@ -61,13 +65,21 @@ gd=none
 wt=none
 fgd=0
 fwt=0
+gdv=
+ix=none
 if [ -n "${GIT_DIR:-}" ]; then
   if [ "$GIT_DIR" = "$PAJA_WT_GITDIR" ] || [ "$GIT_DIR" -ef "$PAJA_WT_GITDIR" ]; then gd=inherited; else gd=own; fi
 fi
 if [ -n "${GIT_WORK_TREE:-}" ]; then
   if [ "$GIT_WORK_TREE" = "$PAJA_WT_ROOT" ] || [ "$GIT_WORK_TREE" -ef "$PAJA_WT_ROOT" ]; then wt=inherited; else wt=own; fi
 fi
+if [ -n "${GIT_INDEX_FILE:-}" ] && [ "$(dirname "$GIT_INDEX_FILE")" -ef "$PAJA_WT_GITDIR" ]; then ix=inherited; fi
 for a in "$@"; do
+  if [ "$want" = 2 ]; then
+    gdv=$a
+    want=0
+    continue
+  fi
   if [ "$want" = 1 ]; then
     dir=$(cd "$dir" 2>/dev/null && cd "$a" 2>/dev/null && pwd -P) || dir=/nonexistent-paja
     want=0
@@ -80,16 +92,22 @@ for a in "$@"; do
   case "$a" in
     -C) want=1 ;;
     -c|--namespace|--super-prefix|--config-env) skip=1 ;;
-    --git-dir) fgd=1; skip=1 ;;
+    --git-dir) fgd=1; want=2 ;;
     --work-tree) fwt=1; skip=1 ;;
-    --git-dir=*) fgd=1 ;;
+    --git-dir=*) fgd=1; gdv=${a#--git-dir=} ;;
     --work-tree=*) fwt=1 ;;
     -*) ;;
     *) break ;;
   esac
 done
 if [ "$fgd" = 1 ] || [ "$gd" = own ]; then
-  if [ "$wt" = inherited ]; then unset GIT_WORK_TREE; fi
+  # The caller chose a repository: the worktree's inherited work tree and index belong to it
+  # only when that is the worktree's own git directory.
+  chosen=${gdv:-$GIT_DIR}
+  if [ "$fgd" = 0 ] || { [ "$chosen" != "$PAJA_WT_GITDIR" ] && ! [ "$chosen" -ef "$PAJA_WT_GITDIR" ]; }; then
+    if [ "$wt" = inherited ]; then unset GIT_WORK_TREE; fi
+    if [ "$ix" = inherited ]; then unset GIT_INDEX_FILE; fi
+  fi
   exec "$PAJA_REAL_GIT" "$@"
 fi
 p=$(cd "$dir" 2>/dev/null && pwd -P)
@@ -105,6 +123,7 @@ while [ -n "$p" ]; do
 done
 if [ "$gd" = inherited ]; then unset GIT_DIR; fi
 if [ "$wt" = inherited ]; then unset GIT_WORK_TREE; fi
+if [ "$ix" = inherited ]; then unset GIT_INDEX_FILE; fi
 exec "$PAJA_REAL_GIT" "$@""#;
 
 /// Puts rustup's directory on `PATH`, installs the git shim when the worktree needs one, then
@@ -733,7 +752,7 @@ mod tests {
         std::fs::write(&shim, GIT_SHIM).unwrap();
         std::fs::write(
             &real,
-            "#!/bin/sh\ndir=; tree=\nfor a in \"$@\"; do case \"$a\" in --git-dir=*) dir=${a#--git-dir=} ;; --work-tree=*) tree=${a#--work-tree=} ;; esac; done\nif [ -n \"${GIT_WORK_TREE:-}\" ]; then wt=\" wt=$GIT_WORK_TREE\"; fi\necho \"dir=$dir tree=$tree env=${GIT_DIR:-}$wt\"\n",
+            "#!/bin/sh\ndir=; tree=; wt=\nfor a in \"$@\"; do case \"$a\" in --git-dir=*) dir=${a#--git-dir=} ;; --work-tree=*) tree=${a#--work-tree=} ;; esac; done\nif [ -n \"${GIT_WORK_TREE:-}\" ]; then wt=\" wt=$GIT_WORK_TREE\"; fi\nif [ -n \"${GIT_INDEX_FILE:-}\" ]; then wt=\"$wt ix=$GIT_INDEX_FILE\"; fi\necho \"dir=$dir tree=$tree env=${GIT_DIR:-}$wt\"\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -927,6 +946,50 @@ mod tests {
                 &[("GIT_DIR", "/x"), ("GIT_WORK_TREE", &root_s)]
             ),
             "dir= tree= env=/x"
+        );
+        // So does `--git-dir` naming another repository, in either form; one naming the
+        // worktree's own git directory keeps the work tree that goes with it.
+        let flagged = |args: &[&str], env: &[(&str, &str)]| {
+            shim_sees_in(&root_s, &gitdir_s, root.path(), args, env)
+        };
+        let inherited_tree = [("GIT_WORK_TREE", root_s.as_str())];
+        assert_eq!(
+            flagged(&["--git-dir=/x", "status"], &inherited_tree),
+            "dir=/x tree= env="
+        );
+        assert_eq!(
+            flagged(&["--git-dir", "/x", "status"], &inherited_tree),
+            "dir= tree= env="
+        );
+        let own_dir = format!("--git-dir={gitdir_s}");
+        assert_eq!(
+            flagged(&[&own_dir, "status"], &inherited_tree),
+            format!("dir={gitdir_s} tree= env= wt={root_s}")
+        );
+        assert_eq!(
+            flagged(&["--git-dir", &gitdir_other, "status"], &inherited_tree),
+            format!("dir= tree= env= wt={root_s}")
+        );
+        // An index file git handed down from the worktree's git directory goes with it.
+        let index = format!("{gitdir_s}/index");
+        assert_eq!(
+            sees(
+                other.path(),
+                &[("GIT_DIR", &gitdir_s), ("GIT_INDEX_FILE", &index)]
+            ),
+            outside
+        );
+        assert_eq!(
+            sees(
+                root.path(),
+                &[("GIT_DIR", "/x"), ("GIT_INDEX_FILE", &index)]
+            ),
+            "dir= tree= env=/x"
+        );
+        // Inside the worktree it stays, beside the redirect.
+        assert_eq!(
+            sees(root.path(), &[("GIT_INDEX_FILE", &index)]),
+            format!("dir={gitdir_s} tree={root_s} env= ix={index}")
         );
         // A symlink to the worktree's git directory is the same directory.
         #[cfg(unix)]
