@@ -758,7 +758,11 @@ newest checkout Paja synced in or made an environment from for it that `gh` stil
 (`jono::known_checkouts`, newest first, from the log's `work.checkout` and `env.created`
 events, each folder once in its newest spelling; each sync records `work.checkout` with its checkout's top level, the nearest folder holding `.git` (its path's `..` parts folded first), when it
 is another folder than the last one, and skips a path that isn't UTF-8; Desk asks `gh` about the newest three at most), else the directory Desk
-started in when it is a checkout of that repository, else an error that says where to start. The
+started in when it is a checkout of that repository, else an error that says where to start. The repository list
+shows the checkout by the same lookup, with each `gh` call limited to 10 s. When `gh` fails (offline, signed out,
+rate-limited, timed out) rather than naming another repository, the row keeps the newest remembered checkout and
+carries the error in `checkout_error`, which the window shows beside the path. Desk reuses a repository's answer for
+30 s as long as its remembered checkouts are the same, so the refreshing window doesn't ask `gh` on every tick. The
 person's text stays in the window across refreshes and errors. Desk's Tauri permissions
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
 `https://github.com/` links, nothing else.
