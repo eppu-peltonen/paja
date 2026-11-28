@@ -11416,6 +11416,10 @@ fn run_with_vars(f: &Factory, vars: &[(&str, &str)], args: &[&str]) -> (Value, S
 /// CI still going at `.paja/ci`'s `wait` escalates, naming the setting and showing the checks,
 /// instead of holding the repository's turn to land for as long as the CI hangs, also when
 /// the default branch moved during the wait. The `gh` that was waiting is ended.
+// Unix only, like `stop_now_on_stdin_stops_at_once_and_ends_the_agent`: on Windows CI paja
+// escalated, but now and then the fake `gh`'s Git Bash processes outlived `taskkill /T` and kept
+// paja's output pipes open, so the run never read as ended, even with `ci-hold` removed.
+#[cfg(unix)]
 #[test]
 fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     let f = Factory::new("test -f feature.txt\n", "land");
@@ -11423,11 +11427,19 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     f.on_main(".paja/ci", "required\nwait 30\n");
     std::fs::write(dir.join("ci-hold"), "").unwrap();
     // Once the run waits for CI, the default branch moves on from another clone. Once the run
-    // has asked on the issue, the fake `gh` is let go: on Windows its Git Bash loop can outlive
-    // the kill and hold paja's output open, which would keep the run from reading as ended.
+    // has asked on the issue, the fake `gh` is let go, so nothing it left behind can hold paja's
+    // output open.
     let mover = {
         let dir = dir.clone();
         std::thread::spawn(move || {
+            // However this thread ends, even by a panic, the fake `gh` is let go.
+            struct LetGo(std::path::PathBuf);
+            impl Drop for LetGo {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("ci-hold"));
+                }
+            }
+            let _let_go = LetGo(dir.clone());
             let started = std::time::Instant::now();
             while !dir.join("ci-waiting").exists() {
                 if started.elapsed().as_secs() >= 300 {
@@ -11466,23 +11478,28 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
                     .count()
             };
             let before = comments();
+            // Far past the 10 seconds the wait has: a run still waiting then never ended `gh`,
+            // which, let go, lands the change and fails the test.
             while comments() == before {
-                if asked.elapsed().as_secs() >= 300 {
+                if asked.elapsed().as_secs() >= 120 {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            let _ = std::fs::remove_file(dir.join("ci-hold"));
             true
         })
     };
     let (report, stderr) =
         run_with_vars(&f, &[("PAJA_TEST_CI_WAIT_MS", "10000")], &["--json", "run"]);
     let moved = mover.join().unwrap();
-    #[cfg(unix)]
     let waiting = std::fs::read_to_string(dir.join("ci-pid")).unwrap_or_default();
     assert!(moved, "the run never waited for CI\n{stderr}");
-    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert_eq!(
+        report["outcome"],
+        "escalated",
+        "{report}\n{stderr}\n{}",
+        f.gh_log()
+    );
     let question = report["question"].as_str().unwrap_or_default();
     assert!(
         question.contains("was still going after 10 seconds")
@@ -11498,7 +11515,6 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     );
     // Ended at the limit: the run only asks once the wait is over, and the wait is over only
     // once `gh` is ended, so it was gone before `ci-hold` was removed.
-    #[cfg(unix)]
     {
         let alive = Command::new("kill")
             .args(["-0", waiting.trim()])
