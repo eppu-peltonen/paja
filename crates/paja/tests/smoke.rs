@@ -2838,15 +2838,24 @@ fn a_none_mode_merge_refused_for_status_checks_names_the_ci_file() {
     std::fs::write(f.tmp.path().join("no-workflows"), "").unwrap();
     std::fs::write(f.tmp.path().join("checks-required"), "").unwrap();
     f.on_main(".paja/ci", "none\n");
-    let (_, report) = f.run();
+    let (ok, report) = f.run();
     let log = f.gh_log();
     assert!(log.contains("pr merge"), "{log}");
-    let text = format!("{report}\n{log}");
+    // A merge gh refuses for the status checks escalates the item: the hint is in the question,
+    // which is asked on the issue after the merge.
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let hint = "is `none`, but the default branch's protection still requires status checks";
+    let question = report["question"].as_str().unwrap_or_default();
     assert!(
-        text.contains(
-            "is `none`, but the default branch's protection still requires status checks"
-        ) && text.contains("put `required` in"),
-        "{text}"
+        question.contains(hint) && question.contains("put `required` in"),
+        "{report}"
+    );
+    let after_merge = &log[log.find("pr merge").unwrap()..];
+    assert!(
+        after_merge.contains("issue comment 5 --body-file")
+            && after_merge.contains("--add-label factory-needs-answer"),
+        "{log}"
     );
 }
 
@@ -7809,6 +7818,35 @@ fn doctor_warns_while_no_step_reports_a_usage_window() {
             .unwrap()
             .contains("had allowed_warning, 93% used"),
         "{check}"
+    );
+}
+
+#[test]
+fn a_nearly_used_window_pauses_before_the_workflow_check() {
+    // With only a new item ready and the window nearly used, the pass pauses: no item would be
+    // claimed, so the missing workflow isn't looked for (and isn't the error).
+    let f = Factory::new("true\n", "land");
+    let resets = epoch_secs_in(3600);
+    std::fs::write(f.tmp.path().join("window-warning"), "").unwrap();
+    std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    std::fs::write(f.tmp.path().join("no-workflows"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("issues.json"),
+        r#"[{"number": 6, "title": "Another", "body": "Please.", "url": "https://example.com/6"}]"#,
+    )
+    .unwrap();
+    paja(&f.home, &f.repo, &["work", "sync"]);
+    let listed = f.gh_log().matches("workflow list").count();
+    let (again, stderr) = f.run_with_stderr();
+    assert_eq!(again["outcome"], "paused", "{again}\n{stderr}");
+    assert_eq!(again["resets_at"], resets * 1000, "{again}");
+    assert_eq!(
+        f.gh_log().matches("workflow list").count(),
+        listed,
+        "{}",
+        f.gh_log()
     );
 }
 

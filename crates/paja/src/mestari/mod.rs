@@ -661,10 +661,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // back on GitHub at every pass; only when something could be taken, so an idle pass never
     // calls GitHub for it; and before the build, because waiting for CI that will never run
     // fails after the whole build.
+    // With the window nearly used, no new item is claimed, so only an item left active counts:
+    // with none, the pass pauses below without calling GitHub, as an idle one does.
+    let wanted = |n: u64| opts.item.is_none_or(|only| only == n);
     if config.ci == CiMode::Required
-        && jono::runnable(home, &name)?
-            .iter()
-            .any(|i| opts.item.is_none_or(|n| n == i.number))
+        && if nearly.is_some() {
+            jono::left_active(home, &name)?.into_iter().any(wanted)
+        } else {
+            jono::runnable(home, &name)?
+                .iter()
+                .any(|i| wanted(i.number))
+        }
     {
         require_workflow(&repo)?;
     }
@@ -678,7 +685,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         if let Some(resets_at) = nearly {
             let ready = jono::runnable(home, &name)?
                 .iter()
-                .any(|i| opts.item.is_none_or(|n| n == i.number));
+                .any(|i| wanted(i.number));
             if ready {
                 progress(&format!(
                     "the usage window is nearly used up, so no new item was started; `paja run` \
