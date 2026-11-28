@@ -549,6 +549,34 @@ fn watch(app: tauri::AppHandle) {
     });
 }
 
+/// The window's size when it opens, in logical pixels (`desk/tauri.conf.json` holds the same).
+const WINDOW_SIZE: (f64, f64) = (1440.0, 900.0);
+
+/// The size to open at on a screen of `screen` logical pixels: [`WINDOW_SIZE`], or the screen's
+/// own when it is smaller.
+fn window_size_for(screen: (f64, f64)) -> (f64, f64) {
+    (WINDOW_SIZE.0.min(screen.0), WINDOW_SIZE.1.min(screen.1))
+}
+
+/// Shrink the window to the screen when the screen is smaller than the size it opens at.
+fn fit_window(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(Some(monitor)) = window.primary_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let screen = (
+        f64::from(monitor.size().width) / scale,
+        f64::from(monitor.size().height) / scale,
+    );
+    let (width, height) = window_size_for(screen);
+    if (width, height) != WINDOW_SIZE {
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    }
+}
+
 /// Start Desk's window.
 pub fn run() {
     tauri::Builder::default()
@@ -582,6 +610,7 @@ pub fn run() {
         ])
         .setup(|app| {
             watch(app.handle().clone());
+            fit_window(app);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -591,6 +620,38 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_opens_big_or_as_big_as_the_screen() {
+        assert_eq!(window_size_for((2560.0, 1440.0)), (1440.0, 900.0));
+        assert_eq!(window_size_for((1366.0, 768.0)), (1366.0, 768.0));
+        assert_eq!(window_size_for((1920.0, 800.0)), (1440.0, 800.0));
+    }
+
+    /// The plain functions behind the screen (`desk/ui/view.js`) have their tests in
+    /// `desk/ui/view.test.js`, run by Node, so the desk CI job (`cargo test -p paja-desk`, on
+    /// runners that have Node) runs them. Without Node on `PATH` the test says so and passes.
+    #[test]
+    fn the_screens_view_functions_pass_their_node_tests() {
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let out = std::process::Command::new("node")
+            .arg("--test")
+            .arg("view.test.js")
+            .current_dir(&ui)
+            .output();
+        match out {
+            Ok(out) => assert!(
+                out.status.success(),
+                "node --test desk/ui/view.test.js failed:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(err) if std::env::var_os("CI").is_some() => panic!(
+                "no node on PATH to run desk/ui/view.test.js ({err}); install Node in the CI job"
+            ),
+            Err(err) => eprintln!("skipped: no node on PATH to run desk/ui/view.test.js ({err})"),
+        }
+    }
 
     fn import(home: &Home, repo: &str, number: u64, title: &str) {
         let lock = home.lock().unwrap();

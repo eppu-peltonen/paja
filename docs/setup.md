@@ -320,9 +320,17 @@ wait at once, and the next run resumes the item.
 
 ## Paja Desk
 
-Paja Desk shows the queue of every repository Paja knows in one window, with what waits on you first, and follows the
-event log as it changes. You can answer Paja's questions there and file new work (it shows the issue for approval
-before filing it). Its footer shows Desk's version and the `paja` it found, and it warns when the two differ.
+Paja Desk opens big (1440×900, or the screen's size) on one repository's lanes, and follows the event log as it
+changes. The top bar shows whether the pool runs, how long, what it landed and spent, and has **Start**, **Stop after
+this step**, **Stop now**, **Held** (highlighted when something waits on you), **New work** and **Repositories**; a
+repository picker appears when Desk knows more than one. Each lane is a card with its item, stage, round, reviewers'
+verdicts, clocks, spend and the files it was admitted for; click a card for the item's run. The dashed **+** card adds
+a lane and each card's **−** removes one (as `paja pool lanes <N>` does: a running pool reads it on its next tick, and
+a stopped one starts with it). The side panel has **Next** (ready items, then those waiting and why), **Held** (click
+one for its question and an answer box) and **Out** (what left a lane, and how); the strip along the bottom shows the
+latest events. You can file new work with **New work** (it shows the issue for approval before filing it). Keys: `n`
+new work, `+` add a lane, `h` held, Escape closes the run view. The strip's header shows Desk's version and the `paja`
+it found, and warns when the two differ.
 
 Under **Repositories** Desk lists every repository Paja knows. Add one by pasting its checkout folder's path (Desk
 syncs its issues there, as `paja work sync` does, and remembers the folder). For each repository:
@@ -334,13 +342,8 @@ syncs its issues there, as `paja work sync` does, and remembers the folder). For
 - **Stop after this step** and **Stop now** do what the first and second Ctrl-C do in a terminal.
 - A run started in a terminal shows as running too, and Desk won't start a second one in the same repository; stop it
   where it was started.
-- **Pool** opens the repository's worker pool: whether it runs, how long, what it spent and landed, how many items
-  are ready or held for your answer, which lane is landing and which wait to land, a row per lane (item, stage,
-  step, time in step, spend, the files it was admitted for), the waiting items and why, the last landings and the
-  pool's latest events. **Start the pool** starts `paja run --every 5 --workers <N>`
-  with the lane count in the box. **Set lanes** changes the count of a running pool, which it reads on its next tick,
-  as `paja pool lanes <N>` does; lowering it says which busy lanes finish their items first. A pool started in a
-  terminal shows here too, and its lanes can be changed the same way.
+- **Start** in the top bar starts `paja run --every 5 --workers <N>` with the pool's lane count. A pool started in a
+  terminal shows in the lanes too, and its lanes can be changed the same way.
 
 Closing Desk while its runs are going asks whether to stop them or leave them running on their own. Stopping
 ends the agent or check each run is on, and ends a run still going after 15 seconds with everything it started.
