@@ -277,31 +277,40 @@ commit, and only that commit lands. A conflict, or checks that fail on it, sends
 another round (`conflict` or `checks_failed`) within the five rounds, and the next review reads the whole change.
 A pool admits an item to a lane only when the files it will touch don't overlap a running item's
 (`crates/paja/src/mestari/plan.rs`). Before a lane starts it, the pool plans the item in a `paja pool plan <number>` of
-its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; recorded as `pool.planning`):
-the item's `Touches:` line names the paths when it has one (`source: spec`; the words `and`, `or`, `none` and
-`nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
-`plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). That
-environment is `<repo>-<hash>-plan-<issue>`, so two repositories sharing a home never plan in one checkout; one of that
-name made from another repository stops the plan with the `paja env remove <name>` fix, and an older release's
-`plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an OS lock for its
-item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs is refused
-within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no planner of its
-own, records `pool.planning`, says so, counts the item as being planned (it takes one of the free lanes' planning
-slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A planner of
-the pool's refused because a plan started by hand took the lock just after the pool looked waits the same way. An item
-that leaves the queue meanwhile is no longer waited for. The pool looks only when it is about to plan an item: one that
-already has a plan from this pool run can be admitted on it while a plan started by hand re-plans it. The plan,
-`pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
-they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
-`.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
-`error`) overlaps everything, so its item runs only in an otherwise idle pool,
-unless it is planned again: after the next timed sync, once per pool run. The pool takes items in queue order and
-admits one only once every item before it has a plan, so a plan that finishes first never puts a later item ahead;
-it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording `pool.admitted` (`repo`,
-`number`, `lane`, `paths`, `source`, `high_risk`). Each round records the paths its change touches as `run.changed`;
-when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`, `admitted`), so the planner's
-accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows each lane's `paths` and each
-waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning which files it touches`).
+its own, so its ticks go on meanwhile, recorded as `pool.planning`. With a lane free, it runs at most as many plans at
+once as there are free lanes. With every lane busy, it looks every 5 seconds and plans ahead, in queue order, until the
+first items a freed lane could take, as many as the pool has lanes, have a plan ready or on its way, so the next lane to
+free has its plan waiting. An item that would still wait whichever one lane ends (two running lanes block it: an
+overlap, both high risk, or a failed plan) isn't one of them. An item that one lane blocks counts, though another lane
+may end first, and that lane then plans its next item itself. A look scans at most twice as many items as the pool has
+lanes, no more plans run at once than the pool has lanes, and none are planned ahead while `pool lanes` shrinks the
+pool. Planning ahead reads the queue as last synced, since a busy pool doesn't sync, and a failed plan is retried only
+after a timed sync, which waits for a free lane. In a plan, the item's `Touches:` line names the paths when it has one
+(`source: spec`; the words `and`, `or`, `none` and `nothing` and a sentence's punctuation are skipped, though a bracket
+pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`),
+else a short read-only agent on the `plan` role, in an environment of the default branch under the deny-list hook, lists
+them (`source: plan`). That environment is `<repo>-<hash>-plan-<issue>`, so two repositories sharing a home never plan
+in one checkout; one of that name made from another repository stops the plan with the `paja env remove <name>` fix, and
+an older release's `plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an
+OS lock for its item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs
+is refused within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no
+planner of its own, records `pool.planning`, says so, counts the item as being planned (it takes one of the pool's
+planning slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A
+planner of the pool's refused because a plan started by hand took the lock just after the pool looked waits the same
+way. An item that leaves the queue meanwhile is no longer waited for. The pool looks only when it is about to plan an
+item: one that already has a plan from this pool run can be admitted on it while a plan started by hand re-plans it. The
+plan, `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap
+when they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
+`.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed
+(`source: failed`, with its `error`) overlaps everything, so its item runs only in an otherwise idle pool, unless it is
+planned again: after the next timed sync, once per pool run. The pool takes items in queue order and admits one only
+once every item before it has a plan, so a plan that finishes first never puts a later item ahead; it skips one that
+overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording
+`pool.admitted` (`repo`, `number`, `lane`, `paths`, `source`, `high_risk`). Each round records the paths its change
+touches as `run.changed`; when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`,
+`admitted`), so the planner's accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows
+each lane's `paths` and each waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning which files it
+touches`).
 
 A planner runs in a process group of its own, so a terminal's Ctrl-C reaches only the pool, and any interrupt a
 planner does get (a Ctrl-Break on Windows, a hangup) stops it at once. One still going after 10 minutes is ended and
