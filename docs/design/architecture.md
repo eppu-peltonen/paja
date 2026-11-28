@@ -463,19 +463,18 @@ carries `approved`: the `reviewed` commit, the `commit` it lands as, how many `r
 `run.checked` with `landing` true is of Paja's own merge of the default branch into the approved change, which moves the
 approval's `commit` to it; checks on any other commit in that round, or a later review in it that didn't approve, take
 the approval back. A round stopped or ended on an error has no `noted`, and older events without these fields stay
-readable. Each `run.round` event also lists the
-round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
-Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
-`duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
-already ran, as a `run.round` with verdict `error` and the error as its detail, before the item is parked. A field the
-result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying those events gives
-each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching MCP tools; a step
-with missing fields counts in its `unknown_steps` and adds only the fields it has, so each sum is a lower bound; a
-recorded step Jono can't read counts as unknown and adds nothing, so a bad usage record never stops the queue, and
-the sequence number of its event is listed in `unreadable_events`. While it
-works, `paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each
-review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON.
-`paja run --every 5` keeps going, checking an empty queue every five minutes.
+readable. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or `review` with
+its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and cache-creation
+tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p` result. A round that
+stops on an error still records the steps that already ran, as a `run.round` with verdict `error` and the error as its
+detail, before the item is parked. A field the result lacks is `null`, never zero, and rounds recorded before steps were
+kept have none. Replaying those events gives each work item a `usage` total (null until a step is recorded) in `paja
+work` JSON and the matching MCP tools; a step with missing fields counts in its `unknown_steps` and adds only the fields
+it has, so each sum is a lower bound; a recorded step Jono can't read counts as unknown and adds nothing, so a bad usage
+record never stops the queue, and the sequence number of its event is listed in `unreadable_events`. While it works,
+`paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each review
+and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON. `paja run
+--every 5` keeps going, checking an empty queue every five minutes.
 
 ### Posti
 
