@@ -50,13 +50,12 @@ const WORKTREE_GITDIR_VAR: &str = "PAJA_WT_GITDIR";
 /// other directory is the caller's own and left alone. A caller that sets any of them to
 /// the worktree's own can't be told from git handing it down, so it is treated the same way.
 /// Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a git called
-/// there usually runs the real git, not this shim. A relative value is read against the
-/// current directory, before any `-C`; git hands down absolute ones, except the `.` it gives a
-/// hook as `GIT_WORK_TREE`, which a hook that changes directory makes the caller's own. Paths
-/// are compared by identity (`-ef`: each
-/// directory from the target up to `/` against the root, and the git directories), not by
-/// spelling, so separators, case, short names (`RUNNER~1`), symlinks and mount spellings don't
-/// matter.
+/// there usually runs the real git, not this shim. A relative value is read, as git reads it,
+/// against the directory after any `-C`; git hands down absolute ones, except the `.` it gives
+/// a hook as `GIT_WORK_TREE`, which a hook that runs git in another directory makes the
+/// caller's own. Paths are compared by identity (`-ef`: each directory from the target up to
+/// `/` against the root, and the git directories), not by spelling, so separators, case, short
+/// names (`RUNNER~1`), symlinks and mount spellings don't matter.
 const GIT_SHIM: &str = r#"#!/bin/sh
 dir=.
 want=0
@@ -67,13 +66,6 @@ fgd=0
 fwt=0
 gdv=
 ix=none
-if [ -n "${GIT_DIR:-}" ]; then
-  if [ "$GIT_DIR" = "$PAJA_WT_GITDIR" ] || [ "$GIT_DIR" -ef "$PAJA_WT_GITDIR" ]; then gd=inherited; else gd=own; fi
-fi
-if [ -n "${GIT_WORK_TREE:-}" ]; then
-  if [ "$GIT_WORK_TREE" = "$PAJA_WT_ROOT" ] || [ "$GIT_WORK_TREE" -ef "$PAJA_WT_ROOT" ]; then wt=inherited; else wt=own; fi
-fi
-if [ -n "${GIT_INDEX_FILE:-}" ] && [ "$(dirname "$GIT_INDEX_FILE")" -ef "$PAJA_WT_GITDIR" ]; then ix=inherited; fi
 for a in "$@"; do
   if [ "$want" = 2 ]; then
     gdv=$a
@@ -100,11 +92,20 @@ for a in "$@"; do
     *) break ;;
   esac
 done
+# Git reads a relative value after any `-C`.
+at() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$dir/$1" ;; esac; }
+if [ -n "${GIT_DIR:-}" ]; then
+  if [ "$GIT_DIR" = "$PAJA_WT_GITDIR" ] || [ "$(at "$GIT_DIR")" -ef "$PAJA_WT_GITDIR" ]; then gd=inherited; else gd=own; fi
+fi
+if [ -n "${GIT_WORK_TREE:-}" ]; then
+  if [ "$GIT_WORK_TREE" = "$PAJA_WT_ROOT" ] || [ "$(at "$GIT_WORK_TREE")" -ef "$PAJA_WT_ROOT" ]; then wt=inherited; else wt=own; fi
+fi
+if [ -n "${GIT_INDEX_FILE:-}" ] && [ "$(dirname "$(at "$GIT_INDEX_FILE")")" -ef "$PAJA_WT_GITDIR" ]; then ix=inherited; fi
 if [ "$fgd" = 1 ] || [ "$gd" = own ]; then
   # The caller chose a repository: the worktree's inherited work tree and index belong to it
   # only when that is the worktree's own git directory.
   chosen=${gdv:-$GIT_DIR}
-  if [ "$fgd" = 0 ] || { [ "$chosen" != "$PAJA_WT_GITDIR" ] && ! [ "$chosen" -ef "$PAJA_WT_GITDIR" ]; }; then
+  if [ "$fgd" = 0 ] || { [ "$chosen" != "$PAJA_WT_GITDIR" ] && ! [ "$(at "$chosen")" -ef "$PAJA_WT_GITDIR" ]; }; then
     if [ "$wt" = inherited ]; then unset GIT_WORK_TREE; fi
     if [ "$ix" = inherited ]; then unset GIT_INDEX_FILE; fi
   fi
@@ -974,6 +975,23 @@ mod tests {
                 &[("GIT_WORK_TREE", &root_s), ("GIT_INDEX_FILE", &index)]
             ),
             format!("dir={gitdir_s} tree= env= wt={root_s} ix={index}")
+        );
+        // A relative `GIT_WORK_TREE` is read after `-C` too: a hook's `.` is the worktree only
+        // for a git run there.
+        let other_s = other.path().to_str().unwrap();
+        assert_eq!(
+            flagged(&["-C", other_s, "status"], &[("GIT_WORK_TREE", ".")]),
+            "dir= tree= env= wt=."
+        );
+        assert_eq!(
+            flagged(&["status"], &[("GIT_WORK_TREE", ".")]),
+            format!("dir={gitdir_s} tree={root_s} env= wt=.")
+        );
+        // A relative `--git-dir` is read after `-C`, as git reads it.
+        let gitdirs_s = gitdirs.path().to_str().unwrap();
+        assert_eq!(
+            flagged(&["-C", gitdirs_s, "--git-dir=w", "status"], &inherited_tree),
+            format!("dir=w tree= env= wt={root_s}")
         );
         assert_eq!(
             flagged(&["--git-dir", &gitdir_other, "status"], &inherited_tree),
