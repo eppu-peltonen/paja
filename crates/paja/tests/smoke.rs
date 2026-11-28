@@ -12840,7 +12840,7 @@ fn lanes_waiting_to_land_take_the_turn_in_the_order_they_began_to_wait() {
             .as_array()
             .unwrap()
             .iter()
-            .rfind(|e| e["kind"] == "pool.landing" && e["data"]["number"] == n)
+            .rfind(|e| e["kind"] == "run.landing" && e["data"]["number"] == n)
             .map(|e| e["seq"].as_u64().unwrap())
     };
     // One at a time, so the order they begin to wait is known.
@@ -12980,8 +12980,8 @@ fn two_lanes_ready_at_once_land_one_after_the_other_each_on_the_latest_main() {
             .map(|e| e["seq"].as_u64().unwrap())
             .unwrap_or_else(|| panic!("no {kind} for #{n}"))
     };
-    assert!(seq("run.landed", first) < seq("pool.landing", second));
-    assert!(seq("pool.merging", second) < seq("run.landed", first));
+    assert!(seq("run.landed", first) < seq("run.landing", second));
+    assert!(seq("run.merging", second) < seq("run.landed", first));
     let branch = std::fs::read_to_string(f.tmp.path().join("prs/2")).unwrap();
     let held = on_origin(&f, branch.trim(), &format!("{}.txt", title(first)));
     assert!(held.is_some(), "the second branch lacks the first change");

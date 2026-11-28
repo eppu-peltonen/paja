@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::land::{EV_LANDING, EV_MERGING};
+use super::land::{turn_kind, EV_LANDING, EV_MERGING};
 use super::plan::{blocked_by, overlap, Plan, EV_POOL_PLANNED};
 use super::EV_CHANGED;
 use super::{progress, EV_LANDED, EV_ROUND, EV_STEP};
@@ -1331,7 +1331,7 @@ pub fn status(home: &Home, repo: &str) -> Result<PoolStatus> {
 }
 
 /// Which of `lanes` holds the repository's turn to land, and which wait for it, longest first.
-/// A lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed` since its item
+/// A lane's latest `run.merging`, `run.landing`, `run.round` or `run.landed` since its item
 /// started says: a round or a landing after the turn ends it.
 fn land_turns(
     events: &[Event],
@@ -1349,11 +1349,11 @@ fn land_turns(
             .find(|e| {
                 e.data["repo"] == repo
                     && e.data["number"] == lane.number
-                    && [EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&e.kind.as_str())
+                    && [EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&turn_kind(e))
             });
         match latest {
-            Some(e) if e.kind == EV_LANDING => landing = Some(lane.number),
-            Some(e) if e.kind == EV_MERGING => merging.push((e.seq, lane.number)),
+            Some(e) if turn_kind(e) == EV_LANDING => landing = Some(lane.number),
+            Some(e) if turn_kind(e) == EV_MERGING => merging.push((e.seq, lane.number)),
             _ => {}
         }
     }
@@ -2308,6 +2308,16 @@ mod tests {
         );
         // #5 went back for a round; #7 took the turn.
         events.extend([round(11, 5), turn(12, EV_LANDING, 7)]);
+        let status = from_events(&events, "acme/app", true, &[]);
+        assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
+        // A log written before the rename names them `pool.landing` and `pool.merging`.
+        for e in &mut events {
+            e.kind = match e.kind.as_str() {
+                EV_LANDING => "pool.landing".to_string(),
+                EV_MERGING => "pool.merging".to_string(),
+                _ => e.kind.clone(),
+            };
+        }
         let status = from_events(&events, "acme/app", true, &[]);
         assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
     }
