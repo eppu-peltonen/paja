@@ -168,9 +168,12 @@ pub fn from_events(
                 };
                 let verdict = data["verdict"].as_str().unwrap_or_default().to_string();
                 let detail = data["detail"].as_str().unwrap_or_default().to_string();
-                // A round approved for landing is recorded when its review ends, and again if it
-                // then fails at the turn to land (a conflict, the checks on the latest default
-                // branch, CI): the later record is how the round ended, and keeps what both spent.
+                // A later `run.round` for the same round is how that round ended: a round approved
+                // for landing is recorded when its review ends, and again if it then fails at the
+                // turn to land (a conflict, the checks on the latest default branch, CI) or errors.
+                // Its verdict and detail replace the earlier ones, and the steps of both are kept.
+                // Such a repeat always follows the earlier record directly, and `run` holds only
+                // the latest run, so only the last round shown can be the one repeated.
                 match live.rounds.last_mut().filter(|r| r.round == round) {
                     Some(earlier) => {
                         earlier.verdict = verdict;
@@ -299,7 +302,8 @@ mod tests {
         };
         let review = json!([{"step": "review", "reviewer": 1, "cost_usd": 0.2}]);
         events.push(round(7, "land", "fake review", review));
-        events.push(round(8, "conflict", "feature.txt", json!([])));
+        let fix = json!([{"step": "build", "cost_usd": 0.1}]);
+        events.push(round(8, "conflict", "feature.txt", fix));
         let live = from_events(&events, &item(Status::Active), true, |_| None).unwrap();
         let rounds: Vec<(u32, &str, &str)> = live
             .rounds
@@ -313,8 +317,10 @@ mod tests {
                 (2, "conflict", "feature.txt")
             ]
         );
-        assert_eq!(live.rounds[1].steps.len(), 1, "{:?}", live.rounds[1]);
-        assert_eq!(live.rounds[1].steps[0].cost_usd, Some(0.2));
+        let spent: Vec<Option<f64>> = live.rounds[1].steps.iter().map(|s| s.cost_usd).collect();
+        assert_eq!(spent, [Some(0.2), Some(0.1)], "{:?}", live.rounds[1]);
+        assert_eq!(live.round, 2);
+        assert!(live.step.is_none(), "{:?}", live.step);
     }
 
     #[test]

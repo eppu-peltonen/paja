@@ -422,10 +422,11 @@ queues the item again, with no `run.escalated`. `run.step` (`round`, `role`, `mo
 `reviewer`, `pr`) records that a step starts, so the run can be followed from outside its terminal: an agent step under
 its `.paja/models` role, `checks` for Vasara's checks, and `ci` (or `land` with no CI) once the pull request `pr` is
 open; logs from before it replay with no steps. `run.checked` (`round`, `commit`, `base`)
-records that Vasara's checks passed on a commit. A round approved for landing is recorded when its review ends, and
-again, under the same `round`, if it then fails at the turn to land (a conflict or failed checks on the latest default
-branch, or failed CI): readers take the later record as how the round ended, and `paja run`'s live view shows it once,
-with the steps of both. A `run.round` of a round after which the loop goes on carries
+records that Vasara's checks passed on a commit. A round can be recorded twice in one run: a later `run.round` for the
+same `round` is how that round ended, such as a round approved for landing that then fails at the turn to land (a
+conflict or failed checks on the latest default branch, or failed CI) or errors. Readers take the later record: the
+`run` of `paja work show` (and Paja Desk's run view) shows the round once, with the later verdict and detail in place
+of the earlier ones and the steps of both. A `run.round` of a round after which the loop goes on carries
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
 like `detail`) or null, and with no `prior` the `noted` findings outside the change the latest review named, for the
 next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list
