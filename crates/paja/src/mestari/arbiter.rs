@@ -140,7 +140,8 @@ const ANSWER_MARKERS: [&str; 29] = [
     "fixture",
 ];
 
-/// Words that, beside a check command in an answer, mean not running it as it is.
+/// Words for not running something. An answer that names a check command and has any of them,
+/// anywhere, is overruled; that errs toward asking the person.
 const NOT_RUNNING: [&str; 13] = [
     "skip",
     "drop",
@@ -201,8 +202,8 @@ fn names_a_guard(text: &str) -> Option<&'static str> {
 
 /// What in an answer would have a person decide: a marker of a test or a skipped check, a test
 /// file, or one of Vasara's check commands (a line of `.paja/checks` with arguments, matched as
-/// whole words) beside a word for not running it. An answer that only says a check should pass
-/// stands.
+/// whole words) in an answer that also has a word for not running something ([`NOT_RUNNING`],
+/// anywhere in it). An answer that only says a check should pass stands.
 fn answer_names_a_check(answer: &str, checks: &[String]) -> Option<String> {
     let lower = answer.to_lowercase();
     if let Some(marker) = ANSWER_MARKERS.iter().find(|m| lower.contains(*m)) {
@@ -669,7 +670,8 @@ mod tests {
             let why = found(answer).unwrap_or_default();
             assert!(why.contains("the answer says"), "{answer}: {why}");
         }
-        // A check command beside a word for not running it; only saying it should pass stands.
+        // A check command in an answer with a word for not running something; only saying it
+        // should pass stands.
         let why = found("Skip `cargo test --release` for now").unwrap_or_default();
         assert!(why.contains("`cargo test`"), "{why}");
         assert_eq!(found("Fix it so `cargo test` passes."), None);

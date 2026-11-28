@@ -95,17 +95,17 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
   answer stands only when it gives it as `false`. Word and path rules back it up:
   - weakening phrases (relax the test, skip the check, drop the assert and the like) in the question, the reviewers'
     summaries or the answer;
-  - a guard file or rule named in Paja's own words of the question or in the answer, but not in what reviewers or a
-    check wrote (their summaries, the last feedback a question quotes), which names them only to say what a change is
-    about or where a test failed;
+  - a guard file or rule named in the question itself (Paja's framing, or the builder's or a reviewer's escalation
+    question) or in the answer, but not in the reviewers' summaries or the check output a question quotes, which name
+    them only to say what a change is about or where a test failed;
   - in the answer alone, markers of a changed test or a skipped check (`#[ignore`, `--skip`, `.skip(`, an expected
-    value, a snapshot, the CI config), any test file, and a `.paja/checks` command with arguments next to a word for
-    not running it.
+    value, a snapshot, the CI config), any test file or test code, and a `.paja/checks` command with arguments in an
+    answer that also has a word for not running something (skip, drop, stop and the like, anywhere in it).
 
-  So an answer that only says "add a case in tests/smoke.rs" escalates too; that errs toward asking the person. The
-  person then gets the raw question and the reason. The prompt also tells the arbiter to escalate anything that
-  changes the issue's intent or scope, secrets, actions outside the repository and any question that asks for the
-  person's preference.
+  So an answer that only adds a test ("add a case in tests/smoke.rs") escalates too; that errs toward asking the
+  person. The person then gets the raw question and the reason. The prompt also tells the arbiter to escalate anything
+  that changes the issue's intent or scope, secrets, actions outside the repository and any question that asks for
+  the person's preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not
   decisions (a usage limit, an error Mestari can't fix, landing, CI and merge problems) skip the arbiter.
 
