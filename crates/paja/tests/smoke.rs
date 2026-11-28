@@ -12938,41 +12938,52 @@ fn a_pool_reuses_an_earlier_plan_and_plans_an_edited_item_again() {
     ];
     let (ok, synced) = paja_with(&f.home, &f.repo, &["work", "sync"], &vars);
     assert!(ok, "{synced}");
-    for n in ["5", "6"] {
+    for n in ["5", "6", "7"] {
         let (ok, plan) = paja_with(&f.home, &f.repo, &["pool", "plan", n], &vars);
         assert!(ok, "{plan}");
+        assert!(plan["basis"].is_string(), "{plan}");
     }
-    // #6's `Touches:` line is edited before the pool starts; the pool's first sync sees it.
+    // #6's `Touches:` line is edited; the sync a pool makes as it starts records the edit before
+    // it admits anything.
     std::fs::write(&issues, issues_at("docs/new.md")).unwrap();
-    let pool = start_pool(&f, "2");
-    wait_until(&f, "Alpha and Beta building", || {
-        holding(&f, "Alpha") && holding(&f, "Beta")
-    });
+    let pool = start_pool(&f, "1");
+    wait_until(&f, "Alpha building", || holding(&f, "Alpha"));
+    let planned_6 = || {
+        events_of(&f, "pool.planned")
+            .iter()
+            .filter(|e| e["data"]["number"] == 6)
+            .count()
+    };
+    wait_until(&f, "Beta planned again", || planned_6() == 2);
     let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
     assert!(ok, "{status}");
-    let lane_of = |n: u64| {
-        status["lanes"]
+    assert_eq!(
+        status["lanes"][0]["paths"],
+        serde_json::json!(["Alpha.txt"]),
+        "{status}"
+    );
+    let waiting = |n: u64| {
+        status["waiting"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|l| l["number"] == n)
-            .unwrap_or_else(|| panic!("{status}"))
+            .find(|w| w["number"] == n)
+            .unwrap_or_else(|| panic!("{status}"))["paths"]
             .clone()
     };
-    assert_eq!(lane_of(5)["paths"], serde_json::json!(["Alpha.txt"]));
-    assert_eq!(lane_of(6)["paths"], serde_json::json!(["docs/new.md"]));
+    assert_eq!(waiting(6), serde_json::json!(["docs/new.md"]));
+    assert_eq!(waiting(7), serde_json::json!(["Gamma.txt"]));
     for t in ["Alpha", "Beta", "Gamma"] {
         release(&f, t);
     }
     wait_until(&f, "all three landing", || landed(&f) == 3);
     assert_eq!(stop_pool(&f, pool).len(), 3);
-    // The pool planned #6 (edited) and #7 (never planned), and not #5.
-    let mut planning: Vec<u64> = events_of(&f, "pool.planning")
+    // The pool planned only #6, the edited item; #5 and #7 ran on the plans made by hand.
+    let planning: Vec<u64> = events_of(&f, "pool.planning")
         .iter()
         .map(|e| e["data"]["number"].as_u64().unwrap())
         .collect();
-    planning.sort();
-    assert_eq!(planning, [6, 7]);
+    assert_eq!(planning, [6]);
 }
 
 #[cfg(unix)]

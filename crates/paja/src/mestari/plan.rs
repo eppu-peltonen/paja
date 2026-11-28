@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// A plan of an item: `{repo, number, paths, source, high_risk, error?}`. `source` is `spec`
+/// A plan of an item: `{repo, number, paths, source, high_risk, basis?, error?}`. `source` is `spec`
 /// (its `Touches:` line), `plan` (the planning agent) or `failed`, which the pool treats as
 /// touching everything.
 pub const EV_POOL_PLANNED: &str = "pool.planned";
@@ -21,8 +21,33 @@ pub struct Plan {
     pub source: String,
     /// Whether any path is under `.paja/high-risk`, as main has it.
     pub high_risk: bool,
+    /// What the plan was made from: [`text_basis`] of the item's title and text as the plan read
+    /// them, so a pool can tell a plan of the item as it is now from one of older text. Absent
+    /// from a failed plan, and from plans older releases recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// A short, stable fingerprint of an item's title and text (64-bit FNV-1a, in hex): the same
+/// in every release and on every platform, so a plan's `basis` can be compared with the item
+/// as a later sync left it.
+pub fn text_basis(title: &str, body: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in title.bytes().chain([0]).chain(body.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Whether a plan of `paths` is high risk by the `high_risk` prefixes: a path under one, or a
+/// directory holding one.
+pub fn judge_high_risk(paths: &[String], high_risk: &[String]) -> bool {
+    paths
+        .iter()
+        .any(|p| is_high_risk(p, high_risk) || high_risk.iter().any(|h| overlap(p, h)))
 }
 
 /// The paths a spec's `Touches:` line names, comma- or space-separated, quotes, backticks and
@@ -211,6 +236,7 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
                 paths: Vec::new(),
                 source: "failed".to_string(),
                 high_risk: false,
+                basis: None,
                 error: Some(format!("{err:#}")),
             };
             // A tampered repository gets no more git or gh, and no event that could hide it.
@@ -270,11 +296,10 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
         repo: name.to_string(),
         number,
         // A directory holding a high-risk path is high risk too.
-        high_risk: paths
-            .iter()
-            .any(|p| is_high_risk(p, &high_risk) || high_risk.iter().any(|h| overlap(p, h))),
+        high_risk: judge_high_risk(&paths, &high_risk),
         paths,
         source: source.to_string(),
+        basis: Some(text_basis(&item.title, &item.body)),
         error: None,
     })
 }
@@ -522,6 +547,7 @@ mod tests {
             paths: paths.iter().map(|p| p.to_string()).collect(),
             source: source.into(),
             high_risk,
+            basis: None,
             error: None,
         };
         let a = plan(5, &["src/a.rs"], "spec", false);
