@@ -3316,7 +3316,7 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
     init_repo(&repo);
-    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13];
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     let issues: Vec<Value> = numbers
         .iter()
         .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
@@ -3394,11 +3394,16 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     init_repo(&other);
     tree(&other, &env(11));
     // 12 still has the `work-<n>` environment an older release made: a reopened item wouldn't
-    // resume that name's branch, so it stays for doctor to name.
+    // resume that name's branch, so it stays (#523).
     let legacy = tree(&repo, "work-12");
     // 13 has a change to a tracked file.
     let changed = tree(&repo, &env(13));
     std::fs::write(changed.join("hello.txt"), "changed\n").unwrap();
+    // 14's worktree lost its `.git` file, so git can't read it; 15's folder is gone.
+    let unreadable = tree(&repo, &env(14));
+    std::fs::remove_file(unreadable.join(".git")).unwrap();
+    let gone = tree(&repo, &env(15));
+    std::fs::remove_dir_all(&gone).unwrap();
 
     // The issues are closed instead of answered.
     std::fs::write(tmp.path().join("issues.json"), "[]").unwrap();
@@ -3435,7 +3440,10 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     for n in [6, 13] {
         assert!(why(n).contains("uncommitted changes"), "{report}");
     }
-    assert_eq!(kept.len(), 5, "{report}");
+    assert!(why(14).contains("git couldn't read the HEAD"), "{report}");
+    assert!(why(15).contains("is already gone"), "{report}");
+    assert!(unreadable.join("hello.txt").exists());
+    assert_eq!(kept.len(), 7, "{report}");
     // The branch stays, so a reopened item resumes from it.
     git_out(
         &repo,
@@ -3456,7 +3464,7 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
         .unwrap_or_else(|| panic!("no environments check in {doctor}"))
         .clone();
     let detail = check["detail"].as_str().unwrap();
-    for n in [6, 7, 8, 9, 10, 13] {
+    for n in [6, 7, 8, 9, 10, 13, 14, 15] {
         assert!(detail.contains(&env(n)), "{check}");
     }
     assert!(!detail.contains(WORK_5), "{check}");

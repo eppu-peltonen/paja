@@ -2030,14 +2030,18 @@ pub fn sync_with(
 /// is closed on GitHub instead of answered, nothing else frees the worktree and port block. The
 /// branch stays, so a reopened item resumes from it. Only the environment named by
 /// [`WorkItem::env_name`] is freed: a reopened item resumes from that name's branch only, so an
-/// older release's `work-<n>` stays for `paja doctor` to name. An environment is kept, with the
+/// older release's `work-<n>` stays (`paja doctor` names it only in a log no sync has pinned
+/// to a repository yet; #523 covers the rest). An environment is kept, with the
 /// reason, when:
 ///
 /// - its issue is still open on GitHub (the item left the queue because its label changed, or
 ///   `follow-ups = off` hides it), or `gh` can't say;
 /// - a run holds the item, or the item is no longer closed and parked by the time the home lock
 ///   is taken for the removal;
-/// - its worktree isn't on the item's branch, so commits made there could be lost;
+/// - its worktree folder is already gone: removing it would `git worktree prune` the whole
+///   repository, which `paja env remove` does when asked;
+/// - its worktree isn't on the item's branch, so commits made there could be lost, or git
+///   can't read its HEAD;
 /// - git refuses to remove it: uncommitted changes or untracked files. Ignored files (build
 ///   output, a local `.env`) go with the worktree.
 ///
@@ -2084,6 +2088,8 @@ fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<Str
         });
         match removed {
             Ok(_) => freed.push(name),
+            // Removed since the list was read (another sync, `paja env remove`): nothing to keep.
+            Err(_) if crate::ahjo::get(home, &name).is_err() => {}
             Err(err) => kept.push(Kept {
                 env: name,
                 why: format!("{err:#}"),
@@ -2113,9 +2119,17 @@ fn still_free(
     if home.run_held(repo, number)? {
         return Ok(Some(format!("a run holds item #{number}")));
     }
+    if !env.path.exists() {
+        return Ok(Some(format!(
+            "{} is already gone; `paja env remove {}` forgets it (and prunes the repository's \
+             other missing worktrees)",
+            env.path.display(),
+            env.name
+        )));
+    }
     // git runs only in a repository the tamper check passed; without one the removal says
     // why it stops.
-    if checked.is_some() && env.path.exists() {
+    if checked.is_some() {
         let out = crate::ahjo::git_command()
             .arg("-C")
             .arg(&env.path)
@@ -3073,11 +3087,12 @@ mod tests {
     fn a_closed_items_environment_is_kept_once_the_item_moves_on_or_a_run_holds_it() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path().join("home")).unwrap();
-        // Gone from disk, so only the item's state decides.
+        // No tamper check passed, so no git runs: only the item's state decides.
+        std::fs::create_dir_all(dir.path().join("tree")).unwrap();
         let env = crate::ahjo::Env {
             name: env_name(R, 5),
             repo: dir.path().join("gone"),
-            path: dir.path().join("gone-tree"),
+            path: dir.path().join("tree"),
             branch: format!("paja/{}", env_name(R, 5)),
             base_commit: "abc".into(),
             port_base: 20_000,

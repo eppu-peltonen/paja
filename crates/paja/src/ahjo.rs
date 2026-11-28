@@ -336,7 +336,7 @@ pub(crate) fn remove_unless(
                         repo = env.repo.display()
                     )
                 } else {
-                    format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
+                    format!("removing worktree {path}; git refuses one with uncommitted changes or untracked files (--force discards them), and a locked one or one with submodules")
                 }
             })?;
             }
