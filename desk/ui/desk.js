@@ -531,7 +531,7 @@ function poolNote(status, lanes) {
   const busy = status.lanes.map((lane) => lane.lane);
   if (lanes == null || Number.isNaN(lanes) || busy.length <= lanes) return "";
   const names = busy.length === 1 ? `Lane ${busy[0]} is` : `Lanes ${busy.slice(0, -1).join(", ")} and ${busy[busy.length - 1]} are`;
-  const then = lanes === 0 ? "no new lane starts until the count is raised" : `a new lane starts only once fewer than ${lanes} are busy`;
+  const then = lanes === 0 ? "no new lane starts until the count is raised" : `the pool then keeps ${lanes} ${lanes === 1 ? "lane" : "lanes"} busy`;
   return `${names} busy: each finishes its item, and ${then}.`;
 }
 
