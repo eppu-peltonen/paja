@@ -4025,7 +4025,7 @@ mod tests {
         )
         .unwrap();
         let prefixes = super::lines(&text);
-        for file in ["agent.rs", "land.rs", "mod.rs"] {
+        for file in ["agent.rs", "land.rs", "mod.rs", "plan.rs"] {
             let path = format!("crates/paja/src/mestari/{file}");
             assert!(super::is_high_risk(&path, &prefixes), "{path}");
         }
@@ -4545,7 +4545,6 @@ mod tests {
             "mestari/builder.rs",
             "mestari/follow_ups.rs",
             "mestari/live.rs",
-            "mestari/plan.rs",
             "mestari/pool.rs",
             "mestari/progress.rs",
             "mestari/usage.rs",

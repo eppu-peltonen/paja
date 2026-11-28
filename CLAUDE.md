@@ -44,12 +44,12 @@ the real repository, to the smoke tests.
   the review prompt and verdicts), `agent.rs` (`claude()`, the hook settings and self-test, the sandbox glue,
   `GitGuard`), `arbiter.rs` (the arbiter agent that settles an escalation before it reaches the person, and the
   rules that overrule it), `land.rs` (landing, waiting for CI, escalation), `triage.rs` (`paja triage`: an agent
-  closes duplicate and already-fixed follow-ups) and `detect.rs` (the `init` agents' sandboxes and tool lists).
-  `usage.rs` (what a step spent), `progress.rs` (stderr text), `follow_ups.rs`, `builder.rs` (the builder's question
-  and answers), `pool.rs` (`paja run --workers`: lanes, each a `paja run --item` of its own), `plan.rs` (`paja pool
-  plan`: the files an item will touch, which the pool admits it by) and `live.rs` (where a run is, read from the log)
-  are normal risk. Outside `mestari/`, `init/generate.rs` (the programs a generated skeleton's agent may run) is high
-  risk too.
+  closes duplicate and already-fixed follow-ups), `detect.rs` (the `init` agents' sandboxes and tool lists) and
+  `plan.rs` (`paja pool plan`: the planning agent's tool list and read-only checkout, and the files an item will
+  touch, which the pool admits it by). `usage.rs` (what a step spent), `progress.rs` (stderr text), `follow_ups.rs`,
+  `builder.rs` (the builder's question and answers), `pool.rs` (`paja run --workers`: lanes, each a `paja run
+  --item` of its own) and `live.rs` (where a run is, read from the log) are normal risk. Outside `mestari/`,
+  `init/generate.rs` (the programs a generated skeleton's agent may run) is high risk too.
 - `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`, `.paja/labels`: Vasara's check commands, the
   high-risk path prefixes, the model per agent role, the programs agents may run besides local git (`review <program>`
   for reviewers too; `cargo` when missing) and the repository's `work`, `follow-up` and `needs-answer` issue labels

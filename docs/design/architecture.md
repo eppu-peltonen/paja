@@ -170,10 +170,10 @@ Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/hi
 what lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review
 prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue,
 `GitGuard`), `arbiter.rs` (the arbiter that settles an escalation, and the rules that overrule it), `land.rs`
-(landing, waiting for CI, escalation), `triage.rs` (`paja triage`) and `detect.rs` (the `init` agents' sandboxes and
-tool lists). Outside the module, `init/generate.rs` (the programs a generated skeleton's agent may run) is high risk
-too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`), follow-ups (`follow_ups.rs`), the builder's
-question and answers (`builder.rs`), where a run is (`live.rs`), the pool (`pool.rs`, `plan.rs`) and the rest of
+(landing, waiting for CI, escalation), `triage.rs` (`paja triage`), `detect.rs` (the `init` agents' sandboxes and
+tool lists) and `plan.rs` (the planning agent's tool list and read-only checkout). Outside the module,
+`init/generate.rs` (the programs a generated skeleton's agent may run) is high risk too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`), follow-ups (`follow_ups.rs`), the builder's
+question and answers (`builder.rs`), where a run is (`live.rs`), the pool (`pool.rs`) and the rest of
 `init/` are normal risk. A unit test walks every source file and fails on one that is neither on the list nor named
 as normal risk on purpose.
 
