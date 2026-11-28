@@ -469,11 +469,11 @@ or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the 
 first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool call
 to `paja hook --root <environment> --home <factory home> --programs <list>` as a Claude Code `PreToolUse` hook. No settings file and no
 MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it off.
-Because that also skips `CLAUDE.md`, Mestari passes the default branch's `CLAUDE.md` with `--append-system-prompt`, so the branch
-under review can't rewrite the rules its builder and reviewers follow. The `paja init` agent is the exception: the
-repository it sets up isn't one Paja works in yet, so its `CLAUDE.md` is data the agent reads and judges, never
-system-prompt instructions. The bounds are passed in rather than read from
-the tool call, because the reported `cwd` moves when the agent runs `cd`.
+Because that also skips `CLAUDE.md`, Mestari passes the default branch's `CLAUDE.md` with `--append-system-prompt`, so
+the branch under review can't rewrite the rules its builder and reviewers follow. The `paja init` agent is the
+exception: the repository it sets up isn't one Paja works in yet, so its `CLAUDE.md` is data the agent reads and
+judges, never system-prompt instructions. The bounds are passed in rather than read from the tool call, because the
+reported `cwd` moves when the agent runs `cd`.
 
 The hook adds to Claude Code's auto mode (always on, see Permissions below); it never replaces it. Auto mode is the
 base layer, and its safety improvements reach agents through Claude Code updates. The hook is a thin layer for what only

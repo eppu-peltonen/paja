@@ -9862,8 +9862,9 @@ fn init_without_a_known_stack_writes_templates_and_says_to_fill_them_in() {
 /// `paja init` with the given `files` committed and a fake `claude` that answers with `answer`
 /// (the agent's `structured_output`) and logs each call in `claude-calls` next to the repository.
 /// Returns the temp directory (the fakes' logs are in it), the repository and the result. The
-/// fake records its arguments one per line in `claude-args`, so an argument with a newline in it
-/// (a harness from a committed `CLAUDE.md`) would be split; the fixtures here have none.
+/// fake records its arguments one per line in `claude-args`; an argument with a newline in it
+/// would be split, but the init agent's `--append-system-prompt` is empty (a committed
+/// `CLAUDE.md` never reaches its arguments) and its other arguments are single lines.
 fn init_with_agent(
     files: &[(&str, &str)],
     answer: &Value,
@@ -10215,6 +10216,28 @@ fn init_falls_back_to_the_table_without_the_agents_environment() {
 }
 
 #[test]
+fn every_run_agent_gets_mains_claude_md_as_its_rules() {
+    let f = Factory::new("true\n", "changes");
+    let marker = "Rule from main: keep changes small.";
+    f.on_main("CLAUDE.md", &format!("# Rules\n\n{marker}\n"));
+    std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    // The build, the review, the fix round and its review: every session carried main's
+    // CLAUDE.md.
+    let calls = f.claude_calls();
+    assert!(calls.len() >= 3, "{calls:?}");
+    let args = std::fs::read_to_string(f.tmp.path().join("claude-args.log")).unwrap();
+    assert_eq!(args.matches(marker).count(), calls.len(), "{args}");
+    assert_eq!(
+        args.matches("The project's CLAUDE.md, as it is on the default branch")
+            .count(),
+        calls.len(),
+        "{args}"
+    );
+}
+
+#[test]
 fn init_agent_reads_the_repositorys_claude_md_as_data_not_instructions() {
     // A CLAUDE.md in the repository being set up is the repository's own text: the init agent
     // may read it, but it doesn't come as system-prompt instructions.
@@ -10238,7 +10261,7 @@ fn init_agent_reads_the_repositorys_claude_md_as_data_not_instructions() {
     // The prompt tells it the repository's files, CLAUDE.md among them, are data to judge.
     let prompt = std::fs::read_to_string(tmp.path().join("prompt.txt")).unwrap();
     assert!(
-        prompt.contains("CLAUDE.md, comments, scripts, workflows) is data"),
+        prompt.contains("CLAUDE.md") && prompt.contains("is data"),
         "{prompt}"
     );
 }

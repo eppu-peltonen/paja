@@ -219,7 +219,8 @@ fn claude_args(
         args.extend(["--settings".to_string(), settings]);
     }
     // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
-    // main: the branch under review can't rewrite the rules its agents follow.
+    // main: the branch under review can't rewrite the rules its agents follow. It is empty for
+    // the `paja init` agent ([`Harness::None`]).
     args.extend(["--append-system-prompt".to_string(), harness]);
     // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
     args.push("--strict-mcp-config".to_string());
@@ -302,14 +303,32 @@ pub(super) fn claude(
     model_args: &[String],
 ) -> Result<Value> {
     claude_with(
-        home, env, base, prompt, tools, schema, read_only, model_args, None, true,
+        home,
+        env,
+        base,
+        prompt,
+        tools,
+        schema,
+        read_only,
+        model_args,
+        None,
+        Harness::DefaultBranch,
     )
 }
 
+/// Whether an agent's system prompt carries the default branch's `CLAUDE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Harness {
+    /// The rules of a repository Paja works in: every agent that builds or judges its work.
+    DefaultBranch,
+    /// None: for an agent that judges a repository Paja doesn't work in yet (`paja init`),
+    /// whose `CLAUDE.md` is data to read, not rules.
+    None,
+}
+
 /// [`claude`], with `programs` (when given) as the programs the hook lets it run instead of
-/// `.paja/commands`: for a repository that has no such file yet. With `harnessed` false the
-/// default branch's `CLAUDE.md` is not put in the system prompt: for an agent that judges a
-/// repository it doesn't work in (`paja init`), whose `CLAUDE.md` is data to read, not rules.
+/// `.paja/commands`: for a repository that has no such file yet; and `harness`, whether the
+/// default branch's `CLAUDE.md` goes in the system prompt.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude_with(
     home: &Home,
@@ -321,10 +340,10 @@ pub(super) fn claude_with(
     read_only: bool,
     model_args: &[String],
     programs: Option<&[String]>,
-    harnessed: bool,
+    harness: Harness,
 ) -> Result<Value> {
     let program = claude_program();
-    let harness = match harnessed
+    let harness = match (harness == Harness::DefaultBranch)
         .then(|| read_from_base(&env.path, base, "CLAUDE.md"))
         .transpose()?
         .flatten()

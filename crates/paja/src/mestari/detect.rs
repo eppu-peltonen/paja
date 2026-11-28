@@ -62,7 +62,7 @@ pub fn init_agent(
             true,
             &models.args("init"),
             None,
-            false,
+            Harness::None,
         )?;
         out.get("structured_output")
             .cloned()
@@ -143,7 +143,7 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
             false,
             &Models::default().args("init"),
             Some(programs),
-            true,
+            Harness::DefaultBranch,
         )
     };
     crate::sandbox::activate(None);
