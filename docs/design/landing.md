@@ -98,8 +98,9 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
   files, the hook's rules). The person then gets the raw question and the reason. The arbiter's answer counts if it
   names one of those wordings at all, even to deny it, and its prompt says so. The question and what led to it are
   written by reviewers, who are asked whether a change weakens a check, so one kind of sentence is left out first: a
-  sentence that says, word for word and with nothing added, that the change weakens no check ("It doesn't weaken any
-  check."). Anything more ("apart from the flaky case", "don't skip the test", a question) still counts. The prompt
+  closing sentence (the last of the text, or of one reviewer's part) that says, word for word and with no mark but a
+  final `.` or `!`, that the change weakens no check ("It doesn't weaken any check."). Anything more ("apart from the
+  flaky case" on the next line or in the next sentence, "don't skip the test", a question) still counts. The prompt
   also tells the arbiter to escalate anything that changes the issue's intent or scope, secrets, actions outside the
   repository and any question that asks for the person's preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not

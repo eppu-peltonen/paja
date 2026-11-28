@@ -6075,7 +6075,8 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
 #[test]
 fn the_arbiter_answers_when_a_reviewer_only_says_no_check_is_weakened() {
     let f = Factory::new("true\n", "escalate");
-    // Reviewers often close with this; on its own it is no reason to keep the arbiter out.
+    // Reviewers often close with this; on its own it is no reason to keep the arbiter out. The
+    // fake puts summary.txt into its JSON as it is, so it holds no `"` or `\`.
     std::fs::write(
         f.tmp.path().join("summary.txt"),
         "Adds the test. It doesn't weaken any check.",

@@ -103,21 +103,30 @@ const DENIED_OBJECTS: [&[&str]; 12] = [
 ];
 
 /// Whether text a reviewer or the builder wrote (the escalation's question, or what led to it)
-/// talks about weakening a check: whether it has any of [`WEAKENING`] once every sentence that
-/// only says the change weakens no check ([`denies_weakening`]) is taken out. Reviewers are
-/// asked whether a change would weaken a check, so they often end with "It doesn't weaken any
-/// check."; anything else, a negated instruction ("don't skip the test") included, still
-/// counts. The arbiter's own answer is held to [`mentions_weakening`].
+/// talks about weakening a check: whether it has any of [`WEAKENING`] once a closing sentence
+/// that only says the change weakens no check ([`denies_weakening`]) is taken out. Reviewers
+/// are asked whether a change would weaken a check, so they often end with "It doesn't weaken
+/// any check."; only the last sentence of the text, or of one reviewer's part of it, is taken
+/// out, so a following "Except clippy, which it drops." still counts. Anything else, a negated
+/// instruction ("don't skip the test") included, counts. The arbiter's own answer is held to
+/// [`mentions_weakening`].
 fn names_a_weaker_check(text: &str) -> bool {
     let text = text
         .to_lowercase()
         .replace(['\u{2018}', '\u{2019}', '\u{2bc}'], "'");
-    let kept: String = sentences(&text)
-        .into_iter()
-        .filter(|s| !denies_weakening(s))
-        .collect::<Vec<_>>()
-        .join(" ");
-    mentions_weakening(&kept)
+    let sentences = sentences(&text);
+    let kept: Vec<&str> = sentences
+        .iter()
+        .enumerate()
+        .filter(|&(i, s)| {
+            let closing = sentences
+                .get(i + 1)
+                .is_none_or(|next| reviewer_prefix(next.trim_start()).is_some());
+            !(closing && denies_weakening(s))
+        })
+        .map(|(_, s)| *s)
+        .collect();
+    mentions_weakening(&kept.join(" "))
 }
 
 /// Whether the arbiter's answer names weakening a check at all: any of [`WEAKENING`], said in
@@ -129,33 +138,29 @@ fn mentions_weakening(text: &str) -> bool {
 }
 
 /// Whether `sentence` is, word for word, a statement that the change weakens no check: one of
-/// [`SUBJECTS`], one of [`DENIALS`], one of [`DENIED`] and one of [`DENIED_OBJECTS`], and
-/// nothing else. A reviewer's "Reviewer 1: land — " in front is allowed. A question, or any
-/// other word ("apart from", "just", "unless"), makes it count.
+/// [`SUBJECTS`], one of [`DENIALS`], one of [`DENIED`] and one of [`DENIED_OBJECTS`], nothing
+/// else, and no mark but apostrophes and a closing `.` or `!`. A reviewer's "Reviewer 1: land
+/// — " in front is allowed. A question, a comma, a colon or any other word ("apart from",
+/// "just", "unless") makes it count.
 fn denies_weakening(sentence: &str) -> bool {
     let sentence = sentence.trim();
-    if sentence.ends_with('?') {
+    let sentence = reviewer_prefix(sentence).unwrap_or(sentence).trim();
+    let body = sentence
+        .strip_suffix(['.', '!'])
+        .unwrap_or(sentence)
+        .trim_end();
+    if !body
+        .chars()
+        .all(|c| c.is_alphabetic() || c == ' ' || c == '\'')
+    {
         return false;
     }
-    let words: Vec<&str> = sentence
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '\'')))
-        .filter(|w| !w.is_empty())
-        .collect();
-    // `summaries()` puts "Reviewer N: verdict — " before the first sentence of each review.
-    let words = match words.as_slice() {
-        ["reviewer", n, _verdict, rest @ ..]
-            if n.chars().all(|c| c.is_ascii_digit()) && sentence.contains('\u{2014}') =>
-        {
-            rest
-        }
-        all => all,
-    };
+    let words: Vec<&str> = body.split_whitespace().collect();
     let after = |words: &'static [&'static str], rest: &[&str]| -> Option<usize> {
         rest.starts_with(words).then_some(words.len())
     };
     SUBJECTS.iter().any(|subject| {
-        let Some(n) = after(subject, words) else {
+        let Some(n) = after(subject, &words) else {
             return false;
         };
         let rest = &words[n..];
@@ -170,25 +175,45 @@ fn denies_weakening(sentence: &str) -> bool {
     })
 }
 
-/// `text` cut into sentences, each keeping its closing mark: at `!`, `?`, a line break, a bare
-/// carriage return and a `.` not followed by a letter or digit, so `.paja/checks` and `hook.rs`
-/// stay whole.
+/// What follows the "Reviewer N: verdict — " that `summaries()` in `mod.rs` puts before each
+/// review, if `text` starts with one.
+fn reviewer_prefix(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("reviewer ")?;
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let rest = rest[digits..].strip_prefix(": ").filter(|_| digits > 0)?;
+    ["land", "changes", "escalate"]
+        .iter()
+        .find_map(|verdict| rest.strip_prefix(verdict)?.strip_prefix(" \u{2014} "))
+}
+
+/// `text` cut into sentences, each keeping its closing mark: after a `.`, `!` or `?` that is
+/// followed by whitespace or the end. A line break alone doesn't end one, nor does a dot in a
+/// run of dots ("...") or one closing an abbreviation with dots in it ("e.g."), so a hedge on
+/// the next line stays in the sentence it hedges.
 fn sentences(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
-        let ends = match c {
-            '!' | '?' | '\u{ff1f}' | '\n' | '\r' => true,
-            '.' => chars.peek().is_none_or(|(_, next)| !next.is_alphanumeric()),
-            _ => false,
-        };
+        let followed = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        let ends = followed
+            && match c {
+                '!' | '?' => true,
+                '.' => {
+                    // The word the dot closes: no dot inside it, and more than one letter.
+                    let word = text[start..at].split_whitespace().last().unwrap_or("");
+                    !word.contains('.') && word.chars().count() > 1
+                }
+                _ => false,
+            };
         if ends {
             out.push(&text[start..at + c.len_utf8()]);
             start = at + c.len_utf8();
         }
     }
-    out.push(&text[start..]);
+    if !text[start..].trim().is_empty() {
+        out.push(&text[start..]);
+    }
     out
 }
 
@@ -555,7 +580,7 @@ mod tests {
             "This change does not weaken the gate.",
             "The fix doesn\u{2019}t weaken anything",
             "Reviewer 1: land \u{2014} It doesn't weaken any check.",
-            "Reviewer 2: changes \u{2014} The diff never weakens a check.\nTwo tests are missing.",
+            "Reviewer 2: changes \u{2014} Two tests are missing. The diff never weakens a check.\nReviewer 1: land \u{2014} Fine.",
         ] {
             assert!(!names_a_weaker_check(text), "{text}");
         }
@@ -586,6 +611,22 @@ mod tests {
             "It doesn't touch hook.rs.",
             "Change nothing except .paja/checks.",
             "It doesn't weaken the deny-list.",
+            // A hedge after a line break, a mark or in the next sentence.
+            "It doesn't weaken the check,\napart from the flaky case.",
+            "It doesn't weaken the check\nexcept the flaky case is now skipped.",
+            "It doesn't weaken any check:\nonly the flaky test is now ignored.",
+            "It doesn't weaken any check;\nit only ignores the flaky test.",
+            "It doesn't weaken any check (\nyet).",
+            "It doesn't weaken the check... for now.",
+            "Drop clippy from CI, e.g. it won't loosen anything.",
+            "It doesn't weaken any check. Except clippy, which it drops.",
+            "It doesn't weaken any check. Yet.",
+            "It doesn't weaken any check\u{ff1f}",
+            "Reviewer 1 weaken it doesn't weaken anything \u{2014}",
+            "Reviewer 1: hook.rs \u{2014} It doesn't weaken any check.",
+            "Reviewer 1: .paja/checks \u{2014} It doesn't weaken any check.",
+            "Reviewer 1: deny-list \u{2014} it doesn't weaken any check.",
+            "It doesn't weaken any check\u{203d}",
         ] {
             assert!(names_a_weaker_check(text), "{text}");
         }
