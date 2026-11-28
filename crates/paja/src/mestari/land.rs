@@ -170,6 +170,10 @@ pub(super) fn land(
             if stopped(&err) {
                 return Err(err);
             }
+            if let Some(late) = err.downcast_ref::<CiTimedOut>() {
+                let question = late.to_string();
+                return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+            }
             let err = format!("{err:#}");
             // Only a failed check, or checks that never start because the default branch moved
             // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
@@ -458,11 +462,25 @@ fn stopped(err: &anyhow::Error) -> bool {
     })
 }
 
+/// CI still going at the limit `.paja/ci`'s `wait` sets: the question for the person. Never
+/// the builder's to fix, so the run escalates it whatever else happened during the wait.
+#[derive(Debug)]
+pub(super) struct CiTimedOut(pub(super) String);
+
+impl std::fmt::Display for CiTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CiTimedOut {}
+
 /// Wait until GitHub has registered checks on the pull request, then until they finish, for
 /// at most `minutes` in all (`.paja/ci`'s `wait`; debug builds: `PAJA_TEST_CI_WAIT_MS`). A
 /// pull request that gets no checks at all is not treated as green, and neither is CI still
-/// going at the limit: the run holds the repository's turn to land while it waits, so a CI
-/// that hangs would otherwise hold up every landing there. `stop now` ends the wait at once.
+/// going at the limit, which is a [`CiTimedOut`]: the run holds the repository's turn to land
+/// while it waits, so a CI that hangs would otherwise hold up every landing there. `stop now`
+/// ends the wait at once.
 pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
     const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
     const AGAIN: std::time::Duration = std::time::Duration::from_secs(10);
@@ -476,15 +494,6 @@ pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
         );
     let start = std::time::Instant::now();
     let deadline = start + limit;
-    let too_long = || {
-        anyhow!(
-            "CI on {pr} was still going after {}, so Paja stopped waiting for it. Look at the \
-             pull request's checks on GitHub: a job may be stuck, or queued with no runner to \
-             take it. If this repository's CI takes longer, put `wait <minutes>` in {CI_FILE} \
-             on the default branch (it is now {minutes} minutes)",
-            long(limit)
-        )
-    };
     let gh = jono::gh_program();
     let args = ["pr", "checks", pr, "--watch", "--fail-fast"];
     loop {
@@ -493,32 +502,65 @@ pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
             .current_dir(repo)
             .args(args)
             .stdin(std::process::Stdio::null());
-        let output = match crate::platform::output_until_stopped_or(&mut cmd, deadline) {
-            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => return Err(too_long()),
-            other => other.with_context(|| {
+        let ended =
+            crate::platform::output_until_stopped_or(&mut cmd, deadline).with_context(|| {
                 format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
-            })?,
-        };
-        if output.status.success() {
+            })?;
+        if ended.timed_out {
+            return Err(still_going(pr, limit, minutes, &tail(&ended.output)).into());
+        }
+        if ended.output.status.success() {
             return Ok(());
         }
-        let err = format!("`{gh} {}` failed: {}", args.join(" "), tail(&output));
+        let err = format!("`{gh} {}` failed: {}", args.join(" "), tail(&ended.output));
         if !err.contains("no checks reported") {
             bail!(err);
         }
-        if start.elapsed() > APPEAR {
-            bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
+        // No checks yet: that is the workflows' to fix, not a hung CI, so it keeps its own
+        // message, cut to the limit when that is shorter.
+        let waited = start.elapsed();
+        if waited > APPEAR || waited + AGAIN >= limit {
+            bail!(
+                "no CI checks appeared on {pr} within {}; check the workflows",
+                long(APPEAR.min(limit))
+            );
         }
-        if std::time::Instant::now() + AGAIN >= deadline {
-            return Err(too_long());
+        // In short steps, so `stop now` isn't left waiting between two tries.
+        let next = std::time::Instant::now() + AGAIN;
+        while std::time::Instant::now() < next {
+            if crate::platform::interrupts() >= 2 {
+                return Err(crate::platform::stopped_error().into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(AGAIN);
     }
+}
+
+/// The question for CI on `pr` still going after `limit`, with the checks as `gh` last showed
+/// them.
+fn still_going(pr: &str, limit: std::time::Duration, minutes: u64, checks: &str) -> CiTimedOut {
+    let mut text = format!(
+        "CI on {pr} was still going after {}, so Paja stopped waiting for it and did not land \
+         it. Look at the pull request's checks on GitHub: a job may be stuck, or queued with no \
+         runner to take it. If this repository's CI takes longer, put `wait <minutes>` in \
+         {CI_FILE} on the default branch (it is now {}).\n\nThe change itself needs nothing: \
+         once the checks are unstuck or the wait is raised, answer, and Paja checks this pull \
+         request's CI again before it lands.",
+        long(limit),
+        long(std::time::Duration::from_secs(minutes * 60))
+    );
+    if !checks.is_empty() {
+        text.push_str(&format!(
+            "\n\nThe checks when Paja stopped waiting:\n\n```\n{checks}\n```"
+        ));
+    }
+    CiTimedOut(text)
 }
 
 /// `limit` as a person reads it: whole minutes, or seconds below one.
 fn long(limit: std::time::Duration) -> String {
     match limit.as_secs() {
+        1 => "1 second".to_string(),
         s if s < 60 => format!("{s} seconds"),
         60..=119 => "1 minute".to_string(),
         s => format!("{} minutes", s / 60),

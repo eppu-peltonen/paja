@@ -2435,7 +2435,8 @@ impl Factory {
                  if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
-                 \"pr checks\") if [ -f {d}/ci-hold ]; then : > {d}/ci-waiting; fi; while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
+                 \"pr checks\") if [ -f {d}/ci-none ]; then : > {d}/ci-waiting; echo \"no checks reported on the 'work-5' branch\" >&2; exit 1; fi\n\
+                 if [ -f {d}/ci-hold ]; then echo $$ > {d}/ci-pid; printf 'check (ubuntu-latest)\\tpending\\t0\\n'; : > {d}/ci-waiting; fi; while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
                  if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
@@ -11392,59 +11393,149 @@ fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
     );
 }
 
-/// CI still going at `.paja/ci`'s `wait` escalates, naming the setting, instead of holding the
-/// repository's turn to land for as long as the CI hangs. The `gh` that was waiting is ended.
-#[test]
-fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
-    let f = Factory::new("test -f feature.txt\n", "land");
-    let dir = f.tmp.path();
-    f.on_main(".paja/ci", "required\nwait 30\n");
-    std::fs::write(dir.join("ci-hold"), "").unwrap();
-    let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
-        .current_dir(&f.repo)
+/// `paja run` in the factory's checkout with `vars` set, its stdout and stderr read, ended
+/// and failed past five minutes.
+fn run_with_vars(f: &Factory, vars: &[(&str, &str)], args: &[&str]) -> (Value, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+    cmd.current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
-        .env("PAJA_TEST_CI_WAIT_MS", "2000")
-        .args(["--json", "run"])
+        .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let output = output_within(output, std::time::Duration::from_secs(300));
+        .stdout(Stdio::piped());
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    let output = output_within(cmd.spawn().unwrap(), std::time::Duration::from_secs(300));
+    let report = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    (report, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// CI still going at `.paja/ci`'s `wait` escalates, naming the setting and showing the checks,
+/// instead of holding the repository's turn to land for as long as the CI hangs, also when
+/// the default branch moved during the wait. The `gh` that was waiting is ended.
+#[test]
+fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let dir = f.tmp.path().to_path_buf();
+    f.on_main(".paja/ci", "required\nwait 30\n");
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    // Once the run waits for CI, the default branch moves on from another clone.
+    let mover = {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while !dir.join("ci-waiting").exists() {
+                if started.elapsed().as_secs() >= 300 {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let other = dir.join("elsewhere");
+            let origin = dir.join("origin.git");
+            git(
+                &dir,
+                &["clone", "-q", origin.to_str().unwrap(), "elsewhere"],
+            );
+            std::fs::write(other.join("elsewhere.txt"), "moved on\n").unwrap();
+            git(&other, &["add", "."]);
+            git(
+                &other,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "elsewhere",
+                ],
+            );
+            git(&other, &["push", "-q", "origin", "HEAD:main"]);
+            true
+        })
+    };
+    let (report, stderr) =
+        run_with_vars(&f, &[("PAJA_TEST_CI_WAIT_MS", "10000")], &["--json", "run"]);
+    let moved = mover.join().unwrap();
+    #[cfg(unix)]
+    let waiting = std::fs::read_to_string(dir.join("ci-pid")).unwrap_or_default();
     let _ = std::fs::remove_file(dir.join("ci-hold"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert!(moved, "the run never waited for CI\n{stderr}");
     assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
-    assert!(dir.join("ci-waiting").exists(), "{stderr}");
     let question = report["question"].as_str().unwrap_or_default();
     assert!(
-        question.contains("was still going after 2 seconds")
+        question.contains("was still going after 10 seconds")
             && question.contains("put `wait <minutes>` in .paja/ci")
-            && question.contains("it is now 30 minutes"),
+            && question.contains("it is now 30 minutes")
+            && question.contains("The change itself needs nothing")
+            && question.contains("check (ubuntu-latest)\tpending"),
         "{question}"
     );
     assert!(
         !stderr.contains("sending the failure back to the builder"),
         "{stderr}"
     );
-    // The whole run, builds and reviews included, is far shorter than the wait it was given.
-    assert!(started.elapsed().as_secs() < 240, "{stderr}");
+    // Ended at the limit, not left looping on `ci-hold` until the test removed it.
+    #[cfg(unix)]
+    {
+        let alive = Command::new("kill")
+            .args(["-0", waiting.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !waiting.trim().is_empty() && !alive,
+            "the waiting gh outlived the wait"
+        );
+    }
+}
+
+/// A pull request whose checks never appear within a short `wait` says so, as it does past
+/// five minutes, not that CI was still going.
+#[test]
+fn checks_that_never_appear_within_a_short_wait_say_so() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-none"), "").unwrap();
+    let (report, stderr) =
+        run_with_vars(&f, &[("PAJA_TEST_CI_WAIT_MS", "3000")], &["--json", "run"]);
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    let question = report["question"].as_str().unwrap_or_default();
+    assert!(
+        question.contains("no CI checks appeared on")
+            && question.contains("within 3 seconds; check the workflows")
+            && !question.contains("still going"),
+        "{question}"
+    );
 }
 
 /// `stop now` during the CI wait stops the run at once, leaving the item to resume, rather
-/// than escalating the wait it cut short.
+/// than escalating the wait it cut short: both while `gh` watches the checks and between its
+/// tries while none have appeared yet.
 // Unix only, like `stop_now_on_stdin_stops_at_once_and_ends_the_agent`: on Windows the fake
 // `gh`'s Git Bash loop can outlive `taskkill /T`.
 #[cfg(unix)]
 #[test]
 fn stop_now_in_the_ci_wait_stops_the_run_instead_of_escalating() {
+    for flag in ["ci-hold", "ci-none"] {
+        stop_now_in_the_ci_wait(flag);
+    }
+}
+
+#[cfg(unix)]
+fn stop_now_in_the_ci_wait(flag: &str) {
     use std::io::Write as _;
     let f = Factory::new("test -f feature.txt\n", "land");
     let dir = f.tmp.path();
-    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    std::fs::write(dir.join(flag), "").unwrap();
     let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
@@ -11460,11 +11551,11 @@ fn stop_now_in_the_ci_wait_stops_the_run_instead_of_escalating() {
     let started = std::time::Instant::now();
     while !dir.join("ci-waiting").exists() {
         if let Some(status) = run.try_wait().unwrap() {
-            panic!("`paja run` exited ({status}) before it waited for CI");
+            panic!("{flag}: `paja run` exited ({status}) before it waited for CI");
         }
         assert!(
             started.elapsed().as_secs() < 300,
-            "the run never waited for CI"
+            "{flag}: the run never waited for CI"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -11474,16 +11565,52 @@ fn stop_now_in_the_ci_wait_stops_the_run_instead_of_escalating() {
     let stopping = std::time::Instant::now();
     std::mem::forget(guard);
     let output = output_within(run, std::time::Duration::from_secs(120));
-    let _ = std::fs::remove_file(dir.join("ci-hold"));
+    let _ = std::fs::remove_file(dir.join(flag));
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Well under the 10 seconds after which a stop that never reached a step exits anyway.
     assert!(
-        stopping.elapsed().as_secs() < 30,
-        "paja didn't stop at once\n{stderr}"
+        stopping.elapsed().as_secs() < 8,
+        "{flag}: paja didn't stop at once\n{stderr}"
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    assert_eq!(report["outcome"], "stopped", "{flag}: {report}\n{stderr}");
     let (_, work) = paja(&f.home, &f.repo, &["work", "show", "5"]);
-    assert_eq!(work["status"], "active", "{work}");
+    assert_eq!(work["status"], "active", "{flag}: {work}");
+    // The findings of the review that approved it are left for the resumed run to record.
+    assert!(events_of(&f, "run.follow_up").is_empty(), "{flag}");
+}
+
+/// `paja doctor` reads `.paja/ci` as `paja run` does: a `wait` with `required` is fine, a
+/// `wait` with `none` names the file, the branch and what is wrong.
+#[test]
+fn doctor_reads_a_ci_wait_as_run_does() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let ci = |text: &str| {
+        f.on_main(".paja/ci", text);
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        report["checks"]
+            .as_array()
+            .and_then(|checks| checks.iter().find(|c| c["name"] == "ci").cloned())
+            .unwrap_or_else(|| panic!("{report}"))
+    };
+    let fine = ci("required\nwait 30\n");
+    assert_eq!(fine["status"], "ok", "{fine}");
+    let wrong = ci("none\nwait 30\n");
+    assert_ne!(wrong["status"], "ok", "{wrong}");
+    let detail = wrong["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(".paja/ci on") && detail.contains("says `none` and names a `wait`"),
+        "{wrong}"
+    );
 }
 
 /// A `.paja/ci` that names a `wait` with `none` stops the run before anything is claimed,

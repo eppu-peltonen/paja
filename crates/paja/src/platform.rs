@@ -616,24 +616,43 @@ pub fn output_until_stopped_with_input(
     cmd: &mut Command,
     input: Option<Vec<u8>>,
 ) -> std::io::Result<std::process::Output> {
-    output_until(cmd, input, None)
+    output_until(cmd, input, None).map(|ended| ended.output)
 }
 
-/// [`output_until_stopped`], also ended with everything it started once `deadline` passes,
-/// which returns an error of kind [`std::io::ErrorKind::TimedOut`]: for a wait on something
-/// outside Paja that may never end, such as a pull request's CI.
+/// How a step [`output_until_stopped_or`] ran ended.
+pub struct Bounded {
+    /// What it printed, also when it was ended at its deadline: whatever it had printed by
+    /// then.
+    pub output: std::process::Output,
+    /// Whether it was still going at the deadline, and ended with everything it started.
+    pub timed_out: bool,
+}
+
+/// [`output_until_stopped`], also ended with everything it started once `deadline` passes:
+/// for a wait on something outside Paja that may never end, such as a pull request's CI.
 pub fn output_until_stopped_or(
     cmd: &mut Command,
     deadline: std::time::Instant,
-) -> std::io::Result<std::process::Output> {
+) -> std::io::Result<Bounded> {
     output_until(cmd, None, Some(deadline))
+}
+
+/// The error a step ended by `stop now` (or a second Ctrl-C) returns, of kind
+/// [`std::io::ErrorKind::Interrupted`]: for a wait between steps to return the same.
+pub fn stopped_error() -> std::io::Error {
+    let why = if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+        "stopped by its pool"
+    } else {
+        "stopped by a second Ctrl-C"
+    };
+    std::io::Error::new(std::io::ErrorKind::Interrupted, why)
 }
 
 fn output_until(
     cmd: &mut Command,
     input: Option<Vec<u8>>,
     deadline: Option<std::time::Instant>,
-) -> std::io::Result<std::process::Output> {
+) -> std::io::Result<Bounded> {
     use std::io::{Read, Write};
     use std::process::Stdio;
     if input.is_some() {
@@ -651,15 +670,19 @@ fn output_until(
         })),
         _ => None,
     };
-    // Drain both pipes while waiting, so a chatty child can't fill one and stall.
+    // Drain both pipes while waiting, so a chatty child can't fill one and stall. Each sends
+    // what it read once its pipe closes, so a step ended at its deadline can still be read
+    // from without waiting on a process it started that outlived it.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sent, read) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut bytes);
             }
-            bytes
-        })
+            let _ = sent.send(bytes);
+        });
+        read
     };
     let stdout = drain(
         child
@@ -680,30 +703,35 @@ fn output_until(
         if interrupts() >= 2 {
             kill_tree(&mut child);
             let _ = child.wait();
-            let why = if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
-                "stopped by its pool"
-            } else {
-                "stopped by a second Ctrl-C"
-            };
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, why));
+            return Err(stopped_error());
         }
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             kill_tree(&mut child);
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "ended at its time limit",
-            ));
+            let status = child.wait()?;
+            // A moment for the pipes to close; one held open by a process that outlived the
+            // kill gives what was read so far as nothing, rather than holding Paja up.
+            let late = std::time::Duration::from_secs(2);
+            return Ok(Bounded {
+                output: std::process::Output {
+                    status,
+                    stdout: stdout.recv_timeout(late).unwrap_or_default(),
+                    stderr: stderr.recv_timeout(late).unwrap_or_default(),
+                },
+                timed_out: true,
+            });
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
     if let Some(writer) = writer {
         let _ = writer.join();
     }
-    Ok(std::process::Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+    Ok(Bounded {
+        output: std::process::Output {
+            status,
+            stdout: stdout.recv().unwrap_or_default(),
+            stderr: stderr.recv().unwrap_or_default(),
+        },
+        timed_out: false,
     })
 }
 
@@ -978,8 +1006,8 @@ mod tests {
         stat.trim().is_empty() || stat.trim().starts_with('Z')
     }
 
-    /// A step past its deadline is ended, with what it started, and reads as timed out; one
-    /// that ends first returns its output as usual.
+    /// A step past its deadline is ended, with what it started, and reads as timed out with what
+    /// it printed by then; one that ends first returns its output as usual.
     #[cfg(unix)]
     #[test]
     fn a_step_past_its_deadline_is_ended_as_timed_out() {
@@ -988,9 +1016,12 @@ mod tests {
         let script = format!("sleep 60 & echo $! > '{}'; wait", pid.display());
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(500);
-        let err = output_until_stopped_or(Command::new("sh").args(["-c", &script]), deadline)
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        let script = format!("echo started; {script}");
+        let late =
+            output_until_stopped_or(Command::new("sh").args(["-c", &script]), deadline).unwrap();
+        assert!(late.timed_out);
+        // What it printed before the deadline is kept.
+        assert_eq!(String::from_utf8_lossy(&late.output.stdout), "started\n");
         assert!(started.elapsed().as_secs() < 20);
         let sleeper = std::fs::read_to_string(&pid).unwrap();
         let gone = std::time::Instant::now();
@@ -1002,9 +1033,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let out =
+        let done =
             output_until_stopped_or(Command::new("sh").args(["-c", "echo done"]), later).unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+        assert!(!done.timed_out);
+        assert_eq!(String::from_utf8_lossy(&done.output.stdout), "done\n");
     }
 
     #[cfg(unix)]

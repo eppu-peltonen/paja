@@ -906,7 +906,7 @@ pub(crate) enum CiMode {
 }
 
 /// How long a run waits for a pull request's CI, in minutes, when `.paja/ci` names no `wait`.
-pub const CI_WAIT_MINUTES: u64 = 120;
+pub(crate) const CI_WAIT_MINUTES: u64 = 120;
 /// The longest `wait` `.paja/ci` may name, in minutes: a day.
 const CI_WAIT_MAX: u64 = 1440;
 
@@ -920,26 +920,38 @@ pub(crate) fn parse_ci(text: &str) -> std::result::Result<(CiMode, u64), String>
     for line in lines(text) {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
-            [w @ ("required" | "none")] if mode.is_none() => {
+            [w @ ("required" | "none")] => {
+                if mode.is_some() {
+                    return Err(format!(
+                        "has `{line}` after an earlier `required` or `none` line; keep one"
+                    ));
+                }
                 mode = Some(if *w == "none" {
                     CiMode::None
                 } else {
                     CiMode::Required
                 });
             }
-            ["wait", minutes] if wait.is_none() => match minutes.parse::<u64>() {
-                Ok(m) if (1..=CI_WAIT_MAX).contains(&m) => wait = Some(m),
-                _ => {
+            ["wait", minutes] => {
+                if wait.is_some() {
                     return Err(format!(
-                        "has `{line}`, but the wait is a whole number of minutes from 1 to \
-                         {CI_WAIT_MAX}"
-                    ))
+                        "has `{line}` after an earlier `wait` line; keep one"
+                    ));
                 }
-            },
+                match minutes.parse::<u64>() {
+                    Ok(m) if (1..=CI_WAIT_MAX).contains(&m) => wait = Some(m),
+                    _ => {
+                        return Err(format!(
+                            "has `{line}`, but the wait is a whole number of minutes from 1 to \
+                             {CI_WAIT_MAX}"
+                        ))
+                    }
+                }
+            }
             _ => {
                 return Err(format!(
                     "must hold `required` or `none`, and with `required` an optional \
-                     `wait <minutes>` line, each once; `{line}` is not one of them"
+                     `wait <minutes>` line; `{line}` is not one of them"
                 ))
             }
         }
@@ -1819,6 +1831,9 @@ fn run_item(
                         crate::posti::send(home, repo, &notice);
                     }
                 }
+                // Stopped (`stop now` in the CI wait): the run that resumes the item records
+                // them, once.
+                Err(_) if crate::platform::interrupts() > 0 => {}
                 // Not landed after all: keep the findings in the log, for later.
                 _ => {
                     for (text, _) in &left {
@@ -4082,16 +4097,25 @@ mod tests {
                 "{bad}"
             );
         }
-        for bad in [
-            "wait",
-            "wait 5 minutes",
-            "required\nrequired",
-            "required\nnone",
-            "wait 5\nwait 6",
-            "optional",
-        ] {
-            assert!(err(bad).contains("each once"), "{bad}: {}", err(bad));
+        for bad in ["wait", "wait 5 minutes", "optional", "required now"] {
+            assert!(
+                err(bad).contains("is not one of them"),
+                "{bad}: {}",
+                err(bad)
+            );
         }
+        for bad in ["required\nrequired", "required\nnone", "none\nrequired"] {
+            let why = err(bad);
+            assert!(
+                why.contains("after an earlier `required` or `none` line; keep one"),
+                "{why}"
+            );
+        }
+        let why = err("wait 5\nwait 6");
+        assert!(
+            why.starts_with("has `wait 6` after an earlier `wait` line"),
+            "{why}"
+        );
         assert!(err("none\nwait 5").contains("only `required` has"));
         assert!(err("wait 5\nnone").contains("only `required` has"));
         let branch = CiMode::parse(Some("none\nwait 5\n"), "trunk").unwrap_err();
