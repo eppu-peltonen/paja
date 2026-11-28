@@ -1034,6 +1034,22 @@ mod tests {
         stat.trim().is_empty() || stat.trim().starts_with('Z')
     }
 
+    /// On Windows too, a step past its deadline is ended (`taskkill /T`) and reads as timed out
+    /// soon after.
+    #[cfg(windows)]
+    #[test]
+    fn a_step_past_its_deadline_is_ended_as_timed_out_on_windows() {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
+        let late = output_until_stopped_or(
+            Command::new("ping").args(["-n", "60", "127.0.0.1"]),
+            deadline,
+        )
+        .unwrap();
+        assert!(late.timed_out);
+        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+    }
+
     /// A step past its deadline is ended, with what it started, and reads as timed out with what
     /// it printed by then; one that ends first returns its output as usual.
     #[cfg(unix)]
