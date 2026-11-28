@@ -2399,7 +2399,8 @@ impl Factory {
             format!(
                 "#!/bin/sh\necho \"$@\" >> {d}/gh.log\nprev=; for a in \"$@\"; do [ \"$prev\" = --body-file ] && {{ cat \"$a\"; echo; }} >> {d}/gh.log; prev=$a; done\ncase \"$1 $2\" in\n\
                  \"issue list\") cat {d}/issues.json ;;\n\
-                 \"repo view\") echo '{view}' ;;\n\
+                 \"repo view\") case \"$*\" in *viewerPermission*) if [ -f {d}/settings-after.json ]; then cat {d}/settings-after.json; exit 0; fi ;; esac\n\
+                 echo '{view}' ;;\n\
                  \"workflow list\") if [ -f {d}/workflows-down ]; then echo 'HTTP 403: Resource not accessible' >&2; exit 1; fi\n\
                  if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") if [ -f {d}/pr-open ]; then echo https://example.com/pull/1; else exit 1; fi ;;\n\
@@ -10264,6 +10265,75 @@ fn init_agent_gets_read_only_tools_and_hook() {
 }
 
 #[test]
+fn init_check_lines_for_a_subdirectory_run_there_and_an_unsafe_dir_is_dropped() {
+    // A monorepo proposal: one stack in `apps/svc` (named the loose way, `./apps/svc/`), one in
+    // a directory whose name would be a second command if it reached `cd <dir> && ...`
+    // unquoted. The second is dropped, and the line written for the first runs in its
+    // directory when the checks file is run as written.
+    let evil = "evil;touch pwned";
+    let script = "echo ok > ran\n";
+    let evil_script = format!("{evil}/check.sh");
+    let answer = serde_json::json!({"stacks": [
+        {"name": "svc", "dir": "./apps/svc/", "file": "apps/svc/check.sh",
+         "checks": [{"command": "sh check.sh", "file": "apps/svc/check.sh"}], "commands": ["sh"],
+         "setup": [{"run": "sh check.sh", "file": "apps/svc/check.sh"}]},
+        {"name": "evil", "dir": evil, "file": evil_script,
+         "checks": [{"command": "sh check.sh", "file": evil_script}], "commands": ["sh"],
+         "setup": [{"run": "sh check.sh", "file": evil_script}]}
+    ]});
+    let (_tmp, repo, ok, out) = init_with_agent(
+        &[
+            ("apps/svc/check.sh", script),
+            (evil_script.as_str(), script),
+        ],
+        &answer,
+        &["--ci"],
+    );
+    assert!(ok, "{out}");
+    let dropped = out["detected"]["dropped"].as_array().unwrap();
+    assert!(
+        dropped
+            .iter()
+            .any(|d| d["item"].as_str().unwrap().contains("stack `evil")
+                && d["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("is not a directory on the default branch")),
+        "{out}"
+    );
+    let checks = show(&repo, "paja/init", ".paja/checks");
+    let lines: Vec<&str> = checks
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(lines, ["cd apps/svc && sh check.sh"], "{checks}");
+    // The CI workflow runs the setup step in the stack's directory and the same check line,
+    // and nothing of the dropped stack.
+    let workflow = show(&repo, "paja/init", ".github/workflows/paja.yml");
+    assert!(
+        workflow.contains("      - run: sh check.sh\n        working-directory: apps/svc\n"),
+        "{workflow}"
+    );
+    assert!(
+        workflow.contains("cd apps/svc && sh check.sh") && !workflow.contains("evil"),
+        "{workflow}"
+    );
+    // Run as written, from the repository's root, with the shell Vasara runs each line in.
+    git(&repo, &["checkout", "-q", "paja/init"]);
+    for line in &lines {
+        let status = paja::platform::shell(line)
+            .unwrap()
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{line}");
+    }
+    assert!(repo.join("apps/svc/ran").is_file());
+    assert!(!repo.join("ran").exists() && !repo.join("pwned").exists());
+}
+
+#[test]
 fn init_falls_back_to_the_table_when_claude_is_missing() {
     let (_tmp, repo, home, gh) = init_fixture(&[("go.mod", "module x\n")]);
     let missing = repo.join("no-such-claude");
@@ -10323,6 +10393,12 @@ fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
 fn a_merge_github_refuses_escalates_naming_the_setting() {
     let f = Factory::new("test -f feature.txt\n", "land");
     std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    // Asked after the refusal, GitHub says squash merging is off.
+    std::fs::write(
+        f.tmp.path().join("settings-after.json"),
+        r#"{"viewerPermission": "ADMIN", "squashMergeAllowed": false, "rebaseMergeAllowed": false, "mergeCommitAllowed": false}"#,
+    )
+    .unwrap();
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "escalated", "{report}");
@@ -10332,6 +10408,94 @@ fn a_merge_github_refuses_escalates_naming_the_setting() {
         "{question}"
     );
     assert!(question.contains("allow squash merging"), "{question}");
+}
+
+#[test]
+fn a_merge_refused_for_the_account_s_permission_escalates_saying_so() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("settings-after.json"),
+        r#"{"viewerPermission": "READ", "squashMergeAllowed": true}"#,
+    )
+    .unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("has READ permission on acme/app"),
+        "{question}"
+    );
+}
+
+#[test]
+fn a_failed_merge_github_does_not_explain_is_parked_as_an_error() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    // The error reads like a refusal, but GitHub says the account may merge this way.
+    std::fs::write(f.tmp.path().join("merge-refused"), "").unwrap();
+    std::fs::write(
+        f.tmp.path().join("settings-after.json"),
+        r#"{"viewerPermission": "WRITE", "squashMergeAllowed": true}"#,
+    )
+    .unwrap();
+    let (_, report) = f.run();
+    // Parked on the error, with gh's message, not asked as a merge-setting question.
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.starts_with("Paja's run stopped with an error"),
+        "{question}"
+    );
+    assert!(
+        question.contains("Squash merges are not allowed"),
+        "{question}"
+    );
+    assert!(!question.contains("GitHub refused to merge"), "{question}");
+    assert!(question.contains("protection rules"), "{question}");
+}
+
+#[test]
+fn an_answered_merge_refusal_lands_through_the_open_pull_request() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("merge-refused"), "").unwrap();
+    std::fs::write(dir.join("reuse-prs"), "").unwrap();
+    std::fs::write(
+        dir.join("settings-after.json"),
+        r#"{"viewerPermission": "ADMIN", "squashMergeAllowed": false}"#,
+    )
+    .unwrap();
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    // The person allows squash merging and answers.
+    std::fs::remove_file(dir.join("merge-refused")).unwrap();
+    std::fs::remove_file(dir.join("settings-after.json")).unwrap();
+    let with_gh = [("PAJA_GH", f.gh.as_path())];
+    let (ok, answered) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "Squash merging is allowed now"],
+        &with_gh,
+    );
+    assert!(ok, "{answered}");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    assert_eq!(report["pr"], "https://example.com/pull/1", "{report}");
+    // The pull request opened before the question is the one that lands: no second one.
+    let log = std::fs::read_to_string(dir.join("gh.log")).unwrap();
+    let count = |prefix: &str| log.lines().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(count("pr create"), 1, "{log}");
+    assert!(count("pr edit") >= 1, "{log}");
+    assert_eq!(count("pr merge"), 2, "{log}");
+    // The second merge is of the pull request opened in the first run.
+    let merges: Vec<&str> = log.lines().filter(|l| l.starts_with("pr merge")).collect();
+    assert!(
+        merges[1].starts_with("pr merge https://example.com/pull/1 --squash"),
+        "{log}"
+    );
 }
 
 /// A pool's test factory: items #5 Alpha, #6 Beta, #7 Gamma (and #8 Delta with `four`), each
