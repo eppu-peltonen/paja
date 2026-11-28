@@ -862,7 +862,7 @@ pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
 }
 
 /// [`repo_name`], with `gh` stopped once it has run for `limit`.
-pub(crate) fn repo_name_within(
+pub fn repo_name_within(
     home: &Home,
     path: &Path,
     limit: Option<std::time::Duration>,
