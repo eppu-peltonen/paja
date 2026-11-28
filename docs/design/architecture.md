@@ -409,7 +409,10 @@ its `.paja/models` role, `checks` for Vasara's checks, and `ci` (or `land` with 
 open; logs from before it replay with no steps. `run.checked` (`round`, `commit`, `base`)
 records that Vasara's checks passed on a commit. A `run.round` of a round after which the loop goes on carries
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
-like `detail`) or null; older events without it stay readable. Each `run.round` event also lists the
+like `detail`) or null, and with no `prior` the `noted` findings outside the change the latest review named, for the
+next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list
+when there are none, which a resumed run of that round takes over the earlier ones; a round stopped or ended on an
+error has no `noted`, and older events without these fields stay readable. Each `run.round` event also lists the
 round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
 Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
 `duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that

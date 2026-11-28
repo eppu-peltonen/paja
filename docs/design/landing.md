@@ -35,10 +35,14 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   the person (`left_findings`), since no issue holds them. An `outside` finding is not fixed here, since one concern
   goes in each pull request: it is recorded (`not filed: outside the change`) and listed in the pull request the same
   way. Each re-reviewer checks the earlier findings in the change as fixes, and sees the earlier `outside` findings
-  (also after a red CI) and repeats the ones that still apply. A red CI at the round limit escalates, and what the
-  change would have landed without is recorded as `not filed: the change did not land`. The description goes to `gh`
-  in a file, since ten findings are past Windows' command-line limit, and is cut at GitHub's 65,536 characters; a
-  reused pull request gets the new round's description (if that edit fails, the landing goes on with the old one).
+  (also after a red CI) and repeats the ones that still apply. Every review that reads the whole change after an
+  earlier one sees them too, such as a high-risk one, one of a fix that merged or rewrote history, and the one after a
+  conflict or failed checks at the turn to land. The log keeps them for a resumed run: a round recorded with no
+  `prior` as `next.noted`, and a round whose review approved as `noted` (empty when none). A red CI at the round limit
+  escalates, and what the change would have landed without is recorded as `not filed: the change did not land`. The
+  description goes to `gh` in a file, since ten findings are past Windows' command-line limit, and is cut at GitHub's
+  65,536 characters; a reused pull request gets the new round's description (if that edit fails, the landing goes on
+  with the old one).
 - **The follow-up label stays.** Jono still takes the follow-up issues that are already open, oldest first, and `paja
   triage` still closes duplicates and already-fixed ones. New ones are made only by people. The pull request's
   description is public, so reviewers never copy secrets, environment details or run output into findings, and Mestari
