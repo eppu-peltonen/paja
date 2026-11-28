@@ -7,22 +7,25 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
 
 ## 0.2.0
 
-- Agents run in Docker Sandboxes by default when `sbx` is installed: Paja finds it on `PATH`, checks it works, and
-  stops the step with the fix when it doesn't, never falling back to the host. `PAJA_SBX=off` runs agents on the host.
-  `paja doctor`, the first progress line and `run.started` say which backend a run uses and why.
-- A sandboxed agent no longer hangs when it exits before reading all of its prompt, and each step's sandbox belongs to
-  its own thread.
+- Agents run in Docker Sandboxes by default when `sbx` is installed: Paja finds it on `PATH`, checks it works, and stops
+  the step with the fix when it doesn't, never falling back to the host. `PAJA_SBX=off` runs agents on the host. `paja
+  doctor`, the first progress line and `run.started` say which backend a run uses and why.
+- A sandboxed agent no longer hangs when it exits before reading all of its prompt, and two calls at once in one `paja
+  mcp` never share or lose each other's sandbox.
 - Waiting for CI has a limit: 120 minutes by default, or `wait <minutes>` in `.paja/ci`. CI still going at the limit
   escalates the item instead of holding every other landing, and `stop now` ends the wait at once.
 - Changes waiting to land take the turn in the order they began to wait, and a run resumed after its review approved
   lands without being reviewed again.
 - Landing is sturdier: only a CI check that never started is retried when main moves, a cancelled check or a merge that
-  conflicts at landing escalates, a failed merge is explained from GitHub's own answer, and the default branch is
-  taken from GitHub before `origin/HEAD`.
+  conflicts at landing escalates, a failed merge is explained from GitHub's own answer, and the default branch is taken
+  from GitHub before `origin/HEAD`.
 - Usage pacing reads the usage window Claude Code really reports, and `paja doctor` warns when no recent step reported
-  one. A nearly used window pauses a run before it calls GitHub.
+  one. A pass that pauses because the usage window is nearly used no longer checks GitHub for a CI workflow first.
+- An arbiter agent (the `arbiter` role in `.paja/models`) settles an escalation the issue, the code or `CLAUDE.md`
+  already answers before it reaches you, and otherwise asks you one question with options and a recommendation. `paja
+  work show` and Paja Desk say `answered by arbiter`, and `paja work answer` overrides it.
 - The arbiter overrules any answer that may weaken a check, and a reviewer saying that no check is weakened no longer
-  keeps it out.
+  keeps the arbiter out.
 - `paja run --workers` plans the next items while every lane is busy, keeps a plan across pool runs until the item's
   title or text changes, and ends its planners' agents however the pool stops.
 - A parked item's `work-<n>` environment is freed and its branch carried over when it runs again or its issue closes,
@@ -31,17 +34,25 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
   held and out, an activity strip and every everyday action at hand. Pool status carries what it needs (each lane's
   round, time on the lane and tokens, and the latest items out with their outcome). Stopping a run from Desk ends its
   agents and checks too, and closing says what it waits for.
-- `paja init`'s agent reads the repository's `CLAUDE.md` as data, not instructions, and monorepo check lines run end
-  to end.
+- `paja init` detects the project with an agent (the `init` role): any language, monorepos and workspaces (their check
+  lines run end to end), toolchain versions and services. It keeps only what files on the default branch back up, and
+  reads the repository's text, `CLAUDE.md` included, as data, not instructions. `--no-agent`, a missing `claude` or an
+  unusable answer falls back to the built-in table.
+- `paja init --new` takes any stack: for one with no built-in skeleton an agent writes it, and nothing is pushed unless
+  its checks pass. Without `--stack`, on a terminal, it asks what you are building and recommends one to three stacks;
+  `paja init --recommend` (MCP `init_recommend`) prints the recommendations and creates nothing.
 - `paja --version` built inside some other git repository (a `cargo install` under a home directory that is one) says
   `unknown` instead of naming that repository's commit, and a build without a reflog no longer rebuilds every time.
-- Review findings are fixed in the change that drew them (up to five rounds) instead of being filed as follow-up issues;
-  what is left at the round limit, or lies outside the change, is listed in the pull request.
+- Review findings are fixed in the change that drew them (at most five rounds, up from three) instead of being filed as
+  follow-up issues; what is left at the round limit, or lies outside the change, is listed in the pull request.
 - `paja usage` gives the 90th percentile of wall time per landed item in its summary line, next to the median.
 - `paja doctor` quotes and escapes the role words it names as skipped in `.paja/models`, so a control character in the
   file never reaches the terminal.
 - The events a run writes while it waits for and takes the turn to land are now `run.merging` and `run.landing`, since
   single runs write them as pool lanes do; logs with the old `pool.merging` and `pool.landing` still read the same.
+- Smaller fixes: the Windows install steps check the archive against `SHA256SUMS`; Posti tells you when `.paja/models`
+  names a role this Paja doesn't know; the generated-skeleton agent may run fewer programs, and its fallback keeps none
+  of the agent's environment; Paja Desk on Windows opens no console windows.
 
 ## 0.1.0
 
