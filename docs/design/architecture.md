@@ -276,14 +276,15 @@ commit, and only that commit lands. A conflict, or checks that fail on it, sends
 another round (`conflict` or `checks_failed`) within the five rounds, and the next review reads the whole change.
 A pool admits an item to a lane only when the files it will touch don't overlap a running item's
 (`crates/paja/src/mestari/plan.rs`). Before a lane starts it, the pool plans the item in a `paja pool plan <number>` of
-its own, so its ticks go on meanwhile, recorded as `pool.planning`. With a lane free, it starts at most one plan per
-free lane. With every lane busy, it looks every 5 seconds and plans ahead, in queue order, until the first items a
-freed lane could take, as many as the pool has lanes, have a plan ready or on its way, so the next lane to free has
-its plan waiting. An item whose plan would still wait after any one lane ends (it overlaps two running lanes' plans,
-or failed while another lane runs) isn't one of them; a look scans at most twice as many items as the pool has lanes,
-no more plans run at once than the pool has lanes, and none are planned ahead while `pool lanes` shrinks the pool.
-Planning ahead reads the queue as last synced, since a busy pool doesn't sync, and a failed plan is retried only after
-a timed sync, which waits for a free lane. In a plan,
+its own, so its ticks go on meanwhile, recorded as `pool.planning`. With a lane free, it runs at most as many plans at
+once as there are free lanes. With every lane busy, it looks every 5 seconds and plans ahead, in queue order, until the
+first items a freed lane could take, as many as the pool has lanes, have a plan ready or on its way, so the next lane to
+free has its plan waiting. An item that would still wait whichever one lane ends (two running lanes block it: an
+overlap, both high risk, or a failed plan) isn't one of them. An item that one lane blocks counts, though another lane
+may end first, and that lane then plans its next item itself. A look scans at most twice as many items as the pool has
+lanes, no more plans run at once than the pool has lanes, and none are planned ahead while `pool lanes` shrinks the
+pool. Planning ahead reads the queue as last synced, since a busy pool doesn't sync, and a failed plan is retried only
+after a timed sync, which waits for a free lane. In a plan,
 the item's `Touches:` line names the paths when it has one (`source: spec`; the words `and`, `or`, `none` and
 `nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
 `plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). That

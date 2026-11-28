@@ -823,12 +823,13 @@ fn follow_lane(home: &Home, repo: &str, n: u32, lane: &mut Lane, events: &[Event
     Ok(())
 }
 
-/// With every lane busy, the items of the runnable `queue` to start planning, so that the
-/// first `target` items a lane that frees could take, in queue order, have a plan ready or on
-/// its way. One whose plan would still be blocked after any one lane ends (it overlaps two
-/// `running` lanes, or failed while another lane runs) isn't counted among them. A look scans
-/// at most twice `target` items, so items that wait on each other never get the whole queue
-/// planned, and at most `target` plans run at once, counting the `in_flight` ones.
+/// With every lane busy, the items of the runnable `queue` to start planning, so that the first
+/// `target` items a lane that frees could take, in queue order, have a plan ready or on its way.
+/// One that would still wait whichever one lane ends (two `running` lanes block it: an overlap,
+/// both high risk, or a failed plan) isn't counted among them; one that a single lane blocks
+/// counts, though another lane may end first and plan its next item then. A look scans at most
+/// twice `target` items, so items that wait on each other never get the whole queue planned, and at
+/// most `target` plans run at once, counting the `in_flight` ones.
 fn plan_ahead(
     queue: &[u64],
     plans: &BTreeMap<u64, Plan>,
