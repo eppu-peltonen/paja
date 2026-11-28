@@ -179,8 +179,8 @@ as normal risk on purpose.
 
 `paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
-and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, or `none` for a
-repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims
+and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, with an optional
+`wait <minutes>` for CI, or `none` for a repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims
 anything, once an item is ready to take, so nothing is claimed on GitHub (with the usage window nearly used, only an
 item left active to resume counts, so a pass that pauses with only new items ready skips the check); with `none` landing
 skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and creates an
@@ -257,7 +257,14 @@ Changes land one at a time per repository, each on the latest default branch, wh
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
 `runs/<owner>@<name>@land.lock`, under the home lock (`land::land_turn`), recording `pool.merging` (`repo`, `number`,
 `round`) while another run holds it and `pool.landing` once it has it; it holds the turn through the push, the pull
-request, CI and the merge, and lets go when the change lands or goes back to its builder. With the turn it merges the
+request, CI and the merge, and lets go when the change lands or goes back to its builder. Turns go in the order runs
+began to wait, a pool's lanes and single runs alike (`paja pool status` lists a pool's lanes in that order): a run
+takes a free turn only when no other run of the repository still waiting has a `pool.merging` older than its own, as
+its item's latest `run.started`, `pool.merging`, `pool.landing`, `run.round` or `run.landed` shows. A run still
+waits while it holds its item's merging lock, `runs/<owner>@<name>@<number>@merging.lock`, taken with its
+`pool.merging` and let go when it takes the turn or stops waiting, so a `pool.merging` left by a run that stopped or
+died holds no one up. A run back from its builder after a conflict or failed checks at the turn waits again from the
+back. With the turn it merges the
 latest default branch in again: when that branch moved on while it waited, Vasara's checks run again on the merge
 commit, and only that commit lands. A conflict, or checks that fail on it, sends the item back to its builder for
 another round (`conflict` or `checks_failed`) within the five rounds, and the next review reads the whole change.
@@ -425,7 +432,10 @@ the builder resolves them and commits, which finishes the merge. A merge it leav
 and goes back to it, naming the files that still conflict and any review blockers.
 
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
-for CI with `gh pr checks --watch`, merges it and marks the item landed. A red CI goes back to the builder as another
+for CI with `gh pr checks --watch`, merges it and marks the item landed. The wait has a limit, 120 minutes unless
+`.paja/ci` names a `wait <minutes>` and counting the wait for checks to appear, since the run holds the repository's
+turn to land through it: CI still going at the limit always escalates, with the checks as `gh` last showed them, and
+`stop now` ends the wait like any other step. A red CI goes back to the builder as another
 round, like a failed check, with the failing checks and the end of the first failed job's log (`gh run view --job <id>
 --log-failed`); the pull request stays open and the next round pushes to it. So do checks that never start because the
 default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
@@ -713,7 +723,10 @@ while it starts.
   `sandbox-exec` don't exist on every platform Paja runs on. So Paja has one backend, and the owner opts in.
 - **Assumptions about `sbx`.** Everything Paja assumes about it is in `crates/paja/src/sandbox.rs`: `sbx exec`
   with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, and that a mounted path has the same absolute
-  path inside the sandbox.
+  path inside the sandbox, and that `sbx exec -i` passes stdin through. It never returns when the program inside exits
+  before reading all of its stdin, so a shell in the sandbox reads an agent's prompt to the end first and then
+  becomes the agent, with the prompt on a here-document; the prompt is never written to a file the sandbox can
+  reach. The command-line budget counts the whole `sbx` command, wrapping included.
 - **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
   which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
@@ -761,18 +774,46 @@ door to the one core. Desk keeps no state of its own. Everything it shows comes 
 log, and any write it makes later goes through the core and holds the home lock. The HTTP API, so Desk's view reaches a
 phone, comes after v0.1.
 
-For every repository in the log the window lists the work items, grouped as waiting on you (escalated, with the
-question), active, queued and the latest landed, each linking to its issue (opened in the browser). It reads the queue
-again whenever `events.jsonl` changes, polling its size and time; the commands run off the window's thread, and a
-refresh that finishes late never draws over a newer one. An error from the core shows in the window with the text the
-CLI prints.
+The window opens at 1440×900 (the screen's size when that is smaller; `desk/tauri.conf.json` and `fit_window`), is
+resizable and remembers nothing, and is one screen with no page scroll: each region sizes to the window and scrolls
+inside itself. It shows one repository at a time (a picker in the bar when Desk knows more than one) in four regions:
 
-An active item has a run view ("Follow run"), filled by `mestari::live` from the item's latest `run.started` on: the run's
+- **Top bar.** The pool's state as a coloured dot and word, the figures since the pool started (running time, landed,
+  ready, spend as tokens and dollars) and the actions: `Start` (or `Stop after this step` and `Stop now` while Desk's
+  own pool runs), `Held` (highlighted when above 0; it opens the held tab), `New work` and `Repositories`. The last two
+  open as dialogs; Escape or a click outside closes them. An error from the core shows as one line under the bar with the
+  text the CLI prints, laid over the top of the regions so it doesn't push them down.
+- **Lanes**, the main region: a card per lane the pool keeps, side by side and wrapping. A card shows the item
+  (number in the item's colour, linking to its issue; title), stage and step, the round (`first`, `rework 1`, ...),
+  the reviewers' verdicts while in review (one mark each), clocks for the step and the lane, tokens and dollars, and the
+  files the lane was admitted for. The lane holding the turn to land and those waiting for it say `merging`. An idle lane,
+  and every lane while the pool is stopped, says `idle`. After the last card a dashed `+` card adds a lane and each card's
+  `−` removes one, both by calling `pool_lanes` with one more or less (a running pool reads it on its next tick, a stopped
+  one starts with it); busy lanes beyond the count finish their item first, and the region says the pool is shrinking
+  by that many (the core closes whichever lane frees first, so no card is named). The core's refusal (0 to 32 lanes)
+  shows under the bar. Clicking a card opens the item's run view in place of the side panel.
+- **Side panel**, a third of the width, with three tabs. `Next`: the ready items (waiting only for a free lane) with
+  their files, then, dimmed, the items waiting for another reason and that reason. `Held`: the escalated items, one line
+  each (number, title, first line of the question); one opens its full question and the answer box (the text survives
+  refreshes), and items whose issue is closed sit in a collapsed `closed issues` group. `Out`: the latest items that left
+  a lane with their outcome (`landed`, `held`, `failed`, `retired`) and time. The Held tab carries a count badge.
+- **Activity**, a strip along the bottom: the newest `pool.*` and `run.*` events, newest at the bottom, with time, what
+  happened (`admitted`, `step`, `round`, `landed`, `held`, `lanes`), the item and the detail.
+
+Everything comes from `pool_status`, `pool_events`, `work_list`, `repos` and `work_run`, read again every two seconds and
+whenever `events.jsonl` changes (polling its size and time); the commands run off the window's thread, and a refresh
+that finishes late never draws over a newer one. Desk holds only the picked repository, the open tab, run view and
+dialog, and the answers being typed. Numbers are monospace, right aligned and fixed width; durations read `7m 13s` and
+tokens `2.6M`; each item number has a colour picked from it. Light and dark follow the system. Keys `n` (new work), `+`
+(add a lane), `h` (held) and Escape (close the run view) do nothing while a text box has focus. What is computed from
+the core's JSON (durations, token counts, file lists, colour tags, the lane cards and counts, the activity lines) is plain
+functions in `desk/ui/view.js`, tested by `desk/ui/view.test.js` under Node, which a test of `cargo test -p paja-desk`
+runs (it is skipped, saying so, where Node isn't installed; CI's runners have it).
+
+A lane's run view, opened from its card, is filled by `mestari::live` from the item's latest `run.started` on: the run's
 environment, the round of three, the step it is in (role and model) with a clock since its `run.step`, each finished
 round's verdict and what every step spent (tokens, cost, turns, time, from `run.round`), and the pull request once
-`run.step` names it. The view is read again on every refresh, and every five seconds while one is open, since a run that is killed writes no event;
-the timer reads only the open run views, so an answer being typed elsewhere keeps its focus, and a view closes once its
-item is no longer active. An active item that no `paja run` holds (its
+`run.step` names it. The view is read again on every refresh, since a run that is killed writes no event. An active item that no `paja run` holds (its
 `runs/<repo>@<number>.lock` is free or missing) shows as interrupted, not running; checking tries that lock and lets go
 of it at once, without creating it, holding the home lock that `paja run` claims items under, so a claim never meets it.
 A claim since the latest `run.started` means that run's steps aren't the current ones: a new `paja run` that hasn't
@@ -813,15 +854,13 @@ while Desk's runs are going asks whether to stop them or leave them running; sto
 for them to end before Desk exits, ending a `paja` still going after the same 15 seconds the same way, so none is left
 stuck. The log file holds output only, never state.
 
-Each repository also has a pool view ("Pool"), read every two seconds and on every log change: `pool::status` (lanes
-with their item, stage, step, time in step, spend and admitted files; the lane landing and the merging queue; what
-waits and why; what landed; since the pool started, its
-spend, landings, ready items and items held for an answer) and the repository's newest `pool.*` and `run.*` events.
-Its lane count calls `pool::lanes` (as `paja pool lanes`), which a running pool reads on its next tick; lowering
-it below the busy lanes says which lanes finish their item first, and a box that holds no count is refused rather
-than read as 0. "Start the pool" runs `paja run --every 5 --workers
-N` the same way as a run, and Desk refuses it while a pool already runs for the repository. The view keeps nothing of
-its own: everything it shows is the event log's.
+The lanes, panel and activity are the repository's pool, read from `pool::status` (lanes with their item, stage, step,
+round, reviewers' verdicts, time in step and on the lane, spend and admitted files; the lane landing and the merging
+queue; what waits and why; what left a lane; since the pool started, its spend, landings, ready items and items held
+for an answer) and the repository's newest `pool.*` and `run.*` events. Its lane count calls `pool::lanes` (as `paja
+pool lanes`). `Start` runs `paja run --every 5 --workers N` with the lane count the pool keeps, the same way as a run,
+and Desk refuses it while a pool already runs for the repository. The view keeps nothing of its own: everything it
+shows is the event log's.
 
 Desk is a workspace member but not a default one, since it needs the webview's development files to build (WebKitGTK
 on Linux): plain `cargo build` and `cargo test` cover the core, and CI's `desk` job runs clippy and the tests for
@@ -831,6 +870,6 @@ Each `v*` release also builds Desk's installers with Tauri's bundler (the `desk`
 Windows, a dmg per Mac architecture, an AppImage and a deb on Linux, unsigned for now. The installer carries the
 `paja` built from the same commit as a Tauri sidecar (`desk/tauri.bundle.json`, which only the release build merges
 in, names `desk/binaries/paja-<target>`), next to `paja-desk`: in the install folder on Windows, which the NSIS hooks in
-`desk/installer.nsh` put on the user's `PATH`, inside the app on macOS and in `/usr/bin` from the deb. Desk's footer
-runs that `paja` (next to its own executable, else on `PATH`) with `--json --version`, shows its full path (a bare name
+`desk/installer.nsh` put on the user's `PATH`, inside the app on macOS and in `/usr/bin` from the deb. Desk's activity
+strip header runs that `paja` (next to its own executable, else on `PATH`) with `--json --version`, shows its full path (a bare name
 is looked up on `PATH`), and warns when its version differs from Desk's; a test keeps `desk/tauri.conf.json`, Desk's crate and the core's crate at one version.

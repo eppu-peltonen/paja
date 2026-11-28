@@ -7,13 +7,46 @@
     <link rel="stylesheet" href="desk.css" />
   </head>
   <body>
-    <header>
-      <h1>Paja Desk</h1>
-      <span id="updated" class="muted"></span>
-      <button id="show-repos" type="button" class="quiet">Repositories</button>
-      <button id="new-work" type="button">New work</button>
+    <header id="bar">
+      <select id="repo-pick" title="Repository" hidden></select>
+      <span id="state"><span id="state-dot" class="dot"></span><span id="state-word">stopped</span></span>
+      <dl id="figures">
+        <div><dt>up</dt><dd id="fig-up" class="num">-</dd></div>
+        <div><dt>landed</dt><dd id="fig-landed" class="num">0</dd></div>
+        <div><dt>ready</dt><dd id="fig-ready" class="num">0</dd></div>
+        <div><dt>spend</dt><dd id="fig-spend" class="num">0 · $0.00</dd></div>
+      </dl>
+      <div id="bar-actions">
+        <button id="held-button" type="button" class="quiet" title="Held items (h)">Held <span id="held-count" class="num">0</span></button>
+        <button id="start" type="button" hidden>Start</button>
+        <button id="stop" type="button" hidden>Stop after this step</button>
+        <button id="stop-now" type="button" class="quiet" hidden>Stop now</button>
+        <button id="new-work" type="button" class="quiet" title="New work (n)">New work</button>
+        <button id="show-repos" type="button" class="quiet">Repositories</button>
+      </div>
+      <p id="error" class="error" hidden></p>
     </header>
-    <section id="closing" class="warning" hidden>
+    <p id="versions" class="warning" hidden></p>
+    <div id="screen">
+      <main id="lanes-region">
+        <div id="lanes"></div>
+      </main>
+      <aside id="panel">
+        <nav id="tabs">
+          <button type="button" class="tab" data-tab="next">Next</button>
+          <button type="button" class="tab" data-tab="held">Held <span id="tab-held-count" class="badge" hidden></span></button>
+          <button type="button" class="tab" data-tab="out">Out</button>
+        </nav>
+        <ul id="notices"></ul>
+        <div id="panel-body"></div>
+      </aside>
+      <section id="activity">
+        <div id="activity-head"><strong>Activity</strong><span id="about" class="muted"></span></div>
+        <div id="activity-lines"></div>
+      </section>
+    </div>
+
+    <dialog id="closing">
       <p>Paja Desk is running <strong id="closing-repos"></strong>. What should happen to those runs?</p>
       <div class="actions">
         <button id="close-leave" type="button">Leave them running and close</button>
@@ -24,8 +57,9 @@
         Each run ends the agent or check it is running and stops. One still going after 15 seconds is ended, with
         everything it started. Paja Desk closes once they have all ended.
       </p>
-    </section>
-    <section id="repos" hidden>
+    </dialog>
+
+    <dialog id="repos">
       <h2>Repositories</h2>
       <p class="muted">
         Runs start the installed <code>paja run</code> in the repository's checkout, exactly as in a terminal. Paja
@@ -37,37 +71,9 @@
         <button id="repo-add" type="button">Add</button>
       </div>
       <p id="repo-result" hidden></p>
-    </section>
-    <section id="pool" hidden>
-      <div class="row">
-        <h2>Pool of <span id="pool-repo"></span></h2>
-        <button id="pool-close" type="button" class="quiet">Close</button>
-      </div>
-      <p id="pool-summary"></p>
-      <div class="actions">
-        <label>Lanes <input id="pool-lanes" type="number" min="0" max="32" step="1" /></label>
-        <button id="pool-set" type="button">Set lanes</button>
-        <button id="pool-start" type="button">Start the pool</button>
-        <button id="pool-stop" type="button">Stop after this step</button>
-        <button id="pool-stop-now" type="button" class="quiet">Stop now</button>
-      </div>
-      <p id="pool-note" class="muted" hidden></p>
-      <p id="pool-result" hidden></p>
-      <table id="pool-table">
-        <thead>
-          <tr><th>Lane</th><th>Item</th><th>Stage</th><th>Step</th><th>In step</th><th>Spent</th><th>Files</th></tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <h3>Waiting</h3>
-      <ul id="pool-waiting"></ul>
-      <h3>Landed</h3>
-      <ul id="pool-landed"></ul>
-      <h3>Events</h3>
-      <pre id="pool-stream" class="output"></pre>
-    </section>
-    <p id="versions" class="warning" hidden></p>
-    <section id="filing" hidden>
+    </dialog>
+
+    <dialog id="filing">
       <h2>New work</h2>
       <p class="muted">
         A good issue names the goal, what done looks like, and what is out of scope, and is small enough for one
@@ -92,13 +98,8 @@
         </div>
       </div>
       <p id="file-result" hidden></p>
-    </section>
-    <main>
-      <p id="error" class="error" hidden></p>
-      <ul id="notices"></ul>
-      <div id="queue"></div>
-    </main>
-    <footer id="about" class="muted"></footer>
+    </dialog>
+    <script src="view.js"></script>
     <script src="desk.js"></script>
   </body>
 </html>

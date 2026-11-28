@@ -2435,7 +2435,8 @@ impl Factory {
                  if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
-                 \"pr checks\") if [ -f {d}/ci-hold ]; then : > {d}/ci-waiting; fi; while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
+                 \"pr checks\") if [ -f {d}/ci-none ]; then : > {d}/ci-waiting; echo \"no checks reported on the 'work-5' branch\" >&2; exit 1; fi\n\
+                 if [ -f {d}/ci-hold ]; then echo $$ > {d}/ci-pid; printf 'check (ubuntu-latest)\\tpending\\t0\\n'; : > {d}/ci-waiting; fi; while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
                  if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
@@ -9537,6 +9538,165 @@ fn paja_sbx_name_names_the_sandbox_paja_creates_and_runs_in() {
     );
 }
 
+/// A fake `sbx` like [`fake_sbx`] that also models how `sbx exec -i` hangs: it passes stdin only
+/// with `-i`, and when the program inside exits with some of it unread, it leaves
+/// `stdin-left-unread` (where the real one would never return).
+fn fake_sbx_that_hangs_on_unread_stdin(dir: &Path) -> std::path::PathBuf {
+    let d = slash(dir);
+    program(
+        dir,
+        "sbx",
+        &format!(
+            "#!/bin/sh\necho \"<<sbx>> $*\" >> {d}/sbx.log\n\
+             case \"$1\" in\ncreate) : > {d}/created; exit 0 ;;\nexec) shift; keep=\n\
+             [ -f {d}/created ] || {{ echo 'no such sandbox' >&2; exit 1; }}\n\
+             while [ \"$1\" != \"--\" ]; do case \"$1\" in -i) keep=1; shift ;; -w) cd \"$2\"; shift 2 ;; -e) export \"$2\"; shift 2 ;; *) shift ;; esac; done\n\
+             shift\n\
+             case \"$*\" in *\"cc --version\"*) exit 0 ;; esac\n\
+             [ -n \"$keep\" ] || exec \"$@\" < /dev/null\n\
+             cat > {d}/sbx-stdin-$$\n\
+             exec 3< {d}/sbx-stdin-$$\n\
+             \"$@\" <&3; status=$?\n\
+             left=$(wc -c <&3); [ $left -gt 0 ] && : > {d}/stdin-left-unread\n\
+             rm -f {d}/sbx-stdin-$$; exit $status ;;\nesac\n"
+        ),
+    )
+}
+
+#[test]
+fn the_fake_sbx_notices_a_program_that_leaves_stdin_unread() {
+    // The tests below rely on it: a program that exits without reading its stdin is caught.
+    let tmp = tempfile::tempdir().unwrap();
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(tmp.path());
+    std::fs::write(tmp.path().join("created"), "").unwrap();
+    let mut child = Command::new(&sbx)
+        .args(["exec", "-i", "paja", "--", "sh", "-c", "exit 0"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"a prompt").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(tmp.path().join("stdin-left-unread").exists());
+}
+
+#[test]
+fn agents_in_the_sandbox_get_their_prompt_on_stdin_through_the_drain() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert!(log.contains("exec -i"), "{log}");
+    assert!(!f.tmp.path().join("stdin-left-unread").exists(), "{log}");
+    assert!(f.tmp.path().join("prompt-on-stdin").exists());
+    let calls = f.claude_calls();
+    assert!(calls.len() >= 2, "{calls:?}");
+    assert!(calls.iter().all(|c| c.contains("#5")), "{calls:?}");
+    // Each agent's command reads its stdin to the end before the agent starts.
+    let agents: Vec<&str> = log
+        .split("<<sbx>> ")
+        .filter(|c| c.contains("--output-format"))
+        .collect();
+    assert!(agents.len() >= 2, "{log}");
+    assert!(
+        agents
+            .iter()
+            .all(|c| c.starts_with("exec -i") && c.contains("PAJA_PROMPT_END")),
+        "{log}"
+    );
+}
+
+#[test]
+fn an_agent_in_the_sandbox_that_exits_without_reading_its_prompt_does_not_hang_sbx() {
+    // The real `sbx exec -i` never returns when this happens, which hung sandboxed runs.
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let claude = program(
+        f.tmp.path(),
+        "claude-that-fails-early",
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *--version*) exec {} \"$@\" ;; esac\n\
+             : > {}/failed-early; echo 'failed early' >&2; exit 1\n",
+            slash(&f.claude),
+            slash(f.tmp.path())
+        ),
+    );
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert!(f.tmp.path().join("failed-early").exists(), "{report} {log}");
+    assert!(log.contains("exec -i"), "{log}");
+    assert!(
+        !f.tmp.path().join("stdin-left-unread").exists(),
+        "{report} {log}"
+    );
+}
+
+#[test]
+fn a_sandboxed_agent_whose_whole_command_line_is_too_long_is_refused_before_it_starts() {
+    // The budget counts the sandbox's wrapping too, so Windows never refuses the command.
+    let with_harness = || {
+        let f = Factory::new("true\n", "land");
+        std::fs::write(f.repo.join("CLAUDE.md"), "x".repeat(27_600)).unwrap();
+        git(&f.repo, &["add", "CLAUDE.md"]);
+        git(&f.repo, &["commit", "-qm", "a long harness"]);
+        git(&f.repo, &["push", "-q", "origin", "main"]);
+        f
+    };
+    // On its own, `claude`'s command line fits.
+    let f = with_harness();
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+        ],
+    );
+    assert_eq!(report["outcome"], "landed", "{report}");
+    // Wrapped for the sandbox, it doesn't: the excess, about 1,800 characters, is mostly the
+    // sandbox's own shell wrapping (`Sbx::command`'s git shim), so this needs a new size if that
+    // shrinks.
+    let f = with_harness();
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(
+        report.to_string().contains("over Paja's budget"),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap_or_default();
+    assert!(!log.contains("--output-format"), "{log}");
+}
+
 #[test]
 fn agents_outside_the_sandbox_run_in_auto_mode_too() {
     let f = Factory::new("true\n", "land");
@@ -11441,6 +11601,286 @@ fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
     );
 }
 
+/// `paja run` in the factory's checkout with `vars` set, its stdout and stderr read, ended
+/// and failed past five minutes.
+fn run_with_vars(f: &Factory, vars: &[(&str, &str)], args: &[&str]) -> (Value, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+    cmd.current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    let output = output_within(cmd.spawn().unwrap(), std::time::Duration::from_secs(300));
+    let report = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    (report, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// CI still going at `.paja/ci`'s `wait` escalates, naming the setting and showing the checks,
+/// instead of holding the repository's turn to land for as long as the CI hangs, also when
+/// the default branch moved during the wait. The `gh` that was waiting is ended.
+// Unix only, like `stop_now_on_stdin_stops_at_once_and_ends_the_agent`: on Windows CI the fake
+// `gh`'s Git Bash processes can outlive `taskkill /T` and hold paja's output open, so the run
+// would now and then not read as ended. The deadline path on Windows is covered by
+// `a_step_past_its_deadline_is_ended_as_timed_out_on_windows`, with no Git Bash in it.
+#[cfg(unix)]
+#[test]
+fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let dir = f.tmp.path().to_path_buf();
+    f.on_main(".paja/ci", "required\nwait 30\n");
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    // Once the run waits for CI, the default branch moves on from another clone. Once the run
+    // has asked on the issue, the fake `gh` is let go, so nothing it left behind holds paja's
+    // output open.
+    let mover = {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            // However this thread ends, even by a panic, the fake `gh` is let go.
+            struct LetGo(std::path::PathBuf);
+            impl Drop for LetGo {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("ci-hold"));
+                }
+            }
+            let _let_go = LetGo(dir.clone());
+            let started = std::time::Instant::now();
+            let log = dir.join("gh.log");
+            let comments = || {
+                std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .matches("issue comment")
+                    .count()
+            };
+            while !dir.join("ci-waiting").exists() {
+                if started.elapsed().as_secs() >= 300 {
+                    return Err("the run never waited for CI");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // Counted when the wait begins: the run asks on the issue only once it is over.
+            let before = comments();
+            let other = dir.join("elsewhere");
+            let origin = dir.join("origin.git");
+            git(
+                &dir,
+                &["clone", "-q", origin.to_str().unwrap(), "elsewhere"],
+            );
+            std::fs::write(other.join("elsewhere.txt"), "moved on\n").unwrap();
+            git(&other, &["add", "."]);
+            git(
+                &other,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "elsewhere",
+                ],
+            );
+            git(&other, &["push", "-q", "origin", "HEAD:main"]);
+            if comments() != before {
+                return Err("the wait was over before the default branch moved");
+            }
+            // Far past the wait: a run still waiting then never ended `gh`, which, let go,
+            // lands the change and fails the test.
+            let asked = std::time::Instant::now();
+            while comments() == before {
+                if asked.elapsed().as_secs() >= 150 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(())
+        })
+    };
+    // Long enough for a loaded runner to move the default branch during it.
+    let (report, stderr) =
+        run_with_vars(&f, &[("PAJA_TEST_CI_WAIT_MS", "30000")], &["--json", "run"]);
+    let moved = mover.join().unwrap();
+    let waiting = std::fs::read_to_string(dir.join("ci-pid")).unwrap_or_default();
+    if let Err(why) = moved {
+        panic!("{why}\n{stderr}");
+    }
+    assert_eq!(
+        report["outcome"],
+        "escalated",
+        "{report}\n{stderr}\n{}",
+        f.gh_log()
+    );
+    let question = report["question"].as_str().unwrap_or_default();
+    assert!(
+        question.contains("was still going after 30 seconds")
+            && question.contains("put `wait <minutes>` in .paja/ci")
+            && question.contains("it is now 30 minutes")
+            && question.contains("The change itself needs nothing")
+            && question.contains("check (ubuntu-latest)\tpending"),
+        "{question}"
+    );
+    assert!(
+        !stderr.contains("sending the failure back to the builder"),
+        "{stderr}"
+    );
+    // Ended at the limit: the run only asks once the wait is over, and the wait is over only
+    // once `gh` is ended, so it was gone before `ci-hold` was removed.
+    {
+        let alive = Command::new("kill")
+            .args(["-0", waiting.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !waiting.trim().is_empty() && !alive,
+            "the waiting gh outlived the wait"
+        );
+    }
+}
+
+/// A pull request whose checks never appear within a short `wait` says so, as it does past
+/// five minutes, not that CI was still going.
+#[test]
+fn checks_that_never_appear_within_a_short_wait_say_so() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-none"), "").unwrap();
+    let (report, stderr) =
+        run_with_vars(&f, &[("PAJA_TEST_CI_WAIT_MS", "3000")], &["--json", "run"]);
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    let question = report["question"].as_str().unwrap_or_default();
+    assert!(
+        question.contains("no CI checks appeared on")
+            && question.contains("within 3 seconds; check the workflows")
+            && !question.contains("still going"),
+        "{question}"
+    );
+}
+
+/// `stop now` during the CI wait stops the run at once, leaving the item to resume, rather
+/// than escalating the wait it cut short: both while `gh` watches the checks and between its
+/// tries while none have appeared yet.
+// Unix only, like `stop_now_on_stdin_stops_at_once_and_ends_the_agent`: on Windows the fake
+// `gh`'s Git Bash loop can outlive `taskkill /T`.
+#[cfg(unix)]
+#[test]
+fn stop_now_in_the_ci_wait_stops_the_run_instead_of_escalating() {
+    for flag in ["ci-hold", "ci-none"] {
+        stop_now_in_the_ci_wait(flag);
+    }
+}
+
+#[cfg(unix)]
+fn stop_now_in_the_ci_wait(flag: &str) {
+    use std::io::Write as _;
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let dir = f.tmp.path();
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    std::fs::write(dir.join(flag), "").unwrap();
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run", "--stop-on-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let guard = EndOnPanic(run.id());
+    let started = std::time::Instant::now();
+    while !dir.join("ci-waiting").exists() {
+        if let Some(status) = run.try_wait().unwrap() {
+            panic!("{flag}: `paja run` exited ({status}) before it waited for CI");
+        }
+        assert!(
+            started.elapsed().as_secs() < 300,
+            "{flag}: the run never waited for CI"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut stdin = run.stdin.take().unwrap();
+    writeln!(stdin, "stop now").unwrap();
+    stdin.flush().unwrap();
+    let stopping = std::time::Instant::now();
+    std::mem::forget(guard);
+    let output = output_within(run, std::time::Duration::from_secs(120));
+    let _ = std::fs::remove_file(dir.join(flag));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Well under the 10 seconds after which a stop that never reached a step exits anyway.
+    assert!(
+        stopping.elapsed().as_secs() < 8,
+        "{flag}: paja didn't stop at once\n{stderr}"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(report["outcome"], "stopped", "{flag}: {report}\n{stderr}");
+    let (_, work) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(work["status"], "active", "{flag}: {work}");
+    // The findings of the review that approved it are left for the resumed run to record.
+    assert!(events_of(&f, "run.follow_up").is_empty(), "{flag}");
+}
+
+/// `paja doctor` reads `.paja/ci` as `paja run` does: a `wait` with `required` is fine, a
+/// `wait` with `none` names the file, the branch and what is wrong.
+#[test]
+fn doctor_reads_a_ci_wait_as_run_does() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let ci = |text: &str| {
+        f.on_main(".paja/ci", text);
+        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        report["checks"]
+            .as_array()
+            .and_then(|checks| checks.iter().find(|c| c["name"] == "ci").cloned())
+            .unwrap_or_else(|| panic!("{report}"))
+    };
+    let fine = ci("required\nwait 30\n");
+    assert_eq!(fine["status"], "ok", "{fine}");
+    let wrong = ci("none\nwait 30\n");
+    assert_ne!(wrong["status"], "ok", "{wrong}");
+    let detail = wrong["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(".paja/ci on") && detail.contains("says `none` and names a `wait`"),
+        "{wrong}"
+    );
+}
+
+/// A `.paja/ci` that names a `wait` with `none` stops the run before anything is claimed,
+/// naming the file, the branch and what is wrong.
+#[test]
+fn a_ci_file_with_none_and_a_wait_is_an_error_naming_the_file() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.on_main(".paja/ci", "none\nwait 30\n");
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(".paja/ci on main says `none` and names a `wait`")
+            && error.contains("fix it on main"),
+        "{report}"
+    );
+    let (_, work) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_ne!(work["status"], "active", "{work}");
+}
+
 #[test]
 fn a_merge_github_refuses_escalates_naming_the_setting() {
     let f = Factory::new("test -f feature.txt\n", "land");
@@ -12196,6 +12636,122 @@ fn two_lanes_at_the_land_turn(f: &Factory) -> (u64, u64) {
         }
     });
     turn
+}
+
+/// Two lanes waiting for the turn to land take it in the order they began to wait, the order
+/// `paja pool status` lists them in, not whichever looks first once it is free. The one that
+/// waited first is paused while the turn comes free, so the other looks first.
+#[cfg(unix)]
+#[test]
+fn lanes_waiting_to_land_take_the_turn_in_the_order_they_began_to_wait() {
+    let f = pool_factory(false);
+    std::fs::write(f.tmp.path().join("own-files"), "").unwrap();
+    for flag in ["real-merge", "ci-hold"] {
+        std::fs::write(f.tmp.path().join(flag), "").unwrap();
+    }
+    let pool = start_pool(&f, "3");
+    wait_until(&f, "three lanes building", || {
+        ["Alpha", "Beta", "Gamma"].iter().all(|t| holding(&f, t))
+    });
+    let status = || paja(&f.home, &f.repo, &["pool", "status"]).1;
+    let merging = |status: &Value| -> Vec<u64> {
+        status["merging"]
+            .as_array()
+            .map(|m| m.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    };
+    let took = |n: u64| {
+        paja(&f.home, &f.repo, &["log"])
+            .1
+            .as_array()
+            .unwrap()
+            .iter()
+            .rfind(|e| e["kind"] == "pool.landing" && e["data"]["number"] == n)
+            .map(|e| e["seq"].as_u64().unwrap())
+    };
+    // One at a time, so the order they begin to wait is known.
+    release(&f, "Alpha");
+    wait_until(&f, "one lane landing", || {
+        status()["landing"].as_u64().is_some()
+    });
+    release(&f, "Beta");
+    wait_until(&f, "a second lane waiting", || {
+        merging(&status()).len() == 1
+    });
+    release(&f, "Gamma");
+    wait_until(&f, "a third lane waiting", || merging(&status()).len() == 2);
+    let order = merging(&status());
+    // Pause the lane that waited first, a child of the pool; it still holds its item, so it
+    // still counts.
+    let first = Command::new("pgrep")
+        .args([
+            "-P",
+            &pool.id().to_string(),
+            "-f",
+            "--",
+            &format!("--item {} ", order[0]),
+        ])
+        .output()
+        .unwrap();
+    let first = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    assert!(
+        !first.is_empty() && !first.contains('\n'),
+        "lane of #{}: {first:?}",
+        order[0]
+    );
+    // Whether the lane got the signal; only the last resume may ignore it.
+    let signal = |sig: &str| {
+        Command::new("kill")
+            .args([sig, first.as_str()])
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    // However the test ends from here, the paused lane is let go again.
+    struct Resume<'a>(&'a dyn Fn(&str) -> bool);
+    impl Drop for Resume<'_> {
+        fn drop(&mut self) {
+            let _ = (self.0)("-CONT");
+        }
+    }
+    let resume = Resume(&signal);
+    // Paused while it doesn't hold the home lock, which it takes briefly at each look, so the
+    // first change can still record its landing.
+    let home_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(f.home.join("lock"))
+        .unwrap();
+    loop {
+        assert!(signal("-STOP"), "pausing the lane of #{}", order[0]);
+        match home_lock.try_lock() {
+            Ok(()) => {
+                home_lock.unlock().unwrap();
+                break;
+            }
+            Err(_) => {
+                assert!(signal("-CONT"), "resuming the lane of #{}", order[0]);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    std::fs::remove_file(f.tmp.path().join("ci-hold")).unwrap();
+    wait_until(&f, "the first change landing", || landed(&f) == 1);
+    // Several looks of the second waiter, each finding the turn free.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let jumped = took(order[1]);
+    drop(resume);
+    assert!(
+        jumped.is_none(),
+        "#{} took the turn while #{} waited longer",
+        order[1],
+        order[0]
+    );
+    wait_until(&f, "all three landing", || landed(&f) == 3);
+    let reports = stop_pool(&f, pool);
+    assert!(
+        reports.iter().all(|r| r["outcome"] == "landed"),
+        "{reports:?}"
+    );
+    assert!(took(order[0]).unwrap() < took(order[1]).unwrap());
 }
 
 /// What origin's main holds at `path`, or None.

@@ -14,28 +14,105 @@ const LAND_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Wait for this repository's turn to land, taken under the home lock and held for as long as
 /// the returned lock lives. Recorded as `pool.merging` while it waits, `pool.landing` once taken.
-/// A `stop now` ends the wait.
+/// Turns go in the order runs began to wait, a pool's lanes and single runs alike (`paja pool
+/// status` lists a pool's lanes in that order): a free turn is taken only when no run of the
+/// repository still waiting has waited longer. A run back from its builder after a conflict or
+/// failed checks at the turn waits again from the back. A `stop now` ends the wait.
+///
+/// While it waits, the run holds its item's merging lock ([`Home::try_merging_lock`]), which
+/// is what tells the others it still waits: a `pool.merging` left by a run that stopped or
+/// died, or by one whose item a new run has claimed but not brought to the turn yet, holds no
+/// one up. The log is read only when the turn is free, which is seldom; while the longest
+/// waiting run hasn't looked yet, each other waiter reads it once a tick.
 pub(super) fn land_turn(home: &Home, item: &WorkItem, round: u32) -> Result<crate::home::RunLock> {
     let data = json!({ "repo": item.repo, "number": item.number, "round": round });
-    let mut waiting = false;
+    // The seq of this run's `pool.merging`, once it waits, and the lock that says it does.
+    let mut waiting: Option<(u64, Option<crate::home::RunLock>)> = None;
+    let mut announced = false;
+    let mut probe_failed = false;
     loop {
         {
             let lock = home.lock()?;
             if let Some(turn) = home.try_land_lock(&item.repo)? {
-                home.events().append(&lock, EV_LANDING, data)?;
-                return Ok(turn);
+                let events = home.events().read_all()?;
+                let failed = std::cell::Cell::new(None);
+                // A probe that fails counts as nobody waiting, so a lock file Paja can't read
+                // costs the order, never the landing.
+                let held = |n: u64| {
+                    home.merging_held(&item.repo, n).unwrap_or_else(|err| {
+                        failed.set(Some(format!("{err:#}")));
+                        false
+                    })
+                };
+                let mine = waiting.as_ref().map(|(seq, _)| *seq);
+                let ahead = waiting_ahead(&events, &item.repo, item.number, mine, held);
+                if let Some(err) = failed.take().filter(|_| !probe_failed) {
+                    probe_failed = true;
+                    progress(&format!(
+                        "couldn't tell whether another run waits to land, so turns may not go \
+                         in order: {err}"
+                    ));
+                }
+                if ahead.is_empty() {
+                    home.events().append(&lock, EV_LANDING, data)?;
+                    return Ok(turn);
+                }
+                // Not this run's turn: the longest waiting takes it at its next look.
+                drop(turn);
             }
-            if !waiting {
-                home.events().append(&lock, EV_MERGING, data.clone())?;
+            if waiting.is_none() {
+                let merging = home.try_merging_lock(&item.repo, item.number)?;
+                // The run lock makes the item this run's alone, so another holder means a run
+                // that outlived its run lock; this run still waits, but others can't see it.
+                if merging.is_none() {
+                    progress(&format!(
+                        "another process holds #{}'s merging lock, so runs waiting after this \
+                         one may land first",
+                        item.number
+                    ));
+                }
+                let event = home.events().append(&lock, EV_MERGING, data.clone())?;
+                waiting = Some((event.seq, merging));
             }
         }
-        if !waiting {
-            waiting = true;
+        if !announced {
+            announced = true;
             progress("another change is landing in this repository; waiting for its turn");
         }
         stop_point()?;
         std::thread::sleep(LAND_TICK);
     }
+}
+
+/// The items of `repo` other than `number` whose runs have waited for the turn to land longer
+/// than this one: since `mine`, the seq of this run's `pool.merging`, or at all when it hasn't
+/// waited yet. An item's latest `run.started`, `pool.merging`, `pool.landing`, `run.round` or
+/// `run.landed` says whether it waits, and only a run still waiting (`held`: its item's merging
+/// lock is held) counts, so a run stopped or ended while it waited holds no one up.
+fn waiting_ahead(
+    events: &[crate::events::Event],
+    repo: &str,
+    number: u64,
+    mine: Option<u64>,
+    held: impl Fn(u64) -> bool,
+) -> Vec<u64> {
+    let mut latest: std::collections::BTreeMap<u64, &crate::events::Event> = Default::default();
+    for e in events {
+        if e.data["repo"] != repo
+            || ![EV_STARTED, EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&e.kind.as_str())
+        {
+            continue;
+        }
+        if let Some(n) = e.data["number"].as_u64().filter(|n| *n != number) {
+            latest.insert(n, e);
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|(_, e)| e.kind == EV_MERGING && mine.is_none_or(|mine| e.seq < mine))
+        .map(|(n, _)| n)
+        .filter(|n| held(*n))
+        .collect()
 }
 
 /// How a landing attempt ended.
@@ -59,6 +136,7 @@ pub(super) fn land(
     rounds: u32,
     judged: &str,
     ci: CiMode,
+    ci_wait: u64,
     target: &RepoSettings,
     unsettled: &[String],
 ) -> Result<Landing> {
@@ -164,7 +242,15 @@ pub(super) fn land(
         progress(&format!("opened {pr}; waiting for CI"));
         // A red CI is the builder's to fix, like a failed check: the pull request stays open
         // and the next round pushes to it.
-        if let Err(err) = wait_for_ci(repo, &pr) {
+        if let Err(err) = wait_for_ci(repo, &pr, ci_wait) {
+            // `stop now` ended the wait: the run stops, and the next one resumes the item.
+            if stopped(&err) {
+                return Err(err);
+            }
+            if let Some(late) = err.downcast_ref::<CiTimedOut>() {
+                let question = late.to_string();
+                return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+            }
             let err = format!("{err:#}");
             // Only a failed check, or checks that never start because the default branch moved
             // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
@@ -444,22 +530,136 @@ pub(super) fn comment(home: &Home, repo: &Path, item: &WorkItem, question: &str)
     follow_ups::comment_on_issue(home, repo, item.number, &body)
 }
 
-/// Wait until GitHub has registered checks on the pull request, then until they finish.
-/// A pull request that gets no checks at all is not treated as green.
-pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
+/// Whether `err` is a step that `stop now` (or a second Ctrl-C) ended.
+fn stopped(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+    })
+}
+
+/// CI still going at the limit `.paja/ci`'s `wait` sets: the question for the person. Never
+/// the builder's to fix, so the run escalates it whatever else happened during the wait.
+#[derive(Debug)]
+pub(super) struct CiTimedOut(pub(super) String);
+
+impl std::fmt::Display for CiTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CiTimedOut {}
+
+/// Wait until GitHub has registered checks on the pull request, then until they finish, for
+/// at most `minutes` in all (`.paja/ci`'s `wait`; debug builds: `PAJA_TEST_CI_WAIT_MS`). A
+/// pull request that gets no checks at all is not treated as green, and neither is CI still
+/// going at the limit, which is a [`CiTimedOut`]: the run holds the repository's turn to land
+/// while it waits, so a CI that hangs would otherwise hold up every landing there. `stop now`
+/// ends the wait at once.
+pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
     const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
+    const AGAIN: std::time::Duration = std::time::Duration::from_secs(10);
+    let limit = std::env::var("PAJA_TEST_CI_WAIT_MS")
+        .ok()
+        .filter(|_| cfg!(debug_assertions))
+        .and_then(|ms| ms.parse().ok())
+        .map_or(
+            std::time::Duration::from_secs(minutes * 60),
+            std::time::Duration::from_millis,
+        );
     let start = std::time::Instant::now();
+    let deadline = start + limit;
+    let gh = jono::gh_program();
+    let args = ["pr", "checks", pr, "--watch", "--fail-fast"];
     loop {
-        match run_gh(repo, &["pr", "checks", pr, "--watch", "--fail-fast"]) {
-            Ok(_) => return Ok(()),
-            Err(err) if format!("{err:#}").contains("no checks reported") => {
-                if start.elapsed() > APPEAR {
-                    bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
-                }
-                std::thread::sleep(std::time::Duration::from_secs(10));
-            }
-            Err(err) => return Err(err),
+        let mut cmd = Command::new(&gh);
+        cmd.env("GH_PROMPT_DISABLED", "1")
+            .current_dir(repo)
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        let ended =
+            crate::platform::output_until_stopped_or(&mut cmd, deadline).with_context(|| {
+                format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+            })?;
+        if ended.timed_out {
+            // The table is on stdout; stderr's lines would run into it.
+            let table = clip(String::from_utf8_lossy(&ended.output.stdout).trim());
+            return Err(still_going(pr, limit, minutes, &table).into());
         }
+        if ended.output.status.success() {
+            return Ok(());
+        }
+        let err = format!("`{gh} {}` failed: {}", args.join(" "), tail(&ended.output));
+        if !err.contains("no checks reported") {
+            bail!(err);
+        }
+        // No checks yet: that is the workflows' to fix, not a hung CI, so it keeps its own
+        // message, cut to the limit when that is shorter.
+        let waited = start.elapsed();
+        if waited > APPEAR || waited + AGAIN >= limit {
+            bail!(
+                "no CI checks appeared on {pr} within {}; check the workflows",
+                long(APPEAR.min(limit))
+            );
+        }
+        // In short steps, so `stop now` isn't left waiting between two tries.
+        let next = std::time::Instant::now() + AGAIN;
+        while std::time::Instant::now() < next {
+            if crate::platform::interrupts() >= 2 {
+                return Err(crate::platform::stopped_error().into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// The question for CI on `pr` still going after `limit`, with the checks as `gh` last showed
+/// them.
+fn still_going(pr: &str, limit: std::time::Duration, minutes: u64, checks: &str) -> CiTimedOut {
+    let mut text = format!(
+        "CI on {pr} was still going after {}, so Paja stopped waiting for it and did not land \
+         it. Look at the pull request's checks on GitHub: a job may be stuck, or queued with no \
+         runner to take it. If this repository's CI takes longer, put `wait <minutes>` in \
+         {CI_FILE} on the default branch (it is now {}).\n\nThe change itself needs nothing: \
+         once the checks are unstuck or the wait is raised, answer, and Paja checks this pull \
+         request's CI again before it lands.",
+        long(limit),
+        long(std::time::Duration::from_secs(minutes * 60))
+    );
+    let checks = last_table(checks);
+    if !checks.is_empty() {
+        // A fence longer than any run of backticks in the table, so none can end it.
+        let mut fence = "```".to_string();
+        while checks.contains(fence.as_str()) {
+            fence.push('`');
+        }
+        text.push_str(&format!(
+            "\n\nThe checks when Paja stopped waiting:\n\n{fence}\n{checks}\n{fence}"
+        ));
+    }
+    CiTimedOut(text)
+}
+
+/// The last table in `gh pr checks --watch`'s output: without a terminal it prints the whole
+/// table again at each refresh, with a blank line between them.
+fn last_table(output: &str) -> &str {
+    output
+        .trim()
+        .rsplit("\n\n")
+        .map(str::trim)
+        .find(|table| !table.is_empty())
+        .unwrap_or_default()
+}
+
+/// `limit` as a person reads it: whole minutes, or seconds below one.
+fn long(limit: std::time::Duration) -> String {
+    match limit.as_secs() {
+        1 => "1 second".to_string(),
+        s if s < 60 => format!("{s} seconds"),
+        60..=119 => "1 minute".to_string(),
+        s => format!("{} minutes", s / 60),
     }
 }
 
@@ -518,6 +718,83 @@ mod tests {
         // Another method being off says nothing about this one.
         let v = json!({"viewerPermission": "ADMIN", "rebaseMergeAllowed": false});
         assert_eq!(why(v, super::SQUASH), None);
+    }
+
+    #[test]
+    fn the_turn_to_land_goes_to_the_run_that_waited_longest() {
+        use super::*;
+        let ev = |seq: u64, kind: &str, number: u64| crate::events::Event {
+            seq,
+            kind: kind.to_string(),
+            data: json!({ "repo": "o/r", "number": number }),
+            v: 1,
+            ts_ms: 0,
+        };
+        let events = vec![
+            ev(1, EV_STARTED, 5),
+            ev(2, EV_STARTED, 6),
+            ev(3, EV_STARTED, 7),
+            ev(4, EV_MERGING, 6),
+            ev(5, EV_MERGING, 7),
+            ev(6, EV_MERGING, 5),
+            // Another repository's waiter never counts.
+            crate::events::Event {
+                seq: 7,
+                kind: EV_MERGING.to_string(),
+                data: json!({ "repo": "o/other", "number": 8 }),
+                v: 1,
+                ts_ms: 0,
+            },
+        ];
+        let all = |_: u64| true;
+        // #6 waited first, so it goes first; #7 and #5 wait behind it, in that order.
+        assert!(waiting_ahead(&events, "o/r", 6, Some(4), all).is_empty());
+        assert_eq!(waiting_ahead(&events, "o/r", 7, Some(5), all), [6]);
+        assert_eq!(waiting_ahead(&events, "o/r", 5, Some(6), all), [6, 7]);
+        // A run that hasn't waited yet queues behind every waiter.
+        assert_eq!(waiting_ahead(&events, "o/r", 9, None, all), [5, 6, 7]);
+        // A waiter whose run is gone holds no one up.
+        assert!(waiting_ahead(&events, "o/r", 7, Some(5), |n| n != 6).is_empty());
+        // Nor does one whose item moved on: a round, a landing or a new run since it waited.
+        for kind in [EV_LANDING, EV_ROUND, EV_LANDED, EV_STARTED] {
+            let mut moved = events.clone();
+            moved.push(ev(8, kind, 6));
+            assert!(
+                waiting_ahead(&moved, "o/r", 7, Some(5), all).is_empty(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timeout_question_shows_only_the_last_table_in_a_fence_it_cannot_end() {
+        let watched = "Refreshing checks status every 10 seconds.\n\ncheck\tpending\t0\n\n\
+                       check\tpending\t10s\nlint\tpass\t5s\n";
+        assert_eq!(
+            super::last_table(watched),
+            "check\tpending\t10s\nlint\tpass\t5s"
+        );
+        assert_eq!(super::last_table("  \n"), "");
+        let question = super::still_going(
+            "https://example.com/pull/1",
+            std::time::Duration::from_secs(60),
+            1,
+            "odd ``` name\tpending\t0",
+        )
+        .to_string();
+        assert!(question.contains("after 1 minute,") && question.contains("(it is now 1 minute)"));
+        assert!(
+            question.ends_with("\n````\nodd ``` name\tpending\t0\n````"),
+            "{question}"
+        );
+        let quiet = super::still_going(
+            "https://example.com/pull/1",
+            std::time::Duration::from_secs(1),
+            1,
+            "",
+        );
+        assert!(!quiet.to_string().contains("The checks when"), "{quiet}");
+        assert!(quiet.to_string().contains("after 1 second,"), "{quiet}");
     }
 
     #[test]
