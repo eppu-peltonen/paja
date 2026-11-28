@@ -34,42 +34,38 @@ pub fn init_agent(
         port_count: 0,
         created_ms: 0,
     };
-    crate::sandbox::activate(start_sandbox(home, repo, base)?);
-    let result = (|| {
-        let tools = [
-            "Read",
-            "Glob",
-            "Grep",
-            "Bash(git status*)",
-            "Bash(git diff*)",
-            "Bash(git log*)",
-            "Bash(git show*)",
-            "Bash(tail *)",
-            "Bash(head *)",
-            "Bash(grep *)",
-            "Bash(wc *)",
-            "Bash(pwd)",
-        ];
-        // The repository's CLAUDE.md is data the agent reads and judges, not its rules, so it
-        // isn't put in the system prompt (where a large one could also overrun the command line).
-        let out = claude_with(
-            home,
-            &env,
-            base,
-            prompt,
-            &tools,
-            Some(schema),
-            true,
-            &models.args("init"),
-            None,
-            Harness::Omitted,
-        )?;
-        out.get("structured_output")
-            .cloned()
-            .context("the init agent returned no answer")
-    })();
-    crate::sandbox::activate(None);
-    result
+    let _sandbox = crate::sandbox::enter(start_sandbox(home, repo, base)?);
+    let tools = [
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash(git status*)",
+        "Bash(git diff*)",
+        "Bash(git log*)",
+        "Bash(git show*)",
+        "Bash(tail *)",
+        "Bash(head *)",
+        "Bash(grep *)",
+        "Bash(wc *)",
+        "Bash(pwd)",
+    ];
+    // The repository's CLAUDE.md is data the agent reads and judges, not its rules, so it
+    // isn't put in the system prompt (where a large one could also overrun the command line).
+    let out = claude_with(
+        home,
+        &env,
+        base,
+        prompt,
+        &tools,
+        Some(schema),
+        true,
+        &models.args("init"),
+        None,
+        Harness::Omitted,
+    )?;
+    out.get("structured_output")
+        .cloned()
+        .context("the init agent returned no answer")
 }
 
 /// A sandbox, when `PAJA_SBX` asks for one, that can reach the fresh clone `dir`, which is not
@@ -117,7 +113,7 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
         port_count: 0,
         created_ms: 0,
     };
-    crate::sandbox::activate(clone_sandbox(home, dir)?);
+    let sandbox = crate::sandbox::enter(clone_sandbox(home, dir)?);
     let result = {
         let program_tools = program_tools(programs);
         let mut tools: Vec<&str> = vec!["Read", "Edit", "Write", "Glob", "Grep"];
@@ -146,7 +142,7 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
             Harness::DefaultBranch,
         )
     };
-    crate::sandbox::activate(None);
+    drop(sandbox);
     result?;
     // The agent may run local git, but the skeleton must stay uncommitted on the clone's branch:
     // a commit would hide its files from the next step, and another branch would push nothing.
@@ -169,9 +165,9 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
 /// output, or None when they all pass.
 pub fn skeleton_checks(home: &Home, dir: &Path, checks: &[String]) -> Result<Option<String>> {
     let guard = GitGuard::new(dir)?;
-    crate::sandbox::activate(clone_sandbox(home, dir)?);
+    let sandbox = crate::sandbox::enter(clone_sandbox(home, dir)?);
     let result = run_checks(dir, checks);
-    crate::sandbox::activate(None);
+    drop(sandbox);
     guard.check("Vasara's checks")?;
     result
 }
@@ -226,7 +222,7 @@ pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Valu
             port_count: 0,
             created_ms: 0,
         };
-        crate::sandbox::activate(start_sandbox(home, &dir, &base)?);
+        let sandbox = crate::sandbox::enter(start_sandbox(home, &dir, &base)?);
         let out = claude(
             home,
             &env,
@@ -239,7 +235,7 @@ pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Valu
             true,
             &Models::default().args("init"),
         );
-        crate::sandbox::activate(None);
+        drop(sandbox);
         out?.get("structured_output")
             .cloned()
             .context("the init agent returned no answer")

@@ -612,8 +612,8 @@ fn run(cli: &Cli) -> Result<()> {
                     },
                 );
                 let Some(minutes) = every else {
-                    let report = match outcome {
-                        Ok(report) => report,
+                    let pass = match outcome {
+                        Ok(pass) => pass,
                         Err(err) => {
                             if mestari::is_fatal(&err) {
                                 paja::posti::stopped(&home, repo);
@@ -624,7 +624,7 @@ fn run(cli: &Cli) -> Result<()> {
                             return Err(err);
                         }
                     };
-                    emit(cli, run_json(&report)?, || describe_run(&report));
+                    emit(cli, run_json(&pass)?, || describe_run(&pass.report));
                     break;
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
@@ -632,9 +632,10 @@ fn run(cli: &Cli) -> Result<()> {
                 // A usage limit waits for its reset instead of polling the queue.
                 let mut reset: Option<u64> = None;
                 let wait = match outcome {
-                    Ok(report) => {
+                    Ok(pass) => {
                         failures.passed();
-                        emit(cli, run_json(&report)?, || describe_run(&report));
+                        emit(cli, run_json(&pass)?, || describe_run(&pass.report));
+                        let report = pass.report;
                         idle = matches!(report, mestari::RunReport::Idle);
                         reset = match &report {
                             mestari::RunReport::Paused { resets_at } => Some(*resets_at),
@@ -893,13 +894,10 @@ fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
 }
 
 /// The run's report, with whether a sandbox was in use.
-fn run_json(report: &mestari::RunReport) -> Result<serde_json::Value> {
-    let mut value = serde_json::to_value(report)?;
+fn run_json(pass: &mestari::Pass) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(&pass.report)?;
     if let Some(fields) = value.as_object_mut() {
-        fields.insert(
-            "sandbox".to_string(),
-            json!(paja::sandbox::active().is_some()),
-        );
+        fields.insert("sandbox".to_string(), json!(pass.sandbox));
     }
     Ok(value)
 }

@@ -8591,6 +8591,8 @@ fn agents_and_checks_run_through_the_sandbox() {
     );
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
+    // The report says so, though the pass's sandbox is no longer in use once it has ended.
+    assert_eq!(report["sandbox"], true, "{report}");
     let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
     // The sandbox is created once with the factory's environments mounted, and the agent, the
     // check and the reviewer all went through `exec`.

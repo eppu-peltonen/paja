@@ -640,6 +640,9 @@ while it starts.
   test uses it, so it never removes the person's own). `.paja/setup` runs with stderr merged into stdout, so a failure's
   last lines keep their order, and writes a progress line to stderr while it runs. Detection is optional by design: Paja has no Docker dependency, and its tests
   use a fake `sbx`.
+- **One step's sandbox.** The sandbox a step starts is in use for that step's agents and checks only, on the thread
+  that runs it, and is put back when the step ends, an error included. So two calls at once in one long-lived `paja mcp`
+  never start an agent in each other's sandbox, or with none once the other has finished.
 - **Permissions.** Claude Code is always started with `--permission-mode auto`, with or without a sandbox; the sandbox
   image's default, `bypassPermissions`, and every weaker mode are never used. Auto mode is an extra layer, not a
   replacement for the deny-list hook, `--tools` or the turn caps. If a Claude Code rejects auto mode headless, the step

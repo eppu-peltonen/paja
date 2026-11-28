@@ -109,6 +109,15 @@ pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// The tamper lock lives in Ahjo, next to the git every command runs.
 pub use crate::ahjo::{Tampered, EV_TAMPERED, EV_TAMPER_CHECKED};
 
+/// One pass of `paja run`: how it ended, and whether it started a sandbox.
+#[derive(Debug, Clone)]
+pub struct Pass {
+    pub report: RunReport,
+    /// Whether the pass's agents and checks were to run in a sandbox. Kept here because the
+    /// sandbox is in use only while the pass runs, so it can't be read afterwards.
+    pub sandbox: bool,
+}
+
 /// How a run ended.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -582,7 +591,14 @@ fn require_workflow(repo: &Path) -> Result<()> {
 }
 
 /// Take the next work item and run it to an outcome.
-pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
+pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<Pass> {
+    let mut sandbox = false;
+    let report = one_pass(home, opts, &mut sandbox)?;
+    Ok(Pass { report, sandbox })
+}
+
+/// [`run_once`]'s pass, which sets `sandbox` once it has started one.
+fn one_pass(home: &Home, opts: RunOptions<'_>, sandbox: &mut bool) -> Result<RunReport> {
     // The usage window is the account's: before it resets, nothing is claimed or resumed.
     if let Some(resets_at) = usage_pause(&home.events().read_all()?, crate::events::now_ms()) {
         progress(&format!(
@@ -617,7 +633,9 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     })?;
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
-    crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
+    let sbx = start_sandbox(home, &repo, &base)?;
+    *sandbox = sbx.is_some();
+    let _sandbox = crate::sandbox::enter(sbx);
     let labels =
         jono::Labels::parse(&read_from_base(&repo, &base, jono::LABELS_FILE)?.unwrap_or_default())?;
     let queue = jono::QueueRules::parse(
