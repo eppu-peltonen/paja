@@ -50,7 +50,9 @@ pub fn init_agent(
             "Bash(wc *)",
             "Bash(pwd)",
         ];
-        let out = claude(
+        // The repository's CLAUDE.md is data the agent reads and judges, not its rules, so it
+        // isn't put in the system prompt (where a large one could also overrun the command line).
+        let out = claude_with(
             home,
             &env,
             base,
@@ -59,6 +61,8 @@ pub fn init_agent(
             Some(schema),
             true,
             &models.args("init"),
+            None,
+            false,
         )?;
         out.get("structured_output")
             .cloned()
@@ -139,6 +143,7 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
             false,
             &Models::default().args("init"),
             Some(programs),
+            true,
         )
     };
     crate::sandbox::activate(None);

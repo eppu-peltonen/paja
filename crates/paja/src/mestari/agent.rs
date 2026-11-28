@@ -302,12 +302,14 @@ pub(super) fn claude(
     model_args: &[String],
 ) -> Result<Value> {
     claude_with(
-        home, env, base, prompt, tools, schema, read_only, model_args, None,
+        home, env, base, prompt, tools, schema, read_only, model_args, None, true,
     )
 }
 
 /// [`claude`], with `programs` (when given) as the programs the hook lets it run instead of
-/// `.paja/commands`: for a repository that has no such file yet.
+/// `.paja/commands`: for a repository that has no such file yet. With `harnessed` false the
+/// default branch's `CLAUDE.md` is not put in the system prompt: for an agent that judges a
+/// repository it doesn't work in (`paja init`), whose `CLAUDE.md` is data to read, not rules.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude_with(
     home: &Home,
@@ -319,9 +321,14 @@ pub(super) fn claude_with(
     read_only: bool,
     model_args: &[String],
     programs: Option<&[String]>,
+    harnessed: bool,
 ) -> Result<Value> {
     let program = claude_program();
-    let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
+    let harness = match harnessed
+        .then(|| read_from_base(&env.path, base, "CLAUDE.md"))
+        .transpose()?
+        .flatten()
+    {
         Some(text) => format!("The project's CLAUDE.md, as it is on the default branch:\n\n{text}"),
         None => String::new(),
     };
