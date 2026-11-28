@@ -235,7 +235,7 @@ share, else the first path's top folder, empty without paths) and, in `review`, 
 `reviewer`, `verdict`). A waiting item has an `area` too. The pool has `tokens` next to `spent_usd`, `out` (the latest
 five items that left a lane, newest first: `number`, `title`, `outcome` and `ts_ms`; the outcome is `landed`, `held`
 for an escalation, `failed` for a run that errored, or `retired` for an item closed without landing, from the lane's
-`done`), `retired_since_start` and `target`, 1 for a repository that never recorded a lane count. `run.checked` records
+`done`), `retired_since_start` (the `failed` and `retired` exits since the pool started) and `target`, 1 for a repository that never recorded a lane count. `run.checked` records
 `checks_passed` and `run.landed` the `checks_passed` and `merge_commit` of the change, on new events only.
 
 Then, for at most three rounds:

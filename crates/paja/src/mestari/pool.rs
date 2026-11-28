@@ -1433,7 +1433,9 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
     let retired_since_start = since.map_or(0, |since| {
         exits
             .iter()
-            .filter(|(seq, exit)| *seq > since[0].seq && exit.outcome == "retired")
+            .filter(|(seq, exit)| {
+                *seq > since[0].seq && matches!(exit.outcome.as_str(), "retired" | "failed")
+            })
             .count()
     });
     let out = exits
@@ -1872,7 +1874,8 @@ mod tests {
         );
         assert_eq!(status.out[0].ts_ms, 10_000);
         assert_eq!(status.out[3].title, "item 11");
-        assert_eq!(status.retired_since_start, 1);
+        // Failed (#13) and retired (#14) both left without landing or being held.
+        assert_eq!(status.retired_since_start, 2);
         // A reviewer's block shows, and a stopped pool has no lanes and none since its start.
         let mut more = events.clone();
         more.push(reviewed(48, 7, 3, 2, "changes"));
