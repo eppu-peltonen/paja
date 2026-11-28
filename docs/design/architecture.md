@@ -270,9 +270,10 @@ the item's `Touches:` line names the paths when it has one (`source: spec`; the 
 environment is `<repo>-<hash>-plan-<issue>`, so two repositories sharing a home never plan in one checkout; one of that
 name made from another repository stops the plan with the `paja env remove <name>` fix, and an older release's
 `plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an OS lock for its
-item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs is refused at
-once and records nothing. A pool that finds the lock held (a plan started by hand) starts no planner of its own, says
-so, and admits the item on the plan that one records. The plan,
+item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs is refused
+within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no planner of its
+own, says so, counts the item as being planned (it takes one of the free lanes' planning slots), and admits it on the plan that one records; after 10 minutes it stops
+waiting and the plan fails. The plan,
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its

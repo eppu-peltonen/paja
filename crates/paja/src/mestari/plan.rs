@@ -177,7 +177,16 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     let name = jono::repo_name(home, &repo)?;
     // Taken before anything is recorded: a plan that finds another one running records nothing,
     // so it never replaces that plan's result.
-    let Some(_lock) = home.try_plan_lock(&name, number)? else {
+    // Tried for a moment: a pool probing whether a plan runs holds the lock for an instant.
+    let mut lock = home.try_plan_lock(&name, number)?;
+    for _ in 0..20 {
+        if lock.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lock = home.try_plan_lock(&name, number)?;
+    }
+    let Some(_lock) = lock else {
         bail!(
             "another `paja pool plan {number}` of {name} is running (a pool's planner, or one \
              started by hand); wait for it, then `paja pool status` shows its plan"
