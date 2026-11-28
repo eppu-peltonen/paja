@@ -12551,19 +12551,41 @@ fn lanes_waiting_to_land_take_the_turn_in_the_order_they_began_to_wait() {
         order[0]
     );
     let signal = |sig: &str| {
-        assert!(Command::new("kill")
-            .args([sig, &first])
-            .status()
-            .unwrap()
-            .success());
+        let _ = Command::new("kill").args([sig, first.as_str()]).status();
     };
-    signal("-STOP");
+    // However the test ends from here, the paused lane is let go again.
+    struct Resume<'a>(&'a dyn Fn(&str));
+    impl Drop for Resume<'_> {
+        fn drop(&mut self) {
+            (self.0)("-CONT");
+        }
+    }
+    let resume = Resume(&signal);
+    // Paused while it doesn't hold the home lock, which it takes briefly at each look, so the
+    // first change can still record its landing.
+    let home_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(f.home.join("lock"))
+        .unwrap();
+    loop {
+        signal("-STOP");
+        match home_lock.try_lock() {
+            Ok(()) => {
+                home_lock.unlock().unwrap();
+                break;
+            }
+            Err(_) => {
+                signal("-CONT");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
     std::fs::remove_file(f.tmp.path().join("ci-hold")).unwrap();
     wait_until(&f, "the first change landing", || landed(&f) == 1);
     // Several looks of the second waiter, each finding the turn free.
     std::thread::sleep(std::time::Duration::from_secs(3));
     let jumped = took(order[1]);
-    signal("-CONT");
+    drop(resume);
     assert!(
         jumped.is_none(),
         "#{} took the turn while #{} waited longer",
