@@ -2270,6 +2270,32 @@ fn work_show_tells_where_an_active_items_run_is_and_that_it_stopped() {
 }
 
 #[test]
+fn work_show_shows_a_round_recorded_twice_once_with_how_it_ended() {
+    // A round approved for landing, then sent back by a conflict at the turn to land.
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.status","data":{"number":3,"status":"active","note":null}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"run.started","data":{"number":3,"env":"app-3"}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":4,"kind":"run.round","data":{"number":3,"round":1,"verdict":"land","detail":"fake review","noted":[],"steps":[{"step":"build","cost_usd":0.5,"session_id":"a"}]}}"#,
+        r#"{"v":1,"seq":5,"ts_ms":5,"kind":"run.round","data":{"number":3,"round":1,"verdict":"conflict","detail":"feature.txt","steps":[],"next":{"feedback":"merge","prior":null,"noted":[]}}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let (ok, item) = paja(&home, &repo, &["work", "show", "3"]);
+    assert!(ok, "{item}");
+    let rounds = item["run"]["rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 1, "{item}");
+    assert_eq!(rounds[0]["verdict"], "conflict", "{item}");
+    assert_eq!(rounds[0]["detail"], "feature.txt", "{item}");
+    assert_eq!(rounds[0]["steps"][0]["cost_usd"], 0.5, "{item}");
+    // Its spend is counted once.
+    assert_eq!(item["usage"]["steps"], 1, "{item}");
+}
+
+#[test]
 fn a_log_written_before_repositories_replays_to_the_same_items() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
