@@ -47,7 +47,7 @@ const WORKTREE_GITDIR_VAR: &str = "PAJA_WT_GITDIR";
 /// a command aimed outside the worktree, and an inherited `GIT_WORK_TREE` that is the worktree is
 /// cleared for a command aimed outside it or at another repository of the caller's choosing,
 /// and so is an inherited `GIT_INDEX_FILE` in the worktree's git directory. A value naming any
-/// other directory is the caller's own and left alone. A caller that sets either to
+/// other directory is the caller's own and left alone. A caller that sets any of them to
 /// the worktree's own can't be told from git handing it down, so it is treated the same way.
 /// Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a git called
 /// there usually runs the real git, not this shim. A relative value is read against the
@@ -769,6 +769,7 @@ mod tests {
             .env(WORKTREE_GITDIR_VAR, gitdir_s)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .envs(env.iter().copied());
         let out = cmd.output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -966,12 +967,19 @@ mod tests {
             flagged(&[&own_dir, "status"], &inherited_tree),
             format!("dir={gitdir_s} tree= env= wt={root_s}")
         );
+        let index = format!("{gitdir_s}/index");
+        assert_eq!(
+            flagged(
+                &[&own_dir, "status"],
+                &[("GIT_WORK_TREE", &root_s), ("GIT_INDEX_FILE", &index)]
+            ),
+            format!("dir={gitdir_s} tree= env= wt={root_s} ix={index}")
+        );
         assert_eq!(
             flagged(&["--git-dir", &gitdir_other, "status"], &inherited_tree),
             format!("dir= tree= env= wt={root_s}")
         );
         // An index file git handed down from the worktree's git directory goes with it.
-        let index = format!("{gitdir_s}/index");
         assert_eq!(
             sees(
                 other.path(),
