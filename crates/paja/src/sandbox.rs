@@ -11,9 +11,9 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 
 /// The environment variable that names the `sbx` program and turns the sandbox on.
 pub const PROGRAM_VAR: &str = "PAJA_SBX";
@@ -227,16 +227,37 @@ pub struct Sbx {
     name: String,
 }
 
-static ACTIVE: Mutex<Option<Sbx>> = Mutex::new(None);
-
-/// Use `sandbox` for every agent and check from now on, or none.
-pub fn activate(sandbox: Option<Sbx>) {
-    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = sandbox;
+thread_local! {
+    // One slot per thread, not per process: a long-lived `paja mcp` (or Paja Desk) runs each
+    // call on a thread of its own, so two calls at once never start an agent in each other's
+    // sandbox, or in none once the other has finished.
+    static ACTIVE: RefCell<Option<Sbx>> = const { RefCell::new(None) };
 }
 
-/// The sandbox in use, if the run started one.
+/// Use `sandbox` (or none) for the agents and checks this thread starts until the returned
+/// guard is dropped, which puts back the sandbox in use before, on every way out.
+#[must_use = "the sandbox is in use only while the guard lives"]
+pub fn enter(sandbox: Option<Sbx>) -> Entered {
+    Entered {
+        before: ACTIVE.with(|slot| slot.replace(sandbox)),
+    }
+}
+
+/// The sandbox in use on this thread, if the step started one.
 pub fn active() -> Option<Sbx> {
-    ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    ACTIVE.with(|slot| slot.borrow().clone())
+}
+
+/// What [`enter`] returns: while it lives, its sandbox is the thread's.
+pub struct Entered {
+    before: Option<Sbx>,
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        let before = self.before.take();
+        ACTIVE.with(|slot| *slot.borrow_mut() = before);
+    }
 }
 
 /// The `sbx` program, when the person turned the sandbox on.
@@ -628,6 +649,69 @@ mod tests {
             program: "sbx".into(),
             name: "paja".into(),
         }
+    }
+
+    fn named(name: &str) -> Option<Sbx> {
+        Some(Sbx {
+            program: "sbx".into(),
+            name: name.into(),
+        })
+    }
+
+    fn active_name() -> Option<String> {
+        active().map(|s| s.name)
+    }
+
+    #[test]
+    fn a_sandbox_is_in_use_while_its_guard_lives_and_the_one_before_comes_back() {
+        assert!(active().is_none());
+        let outer = enter(named("outer"));
+        assert_eq!(active_name().as_deref(), Some("outer"));
+        {
+            let _none = enter(None);
+            assert!(active().is_none());
+        }
+        assert_eq!(active_name().as_deref(), Some("outer"));
+        // An early return (here a `?`) drops the guard too, so the slot is never left set.
+        let step = || -> Result<()> {
+            let _inner = enter(named("inner"));
+            assert_eq!(active_name().as_deref(), Some("inner"));
+            anyhow::bail!("the agent failed")
+        };
+        assert!(step().is_err());
+        assert_eq!(active_name().as_deref(), Some("outer"));
+        drop(outer);
+        assert!(active().is_none());
+    }
+
+    #[test]
+    fn two_threads_at_once_each_keep_their_own_sandbox() {
+        // As two `paja mcp` tool calls do: each enters its sandbox, and the other's entering
+        // and leaving in between changes nothing for it.
+        let (a_in, b_in) = (
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+        );
+        let (a_out, b_out) = (a_in.clone(), b_in.clone());
+        let a = std::thread::spawn(move || {
+            let _a = enter(named("a"));
+            a_out.wait(); // b enters its own
+            b_out.wait(); // b has left its own
+            active_name()
+        });
+        let b = std::thread::spawn(move || {
+            a_in.wait();
+            let first = {
+                let _b = enter(named("b"));
+                active_name()
+            };
+            b_in.wait();
+            (first, active_name())
+        });
+        assert_eq!(a.join().unwrap().as_deref(), Some("a"));
+        let (first, after) = b.join().unwrap();
+        assert_eq!(first.as_deref(), Some("b"));
+        assert_eq!(after, None);
     }
 
     #[test]

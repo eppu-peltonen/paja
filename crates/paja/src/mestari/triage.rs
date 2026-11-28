@@ -943,7 +943,7 @@ fn triage_holding(
             open.len(),
             if open.len() == 1 { "" } else { "s" }
         ));
-        crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
+        let _sandbox = crate::sandbox::enter(start_sandbox(home, &repo, &base)?);
         let (answer, used) = ask(home, &repo, &name, &base, &open, &others, &models)?;
         usage = Some(used);
         items = decide(&open, &others, answer, &|issue, commit, file| {

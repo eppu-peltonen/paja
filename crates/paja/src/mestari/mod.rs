@@ -617,7 +617,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     })?;
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
-    crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
+    let _sandbox = crate::sandbox::enter(start_sandbox(home, &repo, &base)?);
     let labels =
         jono::Labels::parse(&read_from_base(&repo, &base, jono::LABELS_FILE)?.unwrap_or_default())?;
     let queue = jono::QueueRules::parse(

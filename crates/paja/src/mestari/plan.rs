@@ -222,7 +222,7 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
                 &read_from_base(repo, &base, MODELS_FILE)?.unwrap_or_default(),
                 branch,
             )?;
-            crate::sandbox::activate(start_sandbox(home, repo, &base)?);
+            let _sandbox = crate::sandbox::enter(start_sandbox(home, repo, &base)?);
             (ask(home, repo, &base, &item, &models)?, "plan")
         }
     };
