@@ -591,12 +591,13 @@ mod tests {
             .unwrap_err();
         assert!(format!("{refused:#}").contains("acme/app"), "{refused:#}");
         drop(marker);
-        wait_until("the marker being let go", || {
-            !home.repo_run_held("acme/app").unwrap()
+        // Another test's child forked in the instant before the drop (or while a probe held the
+        // lock) shares it until it execs, so a start may be refused for a moment longer.
+        wait_until("a start after the marker was let go", || {
+            runner
+                .start(&home, "acme/app", &checkout, false, None)
+                .is_ok()
         });
-        runner
-            .start(&home, "acme/app", &checkout, false, None)
-            .unwrap();
         runner.stop("acme/app", false).unwrap();
         wait_until("the run ending", || !runner.is_running("acme/app"));
     }
