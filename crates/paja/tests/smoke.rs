@@ -2035,15 +2035,17 @@ impl Factory {
                  \"workflow list\") if [ -f {d}/workflows-down ]; then echo 'HTTP 403: Resource not accessible' >&2; exit 1; fi\n\
                  if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") exit 1 ;;\n\
-                 \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi\n\
+                 \"pr merge\") if [ -f {d}/merge-conflicts ]; then echo 'Pull request is not mergeable: the merge commit cannot be cleanly created' >&2; exit 1; fi\n\
+                 if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi\n\
                  if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
                  \"pr checks\") while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
                  if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
-                 case \"$*\" in *--json*) if [ -f {d}/ci-red-seen ]; then rm {d}/ci-red-seen; echo '[{{\"name\": \"check (ubuntu-latest)\", \"bucket\": \"fail\", \"link\": \"https://example.com/acme/app/actions/runs/7/job/8\"}}]'; else echo '[]'; fi; exit 0 ;; esac\n\
+                 case \"$*\" in *--json*) if [ -f {d}/ci-red-seen ] || [ -f {d}/ci-red-always ]; then rm -f {d}/ci-red-seen; echo '[{{\"name\": \"check (ubuntu-latest)\", \"bucket\": \"fail\", \"link\": \"https://example.com/acme/app/actions/runs/7/job/8\"}}]'; else echo '[]'; fi; exit 0 ;; esac\n\
+                 if [ -f {d}/ci-red-always ]; then echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi\n\
                  if [ -f {d}/ci-red-once ]; then mv {d}/ci-red-once {d}/ci-red-seen; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
-                 \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
+                 \"run view\") echo 'test init_works ... FAILED: Author identity unknown'; if [ -f {d}/log-token ]; then echo \"token {token}\"; fi ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  echo https://example.com/pull/1 ;;\n\
@@ -7246,6 +7248,33 @@ fn red_ci_goes_back_to_the_builder_with_the_failed_log() {
         "{}",
         f.gh_log()
     );
+}
+
+#[test]
+fn red_ci_on_the_last_round_escalates_redacted_and_names_the_reason() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-red-always"), "").unwrap();
+    std::fs::write(f.tmp.path().join("log-token"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 3, "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("CI still failed"), "{question}");
+    assert!(!question.contains(&fake_token()), "{question}");
+    let log = f.gh_log();
+    assert!(log.contains("CI still failed"), "{log}");
+    assert!(!log.contains(&fake_token()), "{log}");
+}
+
+#[test]
+fn a_merge_that_conflicts_at_landing_escalates() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("merge-conflicts"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("no longer merges"), "{question}");
+    assert!(f.gh_log().contains("issue comment 5"), "{}", f.gh_log());
 }
 
 #[test]
