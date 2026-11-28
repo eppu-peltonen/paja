@@ -625,10 +625,24 @@ pub fn no_console(cmd: &mut Command) -> &mut Command {
 
 static WINDOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Say the caller is a windowed program (Paja Desk) with no console, so [`own_process_group`]
-/// also starts what it runs without a console window of its own. `paja` itself never calls it.
+/// Say the caller is a windowed program (Paja Desk) with no console, so
+/// [`own_group_for_caller`] also starts what it runs without a console window of its own.
+/// `paja` itself never calls it.
 pub fn set_windowed() {
     WINDOWED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The Windows creation flags of [`own_group_for_caller`]: a new process group, and no console
+/// window when `windowed`.
+#[cfg(windows)]
+fn caller_group_flags(windowed: bool) -> u32 {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if windowed {
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    } else {
+        CREATE_NEW_PROCESS_GROUP
+    }
 }
 
 /// Run `cmd` in a process group of its own, as [`own_process_group`] does, and without a
@@ -636,14 +650,10 @@ pub fn set_windowed() {
 pub fn own_group_for_caller(cmd: &mut Command) -> &mut Command {
     own_process_group(cmd);
     #[cfg(windows)]
-    if WINDOWED.load(std::sync::atomic::Ordering::Relaxed) {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::os::windows::process::CommandExt::creation_flags(
-            cmd,
-            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-        );
-    }
+    std::os::windows::process::CommandExt::creation_flags(
+        cmd,
+        caller_group_flags(WINDOWED.load(std::sync::atomic::Ordering::Relaxed)),
+    );
     cmd
 }
 
@@ -1066,6 +1076,13 @@ pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windowed_caller_gets_no_console_and_keeps_its_own_process_group() {
+        assert_eq!(caller_group_flags(false), 0x0000_0200);
+        assert_eq!(caller_group_flags(true), 0x0000_0200 | 0x0800_0000);
+    }
 
     /// Whether process `pid` has ended (or is only a zombie left for its parent to reap).
     #[cfg(unix)]
