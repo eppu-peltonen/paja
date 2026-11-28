@@ -212,8 +212,13 @@ run event of the item since it was last queued, claimed or answered, not only th
 again before it records a round keeps its round count and blockers: the round, the feedback for the builder, and the
 reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on the branch's HEAD
 (`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no index flags, it skips
-the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. Any other
-state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
+the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. When every
+reviewer had already approved that very commit (a run stopped waiting for the turn to land, or in the CI wait), and as
+many reviewers as the change needs now, it skips the review as well ("resuming #5 in round 1: the review approved
+abc1234, which was waiting to land") and goes on to land with the findings that review approved with. If the default
+branch moved, Paja merges it in and runs the checks again first, as at the turn to land: checks that fail, or a
+conflict, go back to the builder as having come after the review, and the fix is reviewed in full. Any other state
+builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
 and gh run in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the
 terminal's Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build,
 the checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
@@ -466,21 +471,25 @@ conflict or failed checks on the latest default branch, or failed CI) or errors.
 of the earlier ones and the steps of both. A `run.round` of a round after which the loop goes on carries
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
 like `detail`) or null, and with no `prior` the `noted` findings outside the change the latest review named, for the
-next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list
-when there are none, which a resumed run of that round takes over the earlier ones; a round stopped or ended on an
-error has no `noted`, and older events without these fields stay readable. Each `run.round` event also lists the
-round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
-Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
-`duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
-already ran, as a `run.round` with verdict `error` and the error as its detail, before the item is parked. A field the
-result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying those events gives
-each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching MCP tools; a step
-with missing fields counts in its `unknown_steps` and adds only the fields it has, so each sum is a lower bound; a
-recorded step Jono can't read counts as unknown and adds nothing, so a bad usage record never stops the queue, and
-the sequence number of its event is listed in `unreadable_events`. While it
-works, `paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each
-review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON.
-`paja run --every 5` keeps going, checking an empty queue every five minutes.
+next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list when
+there are none, which a resumed run of that round takes over the earlier ones. A round every reviewer approved also
+carries `approved`: the `reviewed` commit, the `commit` it lands as, how many `reviewers` approved it and all the
+`findings` it lands with, in the change and outside it, so a resumed run lands it without reviewing again. A
+`run.checked` with `landing` true is of Paja's own merge of the default branch into the approved change, which moves the
+approval's `commit` to it; checks on any other commit in that round, or a later review in it that didn't approve, take
+the approval back. A round stopped or ended on an error has no `noted`, and older events without these fields stay
+readable. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or `review` with
+its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and cache-creation
+tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p` result. A round that
+stops on an error still records the steps that already ran, as a `run.round` with verdict `error` and the error as its
+detail, before the item is parked. A field the result lacks is `null`, never zero, and rounds recorded before steps were
+kept have none. Replaying those events gives each work item a `usage` total (null until a step is recorded) in `paja
+work` JSON and the matching MCP tools; a step with missing fields counts in its `unknown_steps` and adds only the fields
+it has, so each sum is a lower bound; a recorded step Jono can't read counts as unknown and adds nothing, so a bad usage
+record never stops the queue, and the sequence number of its event is listed in `unreadable_events`. While it works,
+`paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each review
+and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON. `paja run
+--every 5` keeps going, checking an empty queue every five minutes.
 
 ### Posti
 

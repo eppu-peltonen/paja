@@ -5129,10 +5129,11 @@ fn review_prompts(f: &Factory) -> Vec<String> {
         .collect()
 }
 
-/// A run stopped in the CI wait after its review approved resumes with that review's outside
-/// findings: the approved round's `run.round` keeps them, and the review run again hears them.
+/// A run stopped in the CI wait after its review approved resumes straight to landing: the
+/// approved round's `run.round` keeps the review's findings, so the review isn't run again, the
+/// build and the checks aren't either, and the findings are still listed once.
 #[test]
-fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
+fn a_run_stopped_after_its_review_approved_lands_on_resume_without_reviewing_again() {
     let f = Factory::new("true\n", "land");
     let dir = f.tmp.path();
     f.reviewer_finds(
@@ -5151,16 +5152,177 @@ fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
         approved["data"]["noted"][0]["finding"], "The parser drops a line",
         "{approved}"
     );
+    assert_eq!(
+        approved["data"]["approved"]["findings"][0]["finding"], "The parser drops a line",
+        "{approved}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1);
     let (report, stderr) = f.run_with_stderr();
     assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
-    let reviews = review_prompts(&f);
-    let last = reviews.last().unwrap_or_else(|| panic!("{stderr}"));
-    assert!(reviews.len() >= 2, "{stderr}");
     assert!(
-        last.contains("noted these findings outside the change")
-            && last.contains("The parser drops a line"),
-        "{last}"
+        stderr.contains("resuming #5 in round 1: the review approved "),
+        "{stderr}"
     );
+    assert!(
+        stderr.contains("the review already approved this change; skipping it"),
+        "{stderr}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1, "reviewed again\n{stderr}");
+    assert_eq!(builds(&f), 1, "built again\n{stderr}");
+    let left: Vec<Value> = events_of(&f, "run.follow_up");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["data"]["error"], "not filed: outside the change");
+    let log = f.gh_log();
+    let last = log.rfind("pr create").expect(&log);
+    assert_eq!(
+        log[last..].matches("The parser drops a line").count(),
+        1,
+        "{log}"
+    );
+}
+
+/// A change approved before the run stopped is still checked and reviewed again on resume when
+/// its worktree changed since: the approval holds only for the commit it approved.
+#[test]
+fn an_approval_does_not_carry_to_a_worktree_changed_since() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let env = f
+        .home
+        .join("envs")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Committed, so Paja has nothing left over to commit (CI has no git identity).
+    std::fs::write(env.join("stray.txt"), "changed").unwrap();
+    git(&env, &["add", "stray.txt"]);
+    git(&env, &["commit", "-q", "-m", "stray"]);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(!stderr.contains("the review approved"), "{stderr}");
+    assert!(!stderr.contains("the review already approved"), "{stderr}");
+    assert_eq!(review_prompts(&f).len(), 2, "{stderr}");
+}
+
+/// The approval names the commit it approved: a rebuild after it, checked and then stopped in
+/// its own review, is reviewed when the run resumes again, not landed on the old approval.
+#[test]
+fn an_approval_does_not_carry_to_a_rebuild_stopped_in_its_review() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let env = f
+        .home
+        .join("envs")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Committed, so Paja has nothing left over to commit (CI has no git identity).
+    std::fs::write(env.join("stray.txt"), "changed").unwrap();
+    git(&env, &["add", "stray.txt"]);
+    git(&env, &["commit", "-q", "-m", "stray"]);
+    std::fs::write(dir.join("review-hang"), "").unwrap();
+    interrupt_run(&f, "review-hanging");
+    std::fs::remove_file(dir.join("review-hang")).unwrap();
+    let before = review_prompts(&f).len();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(!stderr.contains("the review already approved"), "{stderr}");
+    assert_eq!(review_prompts(&f).len(), before + 1, "{stderr}");
+}
+
+/// The default branch moved while an approved change was stopped: the resumed run merges it in
+/// and runs the checks again, as at the turn to land, and lands without another review.
+#[test]
+fn an_approved_change_resumed_after_main_moved_is_checked_again_not_reviewed() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    f.on_main("other.txt", "elsewhere\n");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("moved on; merged it into the branch"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("checks already passed"), "{stderr}");
+    assert!(
+        stderr.contains("the review already approved this change; skipping it"),
+        "{stderr}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1, "{stderr}");
+    let checked = events_of(&f, "run.checked");
+    let last = checked.last().unwrap_or_else(|| panic!("{stderr}"));
+    assert_eq!(last["data"]["landing"], true, "{last}");
+}
+
+/// When the checks fail with the moved default branch merged in, the approval is gone: the
+/// builder is told main moved on after the review, and the fix is reviewed in full.
+#[test]
+fn an_approved_change_whose_checks_fail_after_main_moved_goes_back_and_is_reviewed() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let block = dir.join("block");
+    std::fs::write(&block, "").unwrap();
+    // Fails once, then passes.
+    let b = slash(&block);
+    f.on_main(
+        ".paja/checks",
+        &format!("test ! -f {b} || {{ rm {b}; false; }}\n"),
+    );
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let rounds = events_of(&f, "run.round");
+    let failed = rounds
+        .iter()
+        .find(|r| r["data"]["verdict"] == "checks_failed")
+        .unwrap_or_else(|| panic!("{rounds:?}\n{stderr}"));
+    let feedback = failed["data"]["next"]["feedback"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(feedback.contains("moved on after the review"), "{feedback}");
+    assert!(failed["data"]["next"]["prior"].is_null(), "{failed}");
+    assert_eq!(review_prompts(&f).len(), 2, "{stderr}");
+    assert!(
+        !stderr.contains("the review already approved this change; skipping it"),
+        "{stderr}"
+    );
+}
+
+/// An approval holds for as many reviewers as gave it: a change that `.paja/high-risk` on the
+/// default branch makes high risk while it was stopped is reviewed again, by two.
+#[test]
+fn an_approval_by_one_reviewer_does_not_land_a_change_now_high_risk() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    assert_eq!(review_prompts(&f).len(), 1);
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("the change is high risk now and needs 2 reviewers, but 1 approved it"),
+        "{stderr}"
+    );
+    assert_eq!(review_prompts(&f).len(), 3, "{stderr}");
 }
 
 /// A run stopped in the round after a conflict at the turn to land resumes with the outside
