@@ -309,7 +309,7 @@ the pool started, and so does a reopened item whose text is unchanged; a failed 
 `high_risk`, a running lane's too, again by main's `.paja/high-risk` as it reads it at its start and after each sync,
 from the commit of main's tip that sync fetched (the commit, not a ref that could have moved since), keeping the list
 read last, or before any read worked the plan's own judgement, while it can't read it, so a plan made before the list
-changed admits by the list as it is; Each list that differs from the one it read last is recorded as `pool.high_risk`
+changed admits by the list as it is. Each list that differs from the one it read last is recorded as `pool.high_risk`
 (`repo`, `base`, the commit read, and `paths`), and `paja pool status` judges the plans by the latest one, as the pool
 does. Two plans overlap when they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones
 (a path under `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that
