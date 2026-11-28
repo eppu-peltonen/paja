@@ -3331,12 +3331,25 @@ fn record_env(home: &Path, name: &str, repo: &Path, path: &Path) {
     std::fs::write(&log, format!("{text}{event}\n")).unwrap();
 }
 
+/// Append a `run.started` to the log at `home`, as a run of `repo`'s item `number` in the
+/// environment `env` records.
+fn record_started(home: &Path, repo: &str, number: u64, env: &str) {
+    let log = home.join("events.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let seq = text.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let event = serde_json::json!({
+        "v": 1, "seq": seq, "ts_ms": 1, "kind": "run.started",
+        "data": { "repo": repo, "number": number, "env": env, "base": "main" }
+    });
+    std::fs::write(&log, format!("{text}{event}\n")).unwrap();
+}
+
 #[test]
 fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
     init_repo(&repo);
-    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
     let issues: Vec<Value> = numbers
         .iter()
         .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
@@ -3413,9 +3426,15 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let other = tmp.path().join("other");
     init_repo(&other);
     tree(&other, &env(11));
-    // 12 still has the `work-<n>` environment an older release made: a reopened item wouldn't
-    // resume that name's branch, so it stays (#523).
+    // So does 17's `work-<n>` one.
+    tree(&other, "work-17");
+    // 12 still has the `work-<n>` environment an older release made, freed the same way.
     let legacy = tree(&repo, "work-12");
+    record_started(&home, "acme/app", 12, "work-12");
+    // 16's is one too, with an untracked file. An older release ran 16 there.
+    let legacy_dirty = tree(&repo, "work-16");
+    record_started(&home, "acme/app", 16, "work-16");
+    std::fs::write(legacy_dirty.join("draft.txt"), "edit\n").unwrap();
     // 13 has a change to a tracked file.
     let changed = tree(&repo, &env(13));
     std::fs::write(changed.join("hello.txt"), "changed\n").unwrap();
@@ -3431,8 +3450,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     drop(lock);
     assert!(ok, "{report}");
     assert_eq!(report["closed"], serde_json::json!(numbers), "{report}");
-    assert_eq!(report["freed"], serde_json::json!([WORK_5]), "{report}");
-    assert!(!clean.exists() && legacy.exists() && changed.exists());
+    assert_eq!(
+        report["freed"],
+        serde_json::json!([WORK_5, "work-12"]),
+        "{report}"
+    );
+    assert!(!clean.exists() && !legacy.exists() && changed.exists());
     assert!(dirty.join("draft.txt").exists());
     let kept: Vec<(String, String)> = report["kept"]
         .as_array()
@@ -3463,7 +3486,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     assert!(why(14).contains("git couldn't read the HEAD"), "{report}");
     assert!(why(15).contains("is already gone"), "{report}");
     assert!(unreadable.join("hello.txt").exists());
-    assert_eq!(kept.len(), 7, "{report}");
+    assert!(
+        kept.iter()
+            .any(|(e, w)| e == "work-16" && w.contains("uncommitted changes")),
+        "{report}"
+    );
+    assert_eq!(kept.len(), 8, "{report}");
     // The branch stays, so a reopened item resumes from it.
     git_out(
         &repo,
@@ -3487,6 +3515,8 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     for n in [6, 7, 8, 9, 10, 13, 14, 15] {
         assert!(detail.contains(&env(n)), "{check}");
     }
+    // The log shows 16 last ran in `work-16`, so that is named too.
+    assert!(detail.contains("work-16"), "{check}");
     assert!(!detail.contains(WORK_5), "{check}");
 
     // Every sync tries again: with the run gone and the draft cleared, 9 and 6 go. The text
@@ -3598,6 +3628,30 @@ fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds()
     let detail = check["detail"].as_str().unwrap();
     assert!(
         detail.contains("work-5") && !detail.contains("spike") && !detail.contains(&six),
+        "{check}"
+    );
+
+    // A log that names repositories: a closed item's `work-<n>` is named only when the log shows
+    // the item last ran there. acme/app's #7 ran in `work-7`, but acme/fork's #7 ran there since;
+    // acme/fork's #8 ran in `work-8` and nothing ran there after.
+    let pinned = tmp.path().join("pinned");
+    std::fs::create_dir_all(&pinned).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":7,"title":"A","body":"","url":"https://example.com/7"}}"#.to_string(),
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/fork","number":8,"title":"B","body":"","url":"https://example.com/8"}}"#.to_string(),
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":7}}"#.to_string(),
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/fork","number":8}}"#.to_string(),
+    ];
+    std::fs::write(pinned.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(&pinned, "work-7", tmp.path(), &tmp.path().join("tree-7"));
+    record_env(&pinned, "work-8", tmp.path(), &tmp.path().join("tree-8"));
+    record_started(&pinned, "acme/app", 7, "work-7");
+    record_started(&pinned, "acme/fork", 7, "work-7");
+    record_started(&pinned, "acme/fork", 8, "work-8");
+    let check = doctor(&pinned);
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("work-8") && !detail.contains("work-7"),
         "{check}"
     );
 
@@ -7588,6 +7642,61 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
         log.contains("run.follow_up") && log.contains("not filed: the change did not land"),
         "{log}"
     );
+}
+
+#[test]
+fn a_run_that_errors_frees_the_work_n_environment_it_resumed() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("gh-down"), "").unwrap();
+    // Item 5 was started by a release that named its environment `work-5`.
+    std::fs::create_dir_all(&f.home).unwrap();
+    std::fs::write(f.home.join("events.jsonl"), "").unwrap();
+    let path = f.tmp.path().join("work-5");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "paja/work-5",
+            path.to_str().unwrap(),
+        ],
+    );
+    record_env(&f.home, "work-5", &f.repo, &path);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let started = events_of(&f, "run.started");
+    assert_eq!(started[0]["data"]["env"], "work-5", "{started:?}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]), "the worktree it used is freed");
+    assert!(!path.exists());
+    // Its branch stays for the next run to resume.
+    git_out(
+        &f.repo,
+        &["rev-parse", "--verify", "-q", "refs/heads/paja/work-5"],
+    );
+    // And it does: the log shows the run in `work-5`, so the branch becomes the item's own.
+    std::fs::remove_file(f.tmp.path().join("gh-down")).unwrap();
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "GitHub is back"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report} {stderr}");
+    let started = events_of(&f, "run.started");
+    assert_eq!(started[1]["data"]["env"], WORK_5, "{started:?}");
+    assert!(!stderr.contains("not resuming"), "{stderr}");
+    let old = Command::new("git")
+        .current_dir(&f.repo)
+        .args(["rev-parse", "--verify", "-q", "refs/heads/paja/work-5"])
+        .output()
+        .unwrap();
+    assert!(!old.status.success(), "paja/work-5 was carried over");
 }
 
 #[test]
