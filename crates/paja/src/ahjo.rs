@@ -260,6 +260,19 @@ impl From<&Env> for RemoveReport {
 /// Remove an environment's worktree. The branch is kept, since it may hold work that has not
 /// landed yet. Without `force`, a worktree with uncommitted changes is refused.
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
+    remove_unless(home, name, force, |_, _, _| Ok(None))
+}
+
+/// [`remove`], unless `keep` names a reason to keep the environment, which is then the error.
+/// `keep` runs under the home lock, after the tamper check and before git touches anything, with
+/// the log as it stands, the environment and the tamper check's proof (None when the repository
+/// is gone, so no git may run), so what it decides can't change before the removal.
+pub(crate) fn remove_unless(
+    home: &Home,
+    name: &str,
+    force: bool,
+    keep: impl FnOnce(&[Event], &Env, Option<&Untampered>) -> Result<Option<String>>,
+) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
     let events = log.read_all()?;
@@ -276,6 +289,9 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     } else {
         None
     };
+    if let Some(why) = keep(&events, &env, checked.as_ref())? {
+        bail!("{why}");
+    }
 
     match checked {
         None => {
@@ -320,7 +336,7 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
                         repo = env.repo.display()
                     )
                 } else {
-                    format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
+                    format!("removing worktree {path}; git refuses one with uncommitted changes or untracked files (--force discards them), and a locked one or one with submodules")
                 }
             })?;
             }
@@ -1496,6 +1512,43 @@ mod tests {
         events.push(event(EV_TAMPER_CHECKED, &key_a));
         assert_eq!(untampered_in(&events, &a).unwrap().key, key_a);
         assert!(tampered(untampered_in(&events, &b)));
+    }
+
+    #[test]
+    fn remove_unless_keeps_what_its_check_keeps_before_git_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_unchecked(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-q", "--allow-empty", "-m", "c"]);
+        git_unchecked(&repo, &args).unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let env = create(
+            &home,
+            CreateOptions {
+                name: "keep-me",
+                repo: &repo,
+                base: None,
+            },
+        )
+        .unwrap();
+        let before = home.events().read_all().unwrap().len();
+        let err = remove_unless(&home, "keep-me", false, |events, seen, ok| {
+            assert!(ok.is_some());
+            assert_eq!(events.len(), before);
+            assert_eq!(seen.name, "keep-me");
+            Ok(Some("the item was reopened".into()))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the item was reopened");
+        assert!(env.path.exists());
+        assert_eq!(home.events().read_all().unwrap().len(), before);
+        assert!(get(&home, "keep-me").is_ok());
+        // With nothing to keep it, it goes.
+        remove_unless(&home, "keep-me", false, |_, _, _| Ok(None)).unwrap();
+        assert!(!env.path.exists() && get(&home, "keep-me").is_err());
     }
 
     #[test]

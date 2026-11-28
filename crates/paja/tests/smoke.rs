@@ -3313,6 +3313,322 @@ fn doctor_warns_of_an_environment_left_by_a_closed_item() {
     );
 }
 
+/// Append an `env.created` event for `name` in `repo` at `path` to the log in `home`, as a run
+/// that made the environment would have.
+fn record_env(home: &Path, name: &str, repo: &Path, path: &Path) {
+    let log = home.join("events.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let seq = text.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let event = serde_json::json!({
+        "v": 1, "seq": seq, "ts_ms": 1, "kind": "env.created",
+        "data": {
+            "name": name, "repo": repo, "path": path, "branch": format!("paja/{name}"),
+            "base_commit": "abc", "port_base": 4000 + seq * 10, "port_count": 10, "created_ms": 1
+        }
+    });
+    std::fs::write(&log, format!("{text}{event}\n")).unwrap();
+}
+
+#[test]
+fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let issues: Vec<Value> = numbers
+        .iter()
+        .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
+        .collect();
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        Value::from(issues).to_string(),
+    )
+    .unwrap();
+    // GitHub says an issue is closed unless `open.txt` names it.
+    std::fs::write(tmp.path().join("open.txt"), "").unwrap();
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             api*) n=${{2##*/}}; if grep -qx \"$n\" {open}; then echo open; else echo closed; fi ;;\n\
+             *) cat {issues} ;;\nesac\n",
+            open = slash(&tmp.path().join("open.txt")),
+            issues = slash(&tmp.path().join("issues.json"))
+        ),
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    for n in numbers.iter().filter(|n| **n != 7) {
+        let n = n.to_string();
+        let (ok, set) = paja(
+            &home,
+            &repo,
+            &["work", "set", &n, "escalated", "--note", "Which API?"],
+        );
+        assert!(ok, "{set}");
+    }
+    let env = |n: u64| WORK_5.replace("work-5", &format!("work-{n}"));
+    let tree = |repo: &Path, name: &str| {
+        let path = tmp.path().join(format!("tree-{name}"));
+        let branch = format!("paja/{name}");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                path.to_str().unwrap(),
+            ],
+        );
+        record_env(&home, name, repo, &path);
+        path
+    };
+    // 5 is parked with a clean worktree and 6 with an untracked file; 7 is queued.
+    let clean = tree(&repo, &env(5));
+    let dirty = tree(&repo, &env(6));
+    std::fs::write(dirty.join("draft.txt"), "the builder's edit\n").unwrap();
+    tree(&repo, &env(7));
+    // 8 left the queue (its label was removed) but its issue is still open on GitHub.
+    tree(&repo, &env(8));
+    std::fs::write(tmp.path().join("open.txt"), "8\n").unwrap();
+    // A run holds 9.
+    tree(&repo, &env(9));
+    let held = paja::home::Home::at(&home).unwrap();
+    let lock = held.try_run_lock("acme/app", 9).unwrap().expect("run lock");
+    // 10's worktree left its branch for a commit that only its HEAD knows.
+    let detached = tree(&repo, &env(10));
+    git(&detached, &["checkout", "-q", "--detach"]);
+    git(
+        &detached,
+        &["commit", "-q", "--allow-empty", "-m", "only here"],
+    );
+    // 11's environment belongs to another checkout.
+    let other = tmp.path().join("other");
+    init_repo(&other);
+    tree(&other, &env(11));
+    // 12 still has the `work-<n>` environment an older release made: a reopened item wouldn't
+    // resume that name's branch, so it stays (#523).
+    let legacy = tree(&repo, "work-12");
+    // 13 has a change to a tracked file.
+    let changed = tree(&repo, &env(13));
+    std::fs::write(changed.join("hello.txt"), "changed\n").unwrap();
+    // 14's worktree lost its `.git` file, so git can't read it; 15's folder is gone.
+    let unreadable = tree(&repo, &env(14));
+    std::fs::remove_file(unreadable.join(".git")).unwrap();
+    let gone = tree(&repo, &env(15));
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    // The issues are closed instead of answered.
+    std::fs::write(tmp.path().join("issues.json"), "[]").unwrap();
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    drop(lock);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!(numbers), "{report}");
+    assert_eq!(report["freed"], serde_json::json!([WORK_5]), "{report}");
+    assert!(!clean.exists() && legacy.exists() && changed.exists());
+    assert!(dirty.join("draft.txt").exists());
+    let kept: Vec<(String, String)> = report["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            (
+                k["env"].as_str().unwrap().into(),
+                k["why"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    let why = |n: u64| {
+        kept.iter()
+            .find(|(e, _)| *e == env(n))
+            .map(|(_, w)| w.clone())
+            .unwrap_or_else(|| panic!("{} not kept: {report}", env(n)))
+    };
+    assert!(why(8).contains("still open on GitHub"), "{report}");
+    assert!(why(9).contains("a run holds item #9"), "{report}");
+    assert!(
+        why(10).contains("is not on") && why(10).contains("--force"),
+        "{report}"
+    );
+    for n in [6, 13] {
+        assert!(why(n).contains("uncommitted changes"), "{report}");
+    }
+    assert!(why(14).contains("git couldn't read the HEAD"), "{report}");
+    assert!(why(15).contains("is already gone"), "{report}");
+    assert!(unreadable.join("hello.txt").exists());
+    assert_eq!(kept.len(), 7, "{report}");
+    // The branch stays, so a reopened item resumes from it.
+    git_out(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/paja/{WORK_5}"),
+        ],
+    );
+    // The kept ones are what doctor names.
+    let (_, doctor) = paja(&home, &repo, &["doctor"]);
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "environments")
+        .unwrap_or_else(|| panic!("no environments check in {doctor}"))
+        .clone();
+    let detail = check["detail"].as_str().unwrap();
+    for n in [6, 7, 8, 9, 10, 13, 14, 15] {
+        assert!(detail.contains(&env(n)), "{check}");
+    }
+    assert!(!detail.contains(WORK_5), "{check}");
+
+    // Every sync tries again: with the run gone and the draft cleared, 9 and 6 go. The text
+    // output says what was freed and kept.
+    std::fs::remove_file(dirty.join("draft.txt")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["work", "sync"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("freed {}, {}", env(6), env(9))),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("kept {}: issue #8 is still open", env(8))),
+        "{text}"
+    );
+    assert!(!dirty.exists());
+}
+
+#[test]
+fn a_run_says_which_environments_of_closed_items_its_sync_kept() {
+    let f = Factory::new("true\n", "land");
+    let issues = f.tmp.path().join("issues.json");
+    std::fs::write(
+        &issues,
+        r#"[{"number": 9, "title": "T", "body": "", "url": "https://example.com/9"}]"#,
+    )
+    .unwrap();
+    let with_gh = [("PAJA_GH", f.gh.as_path())];
+    let (ok, report) = paja_with(&f.home, &f.repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (ok, set) = paja(
+        &f.home,
+        &f.repo,
+        &["work", "set", "9", "escalated", "--note", "Which API?"],
+    );
+    assert!(ok, "{set}");
+    let name = WORK_5.replace("work-5", "work-9");
+    let path = f.tmp.path().join("tree-9");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("paja/{name}"),
+            path.to_str().unwrap(),
+        ],
+    );
+    record_env(&f.home, &name, &f.repo, &path);
+    // Closed in the queue, but this gh can't say the issue is closed on GitHub.
+    std::fs::write(&issues, "[]").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert!(
+        stderr.contains(&format!("kept {name}: issue #9 is still open on GitHub")),
+        "{report}\n{stderr}"
+    );
+    assert!(path.exists());
+}
+
+#[test]
+fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doctor = |home: &Path| -> Value {
+        let (_, report) = paja(home, tmp.path(), &["doctor"]);
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "environments")
+            .unwrap_or_else(|| panic!("no environments check in {report}"))
+            .clone()
+    };
+    // A log from before items carried their repository: item 5's environment was made in this
+    // checkout, item 6's in another.
+    let old = tmp.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":5,"title":"A","body":"","url":"https://example.com/5"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.imported","data":{"number":6,"title":"B","body":"","url":"https://example.com/6"}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"number":5}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.closed","data":{"number":6}}"#,
+    ];
+    std::fs::write(old.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(&old, "work-5", tmp.path(), &tmp.path().join("tree-5"));
+    // A person's own environment whose name merely ends the same way isn't the item's.
+    record_env(
+        &old,
+        "spike-work-5",
+        tmp.path(),
+        &tmp.path().join("tree-5b"),
+    );
+    let six = WORK_5.replace("work-5", "work-6");
+    record_env(
+        &old,
+        &six,
+        Path::new("/elsewhere/app"),
+        Path::new("/elsewhere/tree-6"),
+    );
+    let check = doctor(&old);
+    assert_eq!(check["status"], "warning", "{check}");
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("work-5") && !detail.contains("spike") && !detail.contains(&six),
+        "{check}"
+    );
+
+    // An item still marked active whose issue was closed, with no run holding it: the run that
+    // had it crashed or was killed.
+    let crashed = tmp.path().join("crashed");
+    std::fs::create_dir_all(&crashed).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":5,"title":"A","body":"","url":"https://example.com/5"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.status","data":{"repo":"acme/app","number":5,"status":"active"}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":5}}"#,
+    ];
+    std::fs::write(crashed.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(
+        &crashed,
+        WORK_5,
+        Path::new("/nowhere/app"),
+        Path::new("/nowhere/tree-5"),
+    );
+    let check = doctor(&crashed);
+    assert_eq!(check["status"], "warning", "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains(WORK_5),
+        "{check}"
+    );
+    // While a run holds it, its environment is still in use.
+    let held = paja::home::Home::at(&crashed).unwrap();
+    let lock = held.try_run_lock("acme/app", 5).unwrap().expect("run lock");
+    let check = doctor(&crashed);
+    drop(lock);
+    assert_eq!(check["status"], "ok", "{check}");
+}
+
 #[test]
 fn doctor_warns_when_claude_code_is_out_of_date() {
     let tmp = tempfile::tempdir().unwrap();

@@ -653,7 +653,7 @@ fn one_pass(home: &Home, opts: RunOptions<'_>, sandbox: &mut bool) -> Result<Run
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
     let name = if opts.sync {
-        jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo
+        synced(jono::sync_with(home, &repo, Some(&labels), Some(&queue))?)
     } else {
         jono::repo_name(home, &repo)?
     };
@@ -854,7 +854,24 @@ pub fn sync_queue(home: &Home, repo: &Path) -> Result<String> {
     let queue = jono::QueueRules::parse(
         &read_from_base(&repo, &base, jono::QUEUE_FILE)?.unwrap_or_default(),
     )?;
-    Ok(jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo)
+    Ok(synced(jono::sync_with(
+        home,
+        &repo,
+        Some(&labels),
+        Some(&queue),
+    )?))
+}
+
+/// The repository a run's sync was of, after telling on stderr which environments of closed,
+/// parked items it freed or kept and why, since a run prints no sync report.
+fn synced(report: jono::SyncReport) -> String {
+    for env in &report.freed {
+        progress(&format!("freed {env}: its parked item's issue was closed"));
+    }
+    for kept in &report.kept {
+        progress(&format!("kept {}: {}", kept.env, kept.why));
+    }
+    report.repo
 }
 
 /// For `paja doctor`: the deny-list hook a builder would run under passes its self-test in
