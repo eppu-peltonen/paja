@@ -218,10 +218,40 @@ pub(super) fn land(
     }
     // Merged: from here nothing may turn this into an escalation.
     let _ = jono::set_status(home, &item.repo, item.number, Status::Landed, Some(&pr));
+    // What the landing shows on a dashboard: best effort, since the merge is done either way.
+    let merge_commit = run_gh(
+        repo,
+        &[
+            "pr",
+            "view",
+            &pr,
+            "--json",
+            "mergeCommit",
+            "--jq",
+            ".mergeCommit.oid",
+        ],
+    )
+    .ok()
+    .map(|oid| oid.trim().to_string())
+    .filter(|oid| (7..=64).contains(&oid.len()) && oid.chars().all(|c| c.is_ascii_hexdigit()));
+    let checks_passed = home.events().read_all().ok().and_then(|events| {
+        events
+            .iter()
+            .rev()
+            .find(|e| {
+                e.kind == EV_CHECKED
+                    && e.data["repo"] == item.repo
+                    && e.data["number"] == item.number
+            })
+            .and_then(|e| e.data["checks_passed"].as_u64())
+    });
     let _ = record(
         home,
         EV_LANDED,
-        json!({ "repo": item.repo, "number": item.number, "pr": pr, "rounds": rounds }),
+        json!({
+            "repo": item.repo, "number": item.number, "pr": pr, "rounds": rounds,
+            "merge_commit": merge_commit, "checks_passed": checks_passed,
+        }),
     );
     progress(&format!("landed #{} ({pr})", item.number));
     Ok(Landing::Done(RunReport::Landed {

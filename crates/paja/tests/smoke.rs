@@ -7824,6 +7824,12 @@ fn an_item_another_runner_claimed_is_skipped_and_says_who_holds_it() {
     let (_, status) = f.with_gh(&["pool", "status"]);
     let why = status["waiting"][0]["why"].as_str().unwrap();
     assert!(why.contains("claimed by runner abc123"), "{status}");
+    // A repository that never recorded a lane count starts with one lane; nothing has left one.
+    assert_eq!(status["target"], 1, "{status}");
+    assert_eq!(status["tokens"], 0, "{status}");
+    assert_eq!(status["out"], serde_json::json!([]), "{status}");
+    assert_eq!(status["retired_since_start"], 0, "{status}");
+    assert_eq!(status["waiting"][0]["area"], "", "{status}");
 }
 
 #[test]
@@ -11641,6 +11647,13 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     assert_eq!(status["target"], 2, "{status}");
     assert_eq!(status["admitted"], serde_json::json!([5, 6]), "{status}");
     assert_eq!(status["lanes"][0]["stage"], "build", "{status}");
+    assert_eq!(status["lanes"][0]["round"], 1, "{status}");
+    assert!(status["lanes"][0]["admitted_ms"].as_u64().is_some());
+    assert_eq!(status["lanes"][0]["tokens"], 0, "{status}");
+    assert_eq!(status["lanes"][0]["reviews"], serde_json::json!([]));
+    assert!(status["lanes"][0]["area"].is_string(), "{status}");
+    assert!(status["tokens"].as_u64().is_some(), "{status}");
+    assert_eq!(status["out"], serde_json::json!([]), "{status}");
     assert_eq!(status["waiting"][0]["number"], 7, "{status}");
     assert_eq!(status["waiting"][0]["why"], "no free lane", "{status}");
     // Since the pool started: nothing landed or held yet, one item ready for a lane.
@@ -11655,7 +11668,16 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     let (ok, by_mcp) = mcp.call("pool_status", serde_json::json!({}));
     assert!(ok, "{by_mcp}");
     assert_eq!(by_mcp["admitted"], status["admitted"]);
-    for key in ["started_ms", "ready", "held", "landed_since_start"] {
+    for key in [
+        "started_ms",
+        "ready",
+        "held",
+        "landed_since_start",
+        "target",
+        "tokens",
+        "out",
+        "retired_since_start",
+    ] {
         assert_eq!(by_mcp[key], status[key], "{key}");
     }
     assert_eq!(
@@ -11682,6 +11704,9 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     assert_eq!(status["state"], "stopped", "{status}");
     assert_eq!(status["busy"], 0, "{status}");
     assert_eq!(status["landed"].as_array().unwrap().len(), 3, "{status}");
+    let out = status["out"].as_array().unwrap();
+    assert_eq!(out.len(), 3, "{status}");
+    assert!(out.iter().all(|o| o["outcome"] == "landed"), "{status}");
     let lanes = events_of(&f, "pool.lane");
     for stage in ["starting", "build", "checks", "review", "land", "done"] {
         assert!(

@@ -422,6 +422,7 @@ fn consult(
         "arbiter",
         Some(scene.models),
         None,
+        None,
     )?;
     let out = claude(
         scene.home,
