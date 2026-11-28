@@ -2854,6 +2854,8 @@ fn a_none_mode_merge_refused_for_status_checks_names_the_ci_file() {
     let after_merge = &log[log.find("pr merge").unwrap()..];
     assert!(
         after_merge.contains("issue comment 5 --body-file")
+            && after_merge.contains(hint)
+            && after_merge.contains("put `required` in")
             && after_merge.contains("--add-label factory-needs-answer"),
         "{log}"
     );
@@ -7848,6 +7850,38 @@ fn a_nearly_used_window_pauses_before_the_workflow_check() {
         "{}",
         f.gh_log()
     );
+}
+
+#[test]
+fn a_nearly_used_window_still_checks_the_workflow_for_an_item_left_active() {
+    // #5 is left active by a run that stopped in its review, and #6 then lands with its build
+    // seeing the window nearly used. The next pass would resume #5, so the missing workflow is
+    // still the error.
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    two_items(&f);
+    std::fs::write(dir.join("review-hang"), "").unwrap();
+    interrupt_run(&f, "review-hanging");
+    std::fs::remove_file(dir.join("review-hang")).unwrap();
+    std::fs::write(dir.join("window-warning"), "").unwrap();
+    std::fs::write(dir.join("reset-at"), epoch_secs_in(3600).to_string()).unwrap();
+    let (ok, report, stderr) = run_args(&f, &["--item", "6"], None);
+    assert!(ok, "{report}\n{stderr}");
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    std::fs::write(dir.join("no-workflows"), "").unwrap();
+    let listed = f.gh_log().matches("workflow list").count();
+    let calls = f.claude_calls().len();
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("add a workflow") && error.contains(".paja/ci"),
+        "{report}"
+    );
+    assert_eq!(f.gh_log().matches("workflow list").count(), listed + 1);
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "active", "{item}");
+    assert_eq!(f.claude_calls().len(), calls, "no agent started");
 }
 
 #[test]
