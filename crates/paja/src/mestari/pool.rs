@@ -2322,9 +2322,16 @@ mod tests {
         }
         let status = from_events(&old, "acme/app", true, &[]);
         assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
-        // Upgraded midway: #6 waited under the old name and takes the turn under the new one.
-        events.truncate(10);
-        events[9].kind = OLD_MERGING.to_string();
+        // Upgraded midway: #5 took the turn and #6 began to wait under the old names, #7 began
+        // to wait after the upgrade; then #6 takes the turn under the new name.
+        events.truncate(7);
+        events.extend([
+            turn(8, OLD_LANDING, 5),
+            turn(9, OLD_MERGING, 6),
+            turn(10, EV_MERGING, 7),
+        ]);
+        let status = from_events(&events, "acme/app", true, &[]);
+        assert_eq!((status.landing, status.merging), (Some(5), vec![6, 7]));
         events.extend([round(11, 5), turn(12, EV_LANDING, 6)]);
         let status = from_events(&events, "acme/app", true, &[]);
         assert_eq!((status.landing, status.merging), (Some(6), vec![7]));
