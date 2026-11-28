@@ -3295,6 +3295,171 @@ fn doctor_warns_of_an_environment_left_by_a_closed_item() {
     );
 }
 
+/// Append an `env.created` event for `name` in `repo` at `path` to the log in `home`, as a run
+/// that made the environment would have.
+fn record_env(home: &Path, name: &str, repo: &Path, path: &Path) {
+    let log = home.join("events.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let seq = text.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let event = serde_json::json!({
+        "v": 1, "seq": seq, "ts_ms": 1, "kind": "env.created",
+        "data": {
+            "name": name, "repo": repo, "path": path, "branch": format!("paja/{name}"),
+            "base_commit": "abc", "port_base": 4000 + seq * 10, "port_count": 10, "created_ms": 1
+        }
+    });
+    std::fs::write(&log, format!("{text}{event}\n")).unwrap();
+}
+
+#[test]
+fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let gh = fake_gh(
+        tmp.path(),
+        r#"[{"number": 5, "title": "A", "body": "", "url": "https://example.com/5"},
+            {"number": 6, "title": "B", "body": "", "url": "https://example.com/6"},
+            {"number": 7, "title": "C", "body": "", "url": "https://example.com/7"}]"#,
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    for n in ["5", "6"] {
+        let (ok, set) = paja(
+            &home,
+            &repo,
+            &["work", "set", n, "escalated", "--note", "Which API?"],
+        );
+        assert!(ok, "{set}");
+    }
+    let env = |n: u64| WORK_5.replace("work-5", &format!("work-{n}"));
+    // 5 is parked with a clean worktree, 6 with an uncommitted file, and 7 is queued.
+    let tree = |n: u64| {
+        let path = tmp.path().join(format!("tree-{n}"));
+        let branch = format!("paja/{}", env(n));
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                path.to_str().unwrap(),
+            ],
+        );
+        record_env(&home, &env(n), &repo, &path);
+        path
+    };
+    let clean = tree(5);
+    let dirty = tree(6);
+    std::fs::write(dirty.join("draft.txt"), "the builder's edit\n").unwrap();
+    tree(7);
+
+    // All three issues are closed instead of answered.
+    std::fs::write(tmp.path().join("issues.json"), "[]").unwrap();
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!([5, 6, 7]), "{report}");
+    assert_eq!(report["freed"], serde_json::json!([WORK_5]), "{report}");
+    assert!(!clean.exists());
+    assert!(dirty.join("draft.txt").exists());
+    // The branch stays, so a reopened item resumes from it.
+    git(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/paja/{WORK_5}"),
+        ],
+    );
+    let (_, envs) = paja(&home, &repo, &["env", "list"]);
+    let names: Vec<&str> = envs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [env(6), env(7)], "{envs}");
+    // The kept ones are what doctor names.
+    let (_, doctor) = paja(&home, &repo, &["doctor"]);
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "environments")
+        .unwrap_or_else(|| panic!("no environments check in {doctor}"))
+        .clone();
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(&env(6)) && detail.contains(&env(7)) && !detail.contains(WORK_5),
+        "{check}"
+    );
+}
+
+#[test]
+fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doctor = |home: &Path| -> Value {
+        let (_, report) = paja(home, tmp.path(), &["doctor"]);
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "environments")
+            .unwrap_or_else(|| panic!("no environments check in {report}"))
+            .clone()
+    };
+    // A log from before items carried their repository: item 5's environment was made in this
+    // checkout, item 6's in another.
+    let old = tmp.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":5,"title":"A","body":"","url":"https://example.com/5"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.imported","data":{"number":6,"title":"B","body":"","url":"https://example.com/6"}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"number":5}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.closed","data":{"number":6}}"#,
+    ];
+    std::fs::write(old.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(&old, WORK_5, tmp.path(), &tmp.path().join("tree-5"));
+    let six = WORK_5.replace("work-5", "work-6");
+    record_env(
+        &old,
+        &six,
+        Path::new("/elsewhere/app"),
+        Path::new("/elsewhere/tree-6"),
+    );
+    let check = doctor(&old);
+    assert_eq!(check["status"], "warning", "{check}");
+    let detail = check["detail"].as_str().unwrap();
+    assert!(detail.contains(WORK_5) && !detail.contains(&six), "{check}");
+
+    // An item still marked active whose issue was closed, with no run holding it: the run that
+    // had it crashed or was killed.
+    let crashed = tmp.path().join("crashed");
+    std::fs::create_dir_all(&crashed).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":5,"title":"A","body":"","url":"https://example.com/5"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.status","data":{"repo":"acme/app","number":5,"status":"active"}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":5}}"#,
+    ];
+    std::fs::write(crashed.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(
+        &crashed,
+        WORK_5,
+        Path::new("/nowhere/app"),
+        Path::new("/nowhere/tree-5"),
+    );
+    let check = doctor(&crashed);
+    assert_eq!(check["status"], "warning", "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains(WORK_5),
+        "{check}"
+    );
+}
+
 #[test]
 fn doctor_warns_when_claude_code_is_out_of_date() {
     let tmp = tempfile::tempdir().unwrap();

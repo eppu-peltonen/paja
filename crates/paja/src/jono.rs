@@ -573,6 +573,9 @@ pub struct SyncReport {
     pub changed: Vec<u64>,
     pub closed: Vec<u64>,
     pub reopened: Vec<u64>,
+    /// The environments removed because their parked item's issue was closed, each with no
+    /// uncommitted changes (its branch is kept).
+    pub freed: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -2003,10 +2006,50 @@ pub fn sync_with(
             }
         }
     }
-    let report = apply_listed(home, &name, &issues, &open_outside, &hidden, &reopened)?;
+    let mut report = apply_listed(home, &name, &issues, &open_outside, &hidden, &reopened)?;
     apply_claims(home, &name, &seen, &held)?;
-    record_checkout(home, &name, &checkout_top(repo)?)?;
+    let top = checkout_top(repo)?;
+    record_checkout(home, &name, &top)?;
+    report.freed = free_closed(home, &name, &top, &report.closed)?;
     Ok(report)
+}
+
+/// Remove the environments of the parked (escalated) items among `closed`, the items of `repo`
+/// a sync just closed, that were made in the checkout `top` and have no uncommitted changes. A
+/// parked item keeps its environment so the builder's edits survive the question; once its
+/// issue is closed instead of answered nothing else frees the worktree and port block. The
+/// branch stays, so a reopened item resumes from it. One with uncommitted changes is kept, and
+/// `paja doctor` names it. A follow-up closed only by `follow-ups = off` is still open on
+/// GitHub, so its environment stays too.
+fn free_closed(home: &Home, repo: &str, top: &Path, closed: &[u64]) -> Result<Vec<String>> {
+    if closed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let events = home.events().read_all()?;
+    let (items, hidden) = replay_with_hidden(&events, repo)?;
+    let envs = crate::ahjo::replay(&events)?;
+    let mut freed = Vec::new();
+    for number in closed {
+        let key = (repo.to_string(), *number);
+        let Some(item) = items.get(&key) else {
+            continue;
+        };
+        if item.open || item.status != Status::Escalated || hidden.contains(&key) {
+            continue;
+        }
+        let env_name = item.env_name();
+        if !envs
+            .get(&env_name)
+            .is_some_and(|env| same_dir(&env.repo, top))
+        {
+            continue;
+        }
+        // A refusal (uncommitted changes, a tampered checkout) keeps the environment.
+        if crate::ahjo::remove(home, &env_name, false).is_ok() {
+            freed.push(env_name);
+        }
+    }
+    Ok(freed)
 }
 
 /// The top level of the checkout `path` is in (the nearest folder holding `.git`), so a sync

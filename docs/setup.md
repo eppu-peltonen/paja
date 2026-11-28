@@ -240,9 +240,11 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   lookup takes a few seconds at most; when it fails (offline), the check says so and stays ok. `PAJA_CLAUDE_LATEST`
   names another source: an `http(s)` URL or a file holding the version.
 - The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
-- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it
-  is answered; if its issue is closed instead, this is a warning that names the environment and the
-  `paja env remove <name>` that frees it (the branch is kept).
+- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it is
+  answered; if its issue is closed instead, the next `paja work sync` (or `paja run`) removes it, keeping the branch,
+  unless the worktree has uncommitted changes. One kept that way, or one whose run crashed or was killed after its issue
+  was closed, is a warning that names the environment and the `paja env remove <name>` that frees it (the branch is
+  kept).
 - Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
   `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
   warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it

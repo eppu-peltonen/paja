@@ -242,7 +242,7 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             checks.push(failed("home folder", why, fix));
         }
     }
-    checks.push(left_over_environments(home));
+    checks.push(left_over_environments(home, repo));
     checks.push(match home.events().read_all() {
         Ok(events) => usage_window(&events, &claude, windowed),
         Err(err) => warning(
@@ -323,19 +323,41 @@ fn usage_window(events: &[crate::events::Event], claude: &str, windowed: bool) -
 }
 
 /// Environments whose work item's issue was closed: a parked item keeps its environment (so the
-/// builder's edits survive the question), and nothing removes it if the issue is closed instead
-/// of answered.
-fn left_over_environments(home: &Home) -> Check {
+/// builder's edits survive the question), and one with uncommitted changes is kept when its
+/// issue is closed instead of answered. An item still marked active counts once no run holds
+/// it (the run crashed or was killed). An item from a log written before items carried their
+/// repository matches the environment of its number made in the checkout `repo` is in.
+fn left_over_environments(home: &Home, repo: &Path) -> Check {
     let name = "environments";
     let found = (|| -> Result<Vec<String>> {
         let events = home.events().read_all()?;
         let envs = ahjo::replay(&events)?;
-        let mut left: Vec<String> = jono::replay(&events, "")?
-            .values()
-            .filter(|item| !item.open && item.status != jono::Status::Active)
-            .map(|item| item.env_name())
-            .filter(|env| envs.contains_key(env))
-            .collect();
+        let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // Made in this checkout: doctor may run from a folder inside it.
+        let checkout = real(repo);
+        let here = |env: &ahjo::Env| checkout.starts_with(real(&env.repo));
+        let mut left = Vec::new();
+        for item in jono::replay(&events, "")?.values() {
+            if item.open {
+                continue;
+            }
+            if item.status == jono::Status::Active {
+                let _home = home.lock()?;
+                if home.run_held(&item.repo, item.number)? {
+                    continue;
+                }
+            }
+            if item.repo.is_empty() {
+                let suffix = format!("-work-{}", item.number);
+                left.extend(
+                    envs.values()
+                        .filter(|env| env.name.ends_with(&suffix) && here(env))
+                        .map(|env| env.name.clone()),
+                );
+            } else if envs.contains_key(&item.env_name()) {
+                left.push(item.env_name());
+            }
+        }
         left.sort();
         left.dedup();
         Ok(left)
