@@ -95,17 +95,13 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
 - **Always escalated, enforced in code:** an answer is overruled to `escalate` when the item already has an arbiter
   answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk` or the
   deny-list hook, or when the escalation or the answer is about weakening a check (editing the failing test, those
-  files, the hook's rules). The person then gets the raw question and the reason. The wording check fails closed: a
-  wording is let go only when a negator ("not", "doesn't", "don't", "never", ...) is the word right before it and the
-  clause's only negator, nothing but a plain object follows it in its clause ("any check", "the failing test"), and
-  its sentence neither asks nor hedges ("why", "should", "unless", "except", "only", "much", a closing `?`). So "this
-  doesn't weaken any check" is not a request to weaken one, while "don't hesitate to edit the failing test" and
-  "don't skip the test unless it's flaky" are. Nor may another weakening act ("disable", "remove", "delete",
-  "ignore", "comment out", ...) follow in the rest of that sentence or the next one, so "don't skip the test, disable
-  it" counts too. A mention of `.paja/checks`, `.paja/high-risk`, `hook.rs` or the
-  deny-list always counts, negated or not. The prompt also tells the arbiter to escalate anything that changes the
-  issue's intent or scope, secrets, actions outside the repository and any question that asks for the person's
-  preference.
+  files, the hook's rules). The person then gets the raw question and the reason. The arbiter's answer counts if it
+  names one of those wordings at all, even to deny it, and its prompt says so. The question and what led to it are
+  written by reviewers, who are asked whether a change weakens a check, so one kind of sentence is left out first: a
+  sentence that says, word for word and with nothing added, that the change weakens no check ("It doesn't weaken any
+  check."). Anything more ("apart from the flaky case", "don't skip the test", a question) still counts. The prompt
+  also tells the arbiter to escalate anything that changes the issue's intent or scope, secrets, actions outside the
+  repository and any question that asks for the person's preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not
   decisions (a usage limit, an error Mestari can't fix, landing, CI and merge problems) skip the arbiter.
 

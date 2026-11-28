@@ -2459,9 +2459,9 @@ impl Factory {
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  if [ -f {d}/review-moves-main.sh ]; then sh {d}/review-moves-main.sh; rm {d}/review-moves-main.sh; fi\n\
-                 v=$(cat {d}/verdict.txt); f='[]'\n\
+                 v=$(cat {d}/verdict.txt); f='[]'; s=$(cat {d}/summary.txt 2>/dev/null || echo fake review)\n\
                  if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"$s\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/mode-rejected ]; then echo \"error: option '--permission-mode <mode>' argument 'auto' is invalid.\" >&2; exit 1; fi\n\
@@ -6073,36 +6073,35 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
 }
 
 #[test]
-fn the_arbiter_answers_when_it_only_says_no_check_is_weakened() {
+fn the_arbiter_answers_when_a_reviewer_only_says_no_check_is_weakened() {
     let f = Factory::new("true\n", "escalate");
-    let answer = "Do one more round and add the missing smoke test. This doesn't weaken any check.";
+    // Reviewers often close with this; on its own it is no reason to keep the arbiter out.
+    std::fs::write(
+        f.tmp.path().join("summary.txt"),
+        "Adds the test. It doesn't weaken any check.",
+    )
+    .unwrap();
     arbiter_says(
         &f,
-        serde_json::json!({
-            "verdict": "answer",
-            "answer": answer,
-            "reason": "Reviewer 1's blocker is a missing test; adding it does not loosen a rule."
-        }),
+        serde_json::json!({"verdict": "answer", "answer": "Use v2.", "reason": "The issue says so."}),
     );
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "arbitrated", "{report}");
     let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
     assert_eq!(item["status"], "queued", "{item}");
-    assert_eq!(item["answers"][0]["answer"], answer, "{item}");
-    let arbitrated = events_of(&f, "run.arbitrated");
-    assert_eq!(arbitrated[0]["data"]["verdict"], "answer", "{arbitrated:?}");
+    assert_eq!(item["answers"][0]["answer"], "Use v2.", "{item}");
 }
 
 #[test]
-fn the_arbiter_is_overruled_when_a_negator_is_not_on_the_weakening() {
+fn the_arbiter_is_overruled_when_its_answer_names_weakening_even_to_deny_it() {
     let f = Factory::new("true\n", "escalate");
     arbiter_says(
         &f,
         serde_json::json!({
             "verdict": "answer",
-            "answer": "Don't hesitate to edit the failing test.",
-            "reason": "It is flaky."
+            "answer": "One more round. This doesn't weaken any check.",
+            "reason": "A test is missing."
         }),
     );
     let (ok, report) = f.run();
