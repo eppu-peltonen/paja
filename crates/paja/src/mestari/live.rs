@@ -166,12 +166,24 @@ pub fn from_events(
                         .collect(),
                     _ => Vec::new(),
                 };
-                live.rounds.push(LiveRound {
-                    round,
-                    verdict: data["verdict"].as_str().unwrap_or_default().to_string(),
-                    detail: data["detail"].as_str().unwrap_or_default().to_string(),
-                    steps,
-                });
+                let verdict = data["verdict"].as_str().unwrap_or_default().to_string();
+                let detail = data["detail"].as_str().unwrap_or_default().to_string();
+                // A round approved for landing is recorded when its review ends, and again if it
+                // then fails at the turn to land (a conflict, the checks on the latest default
+                // branch, CI): the later record is how the round ended, and keeps what both spent.
+                match live.rounds.last_mut().filter(|r| r.round == round) {
+                    Some(earlier) => {
+                        earlier.verdict = verdict;
+                        earlier.detail = detail;
+                        earlier.steps.extend(steps);
+                    }
+                    None => live.rounds.push(LiveRound {
+                        round,
+                        verdict,
+                        detail,
+                        steps,
+                    }),
+                }
                 live.round = live.round.max(round);
                 // The round is over: its steps are finished.
                 live.step = None;
@@ -272,6 +284,37 @@ mod tests {
         assert_eq!(live.rounds.len(), 1);
         assert_eq!(live.rounds[0].verdict, "changes");
         assert_eq!(live.rounds[0].steps[0].input_tokens, Some(10));
+    }
+
+    #[test]
+    fn a_round_that_fails_at_the_turn_to_land_shows_once_with_how_it_ended() {
+        let mut events = run();
+        let round = |seq: u64, verdict: &str, detail: &str, steps: Value| {
+            event(
+                seq,
+                EV_ROUND,
+                json!({"repo": "acme/app", "number": 7, "round": 2, "verdict": verdict,
+                    "detail": detail, "steps": steps}),
+            )
+        };
+        let review = json!([{"step": "review", "reviewer": 1, "cost_usd": 0.2}]);
+        events.push(round(7, "land", "fake review", review));
+        events.push(round(8, "conflict", "feature.txt", json!([])));
+        let live = from_events(&events, &item(Status::Active), true, |_| None).unwrap();
+        let rounds: Vec<(u32, &str, &str)> = live
+            .rounds
+            .iter()
+            .map(|r| (r.round, r.verdict.as_str(), r.detail.as_str()))
+            .collect();
+        assert_eq!(
+            rounds,
+            [
+                (1, "changes", "fix the test"),
+                (2, "conflict", "feature.txt")
+            ]
+        );
+        assert_eq!(live.rounds[1].steps.len(), 1, "{:?}", live.rounds[1]);
+        assert_eq!(live.rounds[1].steps[0].cost_usd, Some(0.2));
     }
 
     #[test]
