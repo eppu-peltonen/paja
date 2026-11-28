@@ -69,67 +69,141 @@ const NEGATORS: [&str; 7] = [
     "not", "never", "doesn't", "don't", "didn't", "won't", "mustn't",
 ];
 
-/// Words that turn a negated wording in the same clause back into a request or a doubt: "why
-/// don't we skip the test", "if not, weaken the gate", "no reason not to weaken it".
-const ASKING: [&str; 6] = ["why", "how", "if", "unless", "reason", "need"];
+/// Words that, anywhere in a negated wording's sentence, make the negation a doubt, a question
+/// or a condition rather than a plain "no": "why don't we skip the test", "no reason not to
+/// weaken it", "don't edit the failing test unless the assertion is wrong", "it doesn't weaken
+/// the gate much". The sentence then counts as about weakening a check.
+const HEDGES: [&str; 26] = [
+    "why",
+    "how",
+    "if",
+    "unless",
+    "reason",
+    "need",
+    "should",
+    "would",
+    "could",
+    "shall",
+    "except",
+    "until",
+    "other",
+    "but",
+    "beyond",
+    "when",
+    "only",
+    "instead",
+    "rather",
+    "besides",
+    "much",
+    "significantly",
+    "entirely",
+    "mostly",
+    "partly",
+    "really",
+];
+
+/// The words that may follow a negated wording to the end of its clause: a plain object, as in
+/// "doesn't weaken any check" or "don't edit the failing test". Anything else after it ("don't
+/// remove the test entirely", "won't loosen anything beyond the flaky case") keeps it counting.
+const PLAIN_OBJECTS: [&str; 26] = [
+    "a", "an", "any", "the", "this", "that", "these", "those", "its", "it", "them", "one", "ones",
+    "check", "checks", "gate", "gates", "rule", "rules", "test", "tests", "failing", "existing",
+    "anything", "here", "either",
+];
 
 /// Whether `text` talks about weakening a check. It fails closed: a wording counts unless one
-/// of [`NEGATORS`] is the word right before it, that is the clause's only negator, the clause
-/// asks nothing ([`ASKING`], or a closing `?`), and the wording is an act, not one of
-/// [`NAMED_GUARDS`]. So a reviewer's "this doesn't weaken any check" or an answer's "don't edit
-/// the failing test" is not a request to weaken one, while "don't hesitate to edit the failing
-/// test" still is.
+/// of [`NEGATORS`] is the word right before it and the clause's only negator, nothing but a
+/// plain object ([`PLAIN_OBJECTS`]) follows it in its clause, its sentence has no hedge
+/// ([`HEDGES`]) and doesn't end in `?`, and the wording is an act, not one of [`NAMED_GUARDS`].
+/// So a reviewer's "this doesn't weaken any check" or an answer's "don't edit the failing test"
+/// is not a request to weaken one, while "don't hesitate to edit the failing test" or "don't
+/// skip the test unless it's flaky" still is.
 fn names_a_weaker_check(text: &str) -> bool {
     let text = text
         .to_lowercase()
         .replace(['\u{2018}', '\u{2019}', '\u{2bc}'], "'");
-    let clauses = clauses(&text);
-    clauses.iter().any(|&(clause, asks)| {
-        WEAKENING.iter().any(|w| {
-            clause
-                .match_indices(w)
-                .any(|(at, _)| asks || NAMED_GUARDS.contains(w) || !negated(&clause[..at]))
+    sentences(&text).into_iter().any(|sentence| {
+        let hedged =
+            sentence.trim_end().ends_with('?') || words(sentence).any(|w| HEDGES.contains(&w));
+        clauses(sentence).into_iter().any(|clause| {
+            WEAKENING.iter().any(|w| {
+                clause.match_indices(w).any(|(at, _)| {
+                    hedged
+                        || NAMED_GUARDS.contains(w)
+                        || !negated(&clause[..at])
+                        || !plain_object(&clause[at + w.len()..])
+                })
+            })
         })
     })
 }
 
-/// `text` cut into clauses, each with whether it ends in a `?`. Cuts fall at `,`, `;`, `:`,
-/// `!`, `?`, brackets, dashes, a line break, and a `.` not followed by a letter or digit, so
-/// `.paja/checks` and `hook.rs` stay whole while "matter.weaken" is cut.
-fn clauses(text: &str) -> Vec<(&str, bool)> {
+/// The words of `text`, without the punctuation around them; a hyphen or apostrophe inside a
+/// word ("no-verify", "doesn't") stays.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '\'')))
+        .filter(|w| !w.is_empty())
+}
+
+/// Whether what follows a wording to the end of its clause is a plain object. The rest of the
+/// matched word ("weaken" in "weakens") is skipped first.
+fn plain_object(after: &str) -> bool {
+    let after = after.trim_start_matches(|c: char| c.is_alphanumeric());
+    words(after).all(|w| PLAIN_OBJECTS.contains(&w))
+}
+
+/// `text` cut into sentences, each keeping its closing `?` or `!`: at `!`, `?`, a line break
+/// and a `.` not followed by a letter or digit, so `.paja/checks` and `hook.rs` stay whole.
+fn sentences(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         let ends = match c {
-            ',' | ';' | ':' | '!' | '?' | '\n' | '(' | ')' | '[' | ']' | '\u{2013}'
-            | '\u{2014}' => true,
+            '!' | '?' | '\n' => true,
             '.' => chars.peek().is_none_or(|(_, next)| !next.is_alphanumeric()),
-            // A spaced hyphen is a dash; one inside a word ("no-verify") is not.
-            '-' => text[..at].ends_with(' ') && chars.peek().is_some_and(|(_, n)| *n == ' '),
             _ => false,
         };
         if ends {
-            out.push((&text[start..at], c == '?'));
+            out.push(&text[start..at + c.len_utf8()]);
             start = at + c.len_utf8();
         }
     }
-    out.push((&text[start..], false));
+    out.push(&text[start..]);
     out
 }
 
-/// Whether the clause up to a wording (`before`) negates it: its last word is a negator, it is
-/// the only negator in the clause so far, and nothing in the clause asks or doubts.
+/// A sentence cut into clauses: at `,`, `;`, `:`, the sentence's closing mark, brackets and
+/// dashes. A hyphen inside a word ("no-verify") is no dash, and a dot inside a name
+/// (`.paja/checks`) no closing mark.
+fn clauses(sentence: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut chars = sentence.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let ends = match c {
+            ',' | ';' | ':' | '!' | '?' | '\n' | '(' | ')' | '[' | ']' | '\u{2013}'
+            | '\u{2014}' => true,
+            '.' => chars.peek().is_none_or(|(_, next)| !next.is_alphanumeric()),
+            '-' => sentence[..at].ends_with(' ') && chars.peek().is_some_and(|(_, n)| *n == ' '),
+            _ => false,
+        };
+        if ends {
+            out.push(&sentence[start..at]);
+            start = at + c.len_utf8();
+        }
+    }
+    out.push(&sentence[start..]);
+    out
+}
+
+/// Whether the clause up to a wording (`before`) negates it: its last word is one of
+/// [`NEGATORS`], and it is the only negator in the clause so far ("no reason not to" is none).
 fn negated(before: &str) -> bool {
-    let words: Vec<&str> = before
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '\'')))
-        .filter(|w| !w.is_empty())
-        .collect();
+    let words: Vec<&str> = words(before).collect();
     let negators = words.iter().filter(|w| is_negator(w)).count();
-    words.last().is_some_and(|w| NEGATORS.contains(w))
-        && negators == 1
-        && !words.iter().any(|w| ASKING.contains(w))
+    words.last().is_some_and(|w| NEGATORS.contains(w)) && negators == 1
 }
 
 /// Any word that negates, for counting double negatives: [`NEGATORS`] and the other `n't`s,
@@ -503,7 +577,8 @@ mod tests {
         for text in [
             "It adds two smoke cases and doesn't weaken any check.",
             "This does not weaken the gate.",
-            "Add tests only; don't edit the failing test.",
+            "Add tests; don't edit the failing test.",
+            "Reviewer 1 is right. This doesn't weaken any check.",
             "The change doesn\u{2019}t weaken anything.",
             "Never skip the test.",
             "The builder won't loosen a rule here",
@@ -534,6 +609,20 @@ mod tests {
             "If not, weaken the gate",
             "If you don't edit the test it stays red",
             "Unless it's flaky, don't skip the test, edit the failing test instead.",
+            "Should we not skip the test",
+            // A condition, an exception or a measure on the negation.
+            "Don't edit the failing test unless the assertion itself is wrong.",
+            "Don't skip the test unless it's flaky.",
+            "Unless it's flaky, don't skip the test.",
+            "Never skip the test, except this once.",
+            "Don't edit the failing test except to fix the typo.",
+            "Do not edit the test other than the snapshot.",
+            "Don't skip the test until CI is fixed",
+            "This does not weaken the gate, unless you count the flaky case.",
+            "This doesn't weaken the gate much.",
+            "It does not weaken the check significantly.",
+            "It won't loosen anything beyond the flaky case",
+            "Don't remove the test entirely; mark it ignored.",
             // Hyphenated words aren't negators.
             "Commit with --no-verify to skip the check",
             // The guarded files count even when negated.

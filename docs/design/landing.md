@@ -96,12 +96,14 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
   answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk` or the
   deny-list hook, or when the escalation or the answer is about weakening a check (editing the failing test, those
   files, the hook's rules). The person then gets the raw question and the reason. The wording check fails closed: a
-  wording is let go only when a negator ("not", "doesn't", "don't", "never", ...) is the word right before it, it is
-  the clause's only negator, and the clause asks nothing ("why", "if", "unless", a closing `?`), so "this doesn't
-  weaken any check" is not a request to weaken one while "don't hesitate to edit the failing test" is. A mention of
-  `.paja/checks`, `.paja/high-risk`, `hook.rs` or the deny-list always counts, negated or not. The prompt also tells the arbiter
-  to escalate anything that changes the issue's intent or scope, secrets, actions outside the repository and any
-  question that asks for the person's preference.
+  wording is let go only when a negator ("not", "doesn't", "don't", "never", ...) is the word right before it and the
+  clause's only negator, nothing but a plain object follows it in its clause ("any check", "the failing test"), and
+  its sentence neither asks nor hedges ("why", "should", "unless", "except", "only", "much", a closing `?`). So "this
+  doesn't weaken any check" is not a request to weaken one, while "don't hesitate to edit the failing test" and
+  "don't skip the test unless it's flaky" are. A mention of `.paja/checks`, `.paja/high-risk`, `hook.rs` or the
+  deny-list always counts, negated or not. The prompt also tells the arbiter to escalate anything that changes the
+  issue's intent or scope, secrets, actions outside the repository and any question that asks for the person's
+  preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not
   decisions (a usage limit, an error Mestari can't fix, landing, CI and merge problems) skip the arbiter.
 
