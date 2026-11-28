@@ -4157,6 +4157,55 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
 }
 
 #[test]
+fn a_run_holds_the_repository_marker_for_its_whole_life() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("hang"), "").unwrap();
+    let home = paja::home::Home::at(&f.home).unwrap();
+    assert!(!home.repo_run_held("acme/app").unwrap());
+    let mut run = paja_command()
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !dir.join("hanging").exists() {
+        if let Some(status) = run.try_wait().unwrap() {
+            panic!("`paja run` exited ({status}) before its builder started");
+        }
+        if started.elapsed().as_secs() >= 300 {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("the builder never started");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        home.repo_run_held("acme/app").unwrap(),
+        "held while it runs"
+    );
+    assert!(!home.repo_run_held("acme/other").unwrap());
+    run.kill().unwrap();
+    run.wait().unwrap();
+    // Let the orphaned fake agent end, so it holds nothing (and no output pipe) open.
+    std::fs::remove_file(dir.join("hang")).unwrap();
+    let started = std::time::Instant::now();
+    while home.repo_run_held("acme/app").unwrap() {
+        assert!(
+            started.elapsed().as_secs() < 30,
+            "the marker stayed held after the process was gone"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn rounds_spent_count_toward_the_cap_when_the_environment_is_lost() {
     let f = Factory::new("true\n", "changes");
     let dir = f.tmp.path();

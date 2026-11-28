@@ -201,8 +201,13 @@ plan's `<repo>-<hash>-plan-<issue>`, and the old `work-<issue>` and `plan-<issue
 removes an environment a person made.
 A mistake in that configuration stops the pass before it claims anything, with an error naming the file and line, so one
 fix on the default branch is all it takes. That holds even when the queue is empty: the pass reports the error, not
-`idle`. A `--every` loop reports it and tries again after its wait. While it works on an item the run holds an OS file
-lock, `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An
+`idle`. A `--every` loop reports it and tries again after its wait. For its whole life a `paja run` also holds a shared
+OS file lock, `runs/<owner>@<name>@any.lock`, the repository's run marker: a pool and its lanes, or runs on different
+items, hold it together, and it covers the gaps no item's lock does (a loop sleeping between items, a run still
+starting). `Home::repo_run_held` probes it with a brief exclusive try, so Desk can tell that some run is going;
+`Home::hold_repo_run` waits out such a probe for a few seconds before giving up. While it works on an item the run holds
+an OS file lock, `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process
+ends. An
 item a `paja run` claimed (its status change carries `"run": true`) that is still `active` while its lock is free was
 left by a run that stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment,
 and says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
@@ -890,9 +895,10 @@ checkout, so it is the CLI's run with its own lock and hook. "Stop after this st
 with `ps`, and then kills it bottom up; a process already reparented away is out of reach), since a run's agents and
 checks are in process groups of their own. The run's output goes to `desk/<owner>@<name>.log` in the home, not to a
 pipe, so a run left going when Desk closes still has somewhere to write; Desk shows its end. Desk refuses to start a run
-while `paja doctor` has a failing check, while its own run of the repository is going, or while any active item's run
-lock is held (a run started from a terminal), probing it under the home lock as the run view does. Closing the window
-while Desk's runs are going asks whether to stop them or leave them running; stopping sends each `stop now` and waits
+while `paja doctor` has a failing check, while its own run of the repository is going, while the repository's run marker
+is held (a `paja run` started from a terminal, even one sleeping between items of `--every` or still starting, which
+holds no item's run lock), or while any active item's run lock is held, probing the item locks under the home lock as
+the run view does. Closing the window while Desk's runs are going asks whether to stop them or leave them running; stopping sends each `stop now` and waits
 for them to end before Desk exits, ending a `paja` still going after the same 15 seconds the same way, so none is left
 stuck. The log file holds output only, never state.
 

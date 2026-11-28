@@ -76,6 +76,12 @@ impl Runner {
                  Desk); change its lanes with the lane count, or stop it there first"
             );
         }
+        if home.repo_run_held(repo)? {
+            bail!(
+                "a paja run is already going for {repo} (started from a terminal or another \
+                 Desk, maybe between items); stop it there first"
+            );
+        }
         if let Some(number) = running_item(home, repo)? {
             bail!(
                 "a paja run is already working on {repo}#{number} (started from a terminal or \
@@ -569,6 +575,31 @@ mod tests {
             "{refused:#}"
         );
         drop(held);
+    }
+
+    #[test]
+    fn a_run_between_items_blocks_a_desk_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let checkout = dir.path().join("app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        // No item is active and no item's run lock is held: only the repository's marker.
+        let marker = home.hold_repo_run("acme/app").unwrap();
+        let runner = Runner::new(fake_paja(dir.path()));
+        let refused = runner
+            .start(&home, "acme/app", &checkout, false, None)
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("acme/app"), "{refused:#}");
+        drop(marker);
+        // Another test's child forked in the instant before the drop (or while a probe held the
+        // lock) shares it until it execs, so a start may be refused for a moment longer.
+        wait_until("a start after the marker was let go", || {
+            runner
+                .start(&home, "acme/app", &checkout, false, None)
+                .is_ok()
+        });
+        runner.stop("acme/app", false).unwrap();
+        wait_until("the run ending", || !runner.is_running("acme/app"));
     }
 
     #[test]
