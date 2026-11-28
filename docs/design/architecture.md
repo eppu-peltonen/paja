@@ -196,34 +196,34 @@ run that stops on an error removes the environment it used, but a `work-<issue>`
 changes, since an older release's park may have kept the builder's edits there; one that belongs to another repository
 is never taken, and a hashed name found to belong to another repository stops the run with the `paja env remove <name>`
 fix. `paja env create` and the MCP tool refuse names of that shape (and the triage pass's `<repo>-<hash>-triage`, a
-plan's `<repo>-<hash>-plan-<issue>` and the old `work-<issue>` and `plan-<issue>`), so Paja never reuses, resets or
-removes an environment a person made. A mistake in that configuration stops the pass before it claims anything, with an
-error naming the file and line, so one fix on the default branch is all it takes. That holds even when the queue is
-empty: the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait. While it
-works on an item the run holds an OS file lock, `runs/<owner>@<name>@<issue>.lock` in the home, which the operating
-system releases however the process ends. An item a `paja run` claimed (its status change carries `"run": true`) that is
-still `active` while its lock is free was left by a run that stopped (Ctrl-C, a closed terminal, a reboot): the next
-pass resumes it first, in its environment, and says so on stderr. The resumed run goes on in the round that was cut off
-("resuming #5 in round 2: the review of abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of
-the item. When the environment or its branch is gone, the item starts again on a new branch with a build, but in the
-round it had reached ("resuming #5 in round 2 on a new branch"), so the rounds already spent still count toward the cap.
-It rebuilds where it stood from every run event of the item since it was last queued, claimed or answered, not only the
-last run's, so an item interrupted again before it records a round keeps its round count and blockers: the round, the
-feedback for the builder, and the reviewed commit, blockers and follow-ups the next review narrows itself to. When the
-checks passed on the branch's HEAD (`run.checked`, with the default branch tip they ran against) and the worktree is
-clean, with no index flags, it skips the build; if the default branch is also unchanged it skips the checks too and goes
-straight to the review. Any other state builds and checks again. Items claimed with `paja work claim` are never taken
-over. Agents, Vasara's checks, git and gh run in process groups of their own (Unix: a new process group; Windows:
-`CREATE_NEW_PROCESS_GROUP`), so the terminal's Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next
-step boundary (before a round's build, the checks or the review; a change both reviewers passed still lands): the
-round's steps are recorded with verdict `stopped`, the item stays active for the next run, and the run reports
-`{"outcome": "stopped"}`; `--every` stops its loop too. Any error after a Ctrl-C ends the same way rather than parking
-the item, unless the repository was tampered with. A second Ctrl-C ends the running agent or check with every process it
-started and stops at once. A program that starts `paja run` without a terminal (Paja Desk) passes `--stop-on-stdin` and
-writes a `stop` or `stop now` line to its stdin instead, which counts as the first or second Ctrl-C on every platform
-(the first stop's message then names `stop now`, not a second Ctrl-C); stdin closing leaves the run going. A stdout
-nobody reads any more (that program exited) loses the report but not the run: Paja doesn't panic on it, and the exit
-code still says how the run ended.
+plan's `<repo>-<hash>-plan-<issue>`, and the old `work-<issue>` and `plan-<issue>`), so Paja never reuses, resets or
+removes an environment a person made.
+A mistake in that configuration stops the pass before it claims anything, with an error naming the file and line, so one
+fix on the default branch is all it takes. That holds even when the queue is empty: the pass reports the error, not
+`idle`. A `--every` loop reports it and tries again after its wait. While it works on an item the run holds an OS file
+lock, `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An
+item a `paja run` claimed (its status change carries `"run": true`) that is still `active` while its lock is free was
+left by a run that stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment,
+and says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
+abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. When the environment or its
+branch is gone, the item starts again on a new branch with a build, but in the round it had reached ("resuming #5 in
+round 2 on a new branch"), so the rounds already spent still count toward the cap. It rebuilds where it stood from every
+run event of the item since it was last queued, claimed or answered, not only the last run's, so an item interrupted
+again before it records a round keeps its round count and blockers: the round, the feedback for the builder, and the
+reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on the branch's HEAD
+(`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no index flags, it skips
+the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. Any other
+state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
+and gh run in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the
+terminal's Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build,
+the checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
+`stopped`, the item stays active for the next run, and the run reports `{"outcome": "stopped"}`; `--every` stops its
+loop too. Any error after a Ctrl-C ends the same way rather than parking the item, unless the repository was tampered
+with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. A program that
+starts `paja run` without a terminal (Paja Desk) passes `--stop-on-stdin` and writes a `stop` or `stop now` line to its
+stdin instead, which counts as the first or second Ctrl-C on every platform (the first stop's message then names
+`stop now`, not a second Ctrl-C); stdin closing leaves the run going. A stdout nobody reads any more (that program
+exited) loses the report but not the run: Paja doesn't panic on it, and the exit code still says how the run ended.
 
 `paja run --every M --workers N` runs a pool of lanes (`crates/paja/src/mestari/pool.rs`). One process holds
 `runs/<owner>@<name>@pool.lock`, so a repository has one pool, and keeps up to N lanes busy. Each lane is a `paja run
@@ -268,9 +268,11 @@ the item's `Touches:` line names the paths when it has one (`source: spec`; the 
 `nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
 `plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). That
 environment is `<repo>-<hash>-plan-<issue>`, so two repositories sharing a home never plan in one checkout; one of that
-name made from another repository stops the plan with the `paja env remove <name>` fix. A plan holds an OS lock for
-its item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs (a pool's
-planner and one started by hand) is refused at once and records nothing, leaving the running plan's result to stand. The plan,
+name made from another repository stops the plan with the `paja env remove <name>` fix, and an older release's
+`plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an OS lock for its
+item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs is refused at
+once and records nothing. A pool that finds the lock held (a plan started by hand) starts no planner of its own, says
+so, and admits the item on the plan that one records. The plan,
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its

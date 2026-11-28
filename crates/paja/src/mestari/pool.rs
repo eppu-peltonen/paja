@@ -146,6 +146,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         opts: &opts,
         lanes: BTreeMap::new(),
         planners: BTreeMap::new(),
+        elsewhere: BTreeSet::new(),
         stopped: Vec::new(),
         since,
         held_back: BTreeSet::new(),
@@ -177,6 +178,9 @@ struct Pool<'a> {
     lanes: BTreeMap<u32, Lane>,
     /// The `pool plan` runs going, by item, with the seq they started after and when.
     planners: BTreeMap<u64, (Child, u64, Instant)>,
+    /// Items another `paja pool plan` (one started by hand) was planning at the last tick, so
+    /// the pool waits for that plan instead of starting one, and isn't idle meanwhile.
+    elsewhere: BTreeSet<u64>,
     /// Planners told `stop now`, with when, until they end or are killed.
     stopped: Vec<(Child, Instant)>,
     /// The seq of this pool's `pool.started`: plans before it are an earlier pool's.
@@ -287,6 +291,7 @@ impl Pool<'_> {
                     if admitted == 0
                         && self.lanes.is_empty()
                         && self.planners.is_empty()
+                        && self.elsewhere.is_empty()
                         && !said_idle
                     {
                         said_idle = true;
@@ -302,6 +307,9 @@ impl Pool<'_> {
     /// running item's, planning each first. Returns how many started.
     fn admit(&mut self, free: usize) -> Result<usize> {
         let busy: BTreeSet<u64> = self.lanes.values().map(|lane| lane.number).collect();
+        let (home, name) = (self.home, self.name);
+        self.elsewhere
+            .retain(|&n| home.plan_held(name, n).unwrap_or(false));
         let next: Vec<WorkItem> = match jono::runnable(self.home, self.name) {
             Ok(items) => items,
             Err(err) => {
@@ -382,7 +390,17 @@ impl Pool<'_> {
     }
 
     /// Plan item `number` in a `paja pool plan` of its own, so the pool's ticks go on meanwhile.
+    /// A plan of the item already running (one started by hand) is left to finish: the pool
+    /// takes the plan it records, and starts none of its own meanwhile.
     fn start_planner(&mut self, number: u64) -> Result<()> {
+        if self.home.plan_held(self.name, number)? {
+            if self.elsewhere.insert(number) {
+                progress(&format!(
+                    "#{number} is being planned by another `paja pool plan`; using its plan"
+                ));
+            }
+            return Ok(());
+        }
         let at = {
             let lock = self.home.lock()?;
             let data = json!({ "repo": self.name, "number": number });
@@ -624,7 +642,9 @@ fn reap(
     let events = home.events().read_all()?;
     let mut failed = Vec::new();
     for (number, at) in ended {
-        planners.remove(&number);
+        let kept = planners
+            .remove(&number)
+            .expect("an ended planner is in the map");
         let planned = events.iter().any(|e| {
             e.seq > at
                 && e.kind == EV_POOL_PLANNED
@@ -632,6 +652,12 @@ fn reap(
                 && e.data["number"] == number
         });
         if planned {
+            continue;
+        }
+        // Refused because another plan of the item is running (one started by hand): that one
+        // records the plan, so wait for it, with the planner kept as if still going.
+        if !overdue.contains(&number) && home.plan_held(repo, number)? {
+            planners.insert(number, kept);
             continue;
         }
         let why = if overdue.contains(&number) {

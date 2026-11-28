@@ -284,14 +284,6 @@ fn prompt(item: &WorkItem) -> String {
     )
 }
 
-/// Whether two repository paths are the same folder, as the file system resolves them.
-fn same_repo(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
-
 /// Run the planning agent in a checkout of the default branch and read its paths.
 fn ask(
     home: &Home,
@@ -303,11 +295,20 @@ fn ask(
     // The repository's name and hash in the name, as an item's environment has, so two
     // repositories sharing a home never plan their #5 in one checkout.
     let name = jono::env_name_for(&item.repo, &format!("plan-{}", item.number));
+    // Releases before planner names carried the repository named it `plan-<n>`. One left by a
+    // killed plan of this repository holds nothing, so it goes, with its branch and port block.
+    let old = format!("plan-{}", item.number);
+    if let Ok(env) = ahjo::get(home, &old) {
+        if ahjo::belongs_to(home, &env, repo)? && ahjo::remove(home, &old, true).is_ok() {
+            let _ = git(repo, &["branch", "-q", "-D", &format!("paja/{old}")]);
+        }
+    }
     // A checkout or branch left behind by a plan that was killed is reused; `discard` puts it
     // back on the default branch.
     let branch = format!("refs/heads/paja/{name}");
     let env = match ahjo::get(home, &name) {
-        Ok(env) if !same_repo(&env.repo, repo) => bail!(
+        // Any checkout or worktree of the repository counts, as the plan may run from one.
+        Ok(env) if !ahjo::belongs_to(home, &env, repo)? => bail!(
             "environment {name} belongs to the repository at {}, not {}; two repositories got \
              the same planner name, so remove it with `paja env remove {name}` if it is stale",
             env.repo.display(),
@@ -374,7 +375,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_planner_checkout_another_repository_holds_is_refused_and_left_alone() {
+    fn a_planner_checkout_another_repository_holds_is_refused_and_an_old_one_of_ours_goes() {
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::at(tmp.path().join("home")).unwrap();
         let (a, b) = (
@@ -392,11 +393,28 @@ mod tests {
             },
         )
         .unwrap();
+        // An older release's `plan-7` of this repository, left by a killed plan, goes.
+        let old = ahjo::create(
+            &home,
+            CreateOptions {
+                name: "plan-7",
+                repo: &a,
+                base: None,
+            },
+        )
+        .unwrap();
         let models = Models::parse_on("", "main").unwrap();
         let err = format!("{:#}", ask(&home, &a, "HEAD", &item, &models).unwrap_err());
         assert!(err.contains(&format!("paja env remove {name}")), "{err}");
         assert!(theirs.path.exists());
         assert_eq!(ahjo::get(&home, &name).unwrap().repo, theirs.repo);
+        assert!(ahjo::get(&home, "plan-7").is_err());
+        assert!(!old.path.exists());
+        assert!(git(
+            &a,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/paja/plan-7"]
+        )
+        .is_err());
     }
 
     #[test]

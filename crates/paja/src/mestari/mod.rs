@@ -2015,10 +2015,7 @@ fn existing_environment(home: &Home, repo: &Path, item: &WorkItem) -> Result<Opt
     let name = item.env_name();
     // The name holds only a short hash of the repository, so two repositories could in
     // principle share it; never run one's item in the other's worktree.
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    };
+    let same = ahjo::same_repo;
     if let Ok(env) = ahjo::get(home, &name) {
         if !same(&env.repo, repo) {
             bail!(

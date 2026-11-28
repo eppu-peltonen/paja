@@ -151,7 +151,17 @@ impl Home {
     /// Whether a live run holds item `number` of `repo`'s run lock, found without writing: a
     /// lock file that isn't there yet is held by no one, so a probe never creates one.
     pub fn run_held(&self, repo: &str, number: u64) -> Result<bool> {
-        let path = self.runs_lock_path(repo, &number.to_string());
+        self.runs_held(repo, &number.to_string())
+    }
+
+    /// Whether a live `paja pool plan` holds item `number` of `repo`'s plan lock (see
+    /// [`Home::try_plan_lock`]), found without writing, as [`Home::run_held`] does.
+    pub fn plan_held(&self, repo: &str, number: u64) -> Result<bool> {
+        self.runs_held(repo, &format!("plan-{number}"))
+    }
+
+    fn runs_held(&self, repo: &str, tail: &str) -> Result<bool> {
+        let path = self.runs_lock_path(repo, tail);
         let file = match OpenOptions::new().read(true).open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),

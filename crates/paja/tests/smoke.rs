@@ -11872,6 +11872,69 @@ fn a_stopping_pool_ends_its_planners_agents() {
     );
 }
 
+/// A pool that finds a plan of an item already running (one started by hand) starts none of
+/// its own and records no failed plan: it waits, says so, and admits the item on that plan.
+#[cfg(unix)]
+#[test]
+fn a_pool_waits_for_a_plan_started_by_hand_and_uses_it() {
+    let f = pool_factory(false);
+    let dir = f.tmp.path();
+    let (ok, synced) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "sync"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{synced}");
+    std::fs::write(dir.join("plan-hold"), "").unwrap();
+    let by_hand = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+        .env_remove("PAJA_SBX")
+        .args(["--json", "pool", "plan", "5"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let guard = EndOnPanic(by_hand.id());
+    wait_until(&f, "the hand-run plan's agent running", || {
+        dir.join("plan-alive").exists()
+    });
+    let pool = start_pool(&f, "1");
+    wait_until(&f, "the pool seeing the hand-run plan", || {
+        std::fs::read_to_string(dir.join("pool.err"))
+            .unwrap_or_default()
+            .contains("#5 is being planned by another `paja pool plan`")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let planning = events_of(&f, "pool.planning");
+    assert!(planning.is_empty(), "{planning:?}");
+    assert!(events_of(&f, "pool.planned").is_empty());
+    // The hand-run plan finishes; the pool admits #5 on it.
+    std::fs::remove_file(dir.join("plan-hold")).unwrap();
+    std::mem::forget(guard);
+    let output = output_within(by_hand, std::time::Duration::from_secs(30));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_until(&f, "Alpha building", || holding(&f, "Alpha"));
+    let planned: Vec<Value> = events_of(&f, "pool.planned")
+        .into_iter()
+        .filter(|e| e["data"]["number"] == 5)
+        .collect();
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["data"]["source"], "plan", "{planned:?}");
+    let admitted = events_of(&f, "pool.admitted");
+    assert_eq!(admitted[0]["data"]["number"], 5, "{admitted:?}");
+    release(&f, "Alpha");
+    stop_pool(&f, pool);
+}
+
 /// A terminal's Ctrl-C reaches the pool, not its planners: the pool tells each `stop now`, so
 /// the planning agent ends with them.
 #[cfg(unix)]
@@ -11987,7 +12050,7 @@ fn a_planner_stopped_now_or_left_by_its_pool_ends_its_agent_and_records_no_plan(
 /// while one runs is refused without recording anything, so it can't replace the first's plan.
 #[cfg(unix)]
 #[test]
-fn a_second_plan_of_an_item_waits_for_the_first_and_planners_are_named_by_repository() {
+fn a_second_plan_of_an_item_is_refused_while_the_first_runs_and_planners_are_named_by_repository() {
     let f = pool_factory(false);
     let dir = f.tmp.path();
     let (ok, synced) = paja_with(
