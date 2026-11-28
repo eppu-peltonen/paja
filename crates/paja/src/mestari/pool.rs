@@ -113,7 +113,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         bail!("--workers takes 1 to {MAX_LANES} lanes");
     }
     let repo = std::path::absolute(opts.repo)?;
-    let name = super::sync_queue(home, &repo)?;
+    let (name, branch) = super::sync_queue_on(home, &repo)?;
     // The key the tamper lock uses for this checkout, read once: the pool looks for a tamper
     // stop on every tick without running git.
     let key = crate::ahjo::repo_key(&repo)?;
@@ -162,7 +162,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         stopped: Vec::new(),
         since,
         high_risk: None,
-        branch: None,
+        branch,
         held_back: BTreeSet::new(),
         retry_failed_to: 0,
         retried: BTreeSet::new(),
@@ -207,9 +207,9 @@ struct Pool<'a> {
     /// Main's `.paja/high-risk`, read at the start and at each sync, by which a plan made against
     /// an older one is judged again; `None` while it can't be read (a plan's own judgement holds).
     high_risk: Option<Vec<String>>,
-    /// The default branch, from `gh repo view` once the first read of `.paja/high-risk` works:
-    /// later reads take the list from `origin/<branch>` as the pool's sync just fetched it.
-    branch: Option<String>,
+    /// The default branch, as the latest sync found it: `.paja/high-risk` is read from
+    /// `refs/remotes/origin/<branch>` as that sync fetched it.
+    branch: String,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
     /// `paja run --every` waits after a failed pass.
     held_back: BTreeSet<u64>,
@@ -304,8 +304,11 @@ impl Pool<'_> {
                             self.held_back.clear();
                             self.retry_failed_to = events.last().map_or(0, |e| e.seq);
                         }
-                        match super::sync_queue(self.home, self.repo) {
-                            Ok(_) => self.read_high_risk(),
+                        match super::sync_queue_on(self.home, self.repo) {
+                            Ok((_, branch)) => {
+                                self.branch = branch;
+                                self.read_high_risk();
+                            }
                             // The next tick tells the lanes and stops, after the usual sleep.
                             Err(err) if super::is_fatal(&err) => fatal = Some(err),
                             Err(err) => self.say_error(&err),
@@ -389,14 +392,10 @@ impl Pool<'_> {
             .collect();
         // A running lane is judged by the list as it is now too, so a lane whose files became
         // high risk still keeps another high-risk item out.
-        let mut lane_plans: BTreeMap<u64, Plan> = self
-            .lanes
-            .values()
-            .map(|lane| (lane.number, lane.plan.clone()))
-            .collect();
-        if let Some(high_risk) = &self.high_risk {
-            judge_again(&mut lane_plans, high_risk);
-        }
+        let lane_plans = judged_lanes(
+            self.lanes.values().map(|lane| &lane.plan),
+            self.high_risk.as_deref(),
+        );
         let running: Vec<&Plan> = lane_plans.values().collect();
         let planning: BTreeSet<u64> = self
             .planners
@@ -464,36 +463,18 @@ impl Pool<'_> {
         Ok(started)
     }
 
-    /// Read main's `.paja/high-risk` again, as the lanes' runs and planners do: at the start from
-    /// the default branch's tip, fetched then (with a `gh repo view` for the branch), and after
-    /// each sync from `origin/<branch>` as that sync fetched it, with no more network. One that
-    /// can't be read is said, and the list read last holds (the plans' own judgement, before any
-    /// read has worked) until a later sync reads it.
+    /// Read main's `.paja/high-risk` again, as the lanes' runs and planners do, at the start and
+    /// after each sync, from `refs/remotes/origin/<branch>` as that sync fetched it: no more
+    /// network. One that can't be read is said, and the list read last holds (the plans' own
+    /// judgement, before any read has worked) until a later sync reads it.
     fn read_high_risk(&mut self) {
-        let read = match &self.branch {
-            Some(branch) => super::read_from_base(
-                self.repo,
-                &format!("origin/{branch}"),
-                super::HIGH_RISK_FILE,
-            ),
-            None => super::RepoSettings::read(self.repo).and_then(|target| {
-                let base = super::fetch_tip(self.repo, &target.branch)?;
-                let text = super::read_from_base(self.repo, &base, super::HIGH_RISK_FILE)?;
-                self.branch = Some(target.branch);
-                Ok(text)
-            }),
-        };
-        match read {
-            Ok(text) => self.high_risk = Some(super::lines(&text.unwrap_or_default())),
-            Err(err) => progress(&format!(
-                "couldn't read main's .paja/high-risk ({err:#}); plans are judged by {} until \
-                 a later sync reads it; check the network and `gh auth status`",
-                if self.high_risk.is_some() {
-                    "the list read last"
-                } else {
-                    "the list they were made with"
-                }
-            )),
+        let read = high_risk_on(self.repo, &self.branch);
+        if let Some(said) = take_list(&mut self.high_risk, read) {
+            progress(&format!(
+                "{said}; run `git fetch origin {}` in {} if it stays so",
+                self.branch,
+                self.repo.display()
+            ));
         }
     }
 
@@ -1012,13 +993,46 @@ fn plans_at(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, (u64, Pla
         let (now, changed) = text
             .get(number)
             .map_or((None, 0), |(t, b, at)| (Some(text_basis(t, b)), *at));
-        match &plan.basis {
-            _ if plan.source == "failed" => *seq > since && changed < *seq,
+        let fits = match &plan.basis {
             Some(basis) => now.as_ref() == Some(basis),
-            None => *seq > since && changed < *seq,
-        }
+            None => changed < *seq,
+        };
+        // A failed plan is tried again by a new pool run.
+        fits && ((plan.source != "failed" && plan.basis.is_some()) || *seq > since)
     });
     latest
+}
+
+/// Main's `.paja/high-risk` as `refs/remotes/origin/<branch>` has it, by its full name, so
+/// a tag or a local branch named `origin/<branch>` (which an agent's local git could make)
+/// can't stand in for it. No file is an empty list.
+fn high_risk_on(repo: &Path, branch: &str) -> Result<Vec<String>> {
+    let text = super::read_from_base(
+        repo,
+        &format!("refs/remotes/origin/{branch}"),
+        super::HIGH_RISK_FILE,
+    )?;
+    Ok(super::lines(&text.unwrap_or_default()))
+}
+
+/// Take a list just `read` into `list`, or keep the one read last when the read failed: then
+/// what to say, naming the list the plans are judged by meanwhile.
+fn take_list(list: &mut Option<Vec<String>>, read: Result<Vec<String>>) -> Option<String> {
+    match read {
+        Ok(read) => {
+            *list = Some(read);
+            None
+        }
+        Err(err) => Some(format!(
+            "couldn't read main's .paja/high-risk ({err:#}); plans are judged by {} until a \
+             later sync reads it",
+            if list.is_some() {
+                "the list read last"
+            } else {
+                "the list they were made with"
+            }
+        )),
+    }
 }
 
 /// The plans [`plans_at`] gives, without their seqs.
@@ -1027,6 +1041,20 @@ fn current_plans(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, Plan
         .into_iter()
         .map(|(number, (_, plan))| (number, plan))
         .collect()
+}
+
+/// The running lanes' plans, by item, each judged again by main's `.paja/high-risk` as last
+/// read (`None`: as they were admitted), so a lane whose files became high risk keeps another
+/// high-risk item out.
+fn judged_lanes<'p>(
+    lanes: impl Iterator<Item = &'p Plan>,
+    high_risk: Option<&[String]>,
+) -> BTreeMap<u64, Plan> {
+    let mut plans: BTreeMap<u64, Plan> = lanes.map(|plan| (plan.number, plan.clone())).collect();
+    if let Some(high_risk) = high_risk {
+        judge_again(&mut plans, high_risk);
+    }
+    plans
 }
 
 /// Judge each plan's `high_risk` again by main's `.paja/high-risk` now, since one made before
@@ -2175,6 +2203,27 @@ mod tests {
         let plans = current_plans(&events, "acme/app", 20);
         let numbers: Vec<u64> = plans.keys().copied().collect();
         assert_eq!(numbers, [10, 12], "{plans:?}");
+        // A failed plan of text a sync changed while it ran is no plan either: the item is
+        // planned again at once, not after a timed sync.
+        let mut failed = events.clone();
+        failed.push(work(30, jono::EV_IMPORTED, 13, "w", Some("acme/app")));
+        failed.push(work(31, jono::EV_CHANGED, 13, "w2", Some("acme/app")));
+        failed.push(event(
+            32,
+            EV_POOL_PLANNED,
+            json!({"repo": "acme/app", "number": 13, "paths": [], "source": "failed",
+                   "high_risk": false, "basis": text_basis("t", "w")}),
+        ));
+        assert!(!current_plans(&failed, "acme/app", 20).contains_key(&13));
+        // One of the text as it is holds for the run.
+        failed.push(event(
+            33,
+            EV_POOL_PLANNED,
+            json!({"repo": "acme/app", "number": 13, "paths": [], "source": "failed",
+                   "high_risk": false, "basis": text_basis("t", "w2")}),
+        ));
+        assert_eq!(current_plans(&failed, "acme/app", 20)[&13].source, "failed");
+        assert!(!current_plans(&failed, "acme/app", 40).contains_key(&13));
         // Without the edit back, #12's plan is of old text.
         let plans = current_plans(&events[..6], "acme/app", 20);
         assert!(!plans.contains_key(&12));
@@ -2201,6 +2250,80 @@ mod tests {
         let risky: Vec<(u64, bool)> = plans.iter().map(|(n, p)| (*n, p.high_risk)).collect();
         // Newly listed, no longer listed, a directory holding a listed file, a failed plan.
         assert_eq!(risky, [(5, true), (6, false), (7, true), (8, false)]);
+    }
+
+    #[test]
+    fn main_s_high_risk_list_is_read_from_origin_by_its_full_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit = |list: &str| {
+            std::fs::create_dir_all(repo.join(".paja")).unwrap();
+            std::fs::write(repo.join(".paja/high-risk"), list).unwrap();
+            git(&["add", "."]);
+            git(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "x",
+            ]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "-q"]);
+        let main = commit("src/hook.rs\n# a comment\n");
+        let other = commit("");
+        git(&["update-ref", "refs/remotes/origin/main", &main]);
+        // An agent's local git could make a tag or a branch of the same short name.
+        git(&["tag", "origin/main", &other]);
+        git(&["branch", "origin/main", &other]);
+        assert_eq!(high_risk_on(repo, "main").unwrap(), ["src/hook.rs"]);
+        assert!(high_risk_on(repo, "trunk").is_err());
+
+        // A read that fails keeps the list read last, and says which list holds.
+        let mut list = None;
+        let said = take_list(&mut list, high_risk_on(repo, "trunk")).unwrap();
+        assert!(said.contains("the list they were made with"), "{said}");
+        assert!(take_list(&mut list, high_risk_on(repo, "main")).is_none());
+        let said = take_list(&mut list, Err(anyhow::anyhow!("gone"))).unwrap();
+        assert!(said.contains("the list read last"), "{said}");
+        assert_eq!(list.as_deref(), Some(&["src/hook.rs".to_string()][..]));
+    }
+
+    #[test]
+    fn a_running_lane_is_judged_by_the_high_risk_list_main_has_now() {
+        let plan = |number: u64, path: &str| Plan {
+            repo: "acme/app".into(),
+            number,
+            paths: vec![path.to_string()],
+            source: "plan".into(),
+            high_risk: false,
+            basis: None,
+            error: None,
+        };
+        let lanes = [plan(5, "a.rs"), plan(6, "b.rs")];
+        let list = ["a.rs".to_string()];
+        let judged = judged_lanes(lanes.iter(), Some(&list));
+        assert!(judged[&5].high_risk && !judged[&6].high_risk);
+        // Before any list was read, a lane keeps the judgement it was admitted with.
+        assert!(!judged_lanes(lanes.iter(), None)[&5].high_risk);
+        // So a high-risk item waits for the lane whose file became high risk.
+        let item = Plan {
+            high_risk: true,
+            ..plan(7, "c.rs")
+        };
+        let running: Vec<&Plan> = judged.values().collect();
+        assert!(blocked_by(&item, &running).is_some());
     }
 
     #[test]

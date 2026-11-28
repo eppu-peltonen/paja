@@ -13019,6 +13019,8 @@ fn a_pool_judges_reused_plans_by_the_high_risk_list_main_has_now() {
         .find(|w| w["number"] == 6)
         .unwrap_or_else(|| panic!("{status}"))
         .clone();
+    // Not "overlaps #5": status shows a waiting plan with the high-risk judgement it was made
+    // with (docs/design/architecture.md), and both lanes are busy anyway.
     assert_eq!(beta["why"], "no free lane", "{status}");
     release(&f, "Alpha");
     wait_until(&f, "Beta starting once Alpha is done", || {
@@ -13044,6 +13046,37 @@ fn a_pool_judges_reused_plans_by_the_high_risk_list_main_has_now() {
         .map(|e| e["data"]["number"].as_u64().unwrap())
         .collect();
     assert_eq!(planning, [7]);
+}
+
+/// main's `.paja/high-risk` changing while lanes run is read at the pool's next sync: a running
+/// lane whose file became high risk keeps a newly high-risk item out, and the next one runs.
+#[cfg(unix)]
+#[test]
+fn a_pool_judges_its_running_lanes_by_the_high_risk_list_after_a_sync() {
+    let f = pool_factory(true);
+    let pool = start_pool(&f, "2");
+    wait_until(&f, "Alpha and Beta building", || {
+        holding(&f, "Alpha") && holding(&f, "Beta")
+    });
+    // Alpha's lane was admitted as low risk; now its file and Gamma's are high risk.
+    f.on_main(".paja/high-risk", "Alpha.txt\nGamma.txt\n");
+    release(&f, "Beta");
+    wait_until(&f, "Delta taking Beta's lane", || holding(&f, "Delta"));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(!holding(&f, "Gamma"), "Gamma ran beside high-risk Alpha");
+    release(&f, "Alpha");
+    wait_until(&f, "Gamma starting once Alpha is done", || {
+        holding(&f, "Gamma")
+    });
+    release(&f, "Gamma");
+    release(&f, "Delta");
+    wait_until(&f, "all four landing", || landed(&f) == 4);
+    assert_eq!(stop_pool(&f, pool).len(), 4);
+    let gamma = events_of(&f, "pool.admitted")
+        .into_iter()
+        .find(|e| e["data"]["number"] == 7)
+        .unwrap();
+    assert_eq!(gamma["data"]["high_risk"], true, "{gamma}");
 }
 
 #[cfg(unix)]

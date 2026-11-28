@@ -842,6 +842,12 @@ fn one_pass(home: &Home, opts: RunOptions<'_>, sandbox: &mut bool) -> Result<Run
 /// labels and queue rules on the fetched default branch, never on a repository whose git
 /// configuration was tampered with. Returns the repository's name (`owner/name`).
 pub fn sync_queue(home: &Home, repo: &Path) -> Result<String> {
+    Ok(sync_queue_on(home, repo)?.0)
+}
+
+/// [`sync_queue`], with the default branch whose tip it fetched, so a caller can read main's
+/// configuration from `refs/remotes/origin/<branch>` without another `gh repo view` or fetch.
+pub fn sync_queue_on(home: &Home, repo: &Path) -> Result<(String, String)> {
     let repo = std::path::absolute(repo)?;
     ahjo::ensure_untampered(home, &repo)?;
     let target = RepoSettings::read(&repo)?;
@@ -857,12 +863,8 @@ pub fn sync_queue(home: &Home, repo: &Path) -> Result<String> {
     let queue = jono::QueueRules::parse(
         &read_from_base(&repo, &base, jono::QUEUE_FILE)?.unwrap_or_default(),
     )?;
-    Ok(synced(jono::sync_with(
-        home,
-        &repo,
-        Some(&labels),
-        Some(&queue),
-    )?))
+    let name = synced(jono::sync_with(home, &repo, Some(&labels), Some(&queue))?);
+    Ok((name, target.branch))
 }
 
 /// The repository a run's sync was of, after telling on stderr which environments of closed,

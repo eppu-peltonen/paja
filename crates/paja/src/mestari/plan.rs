@@ -23,7 +23,7 @@ pub struct Plan {
     pub high_risk: bool,
     /// What the plan was made from: [`text_basis`] of the item's title and text as the plan read
     /// them, so a pool can tell a plan of the item as it is now from one of older text. Absent
-    /// from a failed plan, and from plans older releases recorded.
+    /// from a plan that failed before it read the item, and from plans older releases recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,7 +227,10 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
              started by hand); wait for it, then `paja pool status` shows its plan"
         );
     };
-    let made = make(home, &repo, &name, number);
+    // The item's title and text as the plan read them, which a failed plan records too: an edit
+    // a sync records while the plan runs then makes even a failed plan one of old text.
+    let mut basis = None;
+    let made = make(home, &repo, &name, number, &mut basis);
     let plan = match made {
         Ok(plan) => plan,
         Err(err) => {
@@ -237,7 +240,7 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
                 paths: Vec::new(),
                 source: "failed".to_string(),
                 high_risk: false,
-                basis: None,
+                basis,
                 error: Some(format!("{err:#}")),
             };
             // A tampered repository gets no more git or gh, and no event that could hide it.
@@ -251,7 +254,14 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     Ok(plan)
 }
 
-fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
+/// Make the plan, setting `basis` from the item as soon as it is read.
+fn make(
+    home: &Home,
+    repo: &Path,
+    name: &str,
+    number: u64,
+    basis: &mut Option<String>,
+) -> Result<Plan> {
     ahjo::ensure_untampered(home, repo)?;
     let item = jono::list(home, name)?
         .into_iter()
@@ -259,6 +269,7 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
         .with_context(|| {
             format!("{name} has no work item #{number}; `paja work list` shows the queue")
         })?;
+    *basis = Some(text_basis(&item.title, &item.body));
     let target = RepoSettings::read(repo)?;
     let branch = target.branch.as_str();
     let base = fetch_tip(repo, branch).with_context(|| {
@@ -300,7 +311,7 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
         high_risk: judge_high_risk(&paths, &high_risk),
         paths,
         source: source.to_string(),
-        basis: Some(text_basis(&item.title, &item.body)),
+        basis: basis.clone(),
         error: None,
     })
 }
