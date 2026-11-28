@@ -84,7 +84,7 @@ fn warning(name: &str, detail: impl Into<String>, fix: impl Into<String>) -> Che
 
 /// Run `cmd` with no stdin and no prompts; `Err` is why it couldn't start.
 fn run(cmd: &mut Command) -> std::result::Result<Output, String> {
-    crate::platform::own_process_group(cmd)
+    crate::platform::own_group_for_caller(cmd)
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .output()
