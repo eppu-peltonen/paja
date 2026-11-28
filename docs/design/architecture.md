@@ -298,9 +298,11 @@ planner of its own, records `pool.planning`, says so, counts the item as being p
 planning slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A
 planner of the pool's refused because a plan started by hand took the lock just after the pool looked waits the same
 way. An item that leaves the queue meanwhile is no longer waited for. The pool looks only when it is about to plan an
-item: one that already has a plan from this pool run can be admitted on it while a plan started by hand re-plans it. The
-plan, `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap
-when they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
+item: one that already has a plan can be admitted on it while a plan started by hand re-plans it. The plan,
+`pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds until the item's title or text changes
+(`work.changed`, say an edited `Touches:` line), and the item is then planned again. A later pool run reuses it, as it
+does a plan made by hand before the pool started, but not a failed one, which a new pool run plans again. Two plans
+overlap when they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed
 (`source: failed`, with its `error`) overlaps everything, so its item runs only in an otherwise idle pool, unless it is
 planned again: after the next timed sync, once per pool run. The pool takes items in queue order and admits one only
