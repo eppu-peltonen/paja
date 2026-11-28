@@ -436,6 +436,7 @@ function repoRow(repo) {
   buttons.push(pool);
   const children = [
     el("div", { className: "row" }, [el("strong", {}, repo.repo), el("span", { className: "muted" }, repo.checkout ?? "checkout unknown: add it below")]),
+    ...(repo.checkout_error ? [el("div", { className: "muted" }, "not confirmed with gh: " + repo.checkout_error)] : []),
     el("div", {}, runLine(repo)),
     el("div", { className: "actions" }, buttons),
   ];
