@@ -11422,7 +11422,9 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     let dir = f.tmp.path().to_path_buf();
     f.on_main(".paja/ci", "required\nwait 30\n");
     std::fs::write(dir.join("ci-hold"), "").unwrap();
-    // Once the run waits for CI, the default branch moves on from another clone.
+    // Once the run waits for CI, the default branch moves on from another clone. Once the run
+    // has asked on the issue, the fake `gh` is let go: on Windows its Git Bash loop can outlive
+    // the kill and hold paja's output open, which would keep the run from reading as ended.
     let mover = {
         let dir = dir.clone();
         std::thread::spawn(move || {
@@ -11455,6 +11457,22 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
                 ],
             );
             git(&other, &["push", "-q", "origin", "HEAD:main"]);
+            let asked = std::time::Instant::now();
+            let log = dir.join("gh.log");
+            let comments = || {
+                std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .matches("issue comment")
+                    .count()
+            };
+            let before = comments();
+            while comments() == before {
+                if asked.elapsed().as_secs() >= 300 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = std::fs::remove_file(dir.join("ci-hold"));
             true
         })
     };
@@ -11463,7 +11481,6 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     let moved = mover.join().unwrap();
     #[cfg(unix)]
     let waiting = std::fs::read_to_string(dir.join("ci-pid")).unwrap_or_default();
-    let _ = std::fs::remove_file(dir.join("ci-hold"));
     assert!(moved, "the run never waited for CI\n{stderr}");
     assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
     let question = report["question"].as_str().unwrap_or_default();
@@ -11479,7 +11496,8 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
         !stderr.contains("sending the failure back to the builder"),
         "{stderr}"
     );
-    // Ended at the limit, not left looping on `ci-hold` until the test removed it.
+    // Ended at the limit: the run only asks once the wait is over, and the wait is over only
+    // once `gh` is ended, so it was gone before `ci-hold` was removed.
     #[cfg(unix)]
     {
         let alive = Command::new("kill")
