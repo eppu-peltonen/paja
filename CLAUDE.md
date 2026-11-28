@@ -15,6 +15,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+These cover the core only. A change to the core's public API also has to build Paja Desk, which CI's `desk` job
+does: where WebKitGTK (Linux) or WebView2 (Windows) is available, run `cargo clippy -p paja-desk --all-targets -- -D
+warnings` and `cargo test -p paja-desk` too.
+
 Try the CLI against a throwaway home so you never touch real state:
 
 ```sh
@@ -48,8 +52,9 @@ the real repository, to the smoke tests.
   risk too.
 - `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`, `.paja/labels`: Vasara's check commands, the
   high-risk path prefixes, the model per agent role, the programs agents may run besides local git (`review <program>`
-  for reviewers too; `cargo` when missing) and the repository's `work` and `follow-up` issue labels (`factory` and
-  `factory-follow-up` when missing). `paja run` reads them from `main`, never from the branch under review.
+  for reviewers too; `cargo` when missing) and the repository's `work`, `follow-up` and `needs-answer` issue labels
+  (`factory`, `factory-follow-up` and `factory-needs-answer` when missing). `paja run` reads them from `main`, never
+  from the branch under review.
 - `crates/paja/src/hook.rs`: the deny-list hook (`paja hook`) every agent Mestari starts runs under. It allows local
   git and the programs Mestari passes from `.paja/commands`, and it fails closed.
 - `crates/paja/src/posti.rs`: Posti, the notices that tell the person a run needs them (desktop, `PAJA_NOTIFIER`,
@@ -105,10 +110,12 @@ code.
 - **Escalate, don't wait.** If reviewers disagree, a check can't decide, or a change would weaken a check, the
   question goes to Posti (until Posti exists: a comment on the issue or pull request) as an intent decision, with
   options and a recommendation. Details: `docs/design/landing.md`.
-- **Review converges.** At most three review rounds per change. Only blockers (a bug in what the issue asks for, a
-  security hole the change opens, a broken rule, missing tests) need another round; every other bug or risk goes into
-  the change's one `paja-follow-up` issue for the person to queue, and nits are fixed in a round that runs anyway or
-  dropped. A re-review reads only the fix (high risk: the whole change). Each
+- **Review converges.** At most five review rounds per change. Every finding in the change (bug, risk, missing test,
+  nit) is fixed in that change: the reviewer's findings go back to the builder as the next round's feedback, and
+  the change lands when a round leaves nothing to fix. No follow-up issue is filed. At round five an open blocker (a
+  bug in what the issue asks for, a security hole the change opens, a broken rule, missing tests) escalates; any
+  other open finding, and a real bug in code the change doesn't touch, is listed in the pull request and the change
+  lands. A re-review reads the fix and checks the earlier findings are settled (high risk: the whole change). Each
   review runs in its own fresh session. Details: `docs/design/landing.md`.
 - **Until Paja's own reviewer runs (build step 3)**, Claude does the review and landing for these hand-built seed
   pull requests under the same rules.

@@ -12,7 +12,7 @@ flowchart TB
     approve -- yes --> plan["Plan and review plan"]
     plan --> build["Build in its own environment"]
     build --> checks{"Vasara: checks pass?"}
-    checks -- "no: fix loop, max 3 rounds" --> build
+    checks -- "no: fix loop, max 5 rounds" --> build
     checks -- yes --> review{"Reviewer agent(s) agree?"}
     review -- "changes asked" --> build
     review -- "can't decide" --> posti["Escalate to Posti"]
@@ -29,7 +29,7 @@ flowchart TB
 ```
 
 The issue is usually one with the work label. When no such item is ready, `paja run` takes the oldest open issue with
-the follow-up label instead (the non-blocking findings reviewers leave behind), and it goes through the same loop,
+the follow-up label instead (issues people filed; Mestari files none), and it goes through the same loop,
 risk tier and `Depends on` rules. Work items always come first: a work item that becomes ready is picked before any
 follow-up at the next pick. `follow-ups = off` in `.paja/queue` on the default branch turns this off.
 
@@ -40,29 +40,61 @@ Follow-up issues go stale: later changes fix them, repeat them or make them moot
 cheapest model; a repository with no line runs it on the account's default) reads the open issues with the follow-up
 label, up to 60, and sorts each into one of the verdicts below. Each issue gets a turn: a pass reads first the issues no
 pass has read (oldest first), then those whose last read (in `triage.ran`) is longest ago, so a list longer than 60 is
-read in full over a few passes. The verdicts:
+read in full over a few passes. The next 200 open follow-ups past the 60 are listed too, by number and title only, so an
+issue of the pass can be called a duplicate of one a later pass reads. Issue text is data in the prompt: its angle
+brackets, and brackets that look like them, become `‹` and `›`, so it can't open or close one of the prompt's tags or
+seem to, and characters that render as nothing (format characters and the other default-ignorable code points, such as
+variation selectors and Hangul fillers, and the braille blank) are dropped. The prompt tells the agent that `‹` and `›`
+stand for any angle bracket. The verdicts:
 
 - `keep`: still valid. Also what anything Paja can't back up becomes.
 - `duplicate`: the same as another open follow-up issue, which it names.
 - `already_fixed`: the default branch already fixes it, with a commit on that branch or a file there that shows it.
 - `not_worth_doing`: valid but not worth the effort, with the reason.
 
-Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. "Not worth doing"
-is never closed: the report lists it, and the person decides. An issue that also has the work label is a work item and
-is left out.
+Duplicates and already-fixed issues are closed with a comment that gives the reason and the evidence. A duplicate's
+original also gets a comment naming the closed issue, so if the original is later closed without being done, the
+duplicate's finding can be found and reopened. If that note fails, the item stays closed with the note's failure as its
+`error`, the pass records it in `triage.ran` as `note_failed`, and the next pass tries it again (`retried_notes` in the
+report). Retries run before the agent and are recorded at once as `triage.notes` (`noted`, `note_failed`), so a pass
+whose agent fails still makes them and never posts them twice; a failed retry is also written to stderr. A duplicate
+closed again in a pass that retries its note gets no second note. Before a retry posts, it reads the original's
+comments by the account Paja comments as (`gh api user`): a note GitHub took while `gh` still failed is recorded as
+`noted`, not posted again. A token that can't name its account posts the note without looking. After three passes
+fail the same note, Paja gives up on it, and the last failure's error says to add the comment by hand. "Not worth
+doing" is never closed: the report lists it, and the person decides. An issue that also has the work label is a work
+item and is left out.
 
 The agent reads the default branch only, in a checkout made from it for the pass, under the deny-list hook with
 read-only tools, like a reviewer. The checkout is an Ahjo environment named like a work item's (`<repo>-<hash>-triage`),
-so each repository has its own and an environment a person made is never reused or removed. One pass runs per
-repository at a time: a pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is
-held and says to wait, and `paja run --every` and an idle pool skip their pass then. Its word is not enough to close anything: Paja closes a duplicate only when the
-original is another open issue that stays open, and an already-fixed issue only when the evidence has to do with it: a
-named commit must be on the default branch and committed after the issue was opened, and a named file must exist there
-and be named in the issue's title or body (its whole path, or its file name when that has an extension). Otherwise the
-issue is kept. Issue text reaches the agent as data to judge.
+so each repository has its own and an environment a person made is never reused or removed. The hash covers only
+`owner/name`, so two clones of one repository under one home share the name: a pass reuses a left-over environment
+only when it was made from the same clone, and otherwise stops and names it. One pass runs per repository at a time: a
+pass holds a lock for its whole life, a second `paja triage` (or MCP call) fails while it is held and says to wait,
+and `paja run --every` and an idle pool skip their pass then. Once they hold the lock, they check again that no pass
+ran that day, and a failed pass is recorded before the lock is let go. Its word is not enough to close anything: Paja
+closes a duplicate only when the original is another open issue that stays open, and an already-fixed issue only when
+the evidence has to do with it: a named commit must be on the default branch, committed after the issue was opened,
+and change a file the issue names (a merge against its first parent; a commit with no parent there counts as a root
+only outside a shallow clone, and Paja's git ignores grafts and replace objects), and a named file must exist there
+and be named in the issue's title or body. A path the issue gives names that path (or a longer or shorter one ending
+in it at a `/`, also before a `:line` or after a drive or `@`), and a bare file name with an extension names any file
+of that name; paths use `/` whichever way the agent wrote them. A path followed by an encoded part (`hook.rs%20old`)
+names nothing. A link is a `scheme://` one (its scheme included), or one whose host, written without a scheme (also
+after a `/`, `:`, `@` or other character a host can't have, as in `Ref:github.com/...`), is `github.com`,
+`githubusercontent.com` or a subdomain of either. It runs to the next space, quote or bracket, and none of it is read
+as a path; a word with another host and no scheme is. A link to one of the repository's own files on GitHub
+(`github.com/<owner>/<name>/{blob,tree,blame,raw}/<ref>/<path>` or
+`raw.githubusercontent.com/<owner>/<name>/<ref>/<path>`; a `?` or `#` part and a `:line` after it are left out) names
+exactly that path, with the ref read as one part (or after `refs/heads/` or `refs/tags/`), and a link to another
+repository, host or page, or with an empty ref or a `.` or `..` part (also as `%2e`), names nothing. Otherwise the
+issue is kept. Each issue reaches the agent with when it was opened. Issue text reaches the agent as data to judge.
 
-`--json` prints `{repo, base, items, closed, not_worth_doing}`; each item has its `verdict`, `reason`, `duplicate_of` or
-`evidence` when it has one, and `closed` (or the `error` that stopped a close). Each pass is recorded as `triage.ran`
+`--json` prints `{repo, base, items, closed, not_worth_doing}`, and `retried_notes` when a pass tried earlier notes
+again; each item has its `verdict`, `reason`, `duplicate_of` or
+`evidence` when it has one, and `closed` (or the `error` that stopped a close). Triage posts its reason as a comment
+from a file and then closes the issue, so an issue is never closed without saying why; one whose reason couldn't be
+posted stays open, with the `error`, for the next pass. Each pass is recorded as `triage.ran`
 with what was closed, kept and left for the person.
 
 `paja run --every` triages at most once a day, when a pass finds the queue idle. It reads `triage.ran` (and

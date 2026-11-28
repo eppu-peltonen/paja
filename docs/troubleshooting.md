@@ -79,7 +79,18 @@ alone
 
 Pick one of the two fixes named in the message. See "CI" in [`setup.md`](./setup.md). If a workflow exists but no check
 shows up on the pull request, Paja stops with `no CI checks appeared on <pr> within 5 minutes; check the workflows`: make
-the workflow run on `pull_request`.
+the workflow run on `pull_request`. With a `wait` shorter than 5 minutes in `.paja/ci`, the message names that instead.
+
+### CI still going at the limit
+
+```text
+CI on <pr> was still going after 120 minutes, so Paja stopped waiting for it and did not land it
+```
+
+The item is escalated with the checks as they stood. Look at the pull request's checks on GitHub: a job may be stuck, or
+queued with no runner to take it. Once it is unstuck, answer the item, and Paja checks the pull request's CI again
+before it lands. If the repository's CI simply takes longer, put `wait <minutes>` (up to 1440) in `.paja/ci` on the default
+branch. See "CI" in [`setup.md`](./setup.md).
 
 ### The tamper stop
 
@@ -96,7 +107,7 @@ code. Paja stops and runs no git or gh in that repository, not even to clean up.
 
 ```text
 #<number> escalated:
-Paja tried 3 rounds and the change still isn't ready. Last feedback:
+Paja tried 5 rounds and the change still isn't ready. Last feedback:
 
 <the reviewers' feedback>
 
@@ -104,7 +115,7 @@ Answer with what should change, or what is out of scope.
   answer: paja work answer <number> "<your answer>"
 ```
 
-Three rounds is the most Paja spends on one change. Read the feedback, then answer with `paja work answer <number>
+Five rounds is the most Paja spends on one change. Read the feedback, then answer with `paja work answer <number>
 "<your answer>"` (or `/paja:answer` in Claude Code). The answer is posted on the issue, the item is queued again and its
 next run gets the answer.
 

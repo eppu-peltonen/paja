@@ -168,11 +168,39 @@ pub fn blocked_by(plan: &Plan, running: &[&Plan]) -> Option<(u64, String)> {
     None
 }
 
+/// Take item `number`'s plan lock, trying for a moment, since a pool probing whether a plan
+/// runs holds it for an instant. None when another plan holds it still, or once a stop comes.
+fn plan_lock(home: &Home, repo: &str, number: u64) -> Result<Option<crate::home::RunLock>> {
+    for _ in 0..20 {
+        if let Some(lock) = home.try_plan_lock(repo, number)? {
+            return Ok(Some(lock));
+        }
+        if crate::platform::interrupts() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(None)
+}
+
 /// Plan item `number` of the repository checked out at `repo`, and record it as
-/// `pool.planned`. A plan that fails is recorded as `failed` before the error is returned.
+/// `pool.planned`. A plan that fails is recorded as `failed` before the error is returned; one
+/// stopped now (a second Ctrl-C, or `stop now` from the pool) records nothing, so whoever stopped
+/// it says why.
 pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     let repo = std::path::absolute(repo)?;
     let name = jono::repo_name(home, &repo)?;
+    // Taken before anything is recorded: a plan that finds another one running records nothing,
+    // so it never replaces that plan's result.
+    let Some(_lock) = plan_lock(home, &name, number)? else {
+        if crate::platform::interrupts() > 0 {
+            bail!("stopped before planning #{number}");
+        }
+        bail!(
+            "another `paja pool plan {number}` of {name} is running (a pool's planner, or one \
+             started by hand); wait for it, then `paja pool status` shows its plan"
+        );
+    };
     let made = make(home, &repo, &name, number);
     let plan = match made {
         Ok(plan) => plan,
@@ -186,7 +214,7 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
                 error: Some(format!("{err:#}")),
             };
             // A tampered repository gets no more git or gh, and no event that could hide it.
-            if !is_tampered(&err) {
+            if !is_tampered(&err) && crate::platform::interrupts() < 2 {
                 let _ = record(home, EV_POOL_PLANNED, serde_json::to_value(&failed)?);
             }
             return Err(err);
@@ -220,7 +248,7 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
                 &read_from_base(repo, &base, MODELS_FILE)?.unwrap_or_default(),
                 branch,
             )?;
-            crate::sandbox::activate(start_sandbox(home, repo, &base)?);
+            let _sandbox = crate::sandbox::enter(start_sandbox(home, repo, &base)?);
             (ask(home, repo, &base, &item, &models)?, "plan")
         }
     };
@@ -282,11 +310,28 @@ fn ask(
     item: &WorkItem,
     models: &Models,
 ) -> Result<Vec<String>> {
-    let name = format!("plan-{}", item.number);
+    // The repository's name and hash in the name, as an item's environment has, so two
+    // repositories sharing a home never plan their #5 in one checkout.
+    let name = jono::env_name_for(&item.repo, &format!("plan-{}", item.number));
+    // Releases before planner names carried the repository named it `plan-<n>`. One left by a
+    // killed plan of this repository holds nothing, so it goes, with its branch and port block.
+    let old = format!("plan-{}", item.number);
+    if let Ok(env) = ahjo::get(home, &old) {
+        if ahjo::belongs_to(home, &env, repo)? && ahjo::remove(home, &old, true).is_ok() {
+            let _ = git(repo, &["branch", "-q", "-D", &format!("paja/{old}")]);
+        }
+    }
     // A checkout or branch left behind by a plan that was killed is reused; `discard` puts it
     // back on the default branch.
     let branch = format!("refs/heads/paja/{name}");
     let env = match ahjo::get(home, &name) {
+        // Any checkout or worktree of the repository counts, as the plan may run from one.
+        Ok(env) if !ahjo::belongs_to(home, &env, repo)? => bail!(
+            "environment {name} belongs to the repository at {}, not {}; two repositories got \
+             the same planner name, so remove it with `paja env remove {name}` if it is stale",
+            env.repo.display(),
+            repo.display()
+        ),
         Ok(env) => env,
         Err(_) => {
             let left = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
@@ -348,6 +393,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_plan_lock_held_for_a_moment_is_waited_for_and_one_held_on_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("home")).unwrap();
+        let probe = home.try_plan_lock("o/a", 7).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(probe);
+        });
+        assert!(plan_lock(&home, "o/a", 7).unwrap().is_some());
+        release.join().unwrap();
+        let _other = home.try_plan_lock("o/a", 8).unwrap().unwrap();
+        assert!(plan_lock(&home, "o/a", 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_planner_checkout_another_repository_holds_is_refused_and_an_old_one_of_ours_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("home")).unwrap();
+        let (a, b) = (
+            super::super::tests::repo_with_commit(tmp.path(), "a"),
+            super::super::tests::repo_with_commit(tmp.path(), "b"),
+        );
+        let item = super::super::tests::work_item("o/a", 7);
+        let name = jono::env_name_for("o/a", "plan-7");
+        let theirs = ahjo::create(
+            &home,
+            CreateOptions {
+                name: &name,
+                repo: &b,
+                base: None,
+            },
+        )
+        .unwrap();
+        // An older release's `plan-7` of this repository, left by a killed plan, goes.
+        let old = ahjo::create(
+            &home,
+            CreateOptions {
+                name: "plan-7",
+                repo: &a,
+                base: None,
+            },
+        )
+        .unwrap();
+        let models = Models::parse_on("", "main").unwrap();
+        let err = format!("{:#}", ask(&home, &a, "HEAD", &item, &models).unwrap_err());
+        assert!(err.contains(&format!("paja env remove {name}")), "{err}");
+        assert!(theirs.path.exists());
+        assert_eq!(ahjo::get(&home, &name).unwrap().repo, theirs.repo);
+        assert!(ahjo::get(&home, "plan-7").is_err());
+        assert!(!old.path.exists());
+        assert!(git(
+            &a,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/paja/plan-7"]
+        )
+        .is_err());
+    }
+
+    #[test]
     fn a_touches_line_names_the_paths() {
         let body = "Do it.\n\nTouches: `src/a.rs`, docs/ ./src/b.rs\nMore.";
         assert_eq!(
@@ -383,6 +486,11 @@ mod tests {
                 "src/app/(b)/c.ts".into(),
                 "(a)/(b)".into()
             ])
+        );
+        // A quoted path wrapped in brackets, and a parenthetical that ends a sentence.
+        assert_eq!(
+            touches_line("Touches: (\"src/a.rs\") (see src/b.rs)."),
+            Some(vec!["src/a.rs".into(), "see".into(), "src/b.rs".into()])
         );
         assert_eq!(touches_line("Touches: `.`"), Some(vec![WHOLE.into()]));
     }

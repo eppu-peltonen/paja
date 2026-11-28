@@ -29,7 +29,23 @@ pub(super) fn start_sandbox(
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let setup = read_from_base(repo, base, crate::sandbox::SETUP_FILE)?;
-    crate::sandbox::start(&[envs, PathBuf::from(common)], setup.as_deref())
+    crate::sandbox::start(
+        &sandbox_mounts(envs, PathBuf::from(common)),
+        setup.as_deref(),
+    )
+}
+
+/// The folders the sandbox mounts: the home's environments and the repository's git data. Git
+/// data already under the environments (an `init` agent's scratch repository) is reachable
+/// through them, and a mount of its own would name a folder that is gone once the agent is
+/// done, which a sandbox made then would keep asking for.
+fn sandbox_mounts(envs: PathBuf, common: PathBuf) -> Vec<PathBuf> {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if canonical(&common).starts_with(canonical(&envs)) {
+        vec![envs]
+    } else {
+        vec![envs, common]
+    }
 }
 
 /// `argv` run in `sbx`, in `dir`, with the throwaway variables [`without_credentials`] gives
@@ -203,7 +219,8 @@ fn claude_args(
         args.extend(["--settings".to_string(), settings]);
     }
     // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
-    // main: the branch under review can't rewrite the rules its agents follow.
+    // main: the branch under review can't rewrite the rules its agents follow. It is empty for
+    // the `paja init` agent ([`Harness::Omitted`]).
     args.extend(["--append-system-prompt".to_string(), harness]);
     // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
     args.push("--strict-mcp-config".to_string());
@@ -286,12 +303,32 @@ pub(super) fn claude(
     model_args: &[String],
 ) -> Result<Value> {
     claude_with(
-        home, env, base, prompt, tools, schema, read_only, model_args, None,
+        home,
+        env,
+        base,
+        prompt,
+        tools,
+        schema,
+        read_only,
+        model_args,
+        None,
+        Harness::DefaultBranch,
     )
 }
 
+/// Whether an agent's system prompt carries the default branch's `CLAUDE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Harness {
+    /// The rules of a repository Paja works in: every agent that builds or judges its work.
+    DefaultBranch,
+    /// Left out: for an agent that judges a repository Paja doesn't work in yet (`paja init`),
+    /// whose `CLAUDE.md` is data to read, not rules.
+    Omitted,
+}
+
 /// [`claude`], with `programs` (when given) as the programs the hook lets it run instead of
-/// `.paja/commands`: for a repository that has no such file yet.
+/// `.paja/commands`: for a repository that has no such file yet; and `harness`, whether the
+/// default branch's `CLAUDE.md` goes in the system prompt.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude_with(
     home: &Home,
@@ -303,9 +340,14 @@ pub(super) fn claude_with(
     read_only: bool,
     model_args: &[String],
     programs: Option<&[String]>,
+    harness: Harness,
 ) -> Result<Value> {
     let program = claude_program();
-    let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
+    let harness = match (harness == Harness::DefaultBranch)
+        .then(|| read_from_base(&env.path, base, "CLAUDE.md"))
+        .transpose()?
+        .flatten()
+    {
         Some(text) => format!("The project's CLAUDE.md, as it is on the default branch:\n\n{text}"),
         None => String::new(),
     };
@@ -344,29 +386,14 @@ pub(super) fn claude_with(
         tools,
         schema,
     );
-    let line: usize = args.iter().map(|arg| arg.len() + 3).sum();
-    if line > COMMAND_LINE_BUDGET {
-        let longest = args
-            .iter()
-            .max_by_key(|arg| arg.len())
-            .cloned()
-            .unwrap_or_default();
-        let _ = std::fs::remove_file(&stamp);
-        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
-            let _ = std::fs::remove_dir(dir);
-        }
-        bail!(
-            "the `claude` command line would be {line} characters, over Paja's budget of \
-             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
-            longest.chars().take(60).collect::<String>()
-        );
-    }
     let mut cmd = match &sbx {
         Some(sbx) => {
             let mut argv = vec![program.clone()];
             argv.extend(args);
+            let argv = crate::sandbox::draining_stdin(&argv);
             let mut cmd = in_sandbox(sbx, &env.path, git_identity, Err(&argv))?;
-            // `sbx exec` passes stdin through only when asked to.
+            // `sbx exec` passes stdin through only when asked to, and the program it runs
+            // reads all of it before the agent starts (see `draining_stdin`).
             crate::sandbox::keep_stdin(&mut cmd);
             cmd
         }
@@ -382,6 +409,32 @@ pub(super) fn claude_with(
             cmd
         }
     };
+    // Measured on the whole command, with the sandbox's wrapping when there is one, as Windows
+    // quotes it for an `.exe`: at most each argument in quotes and a space, and a `\` before
+    // every `"` or `\`. A `.cmd` or `.bat` goes through `cmd.exe`, which escapes differently.
+    let line: usize = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.len() + 3 + arg.matches(['"', '\\']).count()
+        })
+        .sum();
+    if line > COMMAND_LINE_BUDGET {
+        let longest = cmd
+            .get_args()
+            .max_by_key(|arg| arg.len())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&stamp);
+        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
+            let _ = std::fs::remove_dir(dir);
+        }
+        bail!(
+            "the `claude` command line would be {line} characters, over Paja's budget of \
+             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
+            longest.chars().take(60).collect::<String>()
+        );
+    }
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
     let output = crate::platform::output_until_stopped_with_input(
@@ -463,8 +516,8 @@ pub(super) fn claude_with(
     if !output.status.success() {
         // A Claude Code without headless auto mode rejects the flag: stop, never fall back to
         // another permission mode.
-        let text = tail(&output);
-        if text.contains("--permission-mode") {
+        if rejects_auto_mode(&output.stderr) {
+            let text = tail(&output);
             bail!(
                 "`{program} -p` does not accept `--permission-mode auto`; Paja always runs agents \
                  in auto mode and never falls back to another mode, so update Claude Code to a \
@@ -491,6 +544,26 @@ pub(super) fn claude_with(
         .into());
     }
     Ok(value)
+}
+
+/// Whether a failed run is Claude Code's command line rejecting `--permission-mode`. Only stderr
+/// counts, and only a line that names the flag and says it is unknown or invalid: a session's
+/// own JSON on stdout may mention the flag without the CLI having rejected it.
+fn rejects_auto_mode(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::to_lowercase)
+        .any(|line| {
+            line.contains("--permission-mode")
+                && [
+                    "unknown option",
+                    "invalid",
+                    "allowed choices",
+                    "unrecognized",
+                ]
+                .iter()
+                .any(|word| line.contains(word))
+        })
 }
 
 /// The owner's commit name and email, and their global ignore file, which agents' git uses
@@ -1428,6 +1501,34 @@ impl GitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_clis_own_rejection_of_the_flag_counts() {
+        let rejection = "error: option '--permission-mode <mode>' argument 'auto' is invalid.";
+        assert!(rejects_auto_mode(rejection.as_bytes()));
+        assert!(rejects_auto_mode(
+            b"error: unknown option '--permission-mode'"
+        ));
+        // Stderr that merely mentions the flag, or has no stderr at all (the session's JSON is
+        // on stdout, which is never looked at), is no rejection.
+        assert!(!rejects_auto_mode(b"using --permission-mode auto"));
+        assert!(!rejects_auto_mode(b"boom"));
+        assert!(!rejects_auto_mode(b""));
+    }
+
+    #[test]
+    fn git_data_under_the_environments_gets_no_mount_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (envs, repo) = (dir.path().join("envs"), dir.path().join("repo"));
+        let scratch = envs.join("recommend-1-0").join(".git");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(sandbox_mounts(envs.clone(), scratch), vec![envs.clone()]);
+        assert_eq!(
+            sandbox_mounts(envs.clone(), repo.join(".git")),
+            [envs, repo.join(".git")]
+        );
+    }
 
     #[test]
     fn a_stream_folds_into_its_result_with_the_latest_window() {

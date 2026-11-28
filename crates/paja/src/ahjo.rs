@@ -83,6 +83,57 @@ pub struct CreateOptions<'a> {
     pub base: Option<&'a str>,
 }
 
+/// [`create`] for a person (`paja env create`, the MCP tool): names shaped like the ones Paja
+/// gives its own environments are refused, since Paja would reuse, reset and remove them.
+pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
+    validate_name(opts.name)?;
+    if is_paja_name(opts.name) {
+        bail!(
+            "environment name {:?} has the shape Paja gives its own environments \
+             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-plan-<n>`, `<repo>-<hash>-triage`, \
+             `work-<n>`, `plan-<n>`, where \
+             `<hash>` is any six hex digits), and Paja would reuse, reset and remove it; pick \
+             another name",
+            opts.name
+        );
+    }
+    create(home, opts)
+}
+
+/// Whether `name` has the shape of a name Paja gives its own environments: what
+/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage`,
+/// `-work-<n>` or a plan's `-plan-<n>`), or the `work-<n>` and `plan-<n>` of releases before
+/// names carried the repository.
+pub fn is_paja_name(name: &str) -> bool {
+    let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    if ["work-", "plan-"]
+        .iter()
+        .any(|p| name.strip_prefix(p).is_some_and(number))
+    {
+        return true;
+    }
+    // Each ending on its own: a repository named `home-work-app` puts `-work-` before the
+    // `-plan-<n>` its planner's name ends in.
+    let hashed = |head: &str| {
+        let hash = head.rsplit('-').next().unwrap_or(head);
+        hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    name.strip_suffix("-triage").is_some_and(hashed)
+        || ["-work-", "-plan-"].iter().any(|what| {
+            name.rsplit_once(what)
+                .is_some_and(|(head, n)| number(n) && hashed(head))
+        })
+}
+
+/// Whether two repository paths are the same folder, as the file system resolves them; paths
+/// that can't be resolved (a repository that moved) are compared as written.
+pub(crate) fn same_repo(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     validate_name(opts.name)?;
     // Under the lock, so a tamper stop recorded meanwhile is seen before any more git runs.
@@ -218,6 +269,19 @@ impl From<&Env> for RemoveReport {
 /// Remove an environment's worktree. The branch is kept, since it may hold work that has not
 /// landed yet. Without `force`, a worktree with uncommitted changes is refused.
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
+    remove_unless(home, name, force, |_, _, _| Ok(None))
+}
+
+/// [`remove`], unless `keep` names a reason to keep the environment, which is then the error.
+/// `keep` runs under the home lock, after the tamper check and before git touches anything, with
+/// the log as it stands, the environment and the tamper check's proof (None when the repository
+/// is gone, so no git may run), so what it decides can't change before the removal.
+pub(crate) fn remove_unless(
+    home: &Home,
+    name: &str,
+    force: bool,
+    keep: impl FnOnce(&[Event], &Env, Option<&Untampered>) -> Result<Option<String>>,
+) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
     let events = log.read_all()?;
@@ -234,6 +298,9 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     } else {
         None
     };
+    if let Some(why) = keep(&events, &env, checked.as_ref())? {
+        bail!("{why}");
+    }
 
     match checked {
         None => {
@@ -278,7 +345,7 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
                         repo = env.repo.display()
                     )
                 } else {
-                    format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
+                    format!("removing worktree {path}; git refuses one with uncommitted changes or untracked files (--force discards them), and a locked one or one with submodules")
                 }
             })?;
             }
@@ -409,6 +476,11 @@ pub fn clear_tampered(home: &Home, path: &Path) -> Result<String> {
     Ok(key)
 }
 
+/// The top of the checkout `ok` proved safe (it may have been named by a folder inside it).
+pub(crate) fn top_level(ok: &Untampered) -> Result<PathBuf> {
+    git(ok, ok.path(), &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+}
+
 /// The main repository's top level for any path inside it, even from inside a linked
 /// worktree (an agent creating an environment from within its own environment) or a
 /// submodule. git lists the main worktree first.
@@ -457,6 +529,16 @@ fn main_repo(ok: &Untampered, path: &Path) -> Result<PathBuf> {
         .and_then(|l| l.strip_prefix("worktree "))
         .map(PathBuf::from)
         .with_context(|| format!("can't find the main checkout for {}", path.display()))
+}
+
+/// Whether `env` was made from the repository `path` is in (any checkout or worktree of it).
+/// Environment names hold only a short hash of `owner/name`, so two clones of one repository
+/// under one home share them; only git in `path` runs, after `path`'s tamper check.
+pub fn belongs_to(home: &Home, env: &Env, path: &Path) -> Result<bool> {
+    let ok = untampered(home, path)?;
+    let main = main_repo(&ok, path)?;
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok(canonical(&main) == canonical(&env.repo))
 }
 
 /// Whether git still lists `path` as one of `repo`'s worktrees.
@@ -508,6 +590,9 @@ pub(crate) fn git_command() -> Command {
     cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_GRAFT_FILE", "/dev/null");
     cmd.args([
+        // The graft file above is turned off on purpose: no hint about it in error messages.
+        "-c",
+        "advice.graftFileDeprecated=false",
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
@@ -521,49 +606,447 @@ pub(crate) fn git_command() -> Command {
 
 /// A file as it is at `rev` in `repo`, or None if `rev` doesn't have it. Any other git failure
 /// is an error: a settings or check file that can't be read must never count as an empty one.
-/// Git runs in the C locale, since a missing file is told apart by git's English message.
+/// `rev` is resolved to one commit first, so a branch that moves meanwhile can't mix two
+/// trees. Whether that commit has the file is asked of `git ls-tree` (an empty listing), never
+/// read from git's message text, which a translated or changed git words differently; the
+/// content is then read from the very blob the listing names.
 pub(crate) fn show_at(repo: &Path, rev: &str, path: &str) -> Result<Option<String>> {
     let spec = format!("{rev}:{path}");
-    let output = git_command()
-        .env("LC_ALL", "C")
-        .env_remove("LANGUAGE")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &spec])
-        .output()
-        .context("running git (is it installed?)")?;
-    if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    // Refused here rather than with `--end-of-options`, which an older git (before 2.30)
+    // doesn't know, and a `:`, which would name a path inside the tree and not a commit: every
+    // caller passes a ref name or a commit id.
+    if rev.starts_with('-') || rev.contains(':') {
+        bail!("reading {spec}: {rev:?} is not a revision; pass a branch name or a commit id");
     }
-    let err = String::from_utf8_lossy(&output.stderr);
-    if err.contains("does not exist in") || err.contains("exists on disk, but not in") {
-        return Ok(None);
+    let commit = format!("{rev}^{{commit}}");
+    let resolved = run_git(repo, &["rev-parse", "--verify", &commit])?;
+    if !resolved.status.success() {
+        return Err(git_failed(
+            &spec,
+            repo,
+            &format!("git rev-parse {commit}"),
+            &resolved,
+        ));
     }
-    bail!(
-        "git show {spec} failed in {}: {}",
-        repo.display(),
-        err.trim()
-    )
+    let commit = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+    if path.contains('\0') || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+        bail!("reading {spec}: name a file from the top of the tree, such as .paja/checks");
+    }
+    let mut path = path.to_string();
+    // A symbolic link inside the tree (a CLAUDE.md that links to AGENTS.md, say) is followed
+    // to the file it names in the same commit, five links deep at most. A link in the middle
+    // of the path (a `.paja` that is itself a link) is an error: git lists nothing under it,
+    // and the file must not read as missing when a checkout would have it.
+    for links in 0..=5 {
+        let entry = blob_at(repo, &commit, &path, &spec)?;
+        if matches!(entry, Entry::Missing) {
+            if let Some(folder) = not_a_folder(repo, &commit, &path, &spec)? {
+                bail!(
+                    "reading {spec}: {folder}, on the way to {path}, is a symbolic link or a file, \
+                     not a folder; commit the folder itself in its place"
+                );
+            }
+        }
+        match entry {
+            Entry::Missing if links == 0 => return Ok(None),
+            // A link to nothing is never an empty settings file.
+            Entry::Missing => bail!(
+                "reading {spec}: it is a symbolic link to {path}, which that commit doesn't have; \
+                 commit the file itself in its place"
+            ),
+            Entry::File(bytes) => {
+                return String::from_utf8(bytes).map(Some).map_err(|_| {
+                    anyhow::anyhow!("reading {spec}: it is not UTF-8 text; save it as UTF-8")
+                })
+            }
+            Entry::Link(target) => path = link_target(&path, &target, &spec)?,
+        }
+    }
+    bail!("reading {spec}: it is a symbolic link more than five links deep; commit the file itself in its place")
 }
 
-/// A file as it is on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
-/// remote's default branch, whatever its name), else `origin/main`, else a local `main`. None
-/// when the file isn't there, or when there is none of these. Never the branch checked out,
-/// which may be the change under review.
-pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
-    for rev in ["origin/HEAD", "origin/main", "main"] {
-        let spec = format!("{rev}^{{commit}}");
-        let found = git_command()
-            .arg("-C")
-            .arg(ok.path())
-            .args(["rev-parse", "--verify", "-q", &spec])
-            .output()
-            .context("running git (is it installed?)")?;
-        if found.status.success() {
-            return show_at(ok.path(), rev, path);
+/// The first leading part of `path` (`a` of `a/b/c`, then `a/b`) that the commit has as
+/// something other than a folder, if any.
+fn not_a_folder(repo: &Path, commit: &str, path: &str, spec: &str) -> Result<Option<String>> {
+    let parts: Vec<&str> = path.split('/').collect();
+    for end in 1..parts.len() {
+        let prefix = parts[..end].join("/");
+        let listed = run_git(
+            repo,
+            &[
+                "--literal-pathspecs",
+                "ls-tree",
+                "--full-tree",
+                "-z",
+                commit,
+                "--",
+                &prefix,
+            ],
+        )?;
+        if !listed.status.success() {
+            return Err(git_failed(spec, repo, "git ls-tree", &listed));
+        }
+        let entry = String::from_utf8_lossy(&listed.stdout);
+        match entry.split(' ').nth(1) {
+            // Not there: nothing below it is either.
+            None => return Ok(None),
+            Some("tree") => {}
+            Some(_) => return Ok(Some(prefix)),
         }
     }
     Ok(None)
+}
+
+/// What one path at a commit is.
+enum Entry {
+    Missing,
+    File(Vec<u8>),
+    /// A symbolic link, with the path it points to.
+    Link(String),
+}
+
+/// `path` at `commit` (a commit id), from the top of the tree and with the path taken
+/// literally, as `rev:path` names it.
+fn blob_at(repo: &Path, commit: &str, path: &str, spec: &str) -> Result<Entry> {
+    let listed = run_git(
+        repo,
+        &[
+            "--literal-pathspecs",
+            "ls-tree",
+            "--full-tree",
+            "-z",
+            commit,
+            "--",
+            path,
+        ],
+    )?;
+    if !listed.status.success() {
+        return Err(git_failed(spec, repo, "git ls-tree", &listed));
+    }
+    let entries: Vec<&[u8]> = listed
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .collect();
+    // `<mode> <type> <object>\t<path>`: exactly the one entry asked for.
+    let entry = match entries.as_slice() {
+        [] => return Ok(Entry::Missing),
+        [one] => String::from_utf8_lossy(one).into_owned(),
+        _ => bail!("reading {spec}: {path} names a folder, not a file; name one file in it"),
+    };
+    let (head, listed_path) = entry
+        .split_once('\t')
+        .with_context(|| format!("reading {spec}: git ls-tree printed {entry:?}"))?;
+    if listed_path != path {
+        bail!(
+            "reading {spec}: git lists it as {listed_path:?}; name the file from the top of the \
+             tree, with no `.` or `..` parts and no trailing `/`"
+        );
+    }
+    let fields: Vec<&str> = head.split(' ').collect();
+    let [mode, kind, object] = fields.as_slice() else {
+        bail!("reading {spec}: git ls-tree printed {entry:?}");
+    };
+    match *kind {
+        "blob" => {}
+        "tree" => bail!("reading {spec}: {path} is a folder, not a file; name one file in it"),
+        "commit" => bail!(
+            "reading {spec}: {path} is a submodule, not a file; commit the file itself in its place"
+        ),
+        other => bail!("reading {spec}: {path} is a {other}, not a file"),
+    }
+    let output = run_git(repo, &["cat-file", "blob", object])?;
+    if !output.status.success() {
+        return Err(git_failed(
+            spec,
+            repo,
+            &format!("git cat-file blob {object}"),
+            &output,
+        ));
+    }
+    if *mode == "120000" {
+        let target = String::from_utf8(output.stdout).map_err(|_| {
+            anyhow::anyhow!("reading {spec}: {path} is a symbolic link to a name that isn't UTF-8")
+        })?;
+        return Ok(Entry::Link(target));
+    }
+    Ok(Entry::File(output.stdout))
+}
+
+/// The path, from the top of the tree, that a symbolic link at `link` pointing to `target`
+/// names: relative to the link's folder, never outside the tree, and written plainly. A target
+/// a checkout could read differently from this text (a `\\`, an empty, `.` or trailing `/`
+/// part, a `..` after a name) is refused, not guessed at.
+fn link_target(link: &str, target: &str, spec: &str) -> Result<String> {
+    let refuse = |why: &str| {
+        anyhow::anyhow!(
+            "reading {spec}: {link} is a symbolic link to {target:?}, {why}; commit the file \
+             itself in its place"
+        )
+    };
+    if target.starts_with('/') || target.as_bytes().get(1) == Some(&b':') {
+        return Err(refuse("outside the repository"));
+    }
+    if target.contains(['\\', '\0']) {
+        return Err(refuse("which names a file differently on Windows and Unix"));
+    }
+    let mut parts: Vec<&str> = link.split('/').collect();
+    parts.pop();
+    let mut named = false;
+    for part in target.split('/') {
+        match part {
+            "" | "." => return Err(refuse("which isn't a plain path to a file")),
+            ".." if named => return Err(refuse("which isn't a plain path to a file")),
+            ".." => {
+                parts
+                    .pop()
+                    .ok_or_else(|| refuse("outside the repository"))?;
+            }
+            name => {
+                named = true;
+                parts.push(name);
+            }
+        }
+    }
+    if !named {
+        return Err(refuse("a folder, not a file"));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Run git in `repo`.
+fn run_git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+    git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .context("running git (is it installed?)")
+}
+
+/// The error for a git command that failed while reading `spec`.
+fn git_failed(spec: &str, repo: &Path, what: &str, output: &std::process::Output) -> anyhow::Error {
+    anyhow::anyhow!(
+        "reading {spec}: {what} failed in {}: {}; check that the revision exists there (`git \
+         fetch`) and that the repository isn't damaged (`git fsck`)",
+        repo.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+/// The commit the ref named exactly `full` (`refs/remotes/origin/main`, say) points at, or None
+/// when there is no such ref. Exactly: `git rev-parse` would fall back to a tag or branch named
+/// `refs/remotes/origin/main` (`refs/tags/refs/remotes/origin/main`) when the ref is missing.
+pub(crate) fn ref_commit(repo: &Path, full: &str) -> Result<Option<String>> {
+    let found = run_git(repo, &["show-ref", "--verify", "--hash", full])?;
+    if !found.status.success() {
+        return Ok(None);
+    }
+    let object = String::from_utf8_lossy(&found.stdout).trim().to_string();
+    let commit = run_git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{object}^{{commit}}"),
+        ],
+    )?;
+    Ok(commit
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&commit.stdout).trim().to_string()))
+}
+
+/// The refs that name the default branch, in the order Paja tries them, each with the short name
+/// messages use.
+pub(crate) const DEFAULT_REFS: [(&str, &str); 3] = [
+    ("refs/remotes/origin/HEAD", "origin/HEAD"),
+    ("refs/remotes/origin/main", "origin/main"),
+    ("refs/heads/main", "main"),
+];
+
+/// The prefix of the branches Paja itself creates and pushes (`paja/<name>`), the change under
+/// review among them.
+const BRANCH_PREFIX: &str = "paja/";
+
+/// The default branch of the checkout `ok` proved safe, as its commit and the short name
+/// messages use, or None when no ref names it. Never the branch checked out, which may be the
+/// change under review.
+///
+/// GitHub's name for it decides when `gh repo view` names a usable branch within 15 seconds:
+/// Paja reads `origin/<name>` and nothing else, and errors when that isn't fetched. Code in a
+/// worktree can move `origin/HEAD` (`git remote set-head`, `git update-ref`), which would point
+/// inside `refs/remotes/origin/` once the branch under review is pushed, and can make a local
+/// `main`. Otherwise `origin/HEAD` (the remote's default branch, whatever its name), else
+/// `origin/main`, else a local `main`; `origin/HEAD` must then be a symbolic ref to a
+/// remote-tracking branch that isn't one of Paja's own (`paja/...`), or this errors.
+pub(crate) fn default_branch(ok: &Untampered) -> Result<Option<(String, String)>> {
+    if let Some(name) = github_default_branch(ok) {
+        // GitHub's branch, or an error: a local `main` or `origin/main` may be something else,
+        // and code in a worktree can make one.
+        return match ref_commit(ok.path(), &format!("refs/remotes/origin/{name}"))? {
+            Some(commit) => Ok(Some((commit, format!("origin/{name}")))),
+            None => bail!(
+                "GitHub's default branch is {name}, but {} has no origin/{name}; run `git fetch \
+                 origin {name}` there",
+                ok.path().display()
+            ),
+        };
+    }
+    trusted_origin_head(ok)?;
+    // Full ref names: a short one such as `origin/main` would let a tag or branch of that name
+    // (`refs/tags/origin/main`) stand in for the default branch.
+    for (full, rev) in DEFAULT_REFS {
+        if let Some(commit) = ref_commit(ok.path(), full)? {
+            return Ok(Some((commit, rev.to_string())));
+        }
+    }
+    Ok(None)
+}
+
+/// Errors when `origin/HEAD` exists but can't be trusted to name the default branch: when it
+/// isn't a symbolic ref (one written with `git update-ref`), or points outside
+/// `refs/remotes/origin/` or at one of Paja's own branches.
+pub(crate) fn trusted_origin_head(ok: &Untampered) -> Result<()> {
+    let git = |args: &[&str]| {
+        git_command()
+            .arg("-C")
+            .arg(ok.path())
+            .args(args)
+            .output()
+            .context("running git (is it installed?)")
+    };
+    let fix = "fix it with `git remote set-head origin -a`";
+    let head = git(&["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])?;
+    if !head.status.success() {
+        // Not symbolic: refused if it exists at all.
+        let exists = git(&["show-ref", "--verify", "-q", "refs/remotes/origin/HEAD"])?;
+        if exists.status.success() {
+            bail!(
+                "origin/HEAD in {} is not a symbolic ref, so it is not trusted as the default \
+                 branch; {fix}",
+                ok.path().display()
+            );
+        }
+        return Ok(());
+    }
+    let target = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let Some(branch) = target.strip_prefix("refs/remotes/origin/") else {
+        bail!(
+            "origin/HEAD in {} points at {target}, outside refs/remotes/origin/, so it is not \
+             trusted as the default branch; {fix}",
+            ok.path().display()
+        );
+    };
+    if branch.starts_with(BRANCH_PREFIX) {
+        bail!(
+            "origin/HEAD in {} points at {target}, one of Paja's own branches, so it is not \
+             trusted as the default branch; {fix}",
+            ok.path().display()
+        );
+    }
+    Ok(())
+}
+
+/// A file as it is on the default branch (see [`default_branch`]) of the checkout `ok` proved
+/// safe. None when the file isn't there, or when the checkout has no `origin` remote and no
+/// `main`.
+///
+/// Errors when `origin/HEAD` can't be trusted, and when the checkout has an `origin` remote but
+/// no default branch, so a default branch with another name isn't silently ignored.
+pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
+    if let Some((commit, rev)) = default_branch(ok)? {
+        return show_at(ok.path(), &commit, path)
+            .with_context(|| format!("reading {path} from {rev}, the default branch"));
+    }
+    let has_origin = git_command()
+        .arg("-C")
+        .arg(ok.path())
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .context("running git (is it installed?)")?
+        .status
+        .success();
+    if has_origin {
+        bail!(
+            "{} has an origin remote but gh can't name its default branch, and there is no \
+             origin/HEAD, origin/main or main; run `git fetch origin` and `git remote set-head \
+             origin -a` there",
+            ok.path().display()
+        );
+    }
+    Ok(None)
+}
+
+/// How long a default branch name from `gh` is reused, so a `work sync`, which reads two
+/// files from the default branch, asks once; and how long gh's failure to say is, so a gh
+/// that hangs costs one wait, not two, while the next pass asks again.
+const NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const NO_NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The default branch's name as `gh repo view` reports it, or None when gh can't say within 15
+/// seconds or names something that can't be a branch Paja would trust. The answer is reused
+/// per repository: a name for a few minutes, a None for half a minute.
+fn github_default_branch(ok: &Untampered) -> Option<String> {
+    // Unit tests run without `gh`, whatever the machine has (`GH_REPO`, a signed-in `gh`).
+    if cfg!(test) {
+        return None;
+    }
+    type Names = BTreeMap<String, (std::time::Instant, Option<String>)>;
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<Names>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(Default::default);
+    // A panic elsewhere while the lock was held leaves the map as it was, which is still right.
+    let lock = || {
+        names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some((at, name)) = lock().get(&ok.key) {
+        let reuse = if name.is_some() {
+            NAME_REUSE
+        } else {
+            NO_NAME_REUSE
+        };
+        if at.elapsed() < reuse {
+            return name.clone();
+        }
+    }
+    let name = crate::jono::gh_within(
+        ok,
+        &["repo", "view", "--json", "defaultBranchRef"],
+        Some(std::time::Duration::from_secs(15)),
+    )
+    .ok()
+    .and_then(|out| serde_json::from_str::<serde_json::Value>(&out).ok())
+    .and_then(|v| {
+        v["defaultBranchRef"]["name"]
+            .as_str()
+            .map(|n| n.trim().to_string())
+    })
+    .filter(|name| branch_like(name));
+    lock().insert(ok.key.clone(), (std::time::Instant::now(), name.clone()));
+    name
+}
+
+/// Whether `name` could be a branch's name (git's rules, roughly) that isn't one of Paja's own.
+fn branch_like(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        // Any letter case: on Windows and macOS `head` opens the same ref file as `HEAD`.
+        && !name.eq_ignore_ascii_case("HEAD")
+        && !name.starts_with(BRANCH_PREFIX)
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("/.")
+        && !name.contains(".lock/")
+        && !name.contains("@{")
+        && !name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
 }
 
 /// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
@@ -637,13 +1120,364 @@ mod tests {
         );
         assert_eq!(show_at(repo, "HEAD", "gone.txt").unwrap(), None);
         assert_eq!(show_at(repo, "HEAD", "new.txt").unwrap(), None);
+        // A path is taken literally and from the top, wherever git runs.
+        assert_eq!(show_at(repo, "HEAD", "*.txt").unwrap(), None);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        assert_eq!(
+            show_at(&repo.join("sub"), "HEAD", "kept.txt")
+                .unwrap()
+                .as_deref(),
+            Some("kept\n")
+        );
         let err = show_at(repo, "no-such-rev", "kept.txt")
             .unwrap_err()
             .to_string();
+        assert!(err.contains("reading no-such-rev:kept.txt"), "{err}");
+        // Nested files, as every real caller reads them.
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/checks"), "cargo test\n").unwrap();
+        git_unchecked(repo, &["add", ".paja/checks"]).unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "d",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            show_at(repo, "HEAD", ".paja/checks").unwrap().as_deref(),
+            Some("cargo test\n")
+        );
+        assert_eq!(show_at(repo, "HEAD", ".paja/models").unwrap(), None);
+        // A directory or a spelling git folds is an error, never None and never a listing.
+        assert!(show_at(repo, "HEAD", ".paja").is_err());
+        assert!(show_at(repo, "HEAD", ".paja/./checks").is_err());
+        // A rev that looks like an option, or names a path in a tree, is refused; a full
+        // commit id, as the default branch passes, is read.
+        for rev in ["--output=x", "HEAD:sub"] {
+            let err = show_at(repo, rev, "kept.txt").unwrap_err().to_string();
+            assert!(err.contains("is not a revision"), "{err}");
+        }
+        let head = git_unchecked(repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            show_at(repo, &head, "kept.txt").unwrap().as_deref(),
+            Some("kept\n")
+        );
+        // An empty file is a file; a symbolic link and a file that isn't UTF-8 are errors. They
+        // go in the index by hand, so the test needs no symbolic link on disk (Windows).
+        let add = |mode: &str, name: &str, content: &[u8]| {
+            let file = dir.path().join("content");
+            std::fs::write(&file, content).unwrap();
+            let oid = git_unchecked(
+                repo,
+                &["hash-object", "--no-filters", "-w", &file.to_string_lossy()],
+            )
+            .unwrap();
+            git_unchecked(
+                repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("{mode},{oid},{name}"),
+                ],
+            )
+            .unwrap();
+        };
+        add("100644", "empty", b"");
+        add("100644", "bom", b"\xef\xbb\xbfa\r\n");
+        add("120000", "link", b"kept.txt");
+        add("120000", ".paja/link", b"../link");
+        add("120000", "outside", b"../kept.txt");
+        add("120000", "loop", b"loop");
+        add("120000", "dangling", b"gone.txt");
+        add("120000", "absolute", b"/etc/passwd");
+        add("120000", "drive", b"C:/x");
+        add("120000", "backslash", b"d\\x");
+        add("120000", "dot", b".");
+        add("120000", "climb", b"a/../kept.txt");
+        // A chain of five links to a file is followed; a sixth is one too many.
+        add("120000", "l1", b"l2");
+        add("120000", "l2", b"l3");
+        add("120000", "l3", b"l4");
+        add("120000", "l4", b"l5");
+        add("120000", "l5", b"kept.txt");
+        add("120000", "l0", b"l1");
+        // A folder that is a link, read through or linked through.
+        add("120000", "via", b".paja");
+        add("120000", "through", b"via/checks");
+        add("100644", "latin1", b"caf\xe9\n");
+        git_unchecked(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "e",
+            ],
+        )
+        .unwrap();
+        assert_eq!(show_at(repo, "HEAD", "empty").unwrap().as_deref(), Some(""));
+        // Byte for byte: a BOM and CRLF line endings stay.
+        assert_eq!(
+            show_at(repo, "HEAD", "bom").unwrap().as_deref(),
+            Some("\u{feff}a\r\n")
+        );
+        // A symbolic link in the tree is followed, through another link too; one that leaves
+        // the tree, or loops, is an error that says what to do.
+        assert_eq!(
+            show_at(repo, "HEAD", "link").unwrap().as_deref(),
+            Some("kept\n")
+        );
+        assert_eq!(
+            show_at(repo, "HEAD", ".paja/link").unwrap().as_deref(),
+            Some("kept\n")
+        );
+        assert_eq!(
+            show_at(repo, "HEAD", "l1").unwrap().as_deref(),
+            Some("kept\n")
+        );
+        for name in ["via/checks", "through"] {
+            let err = show_at(repo, "HEAD", name).unwrap_err().to_string();
+            assert!(err.contains("via, on the way"), "{err}");
+        }
+        // A folder that isn't there at all still means the file is missing.
+        assert_eq!(show_at(repo, "HEAD", "nowhere/checks").unwrap(), None);
+        for path in [
+            "",
+            "/kept.txt",
+            "kept.txt/",
+            "nowhere/../gone",
+            "./kept.txt",
+        ] {
+            let err = show_at(repo, "HEAD", path).unwrap_err().to_string();
+            assert!(err.contains("name a file from the top"), "{err}");
+        }
+        for name in [
+            "outside",
+            "loop",
+            "dangling",
+            "absolute",
+            "drive",
+            "backslash",
+            "dot",
+            "climb",
+            "l0",
+        ] {
+            let err = show_at(repo, "HEAD", name).unwrap_err().to_string();
+            assert!(err.contains("commit the file itself"), "{err}");
+        }
+        let err = show_at(repo, "HEAD", "latin1").unwrap_err().to_string();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn default_branch_refuses_a_moved_origin_head_and_a_remote_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_unchecked(repo, &["init", "-q", "-b", "trunk"]).unwrap();
+        std::fs::create_dir_all(repo.join(".paja")).unwrap();
+        std::fs::write(repo.join(".paja/labels"), "work x\n").unwrap();
+        git_unchecked(repo, &["add", "-A"]).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "c"]);
+        git_unchecked(repo, &args).unwrap();
+        let ok = Untampered {
+            key: "k".into(),
+            path: repo.to_path_buf(),
+        };
+        // No remote: nothing to say about a default branch.
+        assert_eq!(show_on_default_branch(&ok, ".paja/labels").unwrap(), None);
+        // A remote, but no origin/HEAD and no main: say what to do.
+        git_unchecked(
+            repo,
+            &["remote", "add", "origin", "https://example.com/r.git"],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git remote set-head origin -a"), "{err}");
+        // origin/HEAD pointing at a local branch is refused.
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/heads/trunk",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside refs/remotes/origin/"), "{err}");
+        // Pointing inside refs/remotes/origin/ is read.
+        git_unchecked(repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]).unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            show_on_default_branch(&ok, ".paja/labels")
+                .unwrap()
+                .as_deref(),
+            Some("work x\n")
+        );
+        // A tag named like the default branch doesn't stand in for it.
+        std::fs::write(repo.join("other"), "").unwrap();
+        git_unchecked(repo, &["add", "-A"]).unwrap();
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "other"]);
+        git_unchecked(repo, &args).unwrap();
+        git_unchecked(repo, &["rm", "-q", "--cached", ".paja/labels"]).unwrap();
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "no labels"]);
+        git_unchecked(repo, &args).unwrap();
+        git_unchecked(repo, &["tag", "origin/HEAD"]).unwrap();
+        assert_eq!(
+            show_on_default_branch(&ok, ".paja/labels")
+                .unwrap()
+                .as_deref(),
+            Some("work x\n")
+        );
+        git_unchecked(repo, &["tag", "-d", "origin/HEAD"]).unwrap();
+        git_unchecked(
+            repo,
+            &["checkout", "-q", "refs/remotes/origin/trunk", "--", "."],
+        )
+        .unwrap();
+        // Nor does a tag named like the full ref when the ref itself is missing.
+        git_unchecked(
+            repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        )
+        .unwrap();
+        git_unchecked(repo, &["tag", "refs/remotes/origin/HEAD"]).unwrap();
+        assert_eq!(
+            ref_commit(repo, "refs/remotes/origin/HEAD").unwrap(),
+            None,
+            "a tag stood in for origin/HEAD"
+        );
+        git_unchecked(repo, &["tag", "-d", "refs/remotes/origin/HEAD"]).unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        )
+        .unwrap();
+        // An error reading it names the default branch it came from.
+        std::fs::remove_file(repo.join(".paja/labels")).unwrap();
+        std::fs::create_dir_all(repo.join(".paja/labels")).unwrap();
+        std::fs::write(repo.join(".paja/labels/x"), "").unwrap();
+        git_unchecked(repo, &["add", "-A"]).unwrap();
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-qm", "d"]);
+        git_unchecked(repo, &args).unwrap();
+        git_unchecked(repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]).unwrap();
+        let err = format!(
+            "{:#}",
+            show_on_default_branch(&ok, ".paja/labels").unwrap_err()
+        );
         assert!(
-            err.contains("git show no-such-rev:kept.txt failed in"),
+            err.contains("from origin/HEAD, the default branch"),
             "{err}"
         );
+        // origin/HEAD pointing at one of Paja's own branches, such as a pushed review branch,
+        // is refused.
+        git_unchecked(
+            repo,
+            &["update-ref", "refs/remotes/origin/paja/app-1", "HEAD"],
+        )
+        .unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/paja/app-1",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one of Paja's own branches"), "{err}");
+        // So is an origin/HEAD that isn't a symbolic ref.
+        git_unchecked(
+            repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        )
+        .unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "update-ref",
+                "--no-deref",
+                "refs/remotes/origin/HEAD",
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a symbolic ref"), "{err}");
+        assert!(err.contains("git remote set-head origin -a"), "{err}");
+    }
+
+    #[test]
+    fn a_default_branch_name_from_gh_must_look_like_a_branch() {
+        for good in ["main", "trunk", "release/1.0", "dev-x"] {
+            assert!(branch_like(good), "{good}");
+        }
+        for bad in [
+            "",
+            "@",
+            "HEAD",
+            "head",
+            "paja/app-1",
+            "-x",
+            "/x",
+            ".x",
+            "x/",
+            "x.",
+            "x.lock",
+            "a..b",
+            "a//b",
+            "a/.b",
+            "a.lock/b",
+            "a@{1}",
+            "a b",
+            "a\tb",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?",
+            "a*",
+            "a[",
+            "a\\b",
+        ] {
+            assert!(!branch_like(bad), "{bad:?}");
+        }
     }
 
     #[test]
@@ -690,6 +1524,43 @@ mod tests {
     }
 
     #[test]
+    fn remove_unless_keeps_what_its_check_keeps_before_git_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_unchecked(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-q", "--allow-empty", "-m", "c"]);
+        git_unchecked(&repo, &args).unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let env = create(
+            &home,
+            CreateOptions {
+                name: "keep-me",
+                repo: &repo,
+                base: None,
+            },
+        )
+        .unwrap();
+        let before = home.events().read_all().unwrap().len();
+        let err = remove_unless(&home, "keep-me", false, |events, seen, ok| {
+            assert!(ok.is_some());
+            assert_eq!(events.len(), before);
+            assert_eq!(seen.name, "keep-me");
+            Ok(Some("the item was reopened".into()))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the item was reopened");
+        assert!(env.path.exists());
+        assert_eq!(home.events().read_all().unwrap().len(), before);
+        assert!(get(&home, "keep-me").is_ok());
+        // With nothing to keep it, it goes.
+        remove_unless(&home, "keep-me", false, |_, _, _| Ok(None)).unwrap();
+        assert!(!env.path.exists() && get(&home, "keep-me").is_err());
+    }
+
+    #[test]
     fn port_blocks_reuse_the_lowest_free_slot() {
         let mut envs = BTreeMap::new();
         assert_eq!(free_port_block(&envs).unwrap(), 20_000);
@@ -713,6 +1584,41 @@ mod tests {
             &"x".repeat(41),
         ] {
             assert!(validate_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn paja_shaped_names_are_told_apart_from_a_persons() {
+        for repo in [
+            "acme/app",
+            "acme/a-very-long-repository-name",
+            "acme/---",
+            "acme/home-work-app",
+            "acme/x-plan-y",
+        ] {
+            for what in ["triage", "work-7", "work-12345", "plan-7"] {
+                let name = crate::jono::env_name_for(repo, what);
+                assert!(is_paja_name(&name), "{name}");
+            }
+        }
+        for name in ["work-7", "plan-12"] {
+            assert!(is_paja_name(name), "{name}");
+        }
+        for theirs in [
+            "triage",
+            "work-",
+            "plan-a",
+            "work-7-fix",
+            "fix-triage",
+            "app-12345-triage",
+            "app-abcdeg-triage",
+            "app-abcdef-work-",
+            "app-abcdef-work-7a",
+            "app-abcdef-worker",
+            "app-abcdef-plan-",
+            "app-abcdef-plan-x",
+        ] {
+            assert!(!is_paja_name(theirs), "{theirs}");
         }
     }
 }

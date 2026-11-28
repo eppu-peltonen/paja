@@ -687,6 +687,69 @@ fn link_out(
     None
 }
 
+/// Names agents never write, as spelled on disk.
+const PROTECTED_NAMES: [&str; 11] = [
+    ".git",
+    ".github",
+    ".claude",
+    ".cargo",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".gitattributes",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "clippy.toml",
+    ".clippy.toml",
+];
+
+/// A Windows 8.3 short name such as `GIT~1` or `RUST-T~1.TOM`: the start of a protected name
+/// (leading dot dropped), then `~` and digits. After several names collide, NTFS keeps only
+/// the first two letters and adds hex digits of a hash, eight characters in all with the `~`
+/// and counter (`GI3F2A~1`, `GI3F2~10`), so any such stem whose first two letters start a
+/// protected name counts too.
+fn short_name_of_protected(word: &str) -> bool {
+    let upper = word.to_uppercase();
+    let (stem, tail) = match upper.split_once('~') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let digits = tail.chars().take_while(char::is_ascii_digit).count();
+    if stem.is_empty() || digits == 0 {
+        return false;
+    }
+    let chars: Vec<char> = stem.chars().collect();
+    // Eight characters in all: a longer counter shortens the hash (`GI3F2~10`, `GI3F~100`).
+    let hashed = (chars.len() >= 3
+        && chars.len() + 1 + digits == 8
+        && chars[2..].iter().all(char::is_ascii_hexdigit))
+    .then(|| chars[..2].iter().collect::<String>());
+    PROTECTED_NAMES.iter().any(|name| {
+        let name = name.trim_start_matches('.').to_uppercase();
+        name.starts_with(stem) || hashed.as_ref().is_some_and(|two| name.starts_with(two))
+    })
+}
+
+/// `name` as Windows opens it: without a stream after `:` and without trailing dots and spaces.
+fn windows_name(name: &str) -> &str {
+    name.split(':')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(['.', ' '])
+}
+
+/// A word that is, or could be shorthand for, a protected name: compared with Unicode's upper
+/// case, as NTFS folds names (`ruſtfmt.toml` is `rustfmt.toml` there), and without what
+/// Windows drops or reads as the same file: trailing dots and spaces (`clippy.toml.`) and a
+/// stream after `:` (`clippy.toml::$DATA`).
+fn is_protected_word(word: &str) -> bool {
+    let word = windows_name(word);
+    let upper = word.to_uppercase();
+    short_name_of_protected(word)
+        || PROTECTED_NAMES
+            .iter()
+            .any(|name| name.to_uppercase() == upper)
+}
+
 /// `path` must be inside the worktree, and not git's link to the repository.
 fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     let full = resolve(path);
@@ -696,13 +759,25 @@ fn inside_root(what: &str, path: &Path, b: &Bounds) -> Option<String> {
     // Git and cargo read configuration from these at any depth.
     let inner = full.strip_prefix(&b.root).unwrap_or(&full);
     // Compared without case, for case-insensitive file systems (macOS's default, NTFS), and
-    // with Unicode's upper case, as NTFS folds names: `ſ` is `S` there.
-    let upper = |text: &str| text.to_uppercase();
+    // with Unicode's upper case, as NTFS folds names: `ſ` is `S` there. Windows also opens
+    // `clippy.toml.` and `clippy.toml::$DATA` as `clippy.toml`.
+    let upper = |text: &str| windows_name(text).to_uppercase();
     let named = |name: &str| {
         inner
             .components()
             .any(|c| upper(&c.as_os_str().to_string_lossy()) == upper(name))
     };
+    // Windows 8.3 short names (`GIT~1` for `.git`) reach the same files.
+    if inner
+        .components()
+        .any(|c| short_name_of_protected(windows_name(&c.as_os_str().to_string_lossy())))
+    {
+        return Some(format!(
+            "{} is a Windows short name for configuration that agents never change; use the \
+             full name",
+            crate::platform::shown(&full)
+        ));
+    }
     if named(".git") {
         return Some(format!(
             "{} is git's own data or link to the repository; agents never change it",
@@ -1127,10 +1202,28 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
             // too, `=` and all.
             Some(rest) => {
                 let glued = rest.char_indices().nth(1).map_or("", |(at, _)| &rest[at..]);
-                let starts_as_path = glued.starts_with(['/', '\\', '.', '~']) || has_drive(glued);
+                // A glued `.` starts a path only as `.`, `..`, `./` or `../`: in `-x.C/tmp/a`
+                // the `.` could be one more flag letter, before `C` and `/tmp/a`. `-o./out`
+                // stays a path (a `.` flag taking `/out` would need a non-letter flag, which
+                // option parsers don't use).
+                let dot_path = matches!(glued, "." | "..")
+                    || ["./", ".\\", "../", "..\\"]
+                        .iter()
+                        .any(|start| glued.starts_with(start));
+                let starts_as_path =
+                    glued.starts_with(['/', '\\', '~']) || dot_path || has_drive(glued);
+                // A letter before a `:` could be a drive (`-xfC:x`); a digit (`-p8080:80`)
+                // can't. `-plocalhost:80` looks the same as a drive and is refused; a space
+                // after the flag lets it through.
+                let drive_inside = glued
+                    .as_bytes()
+                    .windows(2)
+                    .any(|pair| pair[0].is_ascii_alphabetic() && pair[1] == b':');
                 // A cluster such as `-xvf/tmp/a` or `-xC..` hides where its path starts, so it
                 // is refused rather than guessed at.
-                if !starts_as_path && (glued.contains(['/', '\\', ':']) || glued.contains("..")) {
+                if !starts_as_path
+                    && (glued.contains(['/', '\\']) || drive_inside || glued.contains(".."))
+                {
                     return Some(format!(
                         "`{arg}` glues a path to a short flag; put a space between the flag and \
                          its value so the hook can check the path"
@@ -1138,6 +1231,14 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
                 }
                 // Programs don't expand `~`, but one could still read `-o~` as home.
                 if glued.starts_with('~') {
+                    return Some(format!(
+                        "`{arg}` glues `~` to a short flag; name the path inside the worktree"
+                    ));
+                }
+                // A `~` that doesn't start a short name (`HEAD~1`) could read as a home
+                // directory after the flag letters (`-xf~user`).
+                let mut after_tilde = glued.match_indices('~').map(|(at, _)| &glued[at + 1..]);
+                if after_tilde.any(|t| !t.starts_with(|c: char| c.is_ascii_digit())) {
                     return Some(format!(
                         "`{arg}` glues `~` to a short flag; name the path inside the worktree"
                     ));
@@ -1153,11 +1254,38 @@ fn check_listed(program: &str, args: &[&str], here: &Path, b: &Bounds) -> Option
                         .filter(|&(_, c)| c == '.')
                         .map(|(at, _)| &glued[at..]),
                 );
+                // So can a protected name without a dot (`-xfclippy.toml`) or its Windows 8.3
+                // short name (`-xfGIT~1`): every suffix is checked as a name.
+                values.extend(
+                    glued
+                        .char_indices()
+                        .skip(1)
+                        .map(|(at, _)| &glued[at..])
+                        .filter(|s| is_protected_word(s.split('=').next().unwrap_or(s))),
+                );
             }
             None => values.push(arg),
         }
+        // What follows any `=` (`out=/tmp/x`, `--cfg=a=rustfmt.toml`) is checked as a path of
+        // its own; a plain value (`1.2.3`, `on`) is skipped below like any other word.
+        let after_equals: Vec<&str> = values
+            .iter()
+            .flat_map(|value| {
+                value
+                    .match_indices('=')
+                    .map(move |(at, _)| &value[at + 1..])
+            })
+            .collect();
+        values.extend(after_equals);
         for value in values {
-            if !(value.contains(['/', '\\']) || value.starts_with('.') || has_drive(value)) {
+            let protected = value
+                .split(['/', '\\'])
+                .any(|part| is_protected_word(part.split('=').next().unwrap_or(part)));
+            if !(protected
+                || value.contains(['/', '\\'])
+                || value.starts_with('.')
+                || has_drive(value))
+            {
                 continue;
             }
             if let Some(why) = crate::platform::path_problem(value, false) {
@@ -1710,8 +1838,47 @@ mod program_tests {
             "npm test -o=.git",
             "npm test -Dx=.github",
             "npm test -xf.git",
-            "npm test -xo.claude/settings.json",
+            "npm test -xo.claude",
             "npm test -o~",
+            "npm test -xfclippy.toml",
+            "npm test -xfrustfmt.toml",
+            "npm test -xfrust-toolchain",
+            "npm test rustfmt.toml",
+            "npm test rust-toolchain.toml",
+            "npm test -xf~",
+            "npm test -xf~user",
+            "npm test GIT~1",
+            "npm test -xfGIT~1",
+            "npm test GIT~1/config",
+            "npm test -x.C/tmp/a",
+            "npm test -x.C..",
+            "npm test -xfC:x",
+            "npm test GI3F2A~1",
+            "npm test -xfCL0A1B~2",
+            "npm test RU12AB~1/x",
+            "npm test out=clippy.toml",
+            "npm test --cfg=a=rustfmt.toml",
+            "npm test -Da=b=clippy.toml",
+            "npm test out=/tmp/x",
+            "npm test out=../x",
+            "npm test --cfg=a=/tmp/x",
+            "npm test --cfg=a=../../x",
+            "npm test 'out=ruſtfmt.toml'",
+            "npm test '--a=b=ruſtfmt.toml'",
+            "npm test 'ruſtfmt.toml'",
+            "npm test '-xfruſtfmt.toml'",
+            "npm test CAFE00~1",
+            "npm test -x..C",
+            "npm test -.C/tmp/a",
+            "npm test -xf.Git",
+            "npm test -plocalhost:80",
+            "npm test 'clippy.toml.'",
+            "npm test 'out=clippy.toml '",
+            "npm test 'clippy.toml::$DATA'",
+            "npm test 'x=GIT~1.'",
+            "npm test GI3F2~10",
+            "npm test GI3F~100",
+            "npm test GI3~1000",
         ] {
             assert!(bash_as(&["npm"], false, c).is_some(), "{c}");
         }
@@ -1722,6 +1889,8 @@ mod program_tests {
         let ok = |c: &str| assert_eq!(bash_as(&["npm"], false, c), None, "{c}");
         ok("npm test -o./out.txt");
         ok("npm test -j4");
+        ok("npm test HEAD~1");
+        ok("npm test -xfHEAD~1");
         ok("npm test -C/h/.paja/envs/work-1/web");
         let why = bash_as(&["npm"], false, "npm test -Isrc/include").unwrap();
         assert!(why.contains("put a space between"), "{why}");
@@ -1730,6 +1899,16 @@ mod program_tests {
         ok("npm test -ofile.txt");
         ok("npm test -Dversion=1.2.3");
         ok("npm test --out=./build");
+        ok("npm test -p8080:80");
+        ok("npm test -o.");
+        ok("npm test -o.hidden");
+        ok("npm test -o../work-1/x");
+        ok("npm test out=file.txt");
+        ok("npm test AB12CD~1");
+        ok("npm test GI3F2~1");
+        ok("npm test GIXYZW~1");
+        ok("npm test -Dkey=a=b");
+        ok("npm test -p localhost:80");
     }
 }
 
@@ -1974,6 +2153,20 @@ mod tests {
         assert!(decide("Write", json!({"file_path": "/etc/passwd"})).is_some());
         assert!(decide("Edit", json!({"file_path": "../../other/x"})).is_some());
         assert!(decide("Write", json!({"file_path": ".git"})).is_some());
+        // Windows opens these as `clippy.toml` and `.git/config`.
+        for path in [
+            "clippy.toml.",
+            "clippy.toml ",
+            "clippy.toml::$DATA",
+            ".git./config",
+            "GIT~1/config",
+            "GI3F2A~1/config",
+        ] {
+            assert!(
+                decide("Write", json!({ "file_path": path })).is_some(),
+                "{path}"
+            );
+        }
         assert!(decide("Write", json!({"file_path": "/h/.paja/events.jsonl"})).is_some());
         assert!(decide("Read", json!({"file_path": "/h/.ssh/id_rsa"})).is_some());
         assert!(decide("Read", json!({"file_path": "/h/.config/gh/hosts.yml"})).is_some());

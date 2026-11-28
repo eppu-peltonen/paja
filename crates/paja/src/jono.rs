@@ -205,6 +205,9 @@ pub const EV_REOPENED: &str = "work.reopened";
 /// because `.paja/queue` says `follow-ups = off`, so a landed one stays landed when they come
 /// back on.
 const FOLLOW_UPS_OFF: &str = "follow_ups_off";
+/// The mark on a `work.reopened` of a follow-up hidden by `follow-ups = off` that GitHub
+/// reopened while it was hidden (a revert, say): it is a real reopen, so a landed one is queued.
+const REOPENED_ON_GITHUB: &str = "reopened_on_github";
 pub const EV_STATUS: &str = "work.status";
 /// A person answered an escalated item's question.
 pub const EV_ANSWERED: &str = "work.answered";
@@ -225,10 +228,12 @@ pub const EV_CLAIM: &str = "work.claim";
 /// How long a claim lasts without being renewed. A run renews it at each round.
 pub const CLAIM_SECS: u64 = 6 * 60 * 60;
 
-/// Who holds an item on GitHub: the claimed label, and the runner in its latest claim comment.
+/// Who holds an item on GitHub: the claimed label, and the runner in its first live claim comment
+/// (else the latest).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
-    /// The runner id in the latest claim comment; `unknown` when the label has no comment.
+    /// The runner id in the first live claim comment (else the latest); `unknown` when the label
+    /// has no comment.
     pub runner: String,
     /// The UTC time after which another runner may take the item. None when the claim can't go
     /// stale: the item is escalated and waits on a person, or the label has no comment.
@@ -454,7 +459,8 @@ pub fn env_name(repo: &str, number: u64) -> String {
 }
 
 /// An Ahjo environment name of `repo` for `what` (`work-5`, `triage`): the repository's name,
-/// a short hash of `owner/name` and `what`, at most 40 characters as long as `what` leaves room.
+/// a short hash of `owner/name`, and `what`; at most 40 characters as long as `what` leaves
+/// room. Two clones of one repository get the same names.
 pub fn env_name_for(repo: &str, what: &str) -> String {
     let name = repo.rsplit('/').next().unwrap_or(repo).to_ascii_lowercase();
     let name: String = name
@@ -567,6 +573,19 @@ pub struct SyncReport {
     pub changed: Vec<u64>,
     pub closed: Vec<u64>,
     pub reopened: Vec<u64>,
+    /// The environments this sync removed because their parked item's issue was closed, each
+    /// with no uncommitted changes (its branch is kept).
+    pub freed: Vec<String>,
+    /// The environments of closed, parked items, whenever they were closed, that this sync
+    /// kept, and why; every sync tries them again.
+    pub kept: Vec<Kept>,
+}
+
+/// An environment a sync could have freed but kept.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Kept {
+    pub env: String,
+    pub why: String,
 }
 
 #[derive(Deserialize)]
@@ -653,6 +672,27 @@ pub fn item_events<'a>(
         .filter(move |e| e.data["number"] == number && event_repo(e, legacy) == repo)
 }
 
+/// Whether the log shows that the `work-<n>` environment an older release made last held this
+/// item's run: the latest `run.started` in an environment named `work-<n>` is one of the item's
+/// (an item from a log that names no repository counts as `repo`'s, as everywhere else), and no
+/// run of the item landed after it. Another repository's item of the same number that ran in a
+/// `work-<n>` later makes it not the item's; so does a landing, after which the branch holds
+/// work that is already on the base.
+pub(crate) fn ran_in_work_n(events: &[Event], repo: &str, number: u64) -> bool {
+    let plain = format!("work-{number}");
+    let mine: std::collections::BTreeSet<u64> =
+        item_events(events, repo, number).map(|e| e.seq).collect();
+    let mut ours = false;
+    for e in events {
+        if e.kind == crate::mestari::EV_STARTED && e.data["env"].as_str() == Some(plain.as_str()) {
+            ours = mine.contains(&e.seq);
+        } else if e.kind == crate::mestari::EV_LANDED && mine.contains(&e.seq) {
+            ours = false;
+        }
+    }
+    ours
+}
+
 /// Before the first event of a repository is written to a log that holds older, unkeyed ones,
 /// record which repository those belong to (see [`legacy_repo`]), so a later write from another
 /// checkout can't move them. Every writer calls this under the home lock. Returns the log as it
@@ -688,6 +728,15 @@ pub fn replay_repo(events: &[Event], repo: &str) -> Result<BTreeMap<u64, WorkIte
 /// Every repository's queue, derived by replaying the event log. Events written before they
 /// carried a repository belong to [`legacy_repo`] (`fallback` is the checkout's repository).
 pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem>> {
+    Ok(replay_with_hidden(events, fallback)?.0)
+}
+
+/// [`replay`], and the closed items whose last close was a follow-up hidden by
+/// `follow-ups = off` rather than closed on GitHub.
+fn replay_with_hidden(
+    events: &[Event],
+    fallback: &str,
+) -> Result<(BTreeMap<Key, WorkItem>, BTreeSet<Key>)> {
     let mut items: BTreeMap<Key, WorkItem> = BTreeMap::new();
     // Follow-ups whose last close came from `follow-ups = off`, not from GitHub.
     let mut hidden: BTreeSet<Key> = BTreeSet::new();
@@ -748,7 +797,7 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
                     // A landed issue opened again (say after a revert) needs work again, but
                     // not a follow-up that only comes back because follow-ups are on again.
                     let back_from_rules = if item.open {
-                        hidden.remove(&key(n.number))
+                        hidden.remove(&key(n.number)) && event.data[REOPENED_ON_GITHUB] != true
                     } else {
                         if event.data[FOLLOW_UPS_OFF] == true {
                             hidden.insert(key(n.number));
@@ -823,7 +872,7 @@ pub fn replay(events: &[Event], fallback: &str) -> Result<BTreeMap<Key, WorkItem
             item.waiting_on = dependencies(item.number, &item.body);
         }
     }
-    Ok(items)
+    Ok((items, hidden))
 }
 
 /// The items a `work.waiting` event was ever recorded for.
@@ -843,6 +892,15 @@ fn waiting_recorded(events: &[Event], legacy: &str) -> BTreeSet<Key> {
 /// The repository (`owner/name`) of the checkout at `path`, from `gh repo view`. Work items
 /// belong to it.
 pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
+    repo_name_within(home, path, None)
+}
+
+/// [`repo_name`], with `gh` stopped once it has run for `limit`.
+pub fn repo_name_within(
+    home: &Home,
+    path: &Path,
+    limit: Option<std::time::Duration>,
+) -> Result<String> {
     if !path.is_dir() {
         bail!(
             "{} is not a directory; pass --repo with a path inside the checkout",
@@ -850,7 +908,7 @@ pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
         );
     }
     match crate::ahjo::untampered(home, path) {
-        Ok(ok) => name_of(&ok),
+        Ok(ok) => name_of(&ok, limit),
         // gh runs git, which a tampered configuration could abuse, so Paja asks it nothing
         // there. The queue stays readable (and an item can still be set) under the repository
         // the stop recorded.
@@ -868,8 +926,8 @@ pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
     }
 }
 
-fn name_of(ok: &Untampered) -> Result<String> {
-    let out = gh(ok, &["repo", "view", "--json", "nameWithOwner"])?;
+fn name_of(ok: &Untampered, limit: Option<std::time::Duration>) -> Result<String> {
+    let out = gh_within(ok, &["repo", "view", "--json", "nameWithOwner"], limit)?;
     let name = serde_json::from_str::<Value>(&out)
         .ok()
         .and_then(|v| v["nameWithOwner"].as_str().map(str::to_string))
@@ -1280,16 +1338,20 @@ pub fn claim_for_run_on(
         let Some(run_lock) = run_lock else {
             continue;
         };
-        let lost = claim_on_github(&ok, &labels, item.number, &me)?;
+        let race = claim_on_github(&ok, &labels, item.number, &me)?;
         let lock = home.lock()?;
         let log = home.events();
-        if let Some(winner) = lost {
-            log.append(
-                &lock,
-                EV_CLAIM,
-                claim_event(repo, item.number, Some(&winner)),
-            )?;
-            continue;
+        match race {
+            Race::Won => {}
+            Race::LostTo(winner) => {
+                log.append(
+                    &lock,
+                    EV_CLAIM,
+                    claim_event(repo, item.number, Some(&winner)),
+                )?;
+                continue;
+            }
+            Race::Gone => continue,
         }
         let mine = Claim {
             runner: me.clone(),
@@ -1381,19 +1443,19 @@ fn view_issue(ok: &Untampered, number: u64) -> Result<View> {
     })
 }
 
-/// Who holds an issue, from its labels and comments: the runner in the latest claim comment,
-/// when the issue has the claimed label. An escalated item (it carries `needs_answer`) stays
-/// claimed however old its claim is.
+/// Who holds an issue, from its labels and comments, when the issue has the claimed label: the
+/// runner in the first live claim comment, the one that won the race (a loser whose comment
+/// couldn't be deleted is later), else in the latest claim comment. An escalated item (it
+/// carries `needs_answer`) stays claimed however old its claim is.
 fn holder(view: &View, labels: &Labels) -> Option<Claim> {
     if !view.has_label(&labels.claimed()) {
         return None;
     }
     let escalated = view.has_label(&labels.needs_answer);
-    Some(match view.claims().pop() {
-        Some(c) => Claim {
-            runner: c.runner,
-            stale_after: (!escalated).then_some(c.stale_after),
-        },
+    let claims = view.claims();
+    let chosen = race_winner(&claims, now_secs()).or(claims.last());
+    Some(match chosen {
+        Some(c) => held(c, escalated),
         None => Claim {
             runner: "unknown".into(),
             stale_after: None,
@@ -1401,15 +1463,56 @@ fn holder(view: &View, labels: &Labels) -> Option<Claim> {
     })
 }
 
-/// Write this runner's claim on issue `number` and check that it won. None when it did; the
-/// holder when another runner's live claim comment came first, after taking this runner's label
-/// and comment back off.
-fn claim_on_github(
-    ok: &Untampered,
-    labels: &Labels,
-    number: u64,
-    me: &str,
-) -> Result<Option<Claim>> {
+/// The claim that won the race for an issue: its first live claim comment. Every reader of a
+/// race (the claim check, `holder`, freeing) goes by this one rule.
+fn race_winner(claims: &[ClaimComment], now: u64) -> Option<&ClaimComment> {
+    claims.iter().find(|c| !c.is_stale(now))
+}
+
+/// The claim a comment records: its runner and stale time, with no stale time for an escalated
+/// item, which waits on a person and so can't go stale.
+fn held(c: &ClaimComment, escalated: bool) -> Claim {
+    Claim {
+        runner: c.runner.clone(),
+        stale_after: (!escalated).then(|| c.stale_after.clone()),
+    }
+}
+
+/// How a claim race on GitHub came out.
+#[derive(Debug, PartialEq, Eq)]
+enum Race {
+    Won,
+    /// Another runner's live claim came first: the holder, recorded as such.
+    LostTo(Claim),
+    /// This runner's own comment was gone when it read the issue back: a runner giving the
+    /// item back deleted it as a later claim. Nobody holds the item by this runner's reckoning.
+    Gone,
+}
+
+/// Read a race back: `own` is the id of the comment this runner just posted, when `gh` printed
+/// it. The runner won only when its own live comment is still there and is the race's winner.
+fn race_result(claims: &[ClaimComment], me: &str, own: Option<u64>, now: u64) -> Race {
+    if let Some(w) = race_winner(claims, now).filter(|w| w.runner != me) {
+        return Race::LostTo(held(w, false));
+    }
+    let is_own = |c: &ClaimComment| match own {
+        Some(own) => c.id == Some(own),
+        None => c.runner == me,
+    };
+    if claims.iter().any(|c| is_own(c) && !c.is_stale(now)) {
+        Race::Won
+    } else {
+        Race::Gone
+    }
+}
+
+/// Write this runner's claim on issue `number` and check that it won (see `race_result`). On a
+/// loss to another runner's live claim, which comes first, this runner's comment is deleted.
+/// The claimed label stays then: it is shared, and the winner's live claim is what it now
+/// marks, so taking it off would make the item look free until the winner's next renewal. When
+/// this runner's own comment is gone, or a step fails, the claim is taken back (see
+/// `take_back`); a failure's error says the item was not taken.
+fn claim_on_github(ok: &Untampered, labels: &Labels, number: u64, me: &str) -> Result<Race> {
     let claimed = labels.claimed();
     add_label(
         ok,
@@ -1429,40 +1532,74 @@ fn claim_on_github(
             &claim_text(me, now),
         ],
     );
-    let url = match posted {
-        Ok(out) => out.lines().last().unwrap_or_default().trim().to_string(),
+    let not_taken = |err: anyhow::Error| {
+        err.context(format!(
+            "claiming #{number} on GitHub failed, so it was not taken"
+        ))
+    };
+    let own = match posted {
+        Ok(out) => out
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim()
+            .rsplit_once("issuecomment-")
+            .and_then(|(_, id)| id.parse::<u64>().ok()),
         Err(err) => {
-            let _ = remove_label(ok, number, &claimed);
-            return Err(err.context(format!(
-                "claiming #{number} on GitHub failed, so it was not taken"
-            )));
+            take_back(ok, &claimed, number, me, None);
+            return Err(not_taken(err));
         }
     };
     let view = match view_issue(ok, number) {
         Ok(view) => view,
         Err(err) => {
-            let _ = remove_label(ok, number, &claimed);
-            return Err(err.context(format!(
-                "claiming #{number} on GitHub failed, so it was not taken"
-            )));
+            take_back(ok, &claimed, number, me, own);
+            return Err(not_taken(err));
         }
     };
-    let first = view.claims().into_iter().find(|c| !c.is_stale(now));
-    let Some(first) = first.filter(|c| c.runner != me) else {
-        return Ok(None);
-    };
-    let _ = remove_label(ok, number, &claimed);
-    if let Some(id) = url
-        .rsplit_once("issuecomment-")
-        .and_then(|(_, id)| id.parse::<u64>().ok())
-    {
-        let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
-        let _ = gh(ok, &["api", "-X", "DELETE", &path]);
+    let race = race_result(&view.claims(), me, own, now);
+    match (&race, own) {
+        (Race::LostTo(_), Some(id)) => {
+            let _ = delete_comment(ok, id);
+        }
+        // The runner that deleted this one's comment also took the label off when nobody
+        // else held the item; make sure, so the item isn't left labelled with no claim.
+        (Race::Gone, _) => take_back(ok, &claimed, number, me, None),
+        _ => {}
     }
-    Ok(Some(Claim {
-        runner: first.runner,
-        stale_after: Some(first.stale_after),
-    }))
+    Ok(race)
+}
+
+fn delete_comment(ok: &Untampered, id: u64) -> Result<()> {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+    gh(ok, &["api", "-X", "DELETE", &path]).map(drop)
+}
+
+/// Undo a claim that failed part way: delete this runner's comment (`own`, when it was posted),
+/// then take the shared claimed label off unless another runner's live claim is on the issue,
+/// whose label it is (see `label_is_another_runners`). When the issue can't be read the label
+/// comes off, so a failure never leaves an item looking claimed by nobody in particular. Best
+/// effort: the caller reports the failure that brought it here.
+fn take_back(ok: &Untampered, claimed: &str, number: u64, me: &str, own: Option<u64>) {
+    if let Some(id) = own {
+        let _ = delete_comment(ok, id);
+    }
+    let now = now_secs();
+    let other = view_issue(ok, number)
+        .is_ok_and(|view| label_is_another_runners(&view.claims(), me, own, now));
+    if !other {
+        let _ = remove_label(ok, number, claimed);
+    }
+}
+
+/// Whether another runner's live claim holds the claimed label, so taking back this runner's
+/// claim leaves it on. With `own` (this runner's comment id) known, only a claim posted before
+/// it counts: a later one lost the race to this runner's comment and is about to delete itself.
+/// A claim whose id can't be read counts, which keeps the label.
+fn label_is_another_runners(claims: &[ClaimComment], me: &str, own: Option<u64>, now: u64) -> bool {
+    claims.iter().any(|c| {
+        c.runner != me && !c.is_stale(now) && own.is_none_or(|own| c.id.is_none_or(|id| id < own))
+    })
 }
 
 fn add_label(
@@ -1478,22 +1615,40 @@ fn add_label(
             &["issue", "edit", &number.to_string(), "--add-label", label],
         )
     };
-    if add(ok).is_err() {
-        gh(
-            ok,
-            &[
-                "label",
-                "create",
-                label,
-                "--color",
-                color,
-                "--description",
-                description,
-            ],
-        )?;
-        add(ok)?;
+    match add(ok) {
+        Ok(_) => Ok(()),
+        // Only a label the repository lacks is created; any other failure (the network, a
+        // deleted issue, no permission) is the error, not a reason to make a label.
+        Err(err) if label_missing(&err) => {
+            gh(
+                ok,
+                &[
+                    "label",
+                    "create",
+                    label,
+                    "--color",
+                    color,
+                    "--description",
+                    description,
+                ],
+            )?;
+            add(ok).map(drop)
+        }
+        Err(err) => Err(err),
     }
-    Ok(())
+}
+
+/// Whether `gh issue edit --add-label` failed because the repository has no such label: gh
+/// says `could not add label: '<label>' not found`. Matched by that phrase, not by the words
+/// alone, so a checkout path or another error that happens to say "label" or "not found"
+/// isn't taken for it.
+fn label_missing(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_lowercase();
+    text.split("could not add label: ").skip(1).any(|rest| {
+        rest.lines()
+            .next()
+            .is_some_and(|l| l.contains("' not found"))
+    })
 }
 
 fn remove_label(ok: &Untampered, number: u64, label: &str) -> Result<()> {
@@ -1510,9 +1665,11 @@ fn remove_label(ok: &Untampered, number: u64, label: &str) -> Result<()> {
     .map(drop)
 }
 
-/// Renew this runner's claim on `number`: move its claim comment's times on, and put the claimed
-/// label back if it was taken off. A run calls this at each round; the caller reports a failure
-/// and goes on, since the claim only matters to other runners.
+/// Renew this runner's claim on `number`: move its live claim comment's times on (a stale one is
+/// posted again, then deleted), and put the claimed label back if it was taken off. A claim that
+/// went stale while another runner claimed the item is not renewed: that runner holds it, and
+/// the error says so. A run calls this at each round; the caller reports a failure and goes on,
+/// since the claim only matters to other runners.
 pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
     let me = runner_id(home)?;
     let ok = crate::ahjo::untampered(home, checkout)?;
@@ -1522,7 +1679,20 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
     let now = now_secs();
     let text = claim_text(&me, now);
     let mine = view.claims().into_iter().rev().find(|c| c.runner == me);
-    match mine.and_then(|c| c.id) {
+    // A stale claim is posted again rather than edited: edited, it would keep its old place
+    // in comment order and win the race against a claim posted while it was stale.
+    let stale = mine.as_ref().filter(|c| c.is_stale(now)).and_then(|c| c.id);
+    let live_mine = mine.as_ref().is_some_and(|c| !c.is_stale(now));
+    let claims = view.claims();
+    if let Some(other) = race_winner(&claims, now).filter(|w| w.runner != me && !live_mine) {
+        bail!(
+            "#{number}'s claim lapsed and runner {} claimed it on GitHub since, so it holds the \
+             item now; this run goes on, and its work may duplicate that runner's. Stop one of \
+             the two runs",
+            other.runner
+        );
+    }
+    match mine.filter(|c| !c.is_stale(now)).and_then(|c| c.id) {
         Some(id) => {
             let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
             gh(
@@ -1535,6 +1705,10 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
                 &ok,
                 &["issue", "comment", &number.to_string(), "--body", &text],
             )?;
+            // The stale one goes once the new one is up; left, it is only noise.
+            if let Some(id) = stale {
+                let _ = delete_comment(&ok, id);
+            }
         }
     }
     if !view.has_label(&claimed) {
@@ -1550,7 +1724,7 @@ pub fn renew_claim(home: &Home, checkout: &Path, number: u64) -> Result<()> {
         runner: me,
         stale_after: Some(format_utc(now + CLAIM_SECS)),
     };
-    let name = name_of(&ok)?;
+    let name = name_of(&ok, None)?;
     let lock = home.lock()?;
     home.events()
         .append(&lock, EV_CLAIM, claim_event(&name, number, Some(&mine)))?;
@@ -1587,8 +1761,9 @@ pub fn release_own_claim(home: &Home, checkout: &Path, number: u64) {
 /// None every claim goes. With `me`, this runner's own go, and so does every other runner's
 /// posted after its first one: those lost the race (the first live claim wins), and one left
 /// behind would win every later runner's race check while nobody builds the item. A claim
-/// posted before this runner's first stays; the latest of those holds the item.
-fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>) {
+/// posted before this runner's first stays; the first of those (the race's winner) holds the
+/// item.
+fn to_free(live: &[ClaimComment], me: Option<&str>, escalated: bool) -> (Vec<u64>, Option<Claim>) {
     let first_mine = match me {
         None => 0,
         Some(me) => live
@@ -1598,10 +1773,8 @@ fn to_free(live: &[ClaimComment], me: Option<&str>) -> (Vec<u64>, Option<Claim>)
     };
     let (ahead, rest) = live.split_at(first_mine);
     let delete = rest.iter().filter_map(|c| c.id).collect();
-    let stays = ahead.last().map(|c| Claim {
-        runner: c.runner.clone(),
-        stale_after: Some(c.stale_after.clone()),
-    });
+    // `live` holds live claims only, so the first ahead is the race's winner.
+    let stays = ahead.first().map(|c| held(c, escalated));
     (delete, stays)
 }
 
@@ -1626,7 +1799,8 @@ fn free_claim(home: &Home, checkout: &Path, number: u64, freeing: Freeing) {
             .into_iter()
             .filter(|c| !c.is_stale(now))
             .collect();
-        let (delete, stays) = to_free(&live, me.as_deref());
+        let escalated = view.has_label(&labels.needs_answer);
+        let (delete, stays) = to_free(&live, me.as_deref(), escalated);
         for id in delete {
             let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
             // Carry on past a delete that fails (another account's comment answers 403), so
@@ -1635,10 +1809,13 @@ fn free_claim(home: &Home, checkout: &Path, number: u64, freeing: Freeing) {
                 failures.push(format!("deleting claim comment {id}: {err:#}"));
             }
         }
-        let name = name_of(&ok)?;
-        if stays.is_none() && view.has_label(&labels.claimed()) {
+        let name = name_of(&ok, None)?;
+        let labelled = view.has_label(&labels.claimed());
+        if stays.is_none() && labelled {
             remove_label(&ok, number, &labels.claimed())?;
         }
+        // Recorded as a sync would read it: an issue without the label holds nothing.
+        let stays = stays.filter(|_| labelled);
         let lock = home.lock()?;
         home.events()
             .append(&lock, EV_CLAIM, claim_event(&name, number, stays.as_ref()))?;
@@ -1798,7 +1975,7 @@ pub fn sync_with(
         Some(rules) => *rules,
         None => QueueRules::of_default_branch(&ok)?,
     };
-    let name = name_of(&ok)?;
+    let name = name_of(&ok, None)?;
     let mut listed = fetch_issues(&ok, &labels.work)?;
     if rules.follow_ups {
         // An issue with both labels is a work item.
@@ -1835,17 +2012,192 @@ pub fn sync_with(
             open_outside.insert(number);
         }
     }
-    let report = apply_listed(home, &name, &issues, &open_outside, rules.follow_ups)?;
+    // With follow-ups off, an imported follow-up that wasn't listed is hidden by that rule only
+    // while its issue is still open on GitHub; one closed there closes as any item does.
+    let mut hidden = BTreeSet::new();
+    if !rules.follow_ups {
+        for item in replay_repo(&home.events().read_all()?, &name)?.values() {
+            if item.open
+                && item.priority == Priority::FollowUp
+                && !queued.contains(&item.number)
+                && issue_is_open(&ok, item.number)?
+            {
+                hidden.insert(item.number);
+            }
+        }
+    }
+    // With follow-ups on again, a landed follow-up that the rule hid is asked about once: if
+    // GitHub reopened it while it was hidden (it may have closed and reopened in between), it
+    // needs work again.
+    let mut reopened = BTreeSet::new();
+    if rules.follow_ups {
+        for (number, hidden_at) in landed_hidden(&home.events().read_all()?, &name)? {
+            if queued.contains(&number) && reopened_since(&ok, number, hidden_at)? {
+                reopened.insert(number);
+            }
+        }
+    }
+    let mut report = apply_listed(home, &name, &issues, &open_outside, &hidden, &reopened)?;
     apply_claims(home, &name, &seen, &held)?;
-    record_checkout(home, &name, &checkout_top(repo)?)?;
+    let top = checkout_top(repo)?;
+    record_checkout(home, &name, &top)?;
+    (report.freed, report.kept) = free_closed(home, &ok, &name, &top);
     Ok(report)
+}
+
+/// Remove the environments of the closed, parked (escalated) items of `repo` that were made in
+/// the checkout `top`; every sync tries again, so one kept once is freed once nothing keeps it. A
+/// parked item keeps its environment so the builder's edits survive the question; once its issue
+/// is closed on GitHub instead of answered, nothing else frees the worktree and port block. The
+/// branch stays, so a reopened item resumes from it, also from the `paja/work-<n>` of the
+/// `work-<n>` environment an older release made, which is freed the same way when the log shows
+/// the item last ran there (see [`ran_in_work_n`]). An environment
+/// is kept, with the reason, when:
+///
+/// - its issue is still open on GitHub (the item left the queue because its label changed, or
+///   `follow-ups = off` hides it), or `gh` can't say;
+/// - a run holds the item, or the item is no longer closed and parked by the time the home lock
+///   is taken for the removal;
+/// - its worktree folder is already gone: removing it would `git worktree prune` the whole
+///   repository, which `paja env remove` does when asked;
+/// - its worktree isn't on the item's branch, so commits made there could be lost, or git
+///   can't read its HEAD;
+/// - git refuses to remove it: uncommitted changes or untracked files. Ignored files (build
+///   output, a local `.env`) go with the worktree.
+///
+/// Both lists are what the sync reports; `paja doctor` names a kept one until it is removed. A
+/// log that can't be read frees nothing and says so on stderr.
+fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<String>, Vec<Kept>) {
+    let (mut freed, mut kept) = (Vec::new(), Vec::new());
+    let found = (|| -> Result<Vec<(u64, String)>> {
+        let events = home.events().read_all()?;
+        let envs = crate::ahjo::replay(&events)?;
+        Ok(replay_repo(&events, repo)?
+            .values()
+            .filter(|item| !item.open && item.status == Status::Escalated)
+            .flat_map(|item| {
+                [
+                    (item.number, item.env_name()),
+                    (item.number, format!("work-{}", item.number)),
+                ]
+            })
+            .filter(|(_, name)| envs.get(name).is_some_and(|env| same_dir(&env.repo, top)))
+            // A `work-<n>` carries no repository: it is the item's only when the log shows the
+            // item last ran there.
+            .filter(|(number, name)| {
+                *name != format!("work-{number}") || ran_in_work_n(&events, repo, *number)
+            })
+            .collect())
+    })();
+    let found = match found {
+        Ok(found) => found,
+        Err(err) => {
+            eprintln!(
+                "paja: freed no environment of a closed item: couldn't read the event log: {err:#}"
+            );
+            return (freed, kept);
+        }
+    };
+    // Asked once per issue, though an item may have both names.
+    let mut asked: BTreeMap<u64, std::result::Result<bool, String>> = BTreeMap::new();
+    for (number, name) in found {
+        let state = asked
+            .entry(number)
+            .or_insert_with(|| issue_is_open(ok, number).map_err(|err| format!("{err:#}")))
+            .clone();
+        let why = match state {
+            Ok(false) => None,
+            Ok(true) => Some(format!(
+                "issue #{number} is still open on GitHub (or `{} api` couldn't say)",
+                gh_program()
+            )),
+            Err(err) => Some(format!("couldn't ask GitHub about issue #{number}: {err}")),
+        };
+        if let Some(why) = why {
+            kept.push(Kept { env: name, why });
+            continue;
+        }
+        let removed = crate::ahjo::remove_unless(home, &name, false, |events, env, checked| {
+            still_free(home, events, repo, number, env, checked)
+        });
+        match removed {
+            Ok(_) => freed.push(name),
+            // Removed since the list was read (another sync, `paja env remove`): nothing to keep.
+            Err(_) if crate::ahjo::get(home, &name).is_err() => {}
+            Err(err) => kept.push(Kept {
+                env: name,
+                why: format!("{err:#}"),
+            }),
+        }
+    }
+    (freed, kept)
+}
+
+/// Why item `number` of `repo` must keep `env` after all, read under the home lock: it was
+/// reopened, queued or claimed since the sync closed it, a run holds it, or the worktree isn't on
+/// the environment's branch.
+fn still_free(
+    home: &Home,
+    events: &[Event],
+    repo: &str,
+    number: u64,
+    env: &crate::ahjo::Env,
+    checked: Option<&Untampered>,
+) -> Result<Option<String>> {
+    let item = replay_repo(events, repo)?.remove(&number);
+    if !item.is_some_and(|item| !item.open && item.status == Status::Escalated) {
+        return Ok(Some(format!(
+            "item #{number} is no longer closed and parked"
+        )));
+    }
+    if home.run_held(repo, number)? {
+        return Ok(Some(format!("a run holds item #{number}")));
+    }
+    if !env.path.exists() {
+        return Ok(Some(format!(
+            "{} is already gone; `paja env remove {}` forgets it (and prunes the repository's \
+             other missing worktrees)",
+            env.path.display(),
+            env.name
+        )));
+    }
+    // git runs only in a repository the tamper check passed; without one the removal says
+    // why it stops.
+    if checked.is_some() {
+        let out = crate::ahjo::git_command()
+            .arg("-C")
+            .arg(&env.path)
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .output()
+            .with_context(|| format!("running git in {}", env.path.display()))?;
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Exit 1 with no output is a detached HEAD; anything else is git failing to read it.
+        if !out.status.success() && (out.status.code() != Some(1) || !head.is_empty()) {
+            return Ok(Some(format!(
+                "git couldn't read the HEAD of {}: {}; check the worktree with `git -C {} status`",
+                env.path.display(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                env.path.display()
+            )));
+        }
+        if head != format!("refs/heads/{}", env.branch) {
+            return Ok(Some(format!(
+                "{} is not on {}, so removing it could lose commits; check it out there or run \
+                 `paja env remove {} --force`",
+                env.path.display(),
+                env.branch,
+                env.name
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// The top level of the checkout `path` is in (the nearest folder holding `.git`), so a sync
 /// from a subdirectory names the same checkout as one from its root. Found from the path's own
 /// spelling, not from git, so it compares equal to the path an environment records; `..` parts
 /// are folded first, so `/a/b/../c` is `/a/c`.
-fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
+pub(crate) fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
     let path = fold_parents(&std::path::absolute(path)?);
     Ok(path
         .ancestors()
@@ -1887,7 +2239,13 @@ fn record_checkout(home: &Home, repo: &str, path: &Path) -> Result<()> {
         .into_iter()
         .rev()
         .find(|e| e.kind == EV_CHECKOUT && e.data["repo"] == repo);
-    if last.is_some_and(|e| e.data["path"].as_str().map(Path::new) == Some(path.as_path())) {
+    // The same directory spelled another way (through a symlink, a Windows short name) is
+    // not news either.
+    if last.is_some_and(|e| {
+        e.data["path"]
+            .as_str()
+            .is_some_and(|recorded| same_dir(Path::new(recorded), &path))
+    }) {
         return Ok(());
     }
     log.append(&lock, EV_CHECKOUT, json!({ "repo": repo, "path": text }))?;
@@ -1907,24 +2265,98 @@ pub fn apply_with(
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
-    apply_listed(home, repo, open, open_outside, true)
+    apply_listed(
+        home,
+        repo,
+        open,
+        open_outside,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
 }
 
-/// [`apply_with`], where `follow_ups` says whether the sync listed the follow-up label. When it
-/// didn't, a follow-up that closes is recorded as closed by that rule, so a landed one isn't
-/// queued again when follow-ups come back on.
+/// The landed follow-ups of `repo` whose last close came from `follow-ups = off`, each with
+/// when (milliseconds since the epoch) that close was written.
+fn landed_hidden(events: &[Event], repo: &str) -> Result<BTreeMap<u64, u64>> {
+    let (items, hidden) = replay_with_hidden(events, repo)?;
+    let legacy = legacy_repo(events, repo);
+    let mut found = BTreeMap::new();
+    for (r, number) in hidden {
+        let landed = items
+            .get(&(r.clone(), number))
+            .is_some_and(|item| item.status == Status::Landed);
+        if r != repo || !landed {
+            continue;
+        }
+        let closed = events.iter().rev().find(|event| {
+            event.kind == EV_CLOSED
+                && event.data["number"] == number
+                && event_repo(event, legacy) == repo
+        });
+        if let Some(closed) = closed {
+            found.insert(number, closed.ts_ms);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether GitHub reopened issue `number` at or after `since` (milliseconds since the epoch, cut
+/// to the second GitHub's times have), read from the issue's events. A listing gh can't give
+/// fails the sync, so the next one asks again instead of the item staying landed unseen.
+/// Cutting to the second leans toward a reopen: one up to a second before the hiding counts too.
+/// `since` is this machine's clock and the events GitHub's; a skew between them matters little,
+/// since the issue was open on GitHub when it was hidden, so a reopen after that needs a close
+/// first.
+fn reopened_since(ok: &Untampered, number: u64, since: u64) -> Result<bool> {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/events");
+    let listed = gh(
+        ok,
+        &[
+            "api",
+            &path,
+            "--paginate",
+            "--jq",
+            ".[] | select(.event == \"reopened\") | .created_at",
+        ],
+    )
+    .with_context(|| {
+        format!(
+            "asking GitHub whether follow-up #{number}, hidden while follow-ups were off, was \
+             reopened since; the next `paja work sync` asks again"
+        )
+    })?;
+    Ok(listed
+        .lines()
+        .filter_map(parse_utc)
+        .any(|at| at >= since / 1000))
+}
+
+/// [`apply_with`], where `hidden` are the follow-ups the sync didn't list only because
+/// `follow-ups = off` (their issues are still open on GitHub). Each that closes is recorded as
+/// closed by that rule, so a landed one isn't queued again when follow-ups come back on, unless
+/// it is in `reopened`: GitHub reopened it while it was hidden.
 fn apply_listed(
     home: &Home,
     repo: &str,
     open: &[Issue],
     open_outside: &BTreeSet<u64>,
-    follow_ups: bool,
+    hidden: &BTreeSet<u64>,
+    reopened: &BTreeSet<u64>,
 ) -> Result<SyncReport> {
     let lock = home.lock()?;
     let log = home.events();
     let events = pin_legacy(&lock, &log, repo)?;
-    let items = replay_repo(&events, repo)?;
-    let back_from_rules = closed_by_rules(&events, repo);
+    let (all, closed_by_rule) = replay_with_hidden(&events, repo)?;
+    let items: BTreeMap<u64, WorkItem> = all
+        .into_iter()
+        .filter(|((r, _), _)| r == repo)
+        .map(|((_, number), item)| (number, item))
+        .collect();
+    let back_from_rules: BTreeSet<u64> = closed_by_rule
+        .into_iter()
+        .filter(|(r, number)| r == repo && !reopened.contains(number))
+        .map(|(_, number)| number)
+        .collect();
     let recorded: BTreeSet<u64> = waiting_recorded(&events, legacy_repo(&events, repo))
         .into_iter()
         .filter(|(r, _)| r == repo)
@@ -1948,11 +2380,11 @@ fn apply_listed(
             }
             Some(item) => {
                 if !item.open {
-                    log.append(
-                        &lock,
-                        EV_REOPENED,
-                        json!({ "repo": repo, "number": issue.number }),
-                    )?;
+                    let mut data = json!({ "repo": repo, "number": issue.number });
+                    if reopened.contains(&issue.number) {
+                        data[REOPENED_ON_GITHUB] = json!(true);
+                    }
+                    log.append(&lock, EV_REOPENED, data)?;
                     report.reopened.push(issue.number);
                 }
                 if (&item.title, &item.body, &item.url, item.priority)
@@ -1997,7 +2429,7 @@ fn apply_listed(
         let still_open = open.iter().any(|issue| issue.number == item.number);
         if item.open && !still_open {
             let mut data = json!({ "repo": repo, "number": item.number });
-            if !follow_ups && item.priority == Priority::FollowUp {
+            if item.priority == Priority::FollowUp && hidden.contains(&item.number) {
                 data[FOLLOW_UPS_OFF] = json!(true);
             }
             log.append(&lock, EV_CLOSED, data)?;
@@ -2005,26 +2437,6 @@ fn apply_listed(
         }
     }
     Ok(report)
-}
-
-/// The items of `repo` whose last close was a follow-up hidden by `follow-ups = off`.
-fn closed_by_rules(events: &[Event], repo: &str) -> BTreeSet<u64> {
-    let legacy = legacy_repo(events, repo);
-    let mut hidden = BTreeSet::new();
-    for event in events
-        .iter()
-        .filter(|e| e.kind == EV_CLOSED && event_repo(e, legacy) == repo)
-    {
-        let Some(number) = event.data["number"].as_u64() else {
-            continue;
-        };
-        if event.data[FOLLOW_UPS_OFF] == true {
-            hidden.insert(number);
-        } else {
-            hidden.remove(&number);
-        }
-    }
-    hidden
 }
 
 /// Whether the log says this runner holds item `number` of `repo`.
@@ -2105,7 +2517,7 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
     }
     // gh runs git in the checkout to find its GitHub repository.
     let ok = crate::ahjo::untampered(home, repo)?;
-    let name = name_of(&ok)?;
+    let name = name_of(&ok, None)?;
     let item = {
         let lock = home.lock()?;
         let log = home.events();
@@ -2195,17 +2607,29 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
             );
         }
     }
-    gh(
-        &ok,
-        &[
-            "issue",
-            "comment",
-            &number.to_string(),
-            "--body",
-            &format!("**Answer to Paja's question.**\n\n{text}"),
-        ],
-    )
-    .with_context(|| {
+    // Redacted like Paja's own comments: an agent can write the answer (`/paja:answer`, the
+    // MCP tool), so tokens and local paths stay off the public issue and mentions are inert.
+    // From a file: a long answer would not fit a Windows command line.
+    let top = crate::ahjo::top_level(&ok).unwrap_or_else(|_| ok.path().to_path_buf());
+    let text =
+        crate::mestari::redact_for_comment(text, &top, home.root(), crate::mestari::QUOTED_CHARS);
+    let body = format!("**Answer to Paja's question.**\n\n{text}");
+    let posted =
+        crate::mestari::body_file(home, &format!("answer-{number}"), &body).and_then(|file| {
+            let posted = gh(
+                &ok,
+                &[
+                    "issue",
+                    "comment",
+                    &number.to_string(),
+                    "--body-file",
+                    &file.to_string_lossy(),
+                ],
+            );
+            let _ = std::fs::remove_file(&file);
+            posted
+        });
+    posted.with_context(|| {
         format!(
             "the answer is recorded and #{number} is queued, so the next run uses it, but posting \
              it on the issue failed; post it there by hand if others should see it"
@@ -2219,27 +2643,13 @@ pub fn answer(home: &Home, repo: &Path, number: u64, text: &str) -> Result<WorkI
 pub fn mark_needs_answer(home: &Home, repo: &Path, number: u64) -> Result<String> {
     let ok = crate::ahjo::untampered(home, repo)?;
     let label = Labels::of_default_branch(&ok)?.needs_answer;
-    let add = |ok: &Untampered| {
-        gh(
-            ok,
-            &["issue", "edit", &number.to_string(), "--add-label", &label],
-        )
-    };
-    if add(&ok).is_err() {
-        gh(
-            &ok,
-            &[
-                "label",
-                "create",
-                &label,
-                "--color",
-                "d93f0b",
-                "--description",
-                "Paja is waiting for an answer: paja work answer <number> \"<answer>\"",
-            ],
-        )?;
-        add(&ok)?;
-    }
+    add_label(
+        &ok,
+        number,
+        &label,
+        "d93f0b",
+        "Paja is waiting for an answer: paja work answer <number> \"<answer>\"",
+    )?;
     Ok(label)
 }
 
@@ -2261,7 +2671,13 @@ pub fn known_checkouts(home: &Home, repo: &str) -> Result<Vec<std::path::PathBuf
         .iter()
         .rev()
         .filter_map(|e| match e.kind.as_str() {
-            EV_CHECKOUT if e.data["repo"] == repo => e.data["path"].as_str(),
+            EV_CHECKOUT
+                if e.data["repo"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(repo)) =>
+            {
+                e.data["path"].as_str()
+            }
             crate::ahjo::EV_CREATED
                 if e.data["name"].as_str().is_some_and(|name| {
                     name.strip_prefix(prefix)
@@ -2273,13 +2689,37 @@ pub fn known_checkouts(home: &Home, repo: &str) -> Result<Vec<std::path::PathBuf
             _ => None,
         })
         .map(std::path::PathBuf::from)
-        .filter(|path| path.is_dir())
-        .fold(Vec::new(), |mut paths, path| {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-            paths
-        }))
+        .fold(
+            Vec::new(),
+            |mut kept: Vec<(std::path::PathBuf, std::path::PathBuf)>, path| {
+                // Each directory once, however it was spelled: the newest spelling is kept. Each
+                // spelling is resolved once; one that can't be is no directory now.
+                if !kept.iter().any(|(known, _)| *known == path) {
+                    if let Ok(resolved) = std::fs::canonicalize(&path) {
+                        if resolved.is_dir() && !kept.iter().any(|(_, r)| *r == resolved) {
+                            kept.push((path, resolved));
+                        }
+                    }
+                }
+                kept
+            },
+        )
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect())
+}
+
+/// Whether `a` and `b` name the same directory: as resolved by the file system (symlinks,
+/// Windows short names and letter case where it is ignored), or spelled alike when either
+/// can't be resolved.
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// A GitHub issue filed for Jono.
@@ -2310,15 +2750,44 @@ pub fn file(home: &Home, repo: &Path, title: &str, body: &str) -> Result<Filed> 
 /// Run gh in the checkout the tamper lock allowed (`ok`). Every gh Jono runs goes through
 /// here, and taking the proof means no command can run it without the check.
 fn gh_output(ok: &Untampered, args: &[&str]) -> Result<std::process::Output> {
+    gh_output_within(ok, args, None)
+}
+
+/// `gh args` in the checkout. With a `limit`, gh is stopped once it has run that long, and
+/// that is an error.
+fn gh_output_within(
+    ok: &Untampered,
+    args: &[&str],
+    limit: Option<std::time::Duration>,
+) -> Result<std::process::Output> {
     let gh = gh_program();
-    crate::platform::own_process_group(Command::new(&gh).env("GH_PROMPT_DISABLED", "1"))
+    let mut cmd = Command::new(&gh);
+    crate::platform::own_process_group(cmd.env("GH_PROMPT_DISABLED", "1"))
         .current_dir(ok.path())
-        .args(args)
-        .output()
-        .with_context(|| format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)"))
+        .args(args);
+    match limit {
+        None => cmd.output().with_context(|| {
+            format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+        }),
+        Some(limit) => crate::platform::output_within(&mut cmd, limit).with_context(|| {
+            format!(
+                "running `{gh} {}` (if it didn't start, install the GitHub CLI and run `gh \
+                     auth login`)",
+                args.join(" ")
+            )
+        }),
+    }
 }
 
 pub(crate) fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
+    gh_within(ok, args, None)
+}
+
+pub(crate) fn gh_within(
+    ok: &Untampered,
+    args: &[&str],
+    limit: Option<std::time::Duration>,
+) -> Result<String> {
     let repo = ok.path();
     if !repo.is_dir() {
         bail!(
@@ -2327,7 +2796,7 @@ pub(crate) fn gh(ok: &Untampered, args: &[&str]) -> Result<String> {
         );
     }
     let gh = gh_program();
-    let output = gh_output(ok, args)?;
+    let output = gh_output_within(ok, args, limit)?;
     if !output.status.success() {
         bail!(
             "`{gh} {} {}` failed in {}: {}; check `gh auth status` and that this checkout has a \
@@ -2420,6 +2889,37 @@ mod tests {
     }
 
     #[test]
+    fn the_holder_is_the_race_winner_not_a_loser_left_behind() {
+        let labels = Labels::default();
+        let comment = |runner: &str, stale: &str, id: u64| {
+            json!({
+                "body": format!("Claimed by runner {runner} at 2020-01-01T00:00:00Z; stale after {stale}"),
+                "url": format!("https://example.com/acme/app/issues/5#issuecomment-{id}"),
+            })
+        };
+        let view = |comments: Value| -> View {
+            serde_json::from_value(json!({
+                "labels": [{"name": labels.claimed()}],
+                "comments": comments,
+            }))
+            .unwrap()
+        };
+        // A stale claim, the winner, then a loser whose comment couldn't be deleted.
+        let raced = view(json!([
+            comment("old", "2020-01-02T00:00:00Z", 1),
+            comment("winner", "2999-01-01T00:00:00Z", 2),
+            comment("loser", "2999-01-01T00:00:00Z", 3),
+        ]));
+        assert_eq!(holder(&raced, &labels).unwrap().runner, "winner");
+        // With every claim stale, the latest still names who held it last.
+        let stale = view(json!([
+            comment("a", "2020-01-02T00:00:00Z", 1),
+            comment("b", "2020-01-03T00:00:00Z", 2),
+        ]));
+        assert_eq!(holder(&stale, &labels).unwrap().runner, "b");
+    }
+
+    #[test]
     fn claim_times_round_trip_and_claim_comments_read_back() {
         for secs in [0, 951_782_400, 1_785_000_123, 4_102_444_799] {
             assert_eq!(parse_utc(&format_utc(secs)), Some(secs), "{secs}");
@@ -2446,19 +2946,101 @@ mod tests {
         };
         let live = [comment("bbbb", 1), comment("aaaa", 2), comment("cccc", 3)];
         // The person put the item back: every claim goes, and nothing stays.
-        assert_eq!(to_free(&live, None), (vec![1, 2, 3], None));
+        assert_eq!(to_free(&live, None, false), (vec![1, 2, 3], None));
         // A run gives back its own: runner bbbb's earlier claim stays, and with it the label;
         // cccc's later one lost the race to aaaa and goes with it.
-        let (delete, stays) = to_free(&live, Some("aaaa"));
+        let (delete, stays) = to_free(&live, Some("aaaa"), false);
         assert_eq!(delete, vec![2, 3]);
         assert_eq!(stays.unwrap().runner, "bbbb");
         // With no earlier claim, nothing stays and the label comes off too.
-        let (delete, stays) = to_free(&live[1..], Some("aaaa"));
+        let (delete, stays) = to_free(&live[1..], Some("aaaa"), false);
         assert_eq!((delete, stays), (vec![2, 3], None));
-        // A runner with no live claim of its own deletes nothing; the latest claim holds.
-        let (delete, stays) = to_free(&live, Some("dddd"));
+        // A runner with no live claim of its own deletes nothing; the race's winner holds.
+        let (delete, stays) = to_free(&live, Some("dddd"), false);
         assert!(delete.is_empty());
-        assert_eq!(stays.unwrap().runner, "cccc");
+        assert_eq!(stays.unwrap().runner, "bbbb");
+        // Two claims ahead of this runner's (cccc lost to bbbb, its comment left behind): the
+        // earlier one holds the item.
+        let raced = [comment("bbbb", 1), comment("cccc", 2), comment("aaaa", 3)];
+        let (delete, stays) = to_free(&raced, Some("aaaa"), false);
+        assert_eq!(delete, vec![3]);
+        assert_eq!(stays.unwrap().runner, "bbbb");
+        // An escalated item's claim stays with no stale time, as a sync records it.
+        let (_, stays) = to_free(&raced, Some("aaaa"), true);
+        assert_eq!(stays.unwrap().stale_after, None);
+    }
+
+    #[test]
+    fn a_race_is_won_only_by_a_live_own_comment_that_comes_first() {
+        let comment = |runner: &str, id: u64| {
+            let url = format!("https://github.com/a/b/issues/5#issuecomment-{id}");
+            parse_claim_comment(&claim_text(runner, 1_785_000_000), &url).unwrap()
+        };
+        let now = 1_785_000_001;
+        let mine = [comment("aaaa", 2)];
+        assert_eq!(race_result(&mine, "aaaa", Some(2), now), Race::Won);
+        // Without the comment's id (gh printed no URL) it is found by runner.
+        assert_eq!(race_result(&mine, "aaaa", None, now), Race::Won);
+        let lost = [comment("bbbb", 1), comment("aaaa", 2)];
+        match race_result(&lost, "aaaa", Some(2), now) {
+            Race::LostTo(c) => assert_eq!(c.runner, "bbbb"),
+            other => panic!("{other:?}"),
+        }
+        // A runner giving the item back deleted this one's comment as a later claim: no win.
+        assert_eq!(race_result(&[], "aaaa", Some(2), now), Race::Gone);
+        assert_eq!(
+            race_result(&[comment("aaaa", 1)], "aaaa", Some(2), now),
+            Race::Gone
+        );
+        // This runner's own comment, gone stale, wins nothing.
+        assert_eq!(
+            race_result(&mine, "aaaa", Some(2), now + CLAIM_SECS),
+            Race::Gone
+        );
+    }
+
+    #[test]
+    fn taking_back_a_claim_keeps_only_an_earlier_runners_label() {
+        let comment = |runner: &str, id: u64| {
+            let url = format!("https://github.com/a/b/issues/5#issuecomment-{id}");
+            parse_claim_comment(&claim_text(runner, 1_785_000_000), &url).unwrap()
+        };
+        let now = 1_785_000_001;
+        let earlier = [comment("bbbb", 1), comment("aaaa", 2)];
+        assert!(label_is_another_runners(&earlier, "aaaa", Some(2), now));
+        // A later claim lost the race to this runner's comment.
+        let later = [comment("aaaa", 2), comment("cccc", 3)];
+        assert!(!label_is_another_runners(&later, "aaaa", Some(2), now));
+        // With no comment of its own to order against, any other live claim keeps the label.
+        assert!(label_is_another_runners(&later, "aaaa", None, now));
+        // A stale claim holds nothing.
+        assert!(!label_is_another_runners(
+            &earlier,
+            "aaaa",
+            Some(2),
+            now + CLAIM_SECS
+        ));
+        assert!(!label_is_another_runners(
+            &[comment("aaaa", 2)],
+            "aaaa",
+            None,
+            now
+        ));
+    }
+
+    #[test]
+    fn only_a_missing_label_is_taken_for_one() {
+        let missing = anyhow::anyhow!("`gh issue edit` failed: could not add label: 'x' not found");
+        assert!(label_missing(&missing));
+        let down = anyhow::anyhow!("`gh issue edit` failed: HTTP 502: Bad Gateway");
+        assert!(!label_missing(&down));
+        let elsewhere =
+            anyhow::anyhow!("`gh issue edit` failed in /src/labeler: HTTP 404: Not Found");
+        assert!(!label_missing(&elsewhere));
+        let gone = anyhow::anyhow!(
+            "`gh issue edit` failed: GraphQL: Could not resolve to an issue or pull request"
+        );
+        assert!(!label_missing(&gone));
     }
 
     #[test]
@@ -2509,10 +3091,15 @@ mod tests {
         std::fs::create_dir_all(linked.join("deep")).unwrap();
         std::fs::write(linked.join(".git"), "gitdir: elsewhere\n").unwrap();
         assert_eq!(checkout_top(&linked.join("deep")).unwrap(), linked);
-        // No `.git` above it: the path itself.
+        // No `.git` above it: the path itself. A temporary directory that is itself inside
+        // some checkout finds that one instead, and the fallback isn't exercised then.
         let bare = root.join("bare").join("x");
         std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(checkout_top(&bare.join("..").join("x")).unwrap(), bare);
+        let above = root
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .map_or_else(|| bare.clone(), Path::to_path_buf);
+        assert_eq!(checkout_top(&bare.join("..").join("x")).unwrap(), above);
     }
 
     #[test]
@@ -2528,6 +3115,39 @@ mod tests {
             fold_parents(&top.join(path(&["a", ".", "b"]))),
             top.join(path(&["a", "b"]))
         );
+    }
+
+    #[test]
+    fn a_closed_items_environment_is_kept_once_the_item_moves_on_or_a_run_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        // No tamper check passed, so no git runs: only the item's state decides.
+        std::fs::create_dir_all(dir.path().join("tree")).unwrap();
+        let env = crate::ahjo::Env {
+            name: env_name(R, 5),
+            repo: dir.path().join("gone"),
+            path: dir.path().join("tree"),
+            branch: format!("paja/{}", env_name(R, 5)),
+            base_commit: "abc".into(),
+            port_base: 20_000,
+            port_count: 100,
+            created_ms: 1,
+        };
+        let why = |home: &Home| {
+            still_free(home, &home.events().read_all().unwrap(), R, 5, &env, None).unwrap()
+        };
+        apply(&home, &[issue(5, "A")]).unwrap();
+        set_status(&home, 5, Status::Escalated, Some("Which API?")).unwrap();
+        // Parked but open: answered rather than closed.
+        assert!(why(&home).unwrap().contains("no longer closed and parked"));
+        apply(&home, &[]).unwrap();
+        assert_eq!(why(&home), None);
+        let lock = home.try_run_lock(R, 5).unwrap().expect("run lock");
+        assert!(why(&home).unwrap().contains("a run holds item #5"));
+        drop(lock);
+        // Claimed again while closed.
+        set_status(&home, 5, Status::Active, None).unwrap();
+        assert!(why(&home).unwrap().contains("no longer closed and parked"));
     }
 
     #[cfg(unix)]
@@ -2593,6 +3213,59 @@ mod tests {
         );
     }
 
+    /// A checkout reached through a symlink is the same checkout: recorded once, named once.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_spelled_through_a_symlink_is_recorded_and_named_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        record_checkout(&home, R, &real).unwrap();
+        record_checkout(&home, R, &link).unwrap();
+        let recorded = |home: &Home| {
+            home.events()
+                .read_all()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == EV_CHECKOUT)
+                .count()
+        };
+        assert_eq!(recorded(&home), 1);
+        // Both spellings in the log, as an older Paja recorded them: named once, the newest.
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(&lock, EV_CHECKOUT, json!({ "repo": R, "path": link }))
+            .unwrap();
+        drop(lock);
+        assert_eq!(known_checkouts(&home, R).unwrap(), vec![link]);
+    }
+
+    /// On Windows a checkout spelled in other letter case is the same checkout.
+    #[cfg(windows)]
+    #[test]
+    fn a_checkout_spelled_in_other_letter_case_is_recorded_and_named_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let real = std::path::absolute(dir.path()).unwrap().join("Real");
+        std::fs::create_dir_all(&real).unwrap();
+        let other = std::path::PathBuf::from(real.to_str().unwrap().to_uppercase());
+        assert_ne!(other, real);
+        record_checkout(&home, R, &real).unwrap();
+        record_checkout(&home, R, &other).unwrap();
+        let recorded = home
+            .events()
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EV_CHECKOUT)
+            .count();
+        assert_eq!(recorded, 1);
+        assert_eq!(known_checkouts(&home, R).unwrap(), vec![real]);
+    }
+
     #[test]
     fn a_synced_checkout_counts_and_the_newest_existing_one_wins() {
         let dir = tempfile::tempdir().unwrap();
@@ -2629,6 +3302,26 @@ mod tests {
         assert_eq!(
             known_checkout(&home, R).unwrap(),
             Some(dir.path().join("env-repo"))
+        );
+    }
+
+    #[test]
+    fn a_checkout_is_found_whatever_the_case_of_the_repository_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        std::fs::create_dir_all(dir.path().join("synced")).unwrap();
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                EV_CHECKOUT,
+                json!({ "repo": R, "path": dir.path().join("synced") }),
+            )
+            .unwrap();
+        drop(lock);
+        assert_eq!(
+            known_checkouts(&home, "Acme/App").unwrap(),
+            vec![dir.path().join("synced")]
         );
     }
 
@@ -2984,7 +3677,16 @@ mod tests {
             set_status(&home, n, Status::Landed, None).unwrap();
         }
         // Follow-ups off: the sync lists only the work item.
-        let off = super::apply_listed(&home, R, &both[..1], &BTreeSet::new(), false).unwrap();
+        let hidden = BTreeSet::from([2, 3]);
+        let off = super::apply_listed(
+            &home,
+            R,
+            &both[..1],
+            &BTreeSet::new(),
+            &hidden,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(off.closed, vec![2, 3]);
         // A work item that depends on #2 doesn't wait on it once follow-ups are back on.
         let mut dependent = issue(4, "d");
@@ -3003,9 +3705,53 @@ mod tests {
         // A work item closed while follow-ups are off isn't marked: it requeues as before.
         apply(&home, &on).unwrap();
         set_status(&home, 1, Status::Landed, None).unwrap();
-        super::apply_listed(&home, R, &[], &BTreeSet::new(), false).unwrap();
+        let hidden = BTreeSet::from([1, 2, 3]);
+        super::apply_listed(&home, R, &[], &BTreeSet::new(), &hidden, &BTreeSet::new()).unwrap();
         apply(&home, &on).unwrap();
         assert_eq!(get(&home, 1).unwrap().status, Status::Queued);
+        // A landed follow-up whose issue GitHub closed while follow-ups were off isn't hidden
+        // by the rule, so when GitHub reopens it (a revert, say) it is queued again.
+        set_status(&home, 2, Status::Landed, None).unwrap();
+        let only_3 = BTreeSet::from([3]);
+        super::apply_listed(
+            &home,
+            R,
+            &on[..1],
+            &BTreeSet::new(),
+            &only_3,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        apply(&home, &on).unwrap();
+        assert_eq!(get(&home, 2).unwrap().status, Status::Queued);
+        // A landed follow-up the rule hid, which GitHub reopened meanwhile, is queued when
+        // follow-ups come back on; the reopen is marked, so replay agrees.
+        set_status(&home, 2, Status::Landed, None).unwrap();
+        let hidden = BTreeSet::from([2, 3]);
+        super::apply_listed(
+            &home,
+            R,
+            &on[..1],
+            &BTreeSet::new(),
+            &hidden,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let events = home.events().read_all().unwrap();
+        let hidden_at = super::landed_hidden(&events, R).unwrap();
+        assert_eq!(hidden_at.keys().copied().collect::<Vec<_>>(), vec![2]);
+        let reopened = BTreeSet::from([2]);
+        let back =
+            super::apply_listed(&home, R, &on, &BTreeSet::new(), &BTreeSet::new(), &reopened)
+                .unwrap();
+        assert!(back.reopened.contains(&2));
+        assert_eq!(get(&home, 2).unwrap().status, Status::Queued);
+        let last = home.events().read_all().unwrap();
+        let mark = last
+            .iter()
+            .rev()
+            .find(|e| e.kind == EV_REOPENED && e.data["number"] == 2);
+        assert_eq!(mark.unwrap().data[super::REOPENED_ON_GITHUB], true);
     }
 
     #[test]

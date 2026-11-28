@@ -13,7 +13,8 @@ use serde_json::json;
 
 use crate::home::Home;
 
-/// A notice reached a channel: `{"repo", "number", "kind", "channel"}`.
+/// A notice reached a channel: `{"repo", "number", "kind", "channel"}`, plus `subject` (the
+/// roles it named) for a `skipped_role` notice.
 pub const EV_SENT: &str = "notify.sent";
 /// A notice didn't reach a channel: the same fields plus `error`.
 pub const EV_FAILED: &str = "notify.failed";
@@ -30,23 +31,56 @@ pub struct Notice {
     pub repo: Option<String>,
     /// The work item, when the notice is about one.
     pub number: Option<u64>,
-    /// `escalated`, `pass_failed` or `stopped`.
+    /// `escalated`, `left_findings`, `pass_failed`, `stopped` or `skipped_role`.
     pub kind: &'static str,
+    /// What the notice is about beyond the item, recorded with it: the roles a `skipped_role`
+    /// notice names, so each role is told once.
+    pub subject: Option<Vec<String>>,
     pub title: String,
     pub text: String,
 }
 
 impl Notice {
+    /// An item set escalated by hand (`paja work set`, the `work_set` tool): its note stays in
+    /// the log, since a push leaves the machine, and no question is on the issue.
+    pub fn escalated_by_hand(repo: &str, number: u64, title: &str) -> Self {
+        Self {
+            text: format!(
+                "{title}. It was set escalated by hand; paja work show {number} has the note. \
+                 Answer with paja work answer {number} \"<your answer>\"."
+            ),
+            ..Self::escalated(repo, number, title)
+        }
+    }
+
     /// An item that needs the person's decision.
     pub fn escalated(repo: &str, number: u64, title: &str) -> Self {
         Self {
             repo: Some(repo.to_string()),
             number: Some(number),
             kind: "escalated",
+            subject: None,
             title: format!("Paja: {repo}#{number} needs a decision"),
             text: format!(
                 "{title}. The question is on the issue; answer with \
                  paja work answer {number} \"<your answer>\"."
+            ),
+        }
+    }
+
+    /// An item landed with review findings still open at the round limit, listed in its pull
+    /// request; nothing else asks a person to read them.
+    pub fn left_findings(repo: &str, number: u64, title: &str, pr: &str, count: usize) -> Self {
+        let findings = if count == 1 { "finding" } else { "findings" };
+        Self {
+            repo: Some(repo.to_string()),
+            number: Some(number),
+            kind: "left_findings",
+            subject: None,
+            title: format!("Paja: {repo}#{number} landed with {count} open {findings}"),
+            text: format!(
+                "{title}. The reviewers' {findings} still open at the round limit are listed in \
+                 {pr}; read them and open an issue for any you want fixed."
             ),
         }
     }
@@ -63,6 +97,7 @@ impl Notice {
             repo,
             number: None,
             kind: "pass_failed",
+            subject: None,
             title: format!("Paja: a pass failed in {place}"),
             text: text.to_string(),
         }
@@ -75,10 +110,110 @@ impl Notice {
             repo,
             number: None,
             kind: "stopped",
+            subject: None,
             title: format!("Paja stopped in {place}"),
             text: "paja run stopped and needs you; the reason is in the terminal.".to_string(),
         }
     }
+}
+
+/// The most characters a notice shows of one role, escaped, and the most roles it lists; the
+/// rest are counted. So a notice's arguments and push body stay small whatever main's file
+/// holds.
+const ROLE_SHOWN: usize = 64;
+const ROLES_SHOWN: usize = 10;
+
+/// A role as a notice shows it: quoted and escaped at least as much as the run's warning, so a
+/// control character in the file never reaches a terminal or a phone, and cut after
+/// `ROLE_SHOWN` escaped characters, never inside one character's escape.
+fn shown_role(role: &str) -> String {
+    let mut shown = String::new();
+    for c in role.chars() {
+        // Escaped as `{:?}` escapes a one-character string: a quote `'` stays plain.
+        let quoted = format!("{:?}", c.to_string());
+        let escaped = &quoted[1..quoted.len() - 1];
+        if shown.chars().count() + escaped.chars().count() > ROLE_SHOWN {
+            return format!("\"{shown}\"…");
+        }
+        shown.push_str(escaped);
+    }
+    format!("\"{shown}\"")
+}
+
+impl Notice {
+    /// `.paja/models` on `branch` names roles this Paja doesn't know, so their lines are
+    /// skipped.
+    pub fn skipped_roles(repo: &str, branch: &str, roles: &[String]) -> Self {
+        let mut shown: Vec<String> = roles
+            .iter()
+            .take(ROLES_SHOWN)
+            .map(|r| shown_role(r))
+            .collect();
+        if roles.len() > ROLES_SHOWN {
+            shown.push(format!("and {} more", roles.len() - ROLES_SHOWN));
+        }
+        let (named, these) = if roles.len() == 1 {
+            (format!("a line for role {}", shown[0]), "the role runs")
+        } else {
+            (
+                format!("lines for roles {}", shown.join(", ")),
+                "the roles run",
+            )
+        };
+        Self {
+            repo: Some(repo.to_string()),
+            number: None,
+            kind: "skipped_role",
+            subject: Some(roles.to_vec()),
+            title: format!("Paja: {repo} names a role this Paja doesn't know"),
+            text: format!(
+                ".paja/models on {branch} has {named}, which this Paja skips, so {these} on \
+                 the default model or turn cap. If a role is new, install the newer Paja; if it \
+                 is a typo, fix the line."
+            ),
+        }
+    }
+}
+
+/// Tell the person, in one notice, of the roles in `skipped` (the `.paja/models` roles this
+/// Paja doesn't know) that no earlier notice for `repo` named, so a runner left unattended
+/// hears of them without anyone running `paja doctor`. A notice that was tried counts,
+/// delivered or not, so a channel that is down doesn't bring the same notice back at every
+/// pass. Posti's lock for `repo` is held from reading the log until the notice is recorded, so
+/// processes starting together (a pool's lanes) send it once; a process that can't get it in
+/// time leaves the notice to the next pass.
+pub fn skipped_roles(home: &Home, checkout: &Path, repo: &str, branch: &str, skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let Ok(Some(_lock)) = home.posti_lock_within(repo, LIMIT) else {
+        return;
+    };
+    let told = told_roles(home, repo);
+    let new: Vec<String> = skipped
+        .iter()
+        .filter(|r| !told.contains(*r))
+        .cloned()
+        .collect();
+    if !new.is_empty() {
+        send(home, checkout, &Notice::skipped_roles(repo, branch, &new));
+    }
+}
+
+/// The roles earlier `skipped_role` notices for `repo` named, from the log. A log that can't be
+/// read tells nothing, so the notice goes (again, at worst).
+fn told_roles(home: &Home, repo: &str) -> Vec<String> {
+    let Ok(events) = home.events().read_all() else {
+        return Vec::new();
+    };
+    events
+        .iter()
+        .filter(|e| e.kind == EV_SENT || e.kind == EV_FAILED)
+        .filter(|e| e.data["kind"] == "skipped_role" && e.data["repo"] == repo)
+        .filter_map(|e| e.data["subject"].as_array())
+        .flatten()
+        .filter_map(|r| r.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Which failed passes of `paja run --every` Posti tells of: the first in a row only, so an
@@ -112,10 +247,12 @@ pub fn stopped(home: &Home, checkout: &Path) {
     send(home, checkout, &Notice::stopped(repo_of(home, checkout)));
 }
 
-/// The checkout's `owner/name`, when Jono can tell it.
+/// The checkout's `owner/name`, when Jono can tell it within Posti's time limit. Jono asks
+/// `gh`, which has no limit of its own, so Paja stops it at the limit: a `gh` that hangs
+/// costs the notice its repository name, not the run its next pass.
 fn repo_of(home: &Home, checkout: &Path) -> Option<String> {
     let path = std::path::absolute(checkout).ok()?;
-    crate::jono::repo_name(home, &path).ok()
+    crate::jono::repo_name_within(home, &path, Some(LIMIT)).ok()
 }
 
 static LOCAL_WARNED: AtomicBool = AtomicBool::new(false);
@@ -183,12 +320,49 @@ fn push_url(home: &Home, checkout: &Path) -> Result<Option<String>, String> {
             }
         }
     };
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(format!(
-            "the push URL in PAJA_NOTIFY or {NOTIFY_FILE} must start with https:// (or http://)"
-        ));
+    if url.starts_with("https://") {
+        return Ok(Some(url));
     }
-    Ok(Some(url))
+    if url.strip_prefix("http://").is_some_and(loopback) {
+        return Ok(Some(url));
+    }
+    Err(format!(
+        "the push URL in PAJA_NOTIFY or {NOTIFY_FILE} must start with https:// (http:// only for \
+         this machine: localhost, 127.x.x.x or [::1]), since a notice crosses the network"
+    ))
+}
+
+/// Whether the rest of an `http://` URL names this machine: `localhost`, `127.x.x.x` or
+/// `[::1]`, with or without a port.
+fn loopback(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Credentials before an `@` don't name the host.
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((addr, port)) if port.is_empty() || port.starts_with(':') => {
+                return addr == "::1" && port_ok(port);
+            }
+            _ => return false,
+        },
+        None => host,
+    };
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, format!(":{port}")),
+        None => (host, String::new()),
+    };
+    let ipv4 = name
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    (name.eq_ignore_ascii_case("localhost") || ipv4) && port_ok(&port)
+}
+
+/// An empty port part, or `:` and digits.
+fn port_ok(port: &str) -> bool {
+    match port.strip_prefix(':') {
+        None => port.is_empty(),
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+    }
 }
 
 /// POST the notice's title and text to `url` with `curl`, which Windows 10 and later, macOS
@@ -196,6 +370,11 @@ fn push_url(home: &Home, checkout: &Path) -> Result<Option<String>, String> {
 fn push(url: &str, notice: &Notice) -> Result<(), String> {
     let body = format!("{}\n{}", notice.title, notice.text);
     let mut cmd = std::process::Command::new("curl");
+    // Plain http is only ever this machine: never through a proxy, where it would cross the
+    // network in clear text.
+    if url.starts_with("http://") {
+        cmd.args(["--noproxy", "*"]);
+    }
     cmd.args([
         "-fsS",
         "-m",
@@ -223,6 +402,9 @@ fn outcome(
         "kind": notice.kind,
         "channel": channel,
     });
+    if let Some(subject) = &notice.subject {
+        data["subject"] = json!(subject);
+    }
     let kind = match &result {
         Ok(()) => EV_SENT,
         Err(err) => {
@@ -237,8 +419,9 @@ fn outcome(
             EV_FAILED
         }
     };
-    // The notice is the point; a log that can't be written mustn't stop the run either.
-    if let Ok(lock) = home.lock() {
+    // The notice is the point; a log that can't be written mustn't stop the run either, nor
+    // hold it up for long: a pass that failed waiting for the home lock may find it held still.
+    if let Ok(lock) = home.lock_within(LIMIT) {
         let _ = home.events().append(&lock, kind, data);
     }
 }
@@ -246,6 +429,62 @@ fn outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_http_is_only_for_this_machine() {
+        for ok in [
+            "localhost",
+            "localhost:8080/paja",
+            "LOCALHOST/x",
+            "127.0.0.1:80",
+            "127.1.2.3/t",
+            "[::1]:2586/t",
+            "[::1]",
+            "me:pw@localhost/t",
+        ] {
+            assert!(loopback(ok), "{ok}");
+        }
+        for bad in [
+            "ntfy.example/paja",
+            "localhost.example/t",
+            "127.0.0.1.example/t",
+            "localhost@ntfy.example/t",
+            "[::2]/t",
+            "[::1]x/t",
+            "localhost:/t",
+            "localhost:80x",
+            "10.0.0.1/t",
+            "",
+        ] {
+            assert!(!loopback(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn skipped_roles_are_named_escaped_and_cut() {
+        let n = Notice::skipped_roles("acme/app", "main", &["rev\u{1b}[2Jiewer".into()]);
+        assert_eq!(n.kind, "skipped_role");
+        assert_eq!(n.subject, Some(vec!["rev\u{1b}[2Jiewer".to_string()]));
+        assert!(!n.text.contains('\u{1b}'), "{}", n.text);
+        assert!(n.text.contains(r#"role "rev\u{1b}[2Jiewer""#), "{}", n.text);
+        assert!(n.text.contains(".paja/models on main"), "{}", n.text);
+        // Several roles go in one notice; a long one is cut in the text, not in the record.
+        let long = "x".repeat(500);
+        let n = Notice::skipped_roles("acme/app", "main", &["a".into(), long.clone()]);
+        assert!(n.text.contains(r#"roles "a", "xxx"#), "{}", n.text);
+        assert!(n.text.contains("x\"…"), "{}", n.text);
+        assert!(n.text.len() < 400, "{}", n.text);
+        assert_eq!(n.subject, Some(vec!["a".to_string(), long]));
+        // Escapes count toward the cut, and only so many roles are listed.
+        let escapes = "\u{1b}".repeat(500);
+        assert_eq!(shown_role(&escapes).chars().count(), 2 + 60 + 1);
+        assert_eq!(shown_role("it's"), format!("{:?}", "it's"));
+        let many: Vec<String> = (0..1000).map(|i| format!("{escapes}{i}")).collect();
+        let n = Notice::skipped_roles("acme/app", "main", &many);
+        assert!(n.text.len() < 1500, "{}", n.text.len());
+        assert!(n.text.contains("and 990 more"), "{}", n.text);
+        assert_eq!(n.subject.map(|s| s.len()), Some(1000));
+    }
 
     #[test]
     fn an_escalation_names_the_issue_and_the_answer_command() {
