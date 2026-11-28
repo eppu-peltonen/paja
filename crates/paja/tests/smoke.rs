@@ -2409,7 +2409,7 @@ impl Factory {
                  if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
-                 \"pr checks\") while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
+                 \"pr checks\") if [ -f {d}/ci-hold ]; then : > {d}/ci-waiting; fi; while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
                  if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
@@ -2458,6 +2458,7 @@ impl Factory {
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
+                 if [ -f {d}/review-moves-main.sh ]; then sh {d}/review-moves-main.sh; rm {d}/review-moves-main.sh; fi\n\
                  v=$(cat {d}/verdict.txt); f='[]'\n\
                  if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
@@ -2554,6 +2555,12 @@ impl Factory {
     /// [`Factory::main_moves`], but in the first fix round (a builder call for another round).
     fn main_moves_in_a_fix(&self, path: &str, text: &str) {
         self.main_moves_in("fix-moves-main.sh", path, text);
+    }
+
+    /// [`Factory::main_moves`], but in the next review, so main moves after the review and
+    /// before the turn to land.
+    fn main_moves_in_a_review(&self, path: &str, text: &str) {
+        self.main_moves_in("review-moves-main.sh", path, text);
     }
 
     fn main_moves_in(&self, script: &str, path: &str, text: &str) {
@@ -4626,6 +4633,161 @@ fn a_change_landing_with_only_outside_findings_sends_no_notice() {
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
     assert!(!log.exists(), "{}", std::fs::read_to_string(&log).unwrap());
+}
+
+/// A conflict at the turn to land sends the change back for a full review, which still hears
+/// what the approved review noted outside the change.
+#[test]
+fn outside_findings_survive_a_conflict_at_the_turn_to_land() {
+    let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    f.main_moves_in_a_review("feature.txt", "theirs");
+    // The round after the conflict leaves the merge unfinished, so it too ends with no review.
+    std::fs::write(f.tmp.path().join("leave-merge"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 3, "{report}");
+    let rounds = events_of(&f, "run.round");
+    let conflicts: Vec<&Value> = rounds
+        .iter()
+        .filter(|r| r["data"]["verdict"] == "conflict")
+        .collect();
+    assert_eq!(conflicts.len(), 2, "{rounds:?}");
+    // Each keeps them for a resumed run.
+    for conflict in conflicts {
+        assert_eq!(
+            conflict["data"]["next"]["noted"][0]["finding"], "The parser drops a line",
+            "{conflict}"
+        );
+    }
+    let calls = f.claude_calls();
+    let reviews: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.contains("You are an independent reviewer"))
+        .collect();
+    assert_eq!(reviews.len(), 2, "{calls:#?}");
+    assert!(
+        !reviews[0].contains("noted these findings outside"),
+        "{}",
+        reviews[0]
+    );
+    assert!(
+        reviews[1].contains("noted these findings outside the change")
+            && reviews[1].contains("The parser drops a line"),
+        "{}",
+        reviews[1]
+    );
+}
+
+/// Failed checks at the turn to land send the change back too, and its next full review hears
+/// the approved review's outside findings.
+#[test]
+fn outside_findings_survive_failed_checks_at_the_turn_to_land() {
+    let f = Factory::new("test ! -f broken.txt\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    // Main gains a file that fails the checks once merged in; the fix removes it.
+    f.main_moves_in_a_review("broken.txt", "breaks the checks");
+    std::fs::write(
+        f.tmp.path().join("fix-moves-main.sh"),
+        "git rm -q broken.txt\n",
+    )
+    .unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let rounds = events_of(&f, "run.round");
+    let failed = rounds
+        .iter()
+        .find(|r| r["data"]["verdict"] == "checks_failed")
+        .unwrap_or_else(|| panic!("{rounds:?}"));
+    assert_eq!(
+        failed["data"]["next"]["noted"][0]["finding"], "The parser drops a line",
+        "{failed}"
+    );
+    let calls = f.claude_calls();
+    let last = calls
+        .iter()
+        .rfind(|c| c.contains("You are an independent reviewer"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(
+        last.contains("noted these findings outside the change")
+            && last.contains("The parser drops a line"),
+        "{last}"
+    );
+}
+
+/// The review prompts the fake `claude` was given, in order.
+fn review_prompts(f: &Factory) -> Vec<String> {
+    f.claude_calls()
+        .into_iter()
+        .filter(|c| c.contains("You are an independent reviewer"))
+        .collect()
+}
+
+/// A run stopped in the CI wait after its review approved resumes with that review's outside
+/// findings: the approved round's `run.round` keeps them, and the review run again hears them.
+#[test]
+fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let rounds = events_of(&f, "run.round");
+    let approved = rounds
+        .iter()
+        .find(|r| r["data"]["verdict"] == "land")
+        .unwrap_or_else(|| panic!("{rounds:?}"));
+    assert_eq!(
+        approved["data"]["noted"][0]["finding"], "The parser drops a line",
+        "{approved}"
+    );
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let reviews = review_prompts(&f);
+    let last = reviews.last().unwrap_or_else(|| panic!("{stderr}"));
+    assert!(reviews.len() >= 2, "{stderr}");
+    assert!(
+        last.contains("noted these findings outside the change")
+            && last.contains("The parser drops a line"),
+        "{last}"
+    );
+}
+
+/// A run stopped in the round after a conflict at the turn to land resumes with the outside
+/// findings that round's `next.noted` kept.
+#[test]
+fn outside_findings_survive_a_run_stopped_after_a_conflict_at_the_turn() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    f.main_moves_in_a_review("feature.txt", "theirs");
+    std::fs::write(dir.join("hang-fix"), "").unwrap();
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(dir.join("hang-fix")).unwrap();
+    assert_eq!(review_prompts(&f).len(), 1);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let reviews = review_prompts(&f);
+    assert_eq!(reviews.len(), 2, "{stderr}");
+    assert!(
+        reviews[1].contains("noted these findings outside the change")
+            && reviews[1].contains("The parser drops a line"),
+        "{}",
+        reviews[1]
+    );
 }
 
 #[test]

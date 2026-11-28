@@ -1028,6 +1028,13 @@ fn run_item(
         let point = resume_point(&home.events().read_all()?, &item.repo, item.number);
         start = point.round;
         feedback = point.feedback;
+        // With a prior, the earlier outside findings are its `follow_ups`; without, `noted`. They
+        // go in `follow_ups` either way: a round that drops the prior and ends before a review
+        // (a turn limit, say) records its `next.noted` from there.
+        follow_ups = match &point.prior {
+            Some(p) => p.follow_ups.clone(),
+            None => point.noted,
+        };
         prior = point.prior;
         reuse = point.checked;
         let was = match (&reuse, &prior) {
@@ -1206,6 +1213,7 @@ fn run_item(
                 let next = Next {
                     feedback: &feedback,
                     prior: prior.as_ref(),
+                    noted: &outside(&follow_ups),
                 };
                 record_round_next(home, item, round, "turn_limit", &note, steps, Some(next))?;
                 continue;
@@ -1245,6 +1253,7 @@ fn run_item(
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(home, item, round, "conflict", &feedback, steps, Some(next))?;
             continue;
@@ -1260,6 +1269,7 @@ fn run_item(
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(home, item, round, "no_change", &feedback, steps, Some(next))?;
             continue;
@@ -1275,6 +1285,7 @@ fn run_item(
                 let next = Next {
                     feedback: &feedback,
                     prior: Some(prior),
+                    noted: &outside(&follow_ups),
                 };
                 record_round_next(home, item, round, "no_change", &feedback, steps, Some(next))?;
                 continue;
@@ -1300,6 +1311,7 @@ fn run_item(
                 let next = Next {
                     feedback: &feedback,
                     prior: prior.as_ref(),
+                    noted: &outside(&follow_ups),
                 };
                 let detail = files.join(", ");
                 record_round_next(home, item, round, "conflict", &detail, steps, Some(next))?;
@@ -1333,6 +1345,7 @@ fn run_item(
                 let next = Next {
                     feedback: &feedback,
                     prior: prior.as_ref(),
+                    noted: &outside(&follow_ups),
                 };
                 record_round_next(
                     home,
@@ -1371,6 +1384,13 @@ fn run_item(
         )?;
         let risky = paths.iter().any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
+        // A review that reads the whole change (high risk, a fix that isn't a plain diff, or the
+        // round after a conflict or failed checks at the turn to land) still hears what earlier
+        // reviews noted outside the change, so those findings aren't lost.
+        let noted: Vec<Finding> = match &prior {
+            Some(p) => p.follow_ups.clone(),
+            None => outside(&follow_ups),
+        };
         // A fix that merged or rewrote history isn't a plain diff on what was reviewed: read it all.
         if let Some(p) = &prior {
             let plain = git(
@@ -1417,6 +1437,7 @@ fn run_item(
                 &base,
                 &checked,
                 prior.as_ref().filter(|_| !risky),
+                &noted,
                 reviewer,
                 &models,
                 role,
@@ -1501,6 +1522,7 @@ fn run_item(
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(home, item, round, "turn_limit", &note, steps, Some(next))?;
             continue;
@@ -1540,6 +1562,7 @@ fn run_item(
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(
                 home,
@@ -1556,13 +1579,16 @@ fn run_item(
         let ends =
             all_land || verdicts.contains(&"escalate") || (risky && verdicts.contains(&"land"));
         if ends {
-            record_round(
+            // The approved review's outside findings go in the log too: a run stopped at the
+            // turn to land, or in the CI wait, resumes with them.
+            record_round_noted(
                 home,
                 item,
                 round,
                 &verdicts.join(","),
                 &summaries(&reviews),
                 steps,
+                &outside(&follow_ups),
             )?;
         }
 
@@ -1604,6 +1630,7 @@ fn run_item(
                         let next = Next {
                             feedback: &feedback,
                             prior: None,
+                            noted: &outside(&follow_ups),
                         };
                         record_round_next(
                             home,
@@ -1629,6 +1656,7 @@ fn run_item(
                     let next = Next {
                         feedback: &feedback,
                         prior: None,
+                        noted: &outside(&follow_ups),
                     };
                     let detail = files.join(", ");
                     record_round_next(home, item, round, "conflict", &detail, steps, Some(next))?;
@@ -1655,6 +1683,7 @@ fn run_item(
                     let next = Next {
                         feedback: &feedback,
                         prior: prior.as_ref(),
+                        noted: &outside(&follow_ups),
                     };
                     record_round_next(home, item, round, "ci_failed", &why, steps, Some(next))?;
                     // At the round limit no round follows and the run escalates: keep what it
@@ -1768,6 +1797,7 @@ fn run_item(
         let next = Next {
             feedback: &feedback,
             prior: prior.as_ref(),
+            noted: &outside(&follow_ups),
         };
         record_round_next(
             home,
@@ -2365,11 +2395,13 @@ fn build(
 
 /// What a reviewer is asked. `checked` is the commit Vasara's checks passed at, which is the
 /// commit the reviewer judges.
+#[allow(clippy::too_many_arguments)]
 fn review_prompt(
     item: &WorkItem,
     base: &str,
     checked: &str,
     prior: Option<&Prior>,
+    noted: &[Finding],
     diff: &str,
     checks: &[String],
     programs: &[String],
@@ -2377,9 +2409,19 @@ fn review_prompt(
     // A first review reads the whole change; a later one judges only the fix for the blockers
     // an earlier review named, so review rounds converge instead of starting over.
     let scope = match prior {
-        None => format!(
+        None if noted.is_empty() => format!(
             "The change is the diff above (`git diff {base}...HEAD`). Read it cold against the \
              issue."
+        ),
+        None => format!(
+            "The change is the diff above (`git diff {base}...HEAD`). Read it cold against the \
+             issue. An earlier review of it noted these findings outside the change; repeat in \
+             your `follow_ups` the ones that still apply:\n\n{}\n",
+            noted
+                .iter()
+                .map(Finding::shown)
+                .collect::<Vec<_>>()
+                .join("\n\n")
         ),
         Some(prior) => format!(
             "An earlier review of this change (at {reviewed}) asked for these fixes:\n\n{blockers}\n\n\
@@ -2558,6 +2600,7 @@ fn review(
     base: &str,
     checked: &str,
     prior: Option<&Prior>,
+    noted: &[Finding],
     reviewer: u32,
     models: &Models,
     role: &str,
@@ -2580,7 +2623,7 @@ fn review(
         Some(prior) => format!("{}..HEAD", prior.reviewed),
     };
     let diff = review_diff(&env.path, &range, REVIEW_DIFF_CAP)?;
-    let mut prompt = review_prompt(item, base, &before, prior, &diff, checks, programs);
+    let mut prompt = review_prompt(item, base, &before, prior, noted, &diff, checks, programs);
     if focused {
         prompt.push_str(&format!(
             "\nAn earlier review of this commit stopped at its turn limit of {} before giving a \
@@ -2803,6 +2846,9 @@ struct Next<'a> {
     feedback: &'a str,
     /// What the reviewers asked for, which the next review narrows itself to.
     prior: Option<&'a Prior>,
+    /// The findings outside the change the latest review noted, kept for the next review to
+    /// keep or drop; recorded only with no `prior`, whose `follow_ups` hold them otherwise.
+    noted: &'a [Finding],
 }
 
 /// A round that ended without a next round: a question, a landing, an error or a stop.
@@ -2815,6 +2861,30 @@ fn record_round(
     steps: &mut Vec<StepUsage>,
 ) -> Result<()> {
     record_round_next(home, item, round, verdict, detail, steps, None)
+}
+
+/// A round that ended without a next round, with the findings outside the change its review
+/// noted (`noted`, an empty list when there are none), for a resumed run of that round.
+fn record_round_noted(
+    home: &Home,
+    item: &WorkItem,
+    round: u32,
+    verdict: &str,
+    detail: &str,
+    steps: &mut Vec<StepUsage>,
+    noted: &[Finding],
+) -> Result<()> {
+    let steps = std::mem::take(steps);
+    let mut data = json!({
+        "repo": item.repo,
+        "number": item.number,
+        "round": round,
+        "verdict": verdict,
+        "detail": clip(detail),
+        "steps": steps,
+    });
+    data["noted"] = json!(noted);
+    record(home, EV_ROUND, data)
 }
 
 /// A round after which the loop goes on: `next` is what the following round needs.
@@ -2846,6 +2916,10 @@ fn record_round_next(
                 "follow_ups": p.follow_ups,
             })),
         });
+        // With a prior, its `follow_ups` hold them.
+        if next.prior.is_none() && !next.noted.is_empty() {
+            data["next"]["noted"] = json!(next.noted);
+        }
     }
     record(home, EV_ROUND, data)
 }
@@ -2876,6 +2950,8 @@ struct ResumePoint {
     /// What the builder is asked to address in it.
     feedback: String,
     prior: Option<Prior>,
+    /// With no `prior`, the findings outside the change an earlier review noted.
+    noted: Vec<Finding>,
     /// The commit the checks passed on in that round, and the default branch's tip they ran
     /// against.
     checked: Option<(String, String)>,
@@ -2891,6 +2967,7 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
         round: 1,
         feedback: String::new(),
         prior: None,
+        noted: Vec::new(),
         checked: None,
         stopped_in: String::new(),
     };
@@ -2902,6 +2979,7 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                     round: 1,
                     feedback: String::new(),
                     prior: None,
+                    noted: Vec::new(),
                     checked: None,
                     stopped_in: String::new(),
                 };
@@ -2913,13 +2991,29 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                         point.round = round + 1;
                         point.feedback = next["feedback"].as_str().unwrap_or_default().to_string();
                         point.prior = serde_json::from_value(next["prior"].clone()).ok();
+                        point.noted =
+                            serde_json::from_value(next["noted"].clone()).unwrap_or_default();
                         point.checked = None;
                         point.stopped_in = format!(
                             "round {round} ended with {}",
                             data["verdict"].as_str().unwrap_or("no verdict")
                         );
                     }
-                    None => point.round = point.round.max(round),
+                    None => {
+                        point.round = point.round.max(round);
+                        // A round that ended approved names the latest outside findings, newer
+                        // than what the round before it handed on, even when there are none. A
+                        // round recorded without the field (a stop, an error, an older log)
+                        // leaves the earlier ones.
+                        if let Ok(noted) =
+                            serde_json::from_value::<Vec<Finding>>(data["noted"].clone())
+                        {
+                            if let Some(prior) = &mut point.prior {
+                                prior.follow_ups = noted.clone();
+                            }
+                            point.noted = noted;
+                        }
+                    }
                 }
             }
             EV_CHECKED if data["round"].as_u64() == Some(point.round as u64) => {
@@ -3622,7 +3716,16 @@ mod tests {
             .to_vec();
         let cargo = vec!["cargo".to_string()];
         let review_prompt = |item: &_, prior: Option<&super::Prior>| {
-            super::review_prompt(item, "base1", "abc123", prior, "DIFF-TEXT", &checks, &cargo)
+            super::review_prompt(
+                item,
+                "base1",
+                "abc123",
+                prior,
+                &[],
+                "DIFF-TEXT",
+                &checks,
+                &cargo,
+            )
         };
         let prompt = review_prompt(&item, None);
         assert!(
@@ -3637,7 +3740,7 @@ mod tests {
         assert!(builder.contains("only for local git and `cargo`"));
         assert!(builder.contains("`cargo fmt --all --check`, `cargo test`"));
         // No review programs: the reviewer is not told to run anything.
-        let bare = super::review_prompt(&item, "base1", "abc123", None, "D", &checks, &[]);
+        let bare = super::review_prompt(&item, "base1", "abc123", None, &[], "D", &checks, &[]);
         assert!(!bare.contains("run one named test"), "{bare}");
         assert!(bare.contains("limited to local git"), "{bare}");
         assert!(bare.contains("Read-only git is fine"), "{bare}");
@@ -3649,6 +3752,7 @@ mod tests {
             "base1",
             "abc123",
             None,
+            &[],
             "DIFF-TEXT",
             &["npm test".to_string()],
             &npm,
@@ -3867,6 +3971,7 @@ mod tests {
             "base1",
             "abc123",
             None,
+            &[],
             "D",
             &checks,
             &commands.reviewer,
@@ -4042,5 +4147,81 @@ mod tests {
         assert_eq!(at(&[ended(1), checked(1)]).2, None);
         // Checks from a round that later ended don't carry into the next one.
         assert_eq!(at(&[checked(1), ended(1)]).2, None);
+        // What a review noted outside the change carries into the round after a conflict at the
+        // turn to land, and no further.
+        let noted = (
+            EV_ROUND,
+            json!({"round": 1, "verdict": "conflict", "next": {"feedback": "merge",
+                "noted": [{"kind": "outside", "finding": "The parser drops a line"}]}}),
+        );
+        let point = super::resume_point(&item_log(std::slice::from_ref(&noted)), "o/r", 7);
+        assert_eq!(point.noted.len(), 1);
+        assert_eq!(point.noted[0].text, "The parser drops a line");
+        let point = super::resume_point(&item_log(&[noted.clone(), ended(2)]), "o/r", 7);
+        assert!(point.noted.is_empty());
+        // A round that ended approved, cut off at the turn to land, names the latest ones, which
+        // replace what the round before it handed on, prior or not.
+        let approved = (
+            EV_ROUND,
+            json!({"round": 2, "verdict": "land",
+                "noted": [{"kind": "outside", "finding": "The lexer drops a byte"}]}),
+        );
+        let point = super::resume_point(&item_log(&[noted.clone(), approved.clone()]), "o/r", 7);
+        assert_eq!(point.round, 2);
+        assert_eq!(point.noted[0].text, "The lexer drops a byte");
+        let with_prior = (
+            EV_ROUND,
+            json!({"round": 1, "verdict": "changes", "next": {"feedback": "fix it",
+                "prior": {"reviewed": "r1", "blockers": "b", "follow_ups": []}}}),
+        );
+        let point = super::resume_point(&item_log(&[with_prior.clone(), approved]), "o/r", 7);
+        assert_eq!(
+            point.prior.unwrap().follow_ups[0].text,
+            "The lexer drops a byte"
+        );
+        // An approved round that noted none clears the earlier ones; a stopped round, which
+        // records no `noted`, keeps them.
+        let none = (
+            EV_ROUND,
+            json!({"round": 2, "verdict": "land", "noted": []}),
+        );
+        let point = super::resume_point(&item_log(&[noted.clone(), none.clone()]), "o/r", 7);
+        assert!(point.noted.is_empty());
+        let point = super::resume_point(&item_log(&[with_prior, none]), "o/r", 7);
+        assert!(point.prior.unwrap().follow_ups.is_empty());
+        let stopped = (EV_ROUND, json!({"round": 2, "verdict": "stopped"}));
+        let point = super::resume_point(&item_log(&[noted, stopped]), "o/r", 7);
+        assert_eq!(point.noted.len(), 1);
+    }
+
+    #[test]
+    fn a_full_review_hears_what_an_earlier_review_noted_outside_the_change() {
+        let item = WorkItem {
+            repo: "o/r".into(),
+            number: 7,
+            title: "Add a parser".into(),
+            body: "Please.".into(),
+            url: String::new(),
+            open: true,
+            status: crate::jono::Status::Active,
+            note: None,
+            usage: None,
+            answers: Vec::new(),
+            waiting_on: Vec::new(),
+            priority: Default::default(),
+            claim: None,
+        };
+        let noted = [Finding {
+            kind: FindingKind::Outside,
+            text: "The parser drops a line".into(),
+        }];
+        let prompt = super::review_prompt(&item, "base1", "abc123", None, &noted, "D", &[], &[]);
+        assert!(
+            prompt.contains("noted these findings outside the change")
+                && prompt.contains("The parser drops a line"),
+            "{prompt}"
+        );
+        let bare = super::review_prompt(&item, "base1", "abc123", None, &[], "D", &[], &[]);
+        assert!(!bare.contains("noted these findings"), "{bare}");
     }
 }
