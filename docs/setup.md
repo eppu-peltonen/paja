@@ -208,7 +208,8 @@ For one with no template, an agent on the `init` role writes the skeleton instea
 
 1. A first session, with no repository and no tools, names the programs the stack's build, formatter, linter and test
    runner run. Paja keeps plain program names and drops shells, programs that run another command (`nohup`, `wsl`,
-   `busybox`), network tools and the like, with or without an extension (`bash.exe` and `cmd.bat` are dropped too).
+   `busybox`), network tools and the like, in any case and with or without an extension or version (`bash.exe`,
+   `cmd.bat` and `perl5.36.0` are dropped too).
 2. A second session writes a minimal app, one passing test, the formatter's and linter's configuration and a
    `.gitignore`, and runs the formatter, linter and test until they pass. It runs under the deny-list hook, and the
    only programs it may run besides local git are the ones from step 1. It can't write `.github/` (the hook refuses CI
@@ -220,11 +221,12 @@ For one with no template, an agent on the `init` role writes the skeleton instea
 
 When a check fails, or the detection finds no check, nothing is committed or pushed: the repository exists on GitHub and
 the clone stays with the files, the error names the check that failed (with its output) and says so, and you fix it in
-the clone and commit and push by hand, or delete the repository. The three agent sessions each spend usage on the `init`
-model of `.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox
-(`PAJA_SBX`) the agent and the checks run in it, with the clone mounted. Set one for a generated skeleton when you can:
-the stack's own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any code they are
-given, so without a sandbox the hook can't keep the agent from running arbitrary code as you.
+the clone and commit and push by hand, or delete the repository (`gh repo delete <owner>/<name>`, after
+`gh auth refresh -s delete_repo`) and the clone. The three agent sessions each spend usage on the `init` model of
+`.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox (`PAJA_SBX`)
+the agent and the checks run in it, with the clone mounted. Set one for a generated skeleton when you can: the stack's
+own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any code they are given, so
+without a sandbox the hook can't keep the agent from running arbitrary code as you.
 
 ## Check the setup
 
@@ -240,9 +242,16 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   lookup takes a few seconds at most; when it fails (offline), the check says so and stays ok. `PAJA_CLAUDE_LATEST`
   names another source: an `http(s)` URL or a file holding the version.
 - The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
-- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it
-  is answered; if its issue is closed instead, this is a warning that names the environment and the
-  `paja env remove <name>` that frees it (the branch is kept).
+- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it is
+  answered; if its issue is closed on GitHub instead, `paja work sync` (and `paja run`) in the checkout that made it
+  removes it, keeping the branch. It is kept while the issue is still open (its label was removed, say) or `gh` can't
+  say, while a run holds the item, while the worktree has uncommitted changes or untracked files, isn't on its branch or
+  can't be read by git, and when its folder is already gone. The sync lists what it kept and why, and tries again each
+  time, so `paja run` repeats a kept line until the reason is gone. Ignored files in the worktree, such as a local
+  `.env`, go with it. Any environment of a closed item that is still there (kept that way, a queued or landed item's, or
+  one whose run crashed or was killed after its issue was closed) is a warning that names the environment and the
+  `paja env remove <name>` that frees it (the branch is kept). An older release's `work-<n>` environment is named only
+  in a log that no sync has recorded a repository in yet.
 - Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
   `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
   warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it

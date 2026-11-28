@@ -151,9 +151,8 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
     if branch != env.branch || !unborn {
         bail!(
             "the init agent committed or switched branches in {} (it must leave the skeleton \
-             uncommitted on `{}`), so nothing was pushed; delete the new repository on GitHub \
-             (`gh repo delete`) and that folder, then run `paja init --new` again, or use a stack \
-             with a built-in skeleton (rust, node, python)",
+             uncommitted on `{}`), so nothing was pushed; to avoid it, use a stack with a built-in \
+             skeleton (rust, node, python), which needs no init agent",
             dir.display(),
             env.branch
         );

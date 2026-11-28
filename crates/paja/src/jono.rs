@@ -573,6 +573,19 @@ pub struct SyncReport {
     pub changed: Vec<u64>,
     pub closed: Vec<u64>,
     pub reopened: Vec<u64>,
+    /// The environments this sync removed because their parked item's issue was closed, each
+    /// with no uncommitted changes (its branch is kept).
+    pub freed: Vec<String>,
+    /// The environments of closed, parked items, whenever they were closed, that this sync
+    /// kept, and why; every sync tries them again.
+    pub kept: Vec<Kept>,
+}
+
+/// An environment a sync could have freed but kept.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Kept {
+    pub env: String,
+    pub why: String,
 }
 
 #[derive(Deserialize)]
@@ -862,7 +875,7 @@ pub fn repo_name(home: &Home, path: &Path) -> Result<String> {
 }
 
 /// [`repo_name`], with `gh` stopped once it has run for `limit`.
-pub(crate) fn repo_name_within(
+pub fn repo_name_within(
     home: &Home,
     path: &Path,
     limit: Option<std::time::Duration>,
@@ -2003,17 +2016,154 @@ pub fn sync_with(
             }
         }
     }
-    let report = apply_listed(home, &name, &issues, &open_outside, &hidden, &reopened)?;
+    let mut report = apply_listed(home, &name, &issues, &open_outside, &hidden, &reopened)?;
     apply_claims(home, &name, &seen, &held)?;
-    record_checkout(home, &name, &checkout_top(repo)?)?;
+    let top = checkout_top(repo)?;
+    record_checkout(home, &name, &top)?;
+    (report.freed, report.kept) = free_closed(home, &ok, &name, &top);
     Ok(report)
+}
+
+/// Remove the environments of the closed, parked (escalated) items of `repo` that were made in
+/// the checkout `top`; every sync tries again, so one kept once is freed once nothing keeps it. A
+/// parked item keeps its environment so the builder's edits survive the question; once its issue
+/// is closed on GitHub instead of answered, nothing else frees the worktree and port block. The
+/// branch stays, so a reopened item resumes from it. Only the environment named by
+/// [`WorkItem::env_name`] is freed: a reopened item resumes from that name's branch only, so an
+/// older release's `work-<n>` stays (`paja doctor` names it only in a log no sync has pinned
+/// to a repository yet; #523 covers the rest). An environment is kept, with the
+/// reason, when:
+///
+/// - its issue is still open on GitHub (the item left the queue because its label changed, or
+///   `follow-ups = off` hides it), or `gh` can't say;
+/// - a run holds the item, or the item is no longer closed and parked by the time the home lock
+///   is taken for the removal;
+/// - its worktree folder is already gone: removing it would `git worktree prune` the whole
+///   repository, which `paja env remove` does when asked;
+/// - its worktree isn't on the item's branch, so commits made there could be lost, or git
+///   can't read its HEAD;
+/// - git refuses to remove it: uncommitted changes or untracked files. Ignored files (build
+///   output, a local `.env`) go with the worktree.
+///
+/// Both lists are what the sync reports; `paja doctor` names a kept one until it is removed. A
+/// log that can't be read frees nothing and says so on stderr.
+fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<String>, Vec<Kept>) {
+    let (mut freed, mut kept) = (Vec::new(), Vec::new());
+    let found = (|| -> Result<Vec<(u64, String)>> {
+        let events = home.events().read_all()?;
+        let envs = crate::ahjo::replay(&events)?;
+        Ok(replay_repo(&events, repo)?
+            .values()
+            .filter(|item| !item.open && item.status == Status::Escalated)
+            .map(|item| (item.number, item.env_name()))
+            .filter(|(_, name)| envs.get(name).is_some_and(|env| same_dir(&env.repo, top)))
+            .collect())
+    })();
+    let found = match found {
+        Ok(found) => found,
+        Err(err) => {
+            eprintln!(
+                "paja: freed no environment of a closed item: couldn't read the event log: {err:#}"
+            );
+            return (freed, kept);
+        }
+    };
+    for (number, name) in found {
+        let why = match issue_is_open(ok, number) {
+            Ok(false) => None,
+            Ok(true) => Some(format!(
+                "issue #{number} is still open on GitHub (or `{} api` couldn't say)",
+                gh_program()
+            )),
+            Err(err) => Some(format!(
+                "couldn't ask GitHub about issue #{number}: {err:#}"
+            )),
+        };
+        if let Some(why) = why {
+            kept.push(Kept { env: name, why });
+            continue;
+        }
+        let removed = crate::ahjo::remove_unless(home, &name, false, |events, env, checked| {
+            still_free(home, events, repo, number, env, checked)
+        });
+        match removed {
+            Ok(_) => freed.push(name),
+            // Removed since the list was read (another sync, `paja env remove`): nothing to keep.
+            Err(_) if crate::ahjo::get(home, &name).is_err() => {}
+            Err(err) => kept.push(Kept {
+                env: name,
+                why: format!("{err:#}"),
+            }),
+        }
+    }
+    (freed, kept)
+}
+
+/// Why item `number` of `repo` must keep `env` after all, read under the home lock: it was
+/// reopened, queued or claimed since the sync closed it, a run holds it, or the worktree isn't on
+/// the environment's branch.
+fn still_free(
+    home: &Home,
+    events: &[Event],
+    repo: &str,
+    number: u64,
+    env: &crate::ahjo::Env,
+    checked: Option<&Untampered>,
+) -> Result<Option<String>> {
+    let item = replay_repo(events, repo)?.remove(&number);
+    if !item.is_some_and(|item| !item.open && item.status == Status::Escalated) {
+        return Ok(Some(format!(
+            "item #{number} is no longer closed and parked"
+        )));
+    }
+    if home.run_held(repo, number)? {
+        return Ok(Some(format!("a run holds item #{number}")));
+    }
+    if !env.path.exists() {
+        return Ok(Some(format!(
+            "{} is already gone; `paja env remove {}` forgets it (and prunes the repository's \
+             other missing worktrees)",
+            env.path.display(),
+            env.name
+        )));
+    }
+    // git runs only in a repository the tamper check passed; without one the removal says
+    // why it stops.
+    if checked.is_some() {
+        let out = crate::ahjo::git_command()
+            .arg("-C")
+            .arg(&env.path)
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .output()
+            .with_context(|| format!("running git in {}", env.path.display()))?;
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Exit 1 with no output is a detached HEAD; anything else is git failing to read it.
+        if !out.status.success() && (out.status.code() != Some(1) || !head.is_empty()) {
+            return Ok(Some(format!(
+                "git couldn't read the HEAD of {}: {}; check the worktree with `git -C {} status`",
+                env.path.display(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                env.path.display()
+            )));
+        }
+        if head != format!("refs/heads/{}", env.branch) {
+            return Ok(Some(format!(
+                "{} is not on {}, so removing it could lose commits; check it out there or run \
+                 `paja env remove {} --force`",
+                env.path.display(),
+                env.branch,
+                env.name
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// The top level of the checkout `path` is in (the nearest folder holding `.git`), so a sync
 /// from a subdirectory names the same checkout as one from its root. Found from the path's own
 /// spelling, not from git, so it compares equal to the path an environment records; `..` parts
 /// are folded first, so `/a/b/../c` is `/a/c`.
-fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
+pub(crate) fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
     let path = fold_parents(&std::path::absolute(path)?);
     Ok(path
         .ancestors()
@@ -2528,7 +2678,7 @@ pub fn known_checkouts(home: &Home, repo: &str) -> Result<Vec<std::path::PathBuf
 /// Whether `a` and `b` name the same directory: as resolved by the file system (symlinks,
 /// Windows short names and letter case where it is ignored), or spelled alike when either
 /// can't be resolved.
-fn same_dir(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
@@ -2931,6 +3081,39 @@ mod tests {
             fold_parents(&top.join(path(&["a", ".", "b"]))),
             top.join(path(&["a", "b"]))
         );
+    }
+
+    #[test]
+    fn a_closed_items_environment_is_kept_once_the_item_moves_on_or_a_run_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        // No tamper check passed, so no git runs: only the item's state decides.
+        std::fs::create_dir_all(dir.path().join("tree")).unwrap();
+        let env = crate::ahjo::Env {
+            name: env_name(R, 5),
+            repo: dir.path().join("gone"),
+            path: dir.path().join("tree"),
+            branch: format!("paja/{}", env_name(R, 5)),
+            base_commit: "abc".into(),
+            port_base: 20_000,
+            port_count: 100,
+            created_ms: 1,
+        };
+        let why = |home: &Home| {
+            still_free(home, &home.events().read_all().unwrap(), R, 5, &env, None).unwrap()
+        };
+        apply(&home, &[issue(5, "A")]).unwrap();
+        set_status(&home, 5, Status::Escalated, Some("Which API?")).unwrap();
+        // Parked but open: answered rather than closed.
+        assert!(why(&home).unwrap().contains("no longer closed and parked"));
+        apply(&home, &[]).unwrap();
+        assert_eq!(why(&home), None);
+        let lock = home.try_run_lock(R, 5).unwrap().expect("run lock");
+        assert!(why(&home).unwrap().contains("a run holds item #5"));
+        drop(lock);
+        // Claimed again while closed.
+        set_status(&home, 5, Status::Active, None).unwrap();
+        assert!(why(&home).unwrap().contains("no longer closed and parked"));
     }
 
     #[cfg(unix)]

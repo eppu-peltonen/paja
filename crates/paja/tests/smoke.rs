@@ -2409,7 +2409,7 @@ impl Factory {
                  if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
-                 \"pr checks\") while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
+                 \"pr checks\") if [ -f {d}/ci-hold ]; then : > {d}/ci-waiting; fi; while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
                  if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
                  if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
                  \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
@@ -2458,6 +2458,7 @@ impl Factory {
                  if [ -f {d}/review-limit-second ]; then n=$(cat {d}/reviews 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/reviews\n\
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
+                 if [ -f {d}/review-moves-main.sh ]; then sh {d}/review-moves-main.sh; rm {d}/review-moves-main.sh; fi\n\
                  v=$(cat {d}/verdict.txt); f='[]'; s=$(cat {d}/review-summary 2>/dev/null || echo 'fake review')\n\
                  if [ -f {d}/verdict-second.txt ]; then r=$(cat {d}/review-count 2>/dev/null || echo 0); r=$((r+1)); echo $r > {d}/review-count; [ $((r % 2)) = 0 ] && v=$(cat {d}/verdict-second.txt); fi\n\
                  if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
@@ -2556,6 +2557,12 @@ impl Factory {
     /// [`Factory::main_moves`], but in the first fix round (a builder call for another round).
     fn main_moves_in_a_fix(&self, path: &str, text: &str) {
         self.main_moves_in("fix-moves-main.sh", path, text);
+    }
+
+    /// [`Factory::main_moves`], but in the next review, so main moves after the review and
+    /// before the turn to land.
+    fn main_moves_in_a_review(&self, path: &str, text: &str) {
+        self.main_moves_in("review-moves-main.sh", path, text);
     }
 
     fn main_moves_in(&self, script: &str, path: &str, text: &str) {
@@ -3306,6 +3313,322 @@ fn doctor_warns_of_an_environment_left_by_a_closed_item() {
             .contains(&format!("`paja env remove {WORK_5}`")),
         "{check}"
     );
+}
+
+/// Append an `env.created` event for `name` in `repo` at `path` to the log in `home`, as a run
+/// that made the environment would have.
+fn record_env(home: &Path, name: &str, repo: &Path, path: &Path) {
+    let log = home.join("events.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let seq = text.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let event = serde_json::json!({
+        "v": 1, "seq": seq, "ts_ms": 1, "kind": "env.created",
+        "data": {
+            "name": name, "repo": repo, "path": path, "branch": format!("paja/{name}"),
+            "base_commit": "abc", "port_base": 4000 + seq * 10, "port_count": 10, "created_ms": 1
+        }
+    });
+    std::fs::write(&log, format!("{text}{event}\n")).unwrap();
+}
+
+#[test]
+fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let issues: Vec<Value> = numbers
+        .iter()
+        .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
+        .collect();
+    std::fs::write(
+        tmp.path().join("issues.json"),
+        Value::from(issues).to_string(),
+    )
+    .unwrap();
+    // GitHub says an issue is closed unless `open.txt` names it.
+    std::fs::write(tmp.path().join("open.txt"), "").unwrap();
+    let gh = program(
+        tmp.path(),
+        "gh",
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             \"repo view\") echo '{{\"nameWithOwner\": \"acme/app\"}}' ;;\n\
+             api*) n=${{2##*/}}; if grep -qx \"$n\" {open}; then echo open; else echo closed; fi ;;\n\
+             *) cat {issues} ;;\nesac\n",
+            open = slash(&tmp.path().join("open.txt")),
+            issues = slash(&tmp.path().join("issues.json"))
+        ),
+    );
+    let with_gh = [("PAJA_GH", gh.as_path())];
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    for n in numbers.iter().filter(|n| **n != 7) {
+        let n = n.to_string();
+        let (ok, set) = paja(
+            &home,
+            &repo,
+            &["work", "set", &n, "escalated", "--note", "Which API?"],
+        );
+        assert!(ok, "{set}");
+    }
+    let env = |n: u64| WORK_5.replace("work-5", &format!("work-{n}"));
+    let tree = |repo: &Path, name: &str| {
+        let path = tmp.path().join(format!("tree-{name}"));
+        let branch = format!("paja/{name}");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                path.to_str().unwrap(),
+            ],
+        );
+        record_env(&home, name, repo, &path);
+        path
+    };
+    // 5 is parked with a clean worktree and 6 with an untracked file; 7 is queued.
+    let clean = tree(&repo, &env(5));
+    let dirty = tree(&repo, &env(6));
+    std::fs::write(dirty.join("draft.txt"), "the builder's edit\n").unwrap();
+    tree(&repo, &env(7));
+    // 8 left the queue (its label was removed) but its issue is still open on GitHub.
+    tree(&repo, &env(8));
+    std::fs::write(tmp.path().join("open.txt"), "8\n").unwrap();
+    // A run holds 9.
+    tree(&repo, &env(9));
+    let held = paja::home::Home::at(&home).unwrap();
+    let lock = held.try_run_lock("acme/app", 9).unwrap().expect("run lock");
+    // 10's worktree left its branch for a commit that only its HEAD knows.
+    let detached = tree(&repo, &env(10));
+    git(&detached, &["checkout", "-q", "--detach"]);
+    git(
+        &detached,
+        &["commit", "-q", "--allow-empty", "-m", "only here"],
+    );
+    // 11's environment belongs to another checkout.
+    let other = tmp.path().join("other");
+    init_repo(&other);
+    tree(&other, &env(11));
+    // 12 still has the `work-<n>` environment an older release made: a reopened item wouldn't
+    // resume that name's branch, so it stays (#523).
+    let legacy = tree(&repo, "work-12");
+    // 13 has a change to a tracked file.
+    let changed = tree(&repo, &env(13));
+    std::fs::write(changed.join("hello.txt"), "changed\n").unwrap();
+    // 14's worktree lost its `.git` file, so git can't read it; 15's folder is gone.
+    let unreadable = tree(&repo, &env(14));
+    std::fs::remove_file(unreadable.join(".git")).unwrap();
+    let gone = tree(&repo, &env(15));
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    // The issues are closed instead of answered.
+    std::fs::write(tmp.path().join("issues.json"), "[]").unwrap();
+    let (ok, report) = paja_with(&home, &repo, &["work", "sync"], &with_gh);
+    drop(lock);
+    assert!(ok, "{report}");
+    assert_eq!(report["closed"], serde_json::json!(numbers), "{report}");
+    assert_eq!(report["freed"], serde_json::json!([WORK_5]), "{report}");
+    assert!(!clean.exists() && legacy.exists() && changed.exists());
+    assert!(dirty.join("draft.txt").exists());
+    let kept: Vec<(String, String)> = report["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            (
+                k["env"].as_str().unwrap().into(),
+                k["why"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    let why = |n: u64| {
+        kept.iter()
+            .find(|(e, _)| *e == env(n))
+            .map(|(_, w)| w.clone())
+            .unwrap_or_else(|| panic!("{} not kept: {report}", env(n)))
+    };
+    assert!(why(8).contains("still open on GitHub"), "{report}");
+    assert!(why(9).contains("a run holds item #9"), "{report}");
+    assert!(
+        why(10).contains("is not on") && why(10).contains("--force"),
+        "{report}"
+    );
+    for n in [6, 13] {
+        assert!(why(n).contains("uncommitted changes"), "{report}");
+    }
+    assert!(why(14).contains("git couldn't read the HEAD"), "{report}");
+    assert!(why(15).contains("is already gone"), "{report}");
+    assert!(unreadable.join("hello.txt").exists());
+    assert_eq!(kept.len(), 7, "{report}");
+    // The branch stays, so a reopened item resumes from it.
+    git_out(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/paja/{WORK_5}"),
+        ],
+    );
+    // The kept ones are what doctor names.
+    let (_, doctor) = paja(&home, &repo, &["doctor"]);
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "environments")
+        .unwrap_or_else(|| panic!("no environments check in {doctor}"))
+        .clone();
+    let detail = check["detail"].as_str().unwrap();
+    for n in [6, 7, 8, 9, 10, 13, 14, 15] {
+        assert!(detail.contains(&env(n)), "{check}");
+    }
+    assert!(!detail.contains(WORK_5), "{check}");
+
+    // Every sync tries again: with the run gone and the draft cleared, 9 and 6 go. The text
+    // output says what was freed and kept.
+    std::fs::remove_file(dirty.join("draft.txt")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["work", "sync"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("freed {}, {}", env(6), env(9))),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("kept {}: issue #8 is still open", env(8))),
+        "{text}"
+    );
+    assert!(!dirty.exists());
+}
+
+#[test]
+fn a_run_says_which_environments_of_closed_items_its_sync_kept() {
+    let f = Factory::new("true\n", "land");
+    let issues = f.tmp.path().join("issues.json");
+    std::fs::write(
+        &issues,
+        r#"[{"number": 9, "title": "T", "body": "", "url": "https://example.com/9"}]"#,
+    )
+    .unwrap();
+    let with_gh = [("PAJA_GH", f.gh.as_path())];
+    let (ok, report) = paja_with(&f.home, &f.repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (ok, set) = paja(
+        &f.home,
+        &f.repo,
+        &["work", "set", "9", "escalated", "--note", "Which API?"],
+    );
+    assert!(ok, "{set}");
+    let name = WORK_5.replace("work-5", "work-9");
+    let path = f.tmp.path().join("tree-9");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("paja/{name}"),
+            path.to_str().unwrap(),
+        ],
+    );
+    record_env(&f.home, &name, &f.repo, &path);
+    // Closed in the queue, but this gh can't say the issue is closed on GitHub.
+    std::fs::write(&issues, "[]").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert!(
+        stderr.contains(&format!("kept {name}: issue #9 is still open on GitHub")),
+        "{report}\n{stderr}"
+    );
+    assert!(path.exists());
+}
+
+#[test]
+fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doctor = |home: &Path| -> Value {
+        let (_, report) = paja(home, tmp.path(), &["doctor"]);
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "environments")
+            .unwrap_or_else(|| panic!("no environments check in {report}"))
+            .clone()
+    };
+    // A log from before items carried their repository: item 5's environment was made in this
+    // checkout, item 6's in another.
+    let old = tmp.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":5,"title":"A","body":"","url":"https://example.com/5"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.imported","data":{"number":6,"title":"B","body":"","url":"https://example.com/6"}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"number":5}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.closed","data":{"number":6}}"#,
+    ];
+    std::fs::write(old.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(&old, "work-5", tmp.path(), &tmp.path().join("tree-5"));
+    // A person's own environment whose name merely ends the same way isn't the item's.
+    record_env(
+        &old,
+        "spike-work-5",
+        tmp.path(),
+        &tmp.path().join("tree-5b"),
+    );
+    let six = WORK_5.replace("work-5", "work-6");
+    record_env(
+        &old,
+        &six,
+        Path::new("/elsewhere/app"),
+        Path::new("/elsewhere/tree-6"),
+    );
+    let check = doctor(&old);
+    assert_eq!(check["status"], "warning", "{check}");
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("work-5") && !detail.contains("spike") && !detail.contains(&six),
+        "{check}"
+    );
+
+    // An item still marked active whose issue was closed, with no run holding it: the run that
+    // had it crashed or was killed.
+    let crashed = tmp.path().join("crashed");
+    std::fs::create_dir_all(&crashed).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":5,"title":"A","body":"","url":"https://example.com/5"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.status","data":{"repo":"acme/app","number":5,"status":"active"}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":5}}"#,
+    ];
+    std::fs::write(crashed.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(
+        &crashed,
+        WORK_5,
+        Path::new("/nowhere/app"),
+        Path::new("/nowhere/tree-5"),
+    );
+    let check = doctor(&crashed);
+    assert_eq!(check["status"], "warning", "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains(WORK_5),
+        "{check}"
+    );
+    // While a run holds it, its environment is still in use.
+    let held = paja::home::Home::at(&crashed).unwrap();
+    let lock = held.try_run_lock("acme/app", 5).unwrap().expect("run lock");
+    let check = doctor(&crashed);
+    drop(lock);
+    assert_eq!(check["status"], "ok", "{check}");
 }
 
 #[test]
@@ -4628,6 +4951,161 @@ fn a_change_landing_with_only_outside_findings_sends_no_notice() {
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
     assert!(!log.exists(), "{}", std::fs::read_to_string(&log).unwrap());
+}
+
+/// A conflict at the turn to land sends the change back for a full review, which still hears
+/// what the approved review noted outside the change.
+#[test]
+fn outside_findings_survive_a_conflict_at_the_turn_to_land() {
+    let f = Factory::new("true\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    f.main_moves_in_a_review("feature.txt", "theirs");
+    // The round after the conflict leaves the merge unfinished, so it too ends with no review.
+    std::fs::write(f.tmp.path().join("leave-merge"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 3, "{report}");
+    let rounds = events_of(&f, "run.round");
+    let conflicts: Vec<&Value> = rounds
+        .iter()
+        .filter(|r| r["data"]["verdict"] == "conflict")
+        .collect();
+    assert_eq!(conflicts.len(), 2, "{rounds:?}");
+    // Each keeps them for a resumed run.
+    for conflict in conflicts {
+        assert_eq!(
+            conflict["data"]["next"]["noted"][0]["finding"], "The parser drops a line",
+            "{conflict}"
+        );
+    }
+    let calls = f.claude_calls();
+    let reviews: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.contains("You are an independent reviewer"))
+        .collect();
+    assert_eq!(reviews.len(), 2, "{calls:#?}");
+    assert!(
+        !reviews[0].contains("noted these findings outside"),
+        "{}",
+        reviews[0]
+    );
+    assert!(
+        reviews[1].contains("noted these findings outside the change")
+            && reviews[1].contains("The parser drops a line"),
+        "{}",
+        reviews[1]
+    );
+}
+
+/// Failed checks at the turn to land send the change back too, and its next full review hears
+/// the approved review's outside findings.
+#[test]
+fn outside_findings_survive_failed_checks_at_the_turn_to_land() {
+    let f = Factory::new("test ! -f broken.txt\n", "land");
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    // Main gains a file that fails the checks once merged in; the fix removes it.
+    f.main_moves_in_a_review("broken.txt", "breaks the checks");
+    std::fs::write(
+        f.tmp.path().join("fix-moves-main.sh"),
+        "git rm -q broken.txt\n",
+    )
+    .unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let rounds = events_of(&f, "run.round");
+    let failed = rounds
+        .iter()
+        .find(|r| r["data"]["verdict"] == "checks_failed")
+        .unwrap_or_else(|| panic!("{rounds:?}"));
+    assert_eq!(
+        failed["data"]["next"]["noted"][0]["finding"], "The parser drops a line",
+        "{failed}"
+    );
+    let calls = f.claude_calls();
+    let last = calls
+        .iter()
+        .rfind(|c| c.contains("You are an independent reviewer"))
+        .unwrap_or_else(|| panic!("{calls:#?}"));
+    assert!(
+        last.contains("noted these findings outside the change")
+            && last.contains("The parser drops a line"),
+        "{last}"
+    );
+}
+
+/// The review prompts the fake `claude` was given, in order.
+fn review_prompts(f: &Factory) -> Vec<String> {
+    f.claude_calls()
+        .into_iter()
+        .filter(|c| c.contains("You are an independent reviewer"))
+        .collect()
+}
+
+/// A run stopped in the CI wait after its review approved resumes with that review's outside
+/// findings: the approved round's `run.round` keeps them, and the review run again hears them.
+#[test]
+fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let rounds = events_of(&f, "run.round");
+    let approved = rounds
+        .iter()
+        .find(|r| r["data"]["verdict"] == "land")
+        .unwrap_or_else(|| panic!("{rounds:?}"));
+    assert_eq!(
+        approved["data"]["noted"][0]["finding"], "The parser drops a line",
+        "{approved}"
+    );
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let reviews = review_prompts(&f);
+    let last = reviews.last().unwrap_or_else(|| panic!("{stderr}"));
+    assert!(reviews.len() >= 2, "{stderr}");
+    assert!(
+        last.contains("noted these findings outside the change")
+            && last.contains("The parser drops a line"),
+        "{last}"
+    );
+}
+
+/// A run stopped in the round after a conflict at the turn to land resumes with the outside
+/// findings that round's `next.noted` kept.
+#[test]
+fn outside_findings_survive_a_run_stopped_after_a_conflict_at_the_turn() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    f.reviewer_finds(
+        serde_json::json!([{"kind": "outside", "finding": "The parser drops a line"}]),
+        true,
+    );
+    f.main_moves_in_a_review("feature.txt", "theirs");
+    std::fs::write(dir.join("hang-fix"), "").unwrap();
+    interrupt_run(&f, "hanging");
+    std::fs::remove_file(dir.join("hang-fix")).unwrap();
+    assert_eq!(review_prompts(&f).len(), 1);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let reviews = review_prompts(&f);
+    assert_eq!(reviews.len(), 2, "{stderr}");
+    assert!(
+        reviews[1].contains("noted these findings outside the change")
+            && reviews[1].contains("The parser drops a line"),
+        "{}",
+        reviews[1]
+    );
 }
 
 #[test]
@@ -8198,6 +8676,7 @@ fn run_every_waits_for_the_reset_instead_of_polling() {
     let resets = epoch_secs_in(3600);
     std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
     std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let started = std::time::Instant::now();
     let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
@@ -8215,8 +8694,11 @@ fn run_every_waits_for_the_reset_instead_of_polling() {
         .find(|line| {
             line.contains("waiting until it resets at") || line.contains("checking again in")
         });
-    // Long enough for a busy loop to show itself as repeated passes.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // A busy loop would start its next pass at once, and no later pass takes longer than the
+    // first (one that finds the window still closed returns at once), so watching for three
+    // times the first pass shows one however loaded the machine is.
+    let pass = started.elapsed();
+    std::thread::sleep((pass * 3).max(std::time::Duration::from_millis(1500)));
     let still_running = every.try_wait().unwrap().is_none();
     every.kill().unwrap();
     every.wait().unwrap();
@@ -9849,6 +10331,19 @@ fn init_new_pushes_a_generated_skeleton_whose_checks_pass() {
     );
 }
 
+/// A failed generated skeleton's error says once how to clean up after `gh repo create`: the
+/// repository to delete, the scope that takes, and the folder to remove.
+fn assert_names_the_cleanup(error: &str, tmp: &tempfile::TempDir) {
+    let dir = tmp.path().join("work").join("zippy");
+    assert!(
+        error.contains("`gh repo delete acme/")
+            && error.contains("gh auth refresh -s delete_repo")
+            && error.contains(&format!("and remove {}", dir.display()))
+            && error.matches("gh repo delete").count() == 1,
+        "{error}"
+    );
+}
+
 /// Whether anything reached origin's `main`.
 fn pushed(origin: &Path) -> bool {
     Command::new("git")
@@ -9862,21 +10357,29 @@ fn pushed(origin: &Path) -> bool {
 
 #[test]
 fn init_new_says_so_when_the_skeleton_agent_writes_nothing() {
-    let (_tmp, origin, ok, out) = init_new_generated_with("test -f build.zig", "true");
+    let (tmp, origin, ok, out) = init_new_generated_with("test -f build.zig", "true");
     assert!(!ok, "{out}");
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent wrote no files for the zig skeleton")
             && error.contains("delete the new repository on GitHub")
+            && error.contains("`gh repo delete acme/")
+            && error.contains("gh auth refresh -s delete_repo")
+            && !error.contains("`gh repo delete`")
+            && error.contains(&format!(
+                "and remove {}",
+                tmp.path().join("work").join("zippy").display()
+            ))
             && error.contains("paja init --new"),
         "{error}"
     );
+    assert_names_the_cleanup(error, &tmp);
     assert!(!pushed(&origin));
 }
 
 #[test]
 fn init_new_pushes_nothing_when_no_check_is_found_for_a_generated_skeleton() {
-    let (_tmp, origin, ok, out) = init_new_generated("");
+    let (tmp, origin, ok, out) = init_new_generated("");
     assert!(!ok, "{out}");
     let error = out["error"].as_str().unwrap();
     assert!(
@@ -9884,6 +10387,7 @@ fn init_new_pushes_nothing_when_no_check_is_found_for_a_generated_skeleton() {
             && error.contains("nothing was pushed"),
         "{error}"
     );
+    assert_names_the_cleanup(error, &tmp);
     assert!(!pushed(&origin));
 }
 
@@ -9899,6 +10403,13 @@ fn init_new_refuses_a_skeleton_the_agent_committed() {
     assert!(
         error.contains("the init agent committed or switched branches")
             && error.contains("delete the new repository on GitHub")
+            && error.contains("`gh repo delete acme/")
+            && error.contains("gh auth refresh -s delete_repo")
+            && !error.contains("`gh repo delete`")
+            && error.contains(&format!(
+                "and remove {}",
+                tmp.path().join("work").join("zippy").display()
+            ))
             && error.contains("paja init --new"),
         "{error}"
     );
@@ -9906,6 +10417,7 @@ fn init_new_refuses_a_skeleton_the_agent_committed() {
         error.contains(&tmp.path().join("work").join("zippy").display().to_string()),
         "{error}"
     );
+    assert_names_the_cleanup(error, &tmp);
     assert!(!pushed(&origin));
 }
 
@@ -9934,6 +10446,7 @@ fn init_new_pushes_nothing_when_a_generated_skeletons_check_fails() {
         "{error}"
     );
     assert!(error.contains("Nothing was committed or pushed"), "{error}");
+    assert_names_the_cleanup(error, &tmp);
     // The clone stays, with the files and no commit; origin has no branch.
     let dir = tmp.path().join("work").join("zippy");
     assert!(dir.join("build.zig").is_file() && dir.join(".paja/checks").is_file());
@@ -11060,15 +11573,23 @@ fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
     let calls = f.claude_calls().len();
     let admitted = events_of(&f, "pool.admitted").len();
     let pool = start_pool(&f, "2");
-    // Several ticks of the pool, which would have admitted lanes without the pause.
-    std::thread::sleep(std::time::Duration::from_millis(3000));
+    // The pool says it is paused in the tick that would otherwise have planned and admitted.
+    // It reads the `stop` only at the top of a later tick, so once it has stopped that whole
+    // tick is over, however slowly it ran: whatever it started is in the log by then.
+    let paused = || {
+        std::fs::read_to_string(dir.join("pool.err"))
+            .unwrap_or_default()
+            .contains("starting nothing until")
+    };
+    wait_until(&f, "the pool saying it is paused", paused);
+    // That first tick is certain; a few more ticks are extra cover for a pause that holds only
+    // in the tick that announces it.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let reports = stop_pool(&f, pool);
+    assert!(reports.is_empty(), "{reports:?}");
     assert_eq!(events_of(&f, "pool.admitted").len(), admitted);
     assert!(events_of(&f, "pool.planning").is_empty());
     assert_eq!(f.claude_calls().len(), calls, "no agent started");
-    let reports = stop_pool(&f, pool);
-    assert!(reports.is_empty(), "{reports:?}");
-    let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
-    assert!(err.contains("starting nothing until"), "{err}");
 }
 
 /// The pool says how to stop it now; its lanes, which read `stop` from the pool, only say they

@@ -73,14 +73,25 @@ Changing the work label closes the queue as it was: the next sync no longer sees
 every item it imported with it. `.paja/labels` takes effect only once its change lands on the default branch, so add the
 new label to the open issues before it lands, keeping the old one, and remove the old label after: every sync in
 between sees them under one label or the other.
-`paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
-events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than the last one recorded, as the file
-system resolves them (a symlink or a Windows short name to the same folder is the same checkout) (every
-`paja run` syncs first, so runs record it too); it never touches another repository's items, even when their issue
-numbers are the same. `paja work
-list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
-in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with its
-`repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no
+`paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`,
+`work.closed` and `work.reopened` events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than
+the last one recorded, as the file system resolves them (a symlink or a Windows short name to the same folder is the
+same checkout) (every `paja run` syncs first, so runs record it too); it never touches another repository's items, even
+when their issue numbers are the same. Each sync also frees the environments of closed, parked (escalated) items whose
+issue GitHub says is closed: it removes the item's Ahjo environment, by its hashed name, if it was made in this
+checkout, keeping the branch, and lists it under `freed`, since nothing else frees the worktree and port block of an
+item closed instead of answered, and a reopened item resumes from the branch. An older release's `work-<n>` environment
+isn't freed: a reopened item would not resume that name's branch. An environment is kept, listed under `kept` with the
+reason and tried again by the next sync, when the issue is still open (its label changed, or `follow-ups = off` hides
+it), when a run holds the item or the item is no longer closed and parked once the home lock is taken for the removal
+(`ahjo::remove_unless` decides under the same lock as the removal), when the worktree folder is already gone (removing
+it would prune every missing worktree of the repository), when the worktree isn't on the environment's branch or git
+can't read its HEAD, or when git refuses: uncommitted changes, untracked files, a locked worktree or submodules. One
+removed meanwhile by another sync or `paja env remove` is in neither list. Ignored files, such as build output or a
+local `.env`, go with the worktree. `paja run` prints what its sync freed and kept on stderr.
+`paja work list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout
+they run in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with
+its `repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no
 `work.*` event names one yet. Whether an issue is open is kept apart from
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
@@ -409,7 +420,10 @@ its `.paja/models` role, `checks` for Vasara's checks, and `ci` (or `land` with 
 open; logs from before it replay with no steps. `run.checked` (`round`, `commit`, `base`)
 records that Vasara's checks passed on a commit. A `run.round` of a round after which the loop goes on carries
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
-like `detail`) or null; older events without it stay readable. Each `run.round` event also lists the
+like `detail`) or null, and with no `prior` the `noted` findings outside the change the latest review named, for the
+next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list
+when there are none, which a resumed run of that round takes over the earlier ones; a round stopped or ended on an
+error has no `noted`, and older events without these fields stay readable. Each `run.round` event also lists the
 round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
 Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
 `duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
@@ -744,7 +758,11 @@ newest checkout Paja synced in or made an environment from for it that `gh` stil
 (`jono::known_checkouts`, newest first, from the log's `work.checkout` and `env.created`
 events, each folder once in its newest spelling; each sync records `work.checkout` with its checkout's top level, the nearest folder holding `.git` (its path's `..` parts folded first), when it
 is another folder than the last one, and skips a path that isn't UTF-8; Desk asks `gh` about the newest three at most), else the directory Desk
-started in when it is a checkout of that repository, else an error that says where to start. The
+started in when it is a checkout of that repository, else an error that says where to start. The repository list
+shows the checkout by the same lookup, with each `gh` call limited to 10 s. When `gh` fails (offline, signed out,
+rate-limited, timed out) rather than naming another repository, the row keeps the newest remembered checkout and
+carries the error in `checkout_error`, which the window shows beside the path. Desk reuses a repository's answer for
+30 s as long as its remembered checkouts are the same, so the refreshing window doesn't ask `gh` on every tick. The
 person's text stays in the window across refreshes and errors. Desk's Tauri permissions
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
 `https://github.com/` links, nothing else.

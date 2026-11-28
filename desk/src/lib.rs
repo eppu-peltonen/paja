@@ -161,6 +161,72 @@ fn checkout_within(home: &Home, repo: &str, cwd: &Path, asked: usize) -> anyhow:
     )
 }
 
+/// How long `gh` may take to say which repository a checkout is, when the list asks.
+const LIST_LOOKUP_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long the list reuses `gh`'s answer for a repository: the window refreshes every few
+/// seconds, and each fresh answer is a `gh repo view` that shares GitHub's rate limit with runs.
+const LIST_LOOKUP_TTL: Duration = Duration::from_secs(30);
+
+type Memo = std::collections::HashMap<
+    String,
+    (
+        std::time::Instant,
+        Vec<PathBuf>,
+        (Option<PathBuf>, Option<String>),
+    ),
+>;
+
+/// The checkout the repository list shows for `repo`, and why `gh` couldn't settle it: the same
+/// lookup as [`checkout_of`] (newest still-matching checkout, else `cwd`), but a failing or
+/// slow `gh` keeps the newest remembered checkout listed, with the error, rather than
+/// reporting no checkout. A memo of the last answer, kept for [`LIST_LOOKUP_TTL`], is not a
+/// store: the event log and `gh` stay the truth.
+fn listed_checkout(home: &Home, repo: &str, cwd: &Path) -> (Option<PathBuf>, Option<String>) {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Memo>> = std::sync::OnceLock::new();
+    let known = match jono::known_checkouts(home, repo) {
+        Ok(known) => known,
+        Err(err) => return (None, Some(format!("{err:#}"))),
+    };
+    let key = format!("{}\n{repo}\n{}", home.root().display(), cwd.display());
+    let memo = MEMO.get_or_init(Default::default);
+    // A new or changed remembered checkout makes the answer stale at once.
+    if let Some((at, remembered, answer)) = memo.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        if at.elapsed() < LIST_LOOKUP_TTL && remembered == known {
+            return answer;
+        }
+    }
+    let answer = lookup_listed_checkout(home, repo, cwd, &known);
+    if let Ok(mut m) = memo.lock() {
+        m.insert(key, (std::time::Instant::now(), known, answer.clone()));
+    }
+    answer
+}
+
+fn lookup_listed_checkout(
+    home: &Home,
+    repo: &str,
+    cwd: &Path,
+    known: &[PathBuf],
+) -> (Option<PathBuf>, Option<String>) {
+    let matches = |path: &Path| {
+        jono::repo_name_within(home, path, Some(LIST_LOOKUP_LIMIT))
+            .map(|name| name.eq_ignore_ascii_case(repo))
+    };
+    for path in known.iter().take(CHECKOUTS_ASKED) {
+        match matches(path) {
+            Ok(true) => return (Some(path.clone()), None),
+            Ok(false) => {}
+            // `gh` failed, so nothing says the newest checkout is wrong: keep it.
+            Err(err) => return (known.first().cloned(), Some(format!("{err:#}"))),
+        }
+    }
+    match matches(cwd) {
+        Ok(true) => (Some(cwd.to_path_buf()), None),
+        _ => (None, None),
+    }
+}
+
 /// The repositories Paja knows: every one with a work item or a remembered checkout, with the
 /// checkout Desk would use (null when it doesn't know one) and where its runs stand
 /// ([`Runner::status`]).
@@ -190,8 +256,13 @@ pub fn repos_in(home: &Home, runner: &Runner, cwd: &Path) -> Value {
         let repos: Vec<Value> = names
             .iter()
             .map(|repo| {
-                let checkout = jono::known_checkout(home, repo).ok().flatten();
-                json!({ "repo": repo, "checkout": checkout, "runs": runner.status(home, repo) })
+                let (checkout, checkout_error) = listed_checkout(home, repo, cwd);
+                json!({
+                    "repo": repo,
+                    "checkout": checkout,
+                    "checkout_error": checkout_error,
+                    "runs": runner.status(home, repo),
+                })
             })
             .collect();
         Ok(Value::Array(repos))
@@ -914,6 +985,97 @@ mod tests {
             checkout_within(&home, "acme/app", dir.path(), 2).unwrap(),
             checkout
         );
+    }
+
+    /// A newer checkout remembered for acme/app whose remote now names another repository.
+    #[cfg(unix)]
+    fn moved_checkout(home: &Home, dir: &Path) -> PathBuf {
+        let moved = dir.join("moved");
+        std::fs::create_dir_all(&moved).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&moved)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(moved.join("name"), r#"{"nameWithOwner": "acme/elsewhere"}"#).unwrap();
+        import(home, "acme/app", 4, "Add a logout page");
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                paja::ahjo::EV_CREATED,
+                json!({
+                    "name": jono::env_name("acme/app", 4),
+                    "repo": moved,
+                    "path": dir.join("env2"),
+                    "branch": "paja/y",
+                    "base_commit": "0",
+                    "port_base": 41010,
+                    "port_count": 10,
+                    "created_ms": 0,
+                }),
+            )
+            .unwrap();
+        moved
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_repository_list_names_the_older_checkout_when_the_newest_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        moved_checkout(&home, dir.path());
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let listed = repos_in(&home, &runner, dir.path());
+        assert_eq!(listed[0]["repo"], "acme/app", "{listed}");
+        assert_eq!(listed[0]["checkout"], json!(checkout), "{listed}");
+        assert_eq!(listed[0]["checkout_error"], Value::Null, "{listed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_added_between_two_lists_shows_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _) = escalated_with_checkout(dir.path());
+        import(&home, "acme/lib", 1, "Fix the parser");
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let first = repos_in(&home, &runner, dir.path());
+        assert_eq!(first[1]["checkout"], Value::Null, "{first}");
+        // A checkout of acme/lib, added under Repositories (a sync records `work.checkout`).
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&lib)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(lib.join("name"), r#"{"nameWithOwner": "acme/lib"}"#).unwrap();
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                jono::EV_CHECKOUT,
+                json!({ "repo": "acme/lib", "path": lib }),
+            )
+            .unwrap();
+        drop(lock);
+        let second = repos_in(&home, &runner, dir.path());
+        assert_eq!(second[1]["checkout"], json!(lib), "{second}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_gh_keeps_the_checkout_in_the_list_with_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        std::fs::write(checkout.join("gh-down"), "").unwrap();
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let listed = repos_in(&home, &runner, dir.path());
+        assert_eq!(listed[0]["checkout"], json!(checkout), "{listed}");
+        let error = listed[0]["checkout_error"].as_str().unwrap_or_default();
+        assert!(error.contains("HTTP 502"), "{listed}");
     }
 
     #[cfg(unix)]
