@@ -228,18 +228,21 @@ pub struct Sbx {
 }
 
 thread_local! {
-    // One slot per thread, not per process: a long-lived `paja mcp` (or Paja Desk) runs each
+    // One slot per thread, not per process: a long-lived caller such as `paja mcp` runs each
     // call on a thread of its own, so two calls at once never start an agent in each other's
     // sandbox, or in none once the other has finished.
     static ACTIVE: RefCell<Option<Sbx>> = const { RefCell::new(None) };
 }
 
 /// Use `sandbox` (or none) for the agents and checks this thread starts until the returned
-/// guard is dropped, which puts back the sandbox in use before, on every way out.
+/// guard is dropped, which puts back the sandbox in use before, on every way out. Guards are
+/// dropped in the reverse order they were entered, as they are when each is bound to a local;
+/// the guard can't be sent to another thread.
 #[must_use = "the sandbox is in use only while the guard lives"]
 pub fn enter(sandbox: Option<Sbx>) -> Entered {
     Entered {
         before: ACTIVE.with(|slot| slot.replace(sandbox)),
+        _thread: std::marker::PhantomData,
     }
 }
 
@@ -251,6 +254,8 @@ pub fn active() -> Option<Sbx> {
 /// What [`enter`] returns: while it lives, its sandbox is the thread's.
 pub struct Entered {
     before: Option<Sbx>,
+    // Not `Send`: dropped on another thread, it would set that thread's slot instead.
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for Entered {

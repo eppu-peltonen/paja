@@ -639,7 +639,7 @@ while it starts.
   use a fake `sbx`.
 - **One step's sandbox.** The sandbox a step starts is in use for that step's agents and checks only, on the thread
   that runs it, and is put back when the step ends, an error included. So two calls at once in one long-lived `paja mcp`
-  (or Paja Desk) never start an agent in each other's sandbox, or with none once the other has finished.
+  never start an agent in each other's sandbox, or with none once the other has finished.
 - **Permissions.** Claude Code is always started with `--permission-mode auto`, with or without a sandbox; the sandbox
   image's default, `bypassPermissions`, and every weaker mode are never used. Auto mode is an extra layer, not a
   replacement for the deny-list hook, `--tools` or the turn caps. If a Claude Code rejects auto mode headless, the step
