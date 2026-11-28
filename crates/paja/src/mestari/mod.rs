@@ -3349,11 +3349,13 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                     }
                     None => {
                         point.round = point.round.max(round);
-                        // A round that every reviewer approved says so; a record after it (a
-                        // stop, an error) leaves the approval, which only a new round, a
-                        // fresh start or checks on another commit take back.
-                        if let Ok(approval) = serde_json::from_value(data["approved"].clone()) {
-                            point.approved = Some(approval);
+                        // A review that ended the round (it records `noted`) says whether
+                        // every reviewer approved: a later one that didn't (a split, an
+                        // escalation) takes back an earlier approval. A stop or an error records
+                        // no `noted` and leaves it; a new round, a fresh start or checks on
+                        // another commit take it back too.
+                        if data["noted"].is_array() {
+                            point.approved = serde_json::from_value(data["approved"].clone()).ok();
                         }
                         // A round that ended approved names the latest outside findings, newer
                         // than what the round before it handed on, even when there are none. A
@@ -4902,7 +4904,14 @@ mod tests {
             EV_ROUND,
             json!({"round": 5, "verdict": "land,changes", "noted": []}),
         );
-        assert!(resumed(&[split]).approved.is_none());
+        assert!(resumed(std::slice::from_ref(&split)).approved.is_none());
+        // A later review of the same round that didn't approve takes the approval back.
+        let escalated = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "escalate", "noted": []}),
+        );
+        assert!(after(escalated).is_none());
+        assert!(after(split).is_none());
         // An older approval shape, or none, is no approval.
         let older = (
             EV_ROUND,
