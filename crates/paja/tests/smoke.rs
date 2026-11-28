@@ -9538,6 +9538,40 @@ fn paja_sbx_name_names_the_sandbox_paja_creates_and_runs_in() {
 }
 
 #[test]
+fn agents_in_the_sandbox_read_their_prompt_from_a_file_not_from_sbx_exec_stdin() {
+    // `sbx exec -i` can hang for good when the program exits before reading all its stdin, so
+    // the prompt reaches the agent from a file in the repository's git data instead.
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx(f.tmp.path());
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert!(!log.contains("exec -i"), "{log}");
+    assert!(log.contains("paja-prompts"), "{log}");
+    // Both the builder and the reviewer got their prompt on stdin.
+    assert!(f.tmp.path().join("prompt-on-stdin").exists());
+    let calls = f.claude_calls();
+    assert!(calls.len() >= 2, "{calls:?}");
+    assert!(calls.iter().all(|c| c.contains("#5")), "{calls:?}");
+    // Every prompt file is gone once its agent is done.
+    let prompts = f.repo.join(".git").join("paja-prompts");
+    let left: Vec<_> = std::fs::read_dir(&prompts)
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
 fn agents_outside_the_sandbox_run_in_auto_mode_too() {
     let f = Factory::new("true\n", "land");
     let (ok, report) = f.run();

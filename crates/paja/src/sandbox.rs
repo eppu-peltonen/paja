@@ -430,25 +430,54 @@ fn transcript_script(id: &str) -> String {
     format!("ls \"$HOME\"/.claude/projects/*/{id}.jsonl >/dev/null 2>&1")
 }
 
-/// Make an `sbx exec` command from [`Sbx::command`] pass Paja's stdin to the program in the
-/// sandbox (`exec -i`), for a prompt written there. Any other command is left as it is.
-pub fn keep_stdin(cmd: &mut Command) {
-    let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
-    if args.first().map(|a| a == "exec") != Some(true) {
-        return;
-    }
-    let mut kept = Command::new(cmd.get_program());
-    kept.arg("exec").arg("-i").args(&args[1..]);
-    for (key, value) in cmd.get_envs() {
-        match value {
-            Some(value) => kept.env(key, value),
-            None => kept.env_remove(key),
+/// A prompt written to a file the sandbox can read, for an agent's stdin. `sbx exec -i` can
+/// hang for good when the program in the sandbox exits before it has read all of its stdin (the
+/// sandbox's stdin copy fails with a broken pipe and the exec never returns), so Paja never
+/// pipes a prompt through it. The file is removed when this is dropped.
+pub struct PromptFile {
+    host: PathBuf,
+    in_sandbox: String,
+}
+
+impl PromptFile {
+    /// Write `prompt` to a new file under `dir`, a folder the sandbox mounts (the repository's
+    /// git data), in `paja-prompts/`.
+    pub fn write(dir: &Path, prompt: &str) -> Result<PromptFile> {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let folder = dir.join("paja-prompts");
+        std::fs::create_dir_all(&folder)
+            .with_context(|| format!("creating {} for an agent's prompt", folder.display()))?;
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let host = folder.join(format!("{}-{n}.txt", std::process::id()));
+        std::fs::write(&host, prompt)
+            .with_context(|| format!("writing an agent's prompt to {}", host.display()))?;
+        let in_sandbox = match in_sandbox_path(&host) {
+            Ok(path) => path,
+            Err(err) => {
+                let _ = std::fs::remove_file(&host);
+                return Err(err);
+            }
         };
+        Ok(PromptFile { host, in_sandbox })
     }
-    if let Some(dir) = cmd.get_current_dir() {
-        kept.current_dir(dir);
+
+    /// `argv` run with this file on its stdin, by a shell in the sandbox.
+    pub fn feeding(&self, argv: &[String]) -> Vec<String> {
+        let mut fed = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec \"$@\" < \"$0\"".to_string(),
+            self.in_sandbox.clone(),
+        ];
+        fed.extend(argv.iter().cloned());
+        fed
     }
-    *cmd = kept;
+}
+
+impl Drop for PromptFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.host);
+    }
 }
 
 impl Sbx {
@@ -720,22 +749,19 @@ mod tests {
     }
 
     #[test]
-    fn keep_stdin_asks_sbx_exec_for_stdin() {
-        let mut cmd = sbx()
-            .command(Path::new("/work"), &[], &["claude".into(), "-p".into()])
-            .unwrap();
-        keep_stdin(&mut cmd);
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(&args[..2], ["exec", "-i"]);
-        assert_eq!(&args[args.len() - 2..], ["claude", "-p"]);
-        // Anything else is untouched.
-        let mut other = Command::new("sbx");
-        other.args(["ls"]);
-        keep_stdin(&mut other);
-        assert_eq!(other.get_args().collect::<Vec<_>>(), ["ls"]);
+    fn a_prompt_file_feeds_the_agent_and_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = PromptFile::write(dir.path(), "the prompt").unwrap();
+        let host = file.host.clone();
+        assert_eq!(std::fs::read_to_string(&host).unwrap(), "the prompt");
+        let argv = file.feeding(&["claude".to_string(), "-p".to_string()]);
+        assert_eq!(argv[..3], ["sh", "-c", "exec \"$@\" < \"$0\""]);
+        assert_eq!(argv[3], in_sandbox_path(&host).unwrap());
+        assert_eq!(argv[4..], ["claude", "-p"]);
+        let second = PromptFile::write(dir.path(), "another").unwrap();
+        assert_ne!(second.host, host);
+        drop(file);
+        assert!(!host.exists());
     }
 
     #[test]

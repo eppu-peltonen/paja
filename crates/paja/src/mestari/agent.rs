@@ -403,13 +403,22 @@ pub(super) fn claude_with(
             longest.chars().take(60).collect::<String>()
         );
     }
+    // In the sandbox the prompt reaches the agent from a file in the repository's git data,
+    // which the sandbox mounts, never through `sbx exec -i` (see `sandbox::PromptFile`).
+    let mut prompt_file = None;
     let mut cmd = match &sbx {
         Some(sbx) => {
+            let common = git(
+                &env.path,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            let file = crate::sandbox::PromptFile::write(Path::new(&common), prompt)?;
             let mut argv = vec![program.clone()];
             argv.extend(args);
-            let mut cmd = in_sandbox(sbx, &env.path, git_identity, Err(&argv))?;
-            // `sbx exec` passes stdin through only when asked to.
-            crate::sandbox::keep_stdin(&mut cmd);
+            let mut cmd = in_sandbox(sbx, &env.path, git_identity, Err(&file.feeding(&argv)))?;
+            // Paja's own stdin is how a person stops a run; it never reaches the sandbox.
+            cmd.stdin(std::process::Stdio::null());
+            prompt_file = Some(file);
             cmd
         }
         None => {
@@ -428,12 +437,13 @@ pub(super) fn claude_with(
     let status_before = git_status(&env.path);
     let output = crate::platform::output_until_stopped_with_input(
         &mut cmd,
-        Some(prompt.as_bytes().to_vec()),
+        prompt_file.is_none().then(|| prompt.as_bytes().to_vec()),
     )
     .map(|mut out| {
         out.stdout = fold_stream(&out.stdout);
         out
     });
+    drop(prompt_file);
     drop(scratch);
     let hooked = stamp.exists();
     let _ = std::fs::remove_file(&stamp);
