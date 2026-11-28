@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 
 /// How often `paja run --every` checks for work when the queue is empty, in minutes.
 pub const EVERY_MINUTES: u32 = 5;
-/// How long "Stop now" waits for `paja` to end its agents before Desk ends `paja` itself.
+/// How long "Stop now" waits for `paja` to end its agents before Desk itself ends `paja` and
+/// everything it started.
 pub const STOP_NOW_GRACE: Duration = Duration::from_secs(15);
 /// How much of a run's output Desk shows.
 const OUTPUT_LINES: usize = 200;
@@ -37,6 +38,8 @@ struct DeskRun {
 pub struct Runner {
     program: PathBuf,
     runs: Arc<Mutex<HashMap<String, DeskRun>>>,
+    /// [`STOP_NOW_GRACE`], shorter in tests.
+    grace: Duration,
 }
 
 impl Runner {
@@ -45,6 +48,7 @@ impl Runner {
         Self {
             program,
             runs: Arc::new(Mutex::new(HashMap::new())),
+            grace: STOP_NOW_GRACE,
         }
     }
 
@@ -122,7 +126,8 @@ impl Runner {
     }
 
     /// Ask Desk's run of `repo` to stop: after the step in flight, or `now` (it ends its agents
-    /// and checks; if it is still going after a grace period, Desk ends it).
+    /// and checks; if it is still going after a grace period, Desk ends it and everything it
+    /// started).
     pub fn stop(&self, repo: &str, now: bool) -> Result<()> {
         let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
         let Some(run) = runs.get_mut(repo) else {
@@ -151,8 +156,8 @@ impl Runner {
     }
 
     /// Tell every run Desk started to stop now, and wait for them to end, up to `grace`; a
-    /// `paja` still going then is ended. For closing Desk, which takes [`Self::end_later`]'s
-    /// timers with it.
+    /// `paja` still going then is ended with everything it started. For closing Desk, which
+    /// takes [`Self::end_later`]'s timers with it.
     pub fn stop_all_now(&self, grace: Duration) {
         for repo in self.running() {
             let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,23 +171,25 @@ impl Runner {
         }
         let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
         for run in runs.values_mut() {
+            // Under the lock, so nothing else reaps it first and its pid stays its own.
             if alive(&mut run.child) {
-                let _ = run.child.kill();
-                let _ = run.child.wait();
+                paja::platform::kill_with_descendants(&mut run.child);
             }
         }
     }
 
-    /// End `paja` (process `pid`) for `repo` if it is still going after the grace period.
+    /// End `paja` (process `pid`) for `repo`, with everything it started, if it is still going
+    /// after the grace period.
     fn end_later(&self, repo: String, pid: u32) {
         let runs = Arc::clone(&self.runs);
+        let grace = self.grace;
         std::thread::spawn(move || {
-            std::thread::sleep(STOP_NOW_GRACE);
+            std::thread::sleep(grace);
             let mut runs = runs.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(run) = runs.get_mut(&repo) {
+                // Under the lock, so nothing else reaps it first and its pid stays its own.
                 if run.child.id() == pid && alive(&mut run.child) {
-                    let _ = run.child.kill();
-                    let _ = run.child.wait();
+                    paja::platform::kill_with_descendants(&mut run.child);
                 }
             }
         });
@@ -356,22 +363,88 @@ mod tests {
         assert!(runner.stop("acme/app", false).is_err());
     }
 
-    #[test]
-    fn closing_stops_every_run_and_ends_one_that_is_stuck() {
+    /// A `paja` that starts an agent in a process group of its own (bash's `set -m` makes one
+    /// even without a terminal, as `paja` does), says when it is up, reads stop lines and never
+    /// ends. Returns its path.
+    fn stuck_paja(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        let stuck = dir.join("stuck");
+        std::fs::write(
+            &stuck,
+            "#!/usr/bin/env bash\nset -m\nsleep 60 &\necho $! > \"$0.agent\"\nset +m\n\
+             touch \"$0.up\"\nwhile read -r line; do echo \"got: $line\"; done\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stuck
+    }
+
+    /// `ps`'s `field` for process `pid`, empty once it is gone.
+    fn ps(field: &str, pid: &str) -> String {
+        let out = Command::new("ps")
+            .args(["-o", &format!("{field}="), "-p", pid])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Wait for the agent of the [`stuck_paja`] in `dir`, which was in a process group of its
+    /// own, to end (or be left only as a zombie).
+    fn wait_for_end_of_agent(dir: &Path) {
+        let agent = std::fs::read_to_string(dir.join("stuck.agent")).unwrap();
+        let agent = agent.trim();
+        let waited = std::time::Instant::now();
+        loop {
+            let stat = ps("stat", agent);
+            if stat.is_empty() || stat.starts_with('Z') {
+                return;
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "the stuck run's agent {agent} was left running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait until the [`stuck_paja`] in `dir` is reading, and check that its agent is in a
+    /// process group of its own, so the test can't quietly lose that case.
+    fn wait_until_up(dir: &Path, runner: &Runner, repo: &str) {
+        wait_until("the stuck run starting", || dir.join("stuck.up").exists());
+        let agent = std::fs::read_to_string(dir.join("stuck.agent")).unwrap();
+        let pid = runner.runs.lock().unwrap()[repo].child.id().to_string();
+        assert_ne!(
+            ps("pgid", agent.trim()),
+            ps("pgid", &pid),
+            "agent shares paja's group"
+        );
+    }
+
+    #[test]
+    fn stop_now_ends_a_stuck_run_and_its_agent_after_the_grace() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home::at(dir.path().join("home")).unwrap();
         let checkout = dir.path().join("app");
         std::fs::create_dir_all(&checkout).unwrap();
-        // A `paja` that says when it is up, reads stop lines and never ends.
-        let stuck = dir.path().join("stuck");
-        let up = dir.path().join("stuck.up");
-        std::fs::write(
-            &stuck,
-            "#!/bin/sh\ntouch \"$0.up\"\nwhile read -r line; do echo \"got: $line\"; done\nsleep 60\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stuck = stuck_paja(dir.path());
+        let mut runner = Runner::new(stuck);
+        runner.grace = Duration::from_millis(500);
+        runner
+            .start(&home, "acme/lib", &checkout, false, None)
+            .unwrap();
+        wait_until_up(dir.path(), &runner, "acme/lib");
+        runner.stop("acme/lib", true).unwrap();
+        wait_until("the stuck run ending", || !runner.is_running("acme/lib"));
+        wait_for_end_of_agent(dir.path());
+    }
+
+    #[test]
+    fn closing_stops_every_run_and_ends_one_that_is_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let checkout = dir.path().join("app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let stuck = stuck_paja(dir.path());
         let fine = Runner::new(fake_paja(dir.path()));
         fine.start(&home, "acme/app", &checkout, false, None)
             .unwrap();
@@ -386,14 +459,7 @@ mod tests {
             .start(&home, "acme/lib", &checkout, false, None)
             .unwrap();
         // Stop it only once it is reading, and give it time to echo the line on a slow machine.
-        let waited = std::time::Instant::now();
-        while !up.exists() {
-            assert!(
-                waited.elapsed() < Duration::from_secs(30),
-                "the stuck run never started"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until_up(dir.path(), &stuck, "acme/lib");
         stuck.stop_all_now(Duration::from_secs(2));
         assert!(stuck.running().is_empty());
         let output = stuck.status(&home, "acme/lib")["output"]
@@ -401,6 +467,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(output.contains("got: stop now"), "{output}");
+        // Its agent, in a group of its own, is ended with it.
+        wait_for_end_of_agent(dir.path());
     }
 
     #[test]
