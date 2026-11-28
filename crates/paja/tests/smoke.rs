@@ -2270,6 +2270,32 @@ fn work_show_tells_where_an_active_items_run_is_and_that_it_stopped() {
 }
 
 #[test]
+fn work_show_shows_a_round_recorded_twice_once_with_how_it_ended() {
+    // A round approved for landing, then sent back by a conflict at the turn to land.
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
+    init_repo(&repo);
+    std::fs::create_dir_all(&home).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"number":3,"title":"Add a plugin","body":"Ship it.","url":"https://example.com/3"}}"#,
+        r#"{"v":1,"seq":2,"ts_ms":2,"kind":"work.status","data":{"number":3,"status":"active","note":null}}"#,
+        r#"{"v":1,"seq":3,"ts_ms":3,"kind":"run.started","data":{"number":3,"env":"app-3"}}"#,
+        r#"{"v":1,"seq":4,"ts_ms":4,"kind":"run.round","data":{"number":3,"round":1,"verdict":"land","detail":"fake review","noted":[],"steps":[{"step":"build","cost_usd":0.5,"session_id":"a"}]}}"#,
+        r#"{"v":1,"seq":5,"ts_ms":5,"kind":"run.round","data":{"number":3,"round":1,"verdict":"conflict","detail":"feature.txt","steps":[],"next":{"feedback":"merge","prior":null,"noted":[]}}}"#,
+    ];
+    std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    let (ok, item) = paja(&home, &repo, &["work", "show", "3"]);
+    assert!(ok, "{item}");
+    let rounds = item["run"]["rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 1, "{item}");
+    assert_eq!(rounds[0]["verdict"], "conflict", "{item}");
+    assert_eq!(rounds[0]["detail"], "feature.txt", "{item}");
+    assert_eq!(rounds[0]["steps"][0]["cost_usd"], 0.5, "{item}");
+    // Its spend is counted once.
+    assert_eq!(item["usage"]["steps"], 1, "{item}");
+}
+
+#[test]
 fn a_log_written_before_repositories_replays_to_the_same_items() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
@@ -2459,7 +2485,8 @@ impl Factory {
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  if [ -f {d}/review-moves-main.sh ]; then sh {d}/review-moves-main.sh; rm {d}/review-moves-main.sh; fi\n\
-                 v=$(cat {d}/verdict.txt); f='[]'; s=$(cat {d}/summary.txt 2>/dev/null || echo fake review)\n\
+                 v=$(cat {d}/verdict.txt); f='[]'; s=$(cat {d}/review-summary 2>/dev/null || echo 'fake review')\n\
+                 if [ -f {d}/verdict-second.txt ]; then r=$(cat {d}/review-count 2>/dev/null || echo 0); r=$((r+1)); echo $r > {d}/review-count; [ $((r % 2)) = 0 ] && v=$(cat {d}/verdict-second.txt); fi\n\
                  if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"$s\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
@@ -2485,6 +2512,7 @@ impl Factory {
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
+                 if [ -f {d}/cheat-ci ]; then mkdir -p .github/workflows; echo 'on: push' > .github/workflows/ci.yml; git add .github; fi\n\
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add $file\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
@@ -3329,12 +3357,25 @@ fn record_env(home: &Path, name: &str, repo: &Path, path: &Path) {
     std::fs::write(&log, format!("{text}{event}\n")).unwrap();
 }
 
+/// Append a `run.started` to the log at `home`, as a run of `repo`'s item `number` in the
+/// environment `env` records.
+fn record_started(home: &Path, repo: &str, number: u64, env: &str) {
+    let log = home.join("events.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let seq = text.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let event = serde_json::json!({
+        "v": 1, "seq": seq, "ts_ms": 1, "kind": "run.started",
+        "data": { "repo": repo, "number": number, "env": env, "base": "main" }
+    });
+    std::fs::write(&log, format!("{text}{event}\n")).unwrap();
+}
+
 #[test]
 fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
     init_repo(&repo);
-    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
     let issues: Vec<Value> = numbers
         .iter()
         .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
@@ -3411,9 +3452,15 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let other = tmp.path().join("other");
     init_repo(&other);
     tree(&other, &env(11));
-    // 12 still has the `work-<n>` environment an older release made: a reopened item wouldn't
-    // resume that name's branch, so it stays (#523).
+    // So does 17's `work-<n>` one.
+    tree(&other, "work-17");
+    // 12 still has the `work-<n>` environment an older release made, freed the same way.
     let legacy = tree(&repo, "work-12");
+    record_started(&home, "acme/app", 12, "work-12");
+    // 16's is one too, with an untracked file. An older release ran 16 there.
+    let legacy_dirty = tree(&repo, "work-16");
+    record_started(&home, "acme/app", 16, "work-16");
+    std::fs::write(legacy_dirty.join("draft.txt"), "edit\n").unwrap();
     // 13 has a change to a tracked file.
     let changed = tree(&repo, &env(13));
     std::fs::write(changed.join("hello.txt"), "changed\n").unwrap();
@@ -3429,8 +3476,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     drop(lock);
     assert!(ok, "{report}");
     assert_eq!(report["closed"], serde_json::json!(numbers), "{report}");
-    assert_eq!(report["freed"], serde_json::json!([WORK_5]), "{report}");
-    assert!(!clean.exists() && legacy.exists() && changed.exists());
+    assert_eq!(
+        report["freed"],
+        serde_json::json!([WORK_5, "work-12"]),
+        "{report}"
+    );
+    assert!(!clean.exists() && !legacy.exists() && changed.exists());
     assert!(dirty.join("draft.txt").exists());
     let kept: Vec<(String, String)> = report["kept"]
         .as_array()
@@ -3461,7 +3512,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     assert!(why(14).contains("git couldn't read the HEAD"), "{report}");
     assert!(why(15).contains("is already gone"), "{report}");
     assert!(unreadable.join("hello.txt").exists());
-    assert_eq!(kept.len(), 7, "{report}");
+    assert!(
+        kept.iter()
+            .any(|(e, w)| e == "work-16" && w.contains("uncommitted changes")),
+        "{report}"
+    );
+    assert_eq!(kept.len(), 8, "{report}");
     // The branch stays, so a reopened item resumes from it.
     git_out(
         &repo,
@@ -3485,6 +3541,8 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     for n in [6, 7, 8, 9, 10, 13, 14, 15] {
         assert!(detail.contains(&env(n)), "{check}");
     }
+    // The log shows 16 last ran in `work-16`, so that is named too.
+    assert!(detail.contains("work-16"), "{check}");
     assert!(!detail.contains(WORK_5), "{check}");
 
     // Every sync tries again: with the run gone and the draft cleared, 9 and 6 go. The text
@@ -3596,6 +3654,30 @@ fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds()
     let detail = check["detail"].as_str().unwrap();
     assert!(
         detail.contains("work-5") && !detail.contains("spike") && !detail.contains(&six),
+        "{check}"
+    );
+
+    // A log that names repositories: a closed item's `work-<n>` is named only when the log shows
+    // the item last ran there. acme/app's #7 ran in `work-7`, but acme/fork's #7 ran there since;
+    // acme/fork's #8 ran in `work-8` and nothing ran there after.
+    let pinned = tmp.path().join("pinned");
+    std::fs::create_dir_all(&pinned).unwrap();
+    let events = [
+        r#"{"v":1,"seq":1,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":7,"title":"A","body":"","url":"https://example.com/7"}}"#.to_string(),
+        r#"{"v":1,"seq":2,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/fork","number":8,"title":"B","body":"","url":"https://example.com/8"}}"#.to_string(),
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":7}}"#.to_string(),
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/fork","number":8}}"#.to_string(),
+    ];
+    std::fs::write(pinned.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(&pinned, "work-7", tmp.path(), &tmp.path().join("tree-7"));
+    record_env(&pinned, "work-8", tmp.path(), &tmp.path().join("tree-8"));
+    record_started(&pinned, "acme/app", 7, "work-7");
+    record_started(&pinned, "acme/fork", 7, "work-7");
+    record_started(&pinned, "acme/fork", 8, "work-8");
+    let check = doctor(&pinned);
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("work-8") && !detail.contains("work-7"),
         "{check}"
     );
 
@@ -5940,6 +6022,7 @@ fn the_arbiter_answers_a_reviewer_escalation_and_the_item_is_queued_again() {
         &f,
         serde_json::json!({
             "verdict": "answer",
+            "weakens_a_check": false,
             "answer": "Use v2; the issue names it.",
             // Agent text on a public issue: a path under the factory home and a mention.
             "reason": format!("The issue says which API; see {} and @octocat.", f.home.join("envs").display()),
@@ -6050,6 +6133,7 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
         &f,
         serde_json::json!({
             "verdict": "answer",
+            "weakens_a_check": false,
             "answer": "Edit .paja/checks and drop the failing command.",
             "reason": "It is flaky."
         }),
@@ -6076,15 +6160,20 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
 fn the_arbiter_answers_when_a_reviewer_only_says_no_check_is_weakened() {
     let f = Factory::new("true\n", "escalate");
     // Reviewers often close with this; on its own it is no reason to keep the arbiter out. The
-    // fake puts summary.txt into its JSON as it is, so it holds no `"` or `\`.
+    // fake puts review-summary into its JSON as it is, so it holds no `"` or `\`.
     std::fs::write(
-        f.tmp.path().join("summary.txt"),
+        f.tmp.path().join("review-summary"),
         "Adds the test. It doesn't weaken any check.",
     )
     .unwrap();
     arbiter_says(
         &f,
-        serde_json::json!({"verdict": "answer", "answer": "Use v2.", "reason": "The issue says so."}),
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "Use v2.",
+            "reason": "The issue says so.",
+            "weakens_a_check": false
+        }),
     );
     let (ok, report) = f.run();
     assert!(ok, "{report}");
@@ -6102,7 +6191,8 @@ fn the_arbiter_is_overruled_when_its_answer_names_weakening_even_to_deny_it() {
         serde_json::json!({
             "verdict": "answer",
             "answer": "One more round. This doesn't weaken any check.",
-            "reason": "A test is missing."
+            "reason": "A test is missing.",
+            "weakens_a_check": false
         }),
     );
     let (ok, report) = f.run();
@@ -6122,6 +6212,7 @@ fn the_arbiter_answers_an_item_only_once() {
         &f,
         serde_json::json!({
             "verdict": "answer",
+            "weakens_a_check": false,
             "answer": "Use v2.",
             "reason": "The issue says so."
         }),
@@ -6143,6 +6234,216 @@ fn the_arbiter_answers_an_item_only_once() {
         .as_str()
         .unwrap()
         .contains("at most once"));
+}
+
+/// The arbiter's plain answer, which leaves every check as it is.
+fn arbiter_answers(f: &Factory, answer: &str) {
+    arbiter_says(
+        f,
+        serde_json::json!({
+            "verdict": "answer",
+            "weakens_a_check": false,
+            "answer": answer,
+            "reason": "The issue decides it."
+        }),
+    );
+}
+
+/// The item was answered by the arbiter and queued again.
+fn assert_arbitrated(f: &Factory, report: &Value, answer: &str) {
+    assert_eq!(report["outcome"], "arbitrated", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["answers"][0]["by"], "arbiter", "{item}");
+    assert_eq!(item["answers"][0]["answer"], answer, "{item}");
+    let arbitrated = events_of(f, "run.arbitrated");
+    assert_eq!(arbitrated.len(), 1, "{arbitrated:?}");
+    assert_eq!(arbitrated[0]["data"]["verdict"], "answer");
+}
+
+#[test]
+fn the_arbiter_answers_a_builder_question() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("ask"), "").unwrap();
+    arbiter_answers(&f, "Use A; the issue names it.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Use A; the issue names it.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Which API, A or B?"),
+        "{item}"
+    );
+}
+
+#[test]
+fn the_arbiter_answers_after_five_failed_rounds() {
+    let f = Factory::new("test -f never.txt\n", "land");
+    arbiter_answers(&f, "Create feature.txt as the issue says.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Create feature.txt as the issue says.");
+    assert_eq!(report["rounds"], 5, "{report}");
+}
+
+#[test]
+fn the_arbiter_answers_after_five_rounds_whose_check_output_names_the_hook() {
+    // The last feedback quotes a check's output, which names a guard file and says `xfailed`:
+    // Paja's question quotes it, but only what Paja wrote is searched for guard names.
+    let f = Factory::new(
+        "echo panicked at crates/paja/src/hook.rs:3, 1 xfailed && false\n",
+        "land",
+    );
+    arbiter_answers(&f, "Create feature.txt as the issue says.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Create feature.txt as the issue says.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hook.rs:3"),
+        "{item}"
+    );
+}
+
+#[test]
+fn the_arbiter_answers_a_high_risk_split_whose_summaries_name_the_hook() {
+    // One reviewer lands, the other asks for changes; both name the hook only to say what the
+    // change is about, and the diff doesn't touch it.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    std::fs::write(f.tmp.path().join("verdict-second.txt"), "changes").unwrap();
+    std::fs::write(
+        f.tmp.path().join("review-summary"),
+        "The change calls the rule in hook.rs and the deny-list it reads",
+    )
+    .unwrap();
+    arbiter_answers(&f, "Land it; the issue asks for exactly this.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Land it; the issue asks for exactly this.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("The two reviewers disagree"),
+        "{item}"
+    );
+}
+
+#[test]
+fn the_arbiter_answers_a_second_turn_limit() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("build-limit"), "").unwrap();
+    arbiter_answers(&f, "Do only the first half of the issue in this change.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(
+        &f,
+        &report,
+        "Do only the first half of the issue in this change.",
+    );
+    assert_eq!(report["rounds"], 2, "{report}");
+}
+
+#[test]
+fn the_arbiter_is_overruled_when_the_change_touches_a_guard_file() {
+    // The builder edits `.paja/checks` on its branch; the arbiter's answer is harmless, but a
+    // person decides anything about such a change.
+    let f = Factory::new("test -f feature.txt\n", "escalate");
+    std::fs::write(f.tmp.path().join("cheat"), "").unwrap();
+    arbiter_answers(&f, "Use v2.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("touches .paja/checks"), "{question}");
+    let arbitrated = events_of(&f, "run.arbitrated");
+    assert!(
+        arbitrated[0]["data"]["overruled"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(".paja/checks"),
+        "{arbitrated:?}"
+    );
+}
+
+#[test]
+fn the_arbiter_is_overruled_when_the_change_touches_a_ci_workflow() {
+    let f = Factory::new("true\n", "escalate");
+    std::fs::write(f.tmp.path().join("cheat-ci"), "").unwrap();
+    arbiter_answers(&f, "Use v2.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("touches .github/workflows/ci.yml"),
+        "{question}"
+    );
+}
+
+#[test]
+fn the_arbiter_is_overruled_for_any_answer_that_may_weaken_a_check() {
+    let cases = [
+        // No flag at all: a missing `weakens_a_check` never reads as "no".
+        (
+            serde_json::json!({"verdict": "answer", "answer": "Use v2."}),
+            "leaves every test and check",
+        ),
+        // The arbiter flags its own answer.
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": true, "answer": "Use v2."}),
+            "leaves every test and check",
+        ),
+        // Paraphrases, each with the flag saying no.
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": false,
+                "answer": "Change line 3 in tests/smoke.rs to match."}),
+            "test file tests/smoke.rs",
+        ),
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": false,
+                "answer": "Drop that line from the CI config."}),
+            "the answer says `ci config`",
+        ),
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": false,
+                "answer": "Stop running `test -f feature.txt` for this item."}),
+            "the check `test -f feature.txt`",
+        ),
+    ];
+    for (said, why) in cases {
+        let f = Factory::new("test -f feature.txt\n", "escalate");
+        arbiter_says(&f, said.clone());
+        let (ok, report) = f.run();
+        assert!(ok, "{report}");
+        assert_eq!(report["outcome"], "escalated", "{said}: {report}");
+        let question = report["question"].as_str().unwrap();
+        assert!(question.contains("Which API?"), "{question}");
+        assert!(question.contains(why), "{said}: {question}");
+    }
+}
+
+#[test]
+fn a_review_that_names_the_hook_doesnt_stop_the_arbiter() {
+    // The reviewers' summaries only say what the change is about; the diff doesn't touch it.
+    let f = Factory::new("true\n", "escalate");
+    std::fs::write(
+        f.tmp.path().join("review-summary"),
+        "The change calls the rule in hook.rs and the deny-list it reads",
+    )
+    .unwrap();
+    arbiter_answers(&f, "Use v2.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Use v2.");
 }
 
 #[test]
@@ -7419,6 +7720,61 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
 }
 
 #[test]
+fn a_run_that_errors_frees_the_work_n_environment_it_resumed() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("gh-down"), "").unwrap();
+    // Item 5 was started by a release that named its environment `work-5`.
+    std::fs::create_dir_all(&f.home).unwrap();
+    std::fs::write(f.home.join("events.jsonl"), "").unwrap();
+    let path = f.tmp.path().join("work-5");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "paja/work-5",
+            path.to_str().unwrap(),
+        ],
+    );
+    record_env(&f.home, "work-5", &f.repo, &path);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let started = events_of(&f, "run.started");
+    assert_eq!(started[0]["data"]["env"], "work-5", "{started:?}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]), "the worktree it used is freed");
+    assert!(!path.exists());
+    // Its branch stays for the next run to resume.
+    git_out(
+        &f.repo,
+        &["rev-parse", "--verify", "-q", "refs/heads/paja/work-5"],
+    );
+    // And it does: the log shows the run in `work-5`, so the branch becomes the item's own.
+    std::fs::remove_file(f.tmp.path().join("gh-down")).unwrap();
+    let (ok, item) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "answer", "5", "GitHub is back"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{item}");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report} {stderr}");
+    let started = events_of(&f, "run.started");
+    assert_eq!(started[1]["data"]["env"], WORK_5, "{started:?}");
+    assert!(!stderr.contains("not resuming"), "{stderr}");
+    let old = Command::new("git")
+        .current_dir(&f.repo)
+        .args(["rev-parse", "--verify", "-q", "refs/heads/paja/work-5"])
+        .output()
+        .unwrap();
+    assert!(!old.status.success(), "paja/work-5 was carried over");
+}
+
+#[test]
 fn an_error_after_a_round_ended_with_a_verdict_adds_an_error_round() {
     // The review lands, so round 1 is recorded with its verdict; opening the pull request then
     // fails, and the error is recorded as a second `run.round` for the same round.
@@ -7517,6 +7873,12 @@ fn an_item_another_runner_claimed_is_skipped_and_says_who_holds_it() {
     let (_, status) = f.with_gh(&["pool", "status"]);
     let why = status["waiting"][0]["why"].as_str().unwrap();
     assert!(why.contains("claimed by runner abc123"), "{status}");
+    // A repository that never recorded a lane count starts with one lane; nothing has left one.
+    assert_eq!(status["target"], 1, "{status}");
+    assert_eq!(status["tokens"], 0, "{status}");
+    assert_eq!(status["out"], serde_json::json!([]), "{status}");
+    assert_eq!(status["retired_since_start"], 0, "{status}");
+    assert_eq!(status["waiting"][0]["area"], "", "{status}");
 }
 
 #[test]
@@ -11334,6 +11696,13 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     assert_eq!(status["target"], 2, "{status}");
     assert_eq!(status["admitted"], serde_json::json!([5, 6]), "{status}");
     assert_eq!(status["lanes"][0]["stage"], "build", "{status}");
+    assert_eq!(status["lanes"][0]["round"], 1, "{status}");
+    assert!(status["lanes"][0]["admitted_ms"].as_u64().is_some());
+    assert_eq!(status["lanes"][0]["tokens"], 0, "{status}");
+    assert_eq!(status["lanes"][0]["reviews"], serde_json::json!([]));
+    assert!(status["lanes"][0]["area"].is_string(), "{status}");
+    assert!(status["tokens"].as_u64().is_some(), "{status}");
+    assert_eq!(status["out"], serde_json::json!([]), "{status}");
     assert_eq!(status["waiting"][0]["number"], 7, "{status}");
     assert_eq!(status["waiting"][0]["why"], "no free lane", "{status}");
     // Since the pool started: nothing landed or held yet, one item ready for a lane.
@@ -11348,7 +11717,16 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     let (ok, by_mcp) = mcp.call("pool_status", serde_json::json!({}));
     assert!(ok, "{by_mcp}");
     assert_eq!(by_mcp["admitted"], status["admitted"]);
-    for key in ["started_ms", "ready", "held", "landed_since_start"] {
+    for key in [
+        "started_ms",
+        "ready",
+        "held",
+        "landed_since_start",
+        "target",
+        "tokens",
+        "out",
+        "retired_since_start",
+    ] {
         assert_eq!(by_mcp[key], status[key], "{key}");
     }
     assert_eq!(
@@ -11375,6 +11753,9 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     assert_eq!(status["state"], "stopped", "{status}");
     assert_eq!(status["busy"], 0, "{status}");
     assert_eq!(status["landed"].as_array().unwrap().len(), 3, "{status}");
+    let out = status["out"].as_array().unwrap();
+    assert_eq!(out.len(), 3, "{status}");
+    assert!(out.iter().all(|o| o["outcome"] == "landed"), "{status}");
     let lanes = events_of(&f, "pool.lane");
     for stage in ["starting", "build", "checks", "review", "land", "done"] {
         assert!(
