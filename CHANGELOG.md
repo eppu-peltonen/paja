@@ -5,12 +5,60 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
 
 ## Unreleased
 
-- `paja --version` built inside some other git repository (a `cargo install` under a home directory that is one) says `unknown` instead of naming that repository's commit, and a build without a reflog no longer rebuilds every time.
-- Review findings are fixed in the change that drew them (up to five rounds) instead of being filed as follow-up issues; what is left at the round limit, or lies outside the change, is listed in the pull request.
-- `paja doctor` warns of an environment left over from a closed item (a parked item keeps its worktree and ports), and names the `paja env remove` that frees it.
+## 0.2.0
+
+- Breaking: a push URL (`PAJA_NOTIFY` or `.paja/notify`) must be `https://`; plain `http://` now works only for this
+  machine (`localhost`, `127.x.x.x` or `[::1]`).
+- Agents run in Docker Sandboxes by default when `sbx` is installed: Paja finds it on `PATH`, checks it works, and stops
+  the step with the fix when it doesn't, never falling back to the host. `PAJA_SBX=off` runs agents on the host. `paja
+  doctor`, the first progress line and `run.started` say which backend a run uses and why.
+- A sandboxed agent no longer hangs when it exits before reading all of its prompt, and two calls at once in one `paja
+  mcp` never share or lose each other's sandbox.
+- Waiting for CI has a limit: 120 minutes by default, or `wait <minutes>` in `.paja/ci`. CI still going at the limit
+  escalates the item instead of holding every other landing, and `stop now` ends the wait at once.
+- Changes waiting to land take the turn in the order they began to wait, and a run resumed after its review approved
+  lands without being reviewed again.
+- Landing is sturdier: a failed CI check still goes back to the builder, but of other CI problems only checks that never
+  started because main moved are retried; a `gh` error, a cancelled check or a merge that conflicts at landing
+  escalates, a failed merge is explained from GitHub's own answer, and the default branch is taken from GitHub before
+  `origin/HEAD`.
+- Usage pacing reads the usage window Claude Code really reports, and `paja doctor` warns when no recent step reported
+  one. A pass that pauses because the usage window is nearly used no longer checks GitHub for a CI workflow first.
+- An arbiter agent (the `arbiter` role in `.paja/models`) settles an escalation the issue, the code or `CLAUDE.md`
+  already answers before it reaches you, and otherwise asks you one question with options and a recommendation. `paja
+  work show` and Paja Desk say `answered by arbiter`, and `paja work answer` overrides it.
+- An arbiter answer that may weaken a check, or that comes with a change to `.paja/checks`, `.paja/high-risk`,
+  `.paja/models`, `.paja/commands`, the deny-list hook or `.github/workflows/`, always comes to you instead, and a
+  reviewer's closing "it doesn't weaken any check" no longer sends it to you.
+- `paja run --workers` plans the next items while every lane is busy, keeps a plan across pool runs until the item's
+  title or text changes, and ends its planners' agents however the pool stops.
+- `paja work sync` (and so `paja run`) frees the environment of a parked item whose issue was closed, keeping its
+  branch, and `paja doctor` names every environment left over from a closed item, with the `paja env remove` that frees
+  it. An item from before environments carried the repository's name has its old `work-<n>` environment freed the same
+  way, and its `paja/work-<n>` branch carried over when it runs again.
+- Paja Desk opens on the lanes: a card per lane with a + to add one and a - on each, a side panel with what is next,
+  held and out, an activity strip and every everyday action at hand. Pool status carries what it needs (each lane's
+  round, time on the lane and tokens, and the latest items out with their outcome). Stopping a run from Desk ends its
+  agents and checks too, and closing says what it waits for.
+- `paja init` detects the project with an agent (the `init` role): any language, monorepos and workspaces (their check
+  lines run end to end), toolchain versions and services. It keeps only what files on the default branch back up, and
+  reads the repository's text, `CLAUDE.md` included, as data, not instructions. `--no-agent`, a missing `claude` or an
+  unusable answer falls back to the built-in table.
+- `paja init --new` takes any stack: for one with no built-in skeleton an agent writes it, running only the stack's own
+  build, format, lint and test programs, and nothing is pushed unless its checks pass. Without `--stack`, on a terminal,
+  it asks what you are building and recommends one to three stacks; `paja init --recommend` (MCP `init_recommend`)
+  prints the recommendations and creates nothing.
+- `paja --version` built inside some other git repository (a `cargo install` under a home directory that is one) says
+  `unknown` instead of naming that repository's commit, and a build without a reflog no longer rebuilds every time.
+- Review findings are fixed in the change that drew them (at most five rounds, up from three) instead of being filed as
+  follow-up issues; what is left at the round limit, or lies outside the change, is listed in the pull request.
 - `paja usage` gives the 90th percentile of wall time per landed item in its summary line, next to the median.
-- `paja doctor` quotes and escapes the role words it names as skipped in `.paja/models`, so a control character in the file never reaches the terminal.
-- The events a run writes while it waits for and takes the turn to land are now `run.merging` and `run.landing`, since single runs write them as pool lanes do; logs with the old `pool.merging` and `pool.landing` still read the same.
+- `paja doctor` quotes and escapes the role words it names as skipped in `.paja/models`, so a control character in the
+  file never reaches the terminal.
+- The events a run writes while it waits for and takes the turn to land are now `run.merging` and `run.landing`, since
+  single runs write them as pool lanes do; logs with the old `pool.merging` and `pool.landing` still read the same.
+- Smaller fixes: the Windows install steps check the archive against `SHA256SUMS`; Posti tells you when `.paja/models`
+  names a role this Paja doesn't know; Paja Desk on Windows opens no console windows.
 
 ## 0.1.0
 
