@@ -1111,7 +1111,14 @@ fn run_item(
     record(
         home,
         EV_STARTED,
-        json!({ "repo": item.repo, "number": item.number, "env": env.name, "base": base }),
+        json!({
+            "repo": item.repo,
+            "number": item.number,
+            "env": env.name,
+            "base": base,
+            "backend": if crate::sandbox::active().is_some() { "sandbox" } else { "host" },
+            "backend_why": crate::sandbox::backend_why().as_str(),
+        }),
     )?;
 
     let mut feedback = String::new();

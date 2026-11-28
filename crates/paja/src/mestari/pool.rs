@@ -124,6 +124,10 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
              with `paja pool lanes <N>`, or stop it first"
         );
     };
+    // Chosen once, for every lane and planner and the pool's own triage: one that chose for
+    // itself could run on the host after another ran in the sandbox.
+    let backend = crate::sandbox::choose()?;
+    crate::sandbox::pin(&backend);
     record(
         home,
         EV_POOL_LANES,
@@ -135,12 +139,15 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         home.events().append(&lock, EV_POOL_STARTED, data)?.seq
     };
     progress(&format!(
-        "pool of {name}: up to {} lanes (`paja pool lanes <N>` changes it; Ctrl+C stops)",
-        opts.lanes
+        "pool of {name}: up to {} lanes, {} (`paja pool lanes <N>` changes it; Ctrl+C \
+         stops)",
+        opts.lanes,
+        backend.describe()
     ));
     let mut pool = Pool {
         home,
         repo: &repo,
+        backend: &backend,
         name: &name,
         key: &key,
         opts: &opts,
@@ -171,6 +178,8 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
 struct Pool<'a> {
     home: &'a Home,
     repo: &'a Path,
+    /// Where lanes and planners run agents and checks ([`crate::sandbox::pass_to`]).
+    backend: &'a crate::sandbox::Choice,
     name: &'a str,
     /// The checkout's key in the tamper lock.
     key: &'a str,
@@ -377,7 +386,7 @@ impl Pool<'_> {
                     "source": plan.source, "high_risk": plan.high_risk,
                 }),
             )?;
-            match spawn(self.repo, lane, item.number) {
+            match spawn(self.repo, self.backend, lane, item.number) {
                 Ok((child, stdin, report)) => {
                     progress(&format!("lane {lane}: #{} {}", item.number, item.title));
                     self.lanes.insert(
@@ -436,7 +445,7 @@ impl Pool<'_> {
                 .seq
         };
         progress(&format!("planning which files #{number} touches"));
-        match spawn_planner(self.repo, number) {
+        match spawn_planner(self.repo, self.backend, number) {
             Ok(child) => {
                 self.planners.insert(number, (child, at, Instant::now()));
             }
@@ -896,9 +905,10 @@ fn tell_planner(child: &mut Child) {
 
 /// `paja pool plan <number>` as a child of the pool, reading `stop now` on stdin; its progress
 /// lines go to the pool's stderr.
-fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
+fn spawn_planner(repo: &Path, backend: &crate::sandbox::Choice, number: u64) -> Result<Child> {
     let exe = std::env::current_exe().context("finding the paja program to plan with")?;
     let mut cmd = Command::new(exe);
+    crate::sandbox::pass_to(backend, &mut cmd);
     // Only the pool stops a planner: a terminal's Ctrl-C would end it at once and leave its
     // agent, which runs in a process group of its own, going. A planner whose pool is gone
     // stops anyway, when its stdin closes.
@@ -932,11 +942,14 @@ fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
 /// passed on to stderr with the lane in front; its report comes back on the channel.
 fn spawn(
     repo: &Path,
+    backend: &crate::sandbox::Choice,
     lane: u32,
     number: u64,
 ) -> Result<(Child, Option<ChildStdin>, mpsc::Receiver<String>)> {
     let exe = std::env::current_exe().context("finding the paja program to start a lane with")?;
-    let mut child = Command::new(exe)
+    let mut cmd = Command::new(exe);
+    crate::sandbox::pass_to(backend, &mut cmd);
+    let mut child = cmd
         .args(["--json", "run", "--yes", "--stop-on-stdin", "--lane"])
         .arg("--item")
         .arg(number.to_string())
