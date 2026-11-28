@@ -1047,7 +1047,9 @@ mod tests {
         )
         .unwrap();
         assert!(late.timed_out);
-        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+        // Ended at the deadline: not before it, and not long after.
+        let took = started.elapsed();
+        assert!(took.as_secs() >= 2 && took.as_secs() < 20, "{took:?}");
     }
 
     /// A step past its deadline is ended, with what it started, and reads as timed out with what

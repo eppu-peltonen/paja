@@ -11416,6 +11416,11 @@ fn run_with_vars(f: &Factory, vars: &[(&str, &str)], args: &[&str]) -> (Value, S
 /// CI still going at `.paja/ci`'s `wait` escalates, naming the setting and showing the checks,
 /// instead of holding the repository's turn to land for as long as the CI hangs, also when
 /// the default branch moved during the wait. The `gh` that was waiting is ended.
+// Unix only, like `stop_now_on_stdin_stops_at_once_and_ends_the_agent`: on Windows CI the fake
+// `gh`'s Git Bash processes can outlive `taskkill /T` and hold paja's output open, so the run
+// would now and then not read as ended. The deadline path on Windows is covered by
+// `a_step_past_its_deadline_is_ended_as_timed_out_on_windows`, with no Git Bash in it.
+#[cfg(unix)]
 #[test]
 fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     let f = Factory::new("test -f feature.txt\n", "land");
@@ -11423,8 +11428,8 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     f.on_main(".paja/ci", "required\nwait 30\n");
     std::fs::write(dir.join("ci-hold"), "").unwrap();
     // Once the run waits for CI, the default branch moves on from another clone. Once the run
-    // has asked on the issue, the fake `gh` is let go: on Windows the Git Bash loop it runs can
-    // outlive the kill, and would hold paja's output open until then.
+    // has asked on the issue, the fake `gh` is let go, so nothing it left behind holds paja's
+    // output open.
     let mover = {
         let dir = dir.clone();
         std::thread::spawn(move || {
@@ -11493,7 +11498,6 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     let (report, stderr) =
         run_with_vars(&f, &[("PAJA_TEST_CI_WAIT_MS", "30000")], &["--json", "run"]);
     let moved = mover.join().unwrap();
-    #[cfg(unix)]
     let waiting = std::fs::read_to_string(dir.join("ci-pid")).unwrap_or_default();
     if let Err(why) = moved {
         panic!("{why}\n{stderr}");
@@ -11519,7 +11523,6 @@ fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
     );
     // Ended at the limit: the run only asks once the wait is over, and the wait is over only
     // once `gh` is ended, so it was gone before `ci-hold` was removed.
-    #[cfg(unix)]
     {
         let alive = Command::new("kill")
             .args(["-0", waiting.trim()])
