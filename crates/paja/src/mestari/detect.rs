@@ -34,54 +34,49 @@ pub fn init_agent(
         port_count: 0,
         created_ms: 0,
     };
-    crate::sandbox::activate(start_sandbox(home, repo, base)?);
-    let result = (|| {
-        let tools = [
-            "Read",
-            "Glob",
-            "Grep",
-            "Bash(git status*)",
-            "Bash(git diff*)",
-            "Bash(git log*)",
-            "Bash(git show*)",
-            "Bash(tail *)",
-            "Bash(head *)",
-            "Bash(grep *)",
-            "Bash(wc *)",
-            "Bash(pwd)",
-        ];
-        let out = claude(
-            home,
-            &env,
-            base,
-            prompt,
-            &tools,
-            Some(schema),
-            true,
-            &models.args("init"),
-        )?;
-        out.get("structured_output")
-            .cloned()
-            .context("the init agent returned no answer")
-    })();
-    crate::sandbox::activate(None);
-    result
+    let _sandbox = crate::sandbox::enter(start_sandbox(home, repo, base)?);
+    let tools = [
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash(git status*)",
+        "Bash(git diff*)",
+        "Bash(git log*)",
+        "Bash(git show*)",
+        "Bash(tail *)",
+        "Bash(head *)",
+        "Bash(grep *)",
+        "Bash(wc *)",
+        "Bash(pwd)",
+    ];
+    // The repository's CLAUDE.md is data the agent reads and judges, not its rules, so it
+    // isn't put in the system prompt (where a large one could also overrun the command line).
+    let out = claude_with(
+        home,
+        &env,
+        base,
+        prompt,
+        &tools,
+        Some(schema),
+        true,
+        &models.args("init"),
+        None,
+        Harness::Omitted,
+    )?;
+    out.get("structured_output")
+        .cloned()
+        .context("the init agent returned no answer")
 }
 
-/// A sandbox, when `PAJA_SBX` asks for one, that can reach the fresh clone `dir`, which is not
-/// under the home's `envs` folder.
+/// A sandbox, when one is available or `PAJA_SBX` names one, that can reach the fresh clone
+/// `dir`, which is not under the home's `envs` folder.
 fn clone_sandbox(home: &Home, dir: &Path) -> Result<Option<crate::sandbox::Sbx>> {
-    if crate::sandbox::configured().is_none() {
-        progress(&format!(
-            "no sandbox ({} is not set): agents and checks run as you, behind the deny-list hook only",
-            crate::sandbox::PROGRAM_VAR
-        ));
+    let Some(choice) = choose_backend()? else {
         return Ok(None);
-    }
-    progress("starting the sandbox");
+    };
     let envs = home.envs_dir();
     std::fs::create_dir_all(&envs).with_context(|| format!("creating {}", envs.display()))?;
-    crate::sandbox::start(&[envs, dir.to_path_buf()], None)
+    crate::sandbox::start(&choice, &[envs, dir.to_path_buf()], None).map(Some)
 }
 
 /// Run the skeleton agent in `dir`, a fresh clone with no commit, and wait for it to finish: it
@@ -113,7 +108,7 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
         port_count: 0,
         created_ms: 0,
     };
-    crate::sandbox::activate(clone_sandbox(home, dir)?);
+    let sandbox = crate::sandbox::enter(clone_sandbox(home, dir)?);
     let result = {
         let program_tools = program_tools(programs);
         let mut tools: Vec<&str> = vec!["Read", "Edit", "Write", "Glob", "Grep"];
@@ -139,9 +134,10 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
             false,
             &Models::default().args("init"),
             Some(programs),
+            Harness::DefaultBranch,
         )
     };
-    crate::sandbox::activate(None);
+    drop(sandbox);
     result?;
     // The agent may run local git, but the skeleton must stay uncommitted on the clone's branch:
     // a commit would hide its files from the next step, and another branch would push nothing.
@@ -150,9 +146,8 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
     if branch != env.branch || !unborn {
         bail!(
             "the init agent committed or switched branches in {} (it must leave the skeleton \
-             uncommitted on `{}`), so nothing was pushed; delete the new repository on GitHub \
-             (`gh repo delete`) and that folder, then run `paja init --new` again, or use a stack \
-             with a built-in skeleton (rust, node, python)",
+             uncommitted on `{}`), so nothing was pushed; to avoid it, use a stack with a built-in \
+             skeleton (rust, node, python), which needs no init agent",
             dir.display(),
             env.branch
         );
@@ -164,9 +159,9 @@ pub fn skeleton_agent(home: &Home, dir: &Path, programs: &[String], prompt: &str
 /// output, or None when they all pass.
 pub fn skeleton_checks(home: &Home, dir: &Path, checks: &[String]) -> Result<Option<String>> {
     let guard = GitGuard::new(dir)?;
-    crate::sandbox::activate(clone_sandbox(home, dir)?);
+    let sandbox = crate::sandbox::enter(clone_sandbox(home, dir)?);
     let result = run_checks(dir, checks);
-    crate::sandbox::activate(None);
+    drop(sandbox);
     guard.check("Vasara's checks")?;
     result
 }
@@ -221,7 +216,7 @@ pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Valu
             port_count: 0,
             created_ms: 0,
         };
-        crate::sandbox::activate(start_sandbox(home, &dir, &base)?);
+        let sandbox = crate::sandbox::enter(start_sandbox(home, &dir, &base)?);
         let out = claude(
             home,
             &env,
@@ -234,7 +229,7 @@ pub fn recommend_agent(home: &Home, prompt: &str, schema: &Value) -> Result<Valu
             true,
             &Models::default().args("init"),
         );
-        crate::sandbox::activate(None);
+        drop(sandbox);
         out?.get("structured_output")
             .cloned()
             .context("the init agent returned no answer")

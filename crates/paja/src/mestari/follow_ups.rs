@@ -66,6 +66,9 @@ pub(super) fn to_fix(findings: &[Finding]) -> Vec<&Finding> {
         .collect()
 }
 
+/// Why a finding in the change is left: it was still open at the round limit.
+pub(super) const ROUND_LIMIT: &str = "not filed: round limit";
+
 /// The findings a change lands without, each as text fit for a pull request's description and
 /// the log, with why it is left: outside the change, or still open at the round limit. No issue
 /// is filed: a finding is fixed in the change that drew it, and what is left is for a person to
@@ -92,7 +95,7 @@ pub(super) fn unsettled(
             let why = if finding.kind == FindingKind::Outside {
                 "not filed: outside the change"
             } else {
-                "not filed: round limit"
+                ROUND_LIMIT
             };
             (cut, why)
         })

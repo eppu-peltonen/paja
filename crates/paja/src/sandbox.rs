@@ -1,22 +1,80 @@
-//! The optional sandbox: one long-lived Docker Sandboxes (`sbx`) sandbox that Mestari runs agent
-//! sessions and Vasara's checks in, so the code they start can't reach the owner's files or
-//! credentials. See "The sandbox" in `docs/design/architecture.md`.
+//! The sandbox: one long-lived Docker Sandboxes (`sbx`) sandbox that Mestari runs agent sessions
+//! and Vasara's checks in, so the code they start can't reach the owner's files or credentials.
+//! See "The sandbox" in `docs/design/architecture.md`.
 //!
-//! The backend is optional: it is on when `PAJA_SBX` names the `sbx` program, and then it fails
-//! closed. Nothing here needs Docker unless it is on, so tests use a fake `sbx`.
+//! It is on by default whenever `sbx` is available ([`choose`]): `PAJA_SBX` names the program,
+//! or, when it is unset, `sbx` on `PATH` that answers is used; `PAJA_SBX=off` runs on the host.
+//! Once on, it fails closed. Nothing here needs Docker unless `sbx` is there, so tests use a fake
+//! `sbx`.
 //!
 //! Everything Paja assumes about `sbx` is in this file: `sbx exec [-w DIR] [-e K=V] NAME -- CMD`,
-//! `sbx create --name NAME AGENT PATH...`, and that a mounted path has the same absolute path
+//! `sbx create --name NAME AGENT PATH...`, that `sbx version` and `sbx ls` succeed when it and
+//! the Docker engine it needs are working, and that a mounted path has the same absolute path
 //! inside the sandbox.
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 
-/// The environment variable that names the `sbx` program and turns the sandbox on.
+/// The environment variable that names the `sbx` program, or is `off` for the host.
 pub const PROGRAM_VAR: &str = "PAJA_SBX";
+
+/// Set on a child Paja (a pool's lane or planner) by [`pass_to`]: its parent's choice, as
+/// `why:program` for a sandbox and `why` for the host, so the child runs where its parent
+/// chose and says why. `PAJA_SBX` stays as the person set it. The child's `main` takes this out
+/// of its environment as it starts ([`take_passed`]), so agents, checks and the Paja they run
+/// never see it.
+pub const PASSED_VAR: &str = "PAJA_SBX_PASSED";
+
+/// The choice every [`chosen`] in this process returns, once set: by [`pin`], or by
+/// [`take_passed`] from a parent's [`pass_to`].
+static PINNED: std::sync::OnceLock<Choice> = std::sync::OnceLock::new();
+
+/// Make every later [`chosen`] in this process return `choice` (the first pin wins). A pool
+/// pins the choice it made, so its own daily triage runs where its lanes do.
+pub fn pin(choice: &Choice) {
+    let _ = PINNED.set(choice.clone());
+}
+
+/// Read `PAJA_SBX_PASSED`, remove it from this process's environment, and [`pin`] the choice it
+/// holds. Removing a variable is sound only while one thread runs: `paja`'s `main` calls this
+/// first, before anything starts a thread, and nothing else may (Paja Desk and tests never
+/// do, so they never honour it). A value that doesn't parse pins nothing, and the process
+/// chooses for itself.
+pub fn take_passed() {
+    let Some(value) = std::env::var_os(PASSED_VAR) else {
+        return;
+    };
+    std::env::remove_var(PASSED_VAR);
+    if let Some(choice) = parse_passed(&value.to_string_lossy()) {
+        pin(&choice);
+    }
+}
+
+/// [`pass_to`]'s value read back.
+fn parse_passed(value: &str) -> Option<Choice> {
+    // The reason has no `:`, a Windows path does: split at the first.
+    let (why, program) = match value.split_once(':') {
+        Some((why, program)) => (why, Some(program.to_string())),
+        None => (value, None),
+    };
+    let why = [Why::Set, Why::Detected, Why::Off, Why::NotFound]
+        .into_iter()
+        .find(|w| w.as_str() == why)?;
+    // A program goes with a sandbox's reasons only.
+    let sandbox = matches!(why, Why::Set | Why::Detected);
+    (program.as_deref().is_some_and(|p| !p.is_empty()) == sandbox)
+        .then_some(Choice { program, why })
+}
+
+/// The program looked for on `PATH` when [`PROGRAM_VAR`] is unset.
+const DEFAULT_PROGRAM: &str = "sbx";
+
+/// How long finding out whether a detected `sbx` works may take, so a stuck daemon can't hang a
+/// run.
+pub const PROBE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The sandbox's name. One per machine; it is reused by every run.
 const NAME: &str = "paja";
@@ -36,25 +94,42 @@ const WORKTREE_GITDIR_VAR: &str = "PAJA_WT_GITDIR";
 /// A `git` that runs in the sandbox ahead of the real one when the worktree's `.git` file holds a
 /// host path (`C:/.../.git/worktrees/x`) the sandbox can't resolve. A git command aimed at the
 /// worktree (the current directory or the `-C` directories are inside it, after any other global
-/// options) gets `--git-dir` and `--work-tree` in the sandbox's spelling. Git passes the git
-/// directory down to every process it starts (hooks, `!` aliases, submodule commands) as
-/// `GIT_DIR` and `GIT_WORK_TREE`, so a nested git aimed outside the worktree would inherit the
-/// worktree's: the shim clears an inherited `GIT_DIR` that equals the worktree's git directory
-/// for commands aimed outside the worktree. A caller's own `GIT_DIR` (any other value) or
-/// `--git-dir`/`--work-tree` is left alone, and every other git command runs unchanged. Paths
-/// are compared by identity (`-ef`: each directory from the target up to `/` against the root),
-/// not by spelling, so separators, case, short names (`RUNNER~1`) and mount spellings don't
-/// matter.
+/// options) gets `--git-dir` and `--work-tree` in the sandbox's spelling; when the caller chose
+/// its own work tree (`--work-tree` or a `GIT_WORK_TREE` naming another directory) it gets only
+/// `--git-dir`, the repository git would find there itself. A caller that chose its own
+/// repository (`--git-dir` or a `GIT_DIR` naming another directory) gets nothing added.
+///
+/// A git directory passed this way reaches the processes git starts as `GIT_DIR` and
+/// `GIT_WORK_TREE`, so a nested git that does reach the shim could inherit the worktree's. Each is
+/// decided on its own: an inherited `GIT_DIR` that is the worktree's git directory is cleared for
+/// a command aimed outside the worktree, and an inherited `GIT_WORK_TREE` that is the worktree is
+/// cleared for a command aimed outside it or at another repository of the caller's choosing,
+/// and so is an inherited `GIT_INDEX_FILE` in the worktree's git directory. A value naming any
+/// other directory is the caller's own and left alone. A caller that sets any of them to
+/// the worktree's own can't be told from git handing it down, so it is treated the same way.
+/// Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a git called
+/// there usually runs the real git, not this shim. A relative value is read, as git reads it,
+/// against the directory after any `-C`; git hands down absolute ones, except the `.` it gives
+/// a hook as `GIT_WORK_TREE`, which a hook that runs git in another directory makes the
+/// caller's own. Paths are compared by identity (`-ef`: each directory from the target up to
+/// `/` against the root, and the git directories), not by spelling, so separators, case, short
+/// names (`RUNNER~1`), symlinks and mount spellings don't matter.
 const GIT_SHIM: &str = r#"#!/bin/sh
 dir=.
 want=0
 skip=0
-own=0
-inherited=0
-if [ -n "${GIT_DIR:-}" ]; then
-  if [ "$GIT_DIR" = "$PAJA_WT_GITDIR" ]; then inherited=1; else own=1; fi
-fi
+gd=none
+wt=none
+fgd=0
+fwt=0
+gdv=
+ix=none
 for a in "$@"; do
+  if [ "$want" = 2 ]; then
+    gdv=$a
+    want=0
+    continue
+  fi
   if [ "$want" = 1 ]; then
     dir=$(cd "$dir" 2>/dev/null && cd "$a" 2>/dev/null && pwd -P) || dir=/nonexistent-paja
     want=0
@@ -67,23 +142,47 @@ for a in "$@"; do
   case "$a" in
     -C) want=1 ;;
     -c|--namespace|--super-prefix|--config-env) skip=1 ;;
-    --git-dir|--work-tree) own=1; skip=1 ;;
-    --git-dir=*|--work-tree=*) own=1 ;;
+    --git-dir) fgd=1; want=2 ;;
+    --work-tree) fwt=1; skip=1 ;;
+    --git-dir=*) fgd=1; gdv=${a#--git-dir=} ;;
+    --work-tree=*) fwt=1 ;;
     -*) ;;
     *) break ;;
   esac
 done
+# Git reads a relative value after any `-C`.
+at() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$dir/$1" ;; esac; }
+if [ -n "${GIT_DIR:-}" ]; then
+  if [ "$GIT_DIR" = "$PAJA_WT_GITDIR" ] || [ "$(at "$GIT_DIR")" -ef "$PAJA_WT_GITDIR" ]; then gd=inherited; else gd=own; fi
+fi
+if [ -n "${GIT_WORK_TREE:-}" ]; then
+  if [ "$GIT_WORK_TREE" = "$PAJA_WT_ROOT" ] || [ "$(at "$GIT_WORK_TREE")" -ef "$PAJA_WT_ROOT" ]; then wt=inherited; else wt=own; fi
+fi
+if [ -n "${GIT_INDEX_FILE:-}" ] && [ "$(dirname "$(at "$GIT_INDEX_FILE")")" -ef "$PAJA_WT_GITDIR" ]; then ix=inherited; fi
+if [ "$fgd" = 1 ] || [ "$gd" = own ]; then
+  # The caller chose a repository: the worktree's inherited work tree and index belong to it
+  # only when that is the worktree's own git directory.
+  chosen=${gdv:-$GIT_DIR}
+  if [ "$fgd" = 0 ] || { [ "$chosen" != "$PAJA_WT_GITDIR" ] && ! [ "$(at "$chosen")" -ef "$PAJA_WT_GITDIR" ]; }; then
+    if [ "$wt" = inherited ]; then unset GIT_WORK_TREE; fi
+    if [ "$ix" = inherited ]; then unset GIT_INDEX_FILE; fi
+  fi
+  exec "$PAJA_REAL_GIT" "$@"
+fi
 p=$(cd "$dir" 2>/dev/null && pwd -P)
-while [ "$own" = 0 ] && [ -n "$p" ]; do
+while [ -n "$p" ]; do
   if [ "$p" -ef "$PAJA_WT_ROOT" ]; then
+    if [ "$fwt" = 1 ] || [ "$wt" = own ]; then
+      exec "$PAJA_REAL_GIT" --git-dir="$PAJA_WT_GITDIR" "$@"
+    fi
     exec "$PAJA_REAL_GIT" --git-dir="$PAJA_WT_GITDIR" --work-tree="$PAJA_WT_ROOT" "$@"
   fi
   [ "$p" = / ] && break
   p=$(dirname "$p")
 done
-if [ "$inherited" = 1 ] && [ "$own" = 0 ]; then
-  unset GIT_DIR GIT_WORK_TREE
-fi
+if [ "$gd" = inherited ]; then unset GIT_DIR; fi
+if [ "$wt" = inherited ]; then unset GIT_WORK_TREE; fi
+if [ "$ix" = inherited ]; then unset GIT_INDEX_FILE; fi
 exec "$PAJA_REAL_GIT" "$@""#;
 
 /// Puts rustup's directory on `PATH`, installs the git shim when the worktree needs one, then
@@ -184,26 +283,248 @@ const TOOLCHAIN_CHECK: &str = "cc --version && cargo --version && rustfmt --vers
 pub struct Sbx {
     program: String,
     name: String,
+    why: Why,
 }
 
-static ACTIVE: Mutex<Option<Sbx>> = Mutex::new(None);
-
-/// Use `sandbox` for every agent and check from now on, or none.
-pub fn activate(sandbox: Option<Sbx>) {
-    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = sandbox;
+thread_local! {
+    // One slot per thread, not per process: a long-lived caller such as `paja mcp` runs each
+    // call on a thread of its own, so two calls at once never start an agent in each other's
+    // sandbox, or in none once the other has finished.
+    static ACTIVE: RefCell<Option<Sbx>> = const { RefCell::new(None) };
 }
 
-/// The sandbox in use, if the run started one.
+/// Use `sandbox` (or none) for the agents and checks this thread starts until the returned
+/// guard is dropped, which puts back the sandbox in use before, on every way out. Guards are
+/// dropped in the reverse order they were entered, as they are when each is bound to a local;
+/// the guard can't be sent to another thread.
+#[must_use = "the sandbox is in use only while the guard lives"]
+pub fn enter(sandbox: Option<Sbx>) -> Entered {
+    Entered {
+        before: ACTIVE.with(|slot| slot.replace(sandbox)),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// The sandbox in use on this thread, if the step started one.
 pub fn active() -> Option<Sbx> {
-    ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    ACTIVE.with(|slot| slot.borrow().clone())
 }
 
-/// The `sbx` program, when the person turned the sandbox on.
-pub fn configured() -> Option<String> {
-    std::env::var(PROGRAM_VAR)
+/// What [`enter`] returns: while it lives, its sandbox is the thread's.
+pub struct Entered {
+    before: Option<Sbx>,
+    // Not `Send`: dropped on another thread, it would set that thread's slot instead.
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        let before = self.before.take();
+        ACTIVE.with(|slot| *slot.borrow_mut() = before);
+    }
+}
+
+/// Why agents and checks run where they do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// [`PROGRAM_VAR`] names the program.
+    Set,
+    /// [`PROGRAM_VAR`] is unset, and `sbx` on `PATH` answered.
+    Detected,
+    /// [`PROGRAM_VAR`] is `off` (or empty): the host, without looking for `sbx`.
+    Off,
+    /// [`PROGRAM_VAR`] is unset, and there is no `sbx` on `PATH`: the host.
+    NotFound,
+}
+
+impl Why {
+    /// The word the event log and the JSON reports use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Why::Set => "set",
+            Why::Detected => "detected",
+            Why::Off => "off",
+            Why::NotFound => "not_found",
+        }
+    }
+}
+
+/// Where agents and checks run: in the sandbox `program` names, or on the host (`None`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Choice {
+    pub program: Option<String>,
+    pub why: Why,
+}
+
+impl Choice {
+    /// What the run's progress line and `paja doctor` say about it.
+    pub fn describe(&self) -> String {
+        let var = PROGRAM_VAR;
+        match (&self.program, self.why) {
+            (Some(program), Why::Detected) => format!(
+                "the sandbox, with `{program}` found on PATH ({var}=off runs on the host instead)"
+            ),
+            (Some(program), _) => format!("the sandbox, with {var}={program}"),
+            (None, Why::Off) => format!("no sandbox, as {var} is off"),
+            (None, _) => format!("no sandbox, as there is no `{DEFAULT_PROGRAM}` on PATH"),
+        }
+    }
+}
+
+/// Which backend to use, read from [`PROGRAM_VAR`] and `PATH` without starting anything: the
+/// program it names; the host when it is `off` or empty; when it is unset, `sbx` on `PATH`, or
+/// the host when there is none. A detected `sbx` is [`probe`]d before it is used; a named one
+/// fails, if it does, when it starts.
+pub fn chosen() -> Choice {
+    PINNED.get().cloned().unwrap_or_else(chosen_by_var)
+}
+
+/// Make `cmd`, a child Paja, use `choice`, made once by its parent, instead of choosing again:
+/// a pool whose lanes chose each for themselves could start one on the host after another
+/// in the sandbox, were `sbx` to leave `PATH` while it runs. A detected `sbx` is probed again
+/// in the child, which fails closed when it stopped working.
+pub fn pass_to(choice: &Choice, cmd: &mut Command) {
+    let value = match &choice.program {
+        Some(program) => format!("{}:{program}", choice.why.as_str()),
+        None => choice.why.as_str().to_string(),
+    };
+    cmd.env(PASSED_VAR, value);
+}
+
+fn chosen_by_var() -> Choice {
+    match std::env::var_os(PROGRAM_VAR) {
+        Some(value) => {
+            let value = value.to_string_lossy().trim().to_string();
+            if value.is_empty() || value.eq_ignore_ascii_case("off") {
+                Choice {
+                    program: None,
+                    why: Why::Off,
+                }
+            } else {
+                Choice {
+                    program: Some(value),
+                    why: Why::Set,
+                }
+            }
+        }
+        None => match crate::platform::program_on_path(DEFAULT_PROGRAM) {
+            Some(path) => Choice {
+                program: Some(path.to_string_lossy().into_owned()),
+                why: Why::Detected,
+            },
+            None => Choice {
+                program: None,
+                why: Why::NotFound,
+            },
+        },
+    }
+}
+
+/// Whether this process has used an `sbx` it found on `PATH`: once it has, a later step that
+/// finds none stops rather than run on the host (`sbx` mid-upgrade, say).
+static DETECTED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why the last step [`choose`] chose for ran on the host, for [`backend_why`]: what was
+/// chosen, never what `PATH` holds later.
+static LAST_HOST_WHY: std::sync::Mutex<Option<Why>> = std::sync::Mutex::new(None);
+
+/// [`chosen`], with a detected `sbx` [`probe`]d first: one that is installed but doesn't work
+/// is an error that names the fix, never a silent fall back to the host. Neither is an `sbx`
+/// that this process detected before and that has left `PATH` since.
+pub fn choose() -> Result<Choice> {
+    use std::sync::atomic::Ordering;
+    let choice = chosen();
+    match (&choice.program, choice.why) {
+        (Some(program), Why::Detected) => {
+            probe(program)?;
+            DETECTED_ONCE.store(true, Ordering::Relaxed);
+        }
+        (None, Why::NotFound) if detected_earlier() => bail!("{}", lost_sbx()),
+        _ => {}
+    }
+    if choice.program.is_none() {
+        *LAST_HOST_WHY.lock().unwrap_or_else(|e| e.into_inner()) = Some(choice.why);
+    }
+    Ok(choice)
+}
+
+/// Whether this process has used an `sbx` it found on `PATH`, so finding none now is an error.
+pub fn detected_earlier() -> bool {
+    DETECTED_ONCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The error for an `sbx` this process used and no longer finds on `PATH`.
+pub fn lost_sbx() -> String {
+    format!(
+        "`{DEFAULT_PROGRAM}` was on PATH earlier in this run, so its agents ran in the sandbox, \
+         and now it isn't; put Docker Sandboxes (`{DEFAULT_PROGRAM}`) back on PATH, or set \
+         {PROGRAM_VAR}=off and start Paja again (`paja mcp` too) to use the host"
+    )
+}
+
+/// The sandbox's name: `PAJA_SBX_NAME`, or `paja`.
+pub fn sandbox_name() -> String {
+    std::env::var(NAME_VAR)
         .ok()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| NAME.to_string())
+}
+
+/// Whether `program` (an `sbx`) works: `version` succeeds, and so does `ls`, which needs the
+/// Docker engine. Both together are stopped after [`PROBE_LIMIT`]. The error names the fix.
+pub fn probe(program: &str) -> Result<()> {
+    let Err(cause) = probe_within(program, PROBE_LIMIT) else {
+        return Ok(());
+    };
+    bail!(
+        "`{program}` was found on PATH, so Paja runs agents and checks in its sandbox, but {cause}. \
+         {}",
+        probe_fix(program)
+    )
+}
+
+/// What to do about an `sbx` that fails [`probe`].
+pub fn probe_fix(program: &str) -> String {
+    let name = sandbox_name();
+    format!(
+        "Start Docker Desktop (the engine `sbx` needs) and run again; if the sandbox `{name}` \
+         exists and isn't signed in, run `{program} exec -it {name} claude` and type `/login`; or \
+         set {PROGRAM_VAR}=off to run on the host, behind the deny-list hook only"
+    )
+}
+
+/// [`probe`]'s two steps within `limit` in all: which failed and what it said, when one did.
+pub fn probe_within(program: &str, limit: std::time::Duration) -> std::result::Result<(), String> {
+    let started = std::time::Instant::now();
+    for step in ["version", "ls"] {
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(format!(
+                "`{program} {step}` didn't start: the steps before it used all of {}s",
+                limit.as_secs()
+            ));
+        }
+        let mut cmd = Command::new(program);
+        cmd.arg(step);
+        let out =
+            crate::platform::output_within(crate::platform::own_process_group(&mut cmd), left);
+        let said = match out {
+            Ok(out) if out.status.success() => continue,
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                format!(
+                    "{} ({})",
+                    if stderr.is_empty() { stdout } else { stderr },
+                    out.status
+                )
+            }
+            Err(err) => format!("{err:#} (the probe has {}s in all)", limit.as_secs()),
+        };
+        return Err(format!("`{program} {step}` failed: {said}"));
+    }
+    Ok(())
 }
 
 /// The project's setup script, read from the default branch.
@@ -227,21 +548,18 @@ fn script_hash(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Start (or reuse) the sandbox with `mounts` reachable inside it. `Ok(None)` when it isn't
-/// configured; an error, never a silent fallback, when it is configured but can't start.
-/// `setup` is the project's `.paja/setup` from the default branch; without it the sandbox gets
-/// the Rust toolchain.
-pub fn start(mounts: &[PathBuf], setup: Option<&str>) -> Result<Option<Sbx>> {
-    let Some(program) = configured() else {
-        return Ok(None);
-    };
+/// Start (or reuse) the sandbox of `program` with `mounts` reachable inside it: an error, never
+/// a silent fallback, when it can't start. `setup` is the project's `.paja/setup` from the
+/// default branch; without it the sandbox gets the Rust toolchain.
+pub fn start(choice: &Choice, mounts: &[PathBuf], setup: Option<&str>) -> Result<Sbx> {
+    let program = choice
+        .program
+        .as_deref()
+        .context("no sandbox program was chosen")?;
     let sbx = Sbx {
-        program,
-        name: std::env::var(NAME_VAR)
-            .ok()
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| NAME.to_string()),
+        program: program.to_string(),
+        why: choice.why,
+        name: sandbox_name(),
     };
     if sbx.exec_ok("true").is_err() {
         let mut create = Command::new(&sbx.program);
@@ -314,7 +632,7 @@ pub fn start(mounts: &[PathBuf], setup: Option<&str>) -> Result<Option<Sbx>> {
             )
         })?;
     }
-    Ok(Some(sbx))
+    Ok(sbx)
 }
 
 /// `path` as the sandbox spells it. The sandbox is Linux: on Windows `C:\a\b` is `/c/a/b` there
@@ -363,6 +681,25 @@ fn transcript_script(id: &str) -> String {
     format!("ls \"$HOME\"/.claude/projects/*/{id}.jsonl >/dev/null 2>&1")
 }
 
+/// The shell script [`draining_stdin`] runs in the sandbox: read all of stdin (the `.` keeps
+/// trailing newlines through `$(...)`), then become the program with it on a here-document.
+/// The end marker is matched before `$p` is expanded, so no line of the prompt can end it.
+const DRAIN: &str =
+    "p=$(cat; echo .) && p=${p%.} && exec \"$@\" <<PAJA_PROMPT_END\n$p\nPAJA_PROMPT_END";
+
+/// `argv` wrapped so that, in the sandbox, all of its stdin is read before the program starts,
+/// and the program, which replaces the shell, gets it back on its own stdin. `sbx exec -i` never
+/// returns when the program in the sandbox exits before it has read all of its stdin (the
+/// sandbox's copy of stdin fails with a broken pipe), as an agent that fails early does; read
+/// to the end first, the copy always completes. Nothing is written outside the sandbox, so
+/// nothing there can redirect it. The program sees the text with one newline added; it is for
+/// text, since the shell drops NUL bytes.
+pub fn draining_stdin(argv: &[String]) -> Vec<String> {
+    let mut wrapped = vec!["sh".into(), "-c".into(), DRAIN.into(), "sh".into()];
+    wrapped.extend(argv.iter().cloned());
+    wrapped
+}
+
 /// Make an `sbx exec` command from [`Sbx::command`] pass Paja's stdin to the program in the
 /// sandbox (`exec -i`), for a prompt written there. Any other command is left as it is.
 pub fn keep_stdin(cmd: &mut Command) {
@@ -384,21 +721,36 @@ pub fn keep_stdin(cmd: &mut Command) {
     *cmd = kept;
 }
 
+/// Why the agents and checks a step starts now run where they do: the sandbox in use and why it
+/// was chosen, or why there is none.
+pub fn backend_why() -> Why {
+    active().map_or_else(
+        || {
+            LAST_HOST_WHY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|| chosen().why)
+        },
+        |sbx| sbx.why,
+    )
+}
+
 impl Sbx {
     fn unavailable(&self) -> String {
-        format!(
-            "running `{}` ({} names it): {}",
-            self.program,
-            PROGRAM_VAR,
-            self.fix()
-        )
+        let named = match self.why {
+            Why::Detected => "found on PATH".to_string(),
+            _ => format!("{PROGRAM_VAR} names it"),
+        };
+        format!("running `{}` ({named}): {}", self.program, self.fix())
     }
 
     fn fix(&self) -> String {
+        if self.why == Why::Detected {
+            return probe_fix(&self.program);
+        }
         format!(
-            "install Docker Sandboxes (`sbx`) and sign in to Docker, or unset {} to run agents \
-             behind the deny-list hook only",
-            PROGRAM_VAR
+            "install Docker Sandboxes (`sbx`), start Docker Desktop and sign in to Docker, or set \
+             {PROGRAM_VAR}=off to run agents behind the deny-list hook only"
         )
     }
 
@@ -586,7 +938,123 @@ mod tests {
         Sbx {
             program: "sbx".into(),
             name: "paja".into(),
+            why: Why::Set,
         }
+    }
+
+    fn named(name: &str) -> Option<Sbx> {
+        Some(Sbx {
+            program: "sbx".into(),
+            name: name.into(),
+            why: Why::Set,
+        })
+    }
+
+    fn active_name() -> Option<String> {
+        active().map(|s| s.name)
+    }
+
+    #[test]
+    fn a_sandbox_is_in_use_while_its_guard_lives_and_the_one_before_comes_back() {
+        assert!(active().is_none());
+        let outer = enter(named("outer"));
+        assert_eq!(active_name().as_deref(), Some("outer"));
+        {
+            let _none = enter(None);
+            assert!(active().is_none());
+        }
+        assert_eq!(active_name().as_deref(), Some("outer"));
+        // An early return (here a `?`) drops the guard too, so the slot is never left set.
+        let step = || -> Result<()> {
+            let _inner = enter(named("inner"));
+            assert_eq!(active_name().as_deref(), Some("inner"));
+            anyhow::bail!("the agent failed")
+        };
+        assert!(step().is_err());
+        assert_eq!(active_name().as_deref(), Some("outer"));
+        drop(outer);
+        assert!(active().is_none());
+    }
+
+    #[test]
+    fn two_threads_at_once_each_keep_their_own_sandbox() {
+        // As two `paja mcp` tool calls do: each enters its sandbox, and the other's entering
+        // and leaving in between changes nothing for it.
+        let (a_in, b_in) = (
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+        );
+        let (a_out, b_out) = (a_in.clone(), b_in.clone());
+        let a = std::thread::spawn(move || {
+            let _a = enter(named("a"));
+            a_out.wait(); // b enters its own
+            b_out.wait(); // b has left its own
+            active_name()
+        });
+        let b = std::thread::spawn(move || {
+            a_in.wait();
+            let first = {
+                let _b = enter(named("b"));
+                active_name()
+            };
+            b_in.wait();
+            (first, active_name())
+        });
+        assert_eq!(a.join().unwrap().as_deref(), Some("a"));
+        let (first, after) = b.join().unwrap();
+        assert_eq!(first.as_deref(), Some("b"));
+        assert_eq!(after, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draining_stdin_hands_the_program_all_of_stdin_and_becomes_it() {
+        use std::io::Write;
+        let input = "a \"b\" $x `y` \\n\n\n";
+        let argv = draining_stdin(&["cat".to_string()]);
+        assert_eq!(argv[..4], ["sh", "-c", DRAIN, "sh"]);
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("{input}\n"));
+        // A program that exits without reading still leaves stdin read to the end, and its
+        // own exit status is the wrapper's.
+        let argv = draining_stdin(&["sh".into(), "-c".into(), "exit 7".into()]);
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&[b'x'; 300_000])
+            .unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        // The shell hands its process over to the program, so stopping one stops the other.
+        let argv = draining_stdin(&["sh".into(), "-c".into(), "echo $$".into()]);
+        let shell = Command::new("sh")
+            .args(["-c", "echo $$; exec \"$@\""])
+            .arg("sh")
+            .args(&argv)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let shell = String::from_utf8(shell.stdout).unwrap();
+        let mut pids = shell.lines();
+        assert_eq!(pids.next(), pids.next(), "{shell}");
     }
 
     #[test]
@@ -693,6 +1161,18 @@ mod tests {
 
     /// Like `shim_sees`, with `GIT_DIR` set in the shim's environment when given.
     fn shim_sees_with(root_s: &str, cwd: &Path, args: &[&str], git_dir: Option<&str>) -> String {
+        let env: Vec<(&str, &str)> = git_dir.map(|g| ("GIT_DIR", g)).into_iter().collect();
+        shim_sees_in(root_s, "/gitdirs/w", cwd, args, &env)
+    }
+
+    /// Like `shim_sees`, for the worktree git directory `gitdir_s` and with `env` set.
+    fn shim_sees_in(
+        root_s: &str,
+        gitdir_s: &str,
+        cwd: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> String {
         let tools = tempfile::tempdir().unwrap();
         let slash = |p: &Path| p.display().to_string().replace('\\', "/");
         let shim = tools.path().join("shim");
@@ -700,7 +1180,7 @@ mod tests {
         std::fs::write(&shim, GIT_SHIM).unwrap();
         std::fs::write(
             &real,
-            "#!/bin/sh\ndir=; tree=\nfor a in \"$@\"; do case \"$a\" in --git-dir=*) dir=${a#--git-dir=} ;; --work-tree=*) tree=${a#--work-tree=} ;; esac; done\necho \"dir=$dir tree=$tree env=${GIT_DIR:-}\"\n",
+            "#!/bin/sh\ndir=; tree=; wt=\nfor a in \"$@\"; do case \"$a\" in --git-dir=*) dir=${a#--git-dir=} ;; --work-tree=*) tree=${a#--work-tree=} ;; esac; done\nif [ -n \"${GIT_WORK_TREE:-}\" ]; then wt=\" wt=$GIT_WORK_TREE\"; fi\nif [ -n \"${GIT_INDEX_FILE:-}\" ]; then wt=\"$wt ix=$GIT_INDEX_FILE\"; fi\necho \"dir=$dir tree=$tree env=${GIT_DIR:-}$wt\"\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -714,12 +1194,11 @@ mod tests {
             .current_dir(cwd)
             .env("PAJA_REAL_GIT", slash(&real))
             .env(WORKTREE_ROOT_VAR, root_s)
-            .env(WORKTREE_GITDIR_VAR, "/gitdirs/w")
+            .env(WORKTREE_GITDIR_VAR, gitdir_s)
             .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE");
-        if let Some(g) = git_dir {
-            cmd.env("GIT_DIR", g);
-        }
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .envs(env.iter().copied());
         let out = cmd.output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
@@ -815,6 +1294,164 @@ mod tests {
             shim_sees_with(&root_s, other.path(), &["status"], Some("/x")),
             "dir= tree= env=/x"
         );
+    }
+
+    #[test]
+    fn the_git_shim_knows_the_inherited_git_directory_and_work_tree_by_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let gitdirs = tempfile::tempdir().unwrap();
+        let gitdir = gitdirs.path().join("w");
+        std::fs::create_dir(&gitdir).unwrap();
+        let root_s = shell_path(root.path());
+        let gitdir_s = shell_path(&gitdir);
+        // The same directories, spelled another way.
+        let gitdir_other = format!("{}/./w", shell_path(gitdirs.path()));
+        let root_other = format!("{root_s}/.");
+        let sees = |cwd: &Path, env: &[(&str, &str)]| {
+            shim_sees_in(&root_s, &gitdir_s, cwd, &["status"], env)
+        };
+        let outside = "dir= tree= env=";
+        // Git handed the worktree's git directory down in another spelling: still cleared.
+        assert_eq!(sees(other.path(), &[("GIT_DIR", &gitdir_other)]), outside);
+        // An inherited GIT_WORK_TREE, with GIT_DIR or on its own, is cleared too.
+        assert_eq!(
+            sees(
+                other.path(),
+                &[("GIT_DIR", &gitdir_s), ("GIT_WORK_TREE", &root_s)]
+            ),
+            outside
+        );
+        assert_eq!(
+            sees(other.path(), &[("GIT_WORK_TREE", &root_other)]),
+            outside
+        );
+        // Inside the worktree it is redirected, the variable left as it was.
+        assert_eq!(
+            sees(root.path(), &[("GIT_WORK_TREE", &root_s)]),
+            format!("dir={gitdir_s} tree={root_s} env= wt={root_s}")
+        );
+        // A work tree the caller chose is left alone; inside the worktree the command still gets
+        // the worktree's git directory, which git would find there itself.
+        let other_s = shell_path(other.path());
+        assert_eq!(
+            sees(root.path(), &[("GIT_WORK_TREE", &other_s)]),
+            format!("dir={gitdir_s} tree= env= wt={other_s}")
+        );
+        assert_eq!(
+            sees(other.path(), &[("GIT_WORK_TREE", &other_s)]),
+            format!("dir= tree= env= wt={other_s}")
+        );
+        // Each variable is decided on its own: an inherited GIT_DIR beside the caller's own
+        // GIT_WORK_TREE, or beside `--work-tree`, is still cleared outside the worktree.
+        assert_eq!(
+            sees(
+                other.path(),
+                &[("GIT_DIR", &gitdir_s), ("GIT_WORK_TREE", &other_s)]
+            ),
+            format!("dir= tree= env= wt={other_s}")
+        );
+        let flag = format!("--work-tree={other_s}");
+        assert_eq!(
+            shim_sees_in(
+                &root_s,
+                &gitdir_s,
+                other.path(),
+                &[&flag, "status"],
+                &[("GIT_DIR", &gitdir_s)]
+            ),
+            format!("dir= tree={other_s} env=")
+        );
+        // Inside the worktree an inherited GIT_DIR in another spelling is still redirected.
+        assert_eq!(
+            sees(root.path(), &[("GIT_DIR", &gitdir_other)]),
+            format!("dir={gitdir_s} tree={root_s} env={gitdir_other}")
+        );
+        // A repository the caller chose keeps its GIT_DIR, and loses the worktree's inherited
+        // work tree, which isn't its.
+        assert_eq!(
+            sees(
+                root.path(),
+                &[("GIT_DIR", "/x"), ("GIT_WORK_TREE", &root_s)]
+            ),
+            "dir= tree= env=/x"
+        );
+        // So does `--git-dir` naming another repository, in either form; one naming the
+        // worktree's own git directory keeps the work tree that goes with it.
+        let flagged = |args: &[&str], env: &[(&str, &str)]| {
+            shim_sees_in(&root_s, &gitdir_s, root.path(), args, env)
+        };
+        let inherited_tree = [("GIT_WORK_TREE", root_s.as_str())];
+        assert_eq!(
+            flagged(&["--git-dir=/x", "status"], &inherited_tree),
+            "dir=/x tree= env="
+        );
+        assert_eq!(
+            flagged(&["--git-dir", "/x", "status"], &inherited_tree),
+            "dir= tree= env="
+        );
+        let own_dir = format!("--git-dir={gitdir_s}");
+        assert_eq!(
+            flagged(&[&own_dir, "status"], &inherited_tree),
+            format!("dir={gitdir_s} tree= env= wt={root_s}")
+        );
+        let index = format!("{gitdir_s}/index");
+        assert_eq!(
+            flagged(
+                &[&own_dir, "status"],
+                &[("GIT_WORK_TREE", &root_s), ("GIT_INDEX_FILE", &index)]
+            ),
+            format!("dir={gitdir_s} tree= env= wt={root_s} ix={index}")
+        );
+        // A relative `GIT_WORK_TREE` is read after `-C` too: a hook's `.` is the worktree only
+        // for a git run there.
+        let other_s = other.path().to_str().unwrap();
+        assert_eq!(
+            flagged(&["-C", other_s, "status"], &[("GIT_WORK_TREE", ".")]),
+            "dir= tree= env= wt=."
+        );
+        assert_eq!(
+            flagged(&["status"], &[("GIT_WORK_TREE", ".")]),
+            format!("dir={gitdir_s} tree={root_s} env= wt=.")
+        );
+        // A relative `--git-dir` is read after `-C`, as git reads it.
+        let gitdirs_s = gitdirs.path().to_str().unwrap();
+        assert_eq!(
+            flagged(&["-C", gitdirs_s, "--git-dir=w", "status"], &inherited_tree),
+            format!("dir=w tree= env= wt={root_s}")
+        );
+        assert_eq!(
+            flagged(&["--git-dir", &gitdir_other, "status"], &inherited_tree),
+            format!("dir= tree= env= wt={root_s}")
+        );
+        // An index file git handed down from the worktree's git directory goes with it.
+        assert_eq!(
+            sees(
+                other.path(),
+                &[("GIT_DIR", &gitdir_s), ("GIT_INDEX_FILE", &index)]
+            ),
+            outside
+        );
+        assert_eq!(
+            sees(
+                root.path(),
+                &[("GIT_DIR", "/x"), ("GIT_INDEX_FILE", &index)]
+            ),
+            "dir= tree= env=/x"
+        );
+        // Inside the worktree it stays, beside the redirect.
+        assert_eq!(
+            sees(root.path(), &[("GIT_INDEX_FILE", &index)]),
+            format!("dir={gitdir_s} tree={root_s} env= ix={index}")
+        );
+        // A symlink to the worktree's git directory is the same directory.
+        #[cfg(unix)]
+        {
+            let link = gitdirs.path().join("link");
+            std::os::unix::fs::symlink(&gitdir, &link).unwrap();
+            let link_s = shell_path(&link);
+            assert_eq!(sees(other.path(), &[("GIT_DIR", &link_s)]), outside);
+        }
     }
 
     #[test]
@@ -915,11 +1552,84 @@ mod tests {
         assert!(script.contains("apt_retry apt-get install"), "{script}");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn an_unconfigured_sandbox_is_none() {
-        // The variable is unset in the test environment; `start` must not try to run anything.
-        if configured().is_none() {
-            assert!(start(&[], None).unwrap().is_none());
+    fn a_working_sbx_passes_the_probe_and_a_broken_one_names_the_fix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        assert!(probe(&script("ok", "exit 0")).is_ok());
+        let engine = script(
+            "engine",
+            "[ \"$1\" = version ] && exit 0; echo 'engine down' >&2; exit 1",
+        );
+        let err = probe(&engine).unwrap_err().to_string();
+        assert!(
+            err.contains("ls` failed: engine down") && err.contains("Start Docker Desktop"),
+            "{err}"
+        );
+        assert!(
+            err.contains("/login") && err.contains("PAJA_SBX=off"),
+            "{err}"
+        );
+        // A daemon that never answers is stopped at the limit, with its children.
+        let stuck = script("stuck", "[ \"$1\" = version ] && exit 0; sleep 30");
+        let started = std::time::Instant::now();
+        let err = probe_within(&stuck, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{err}"
+        );
+        assert!(
+            err.contains("ls` failed") && err.contains("still running after"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_choice_passed_to_a_child_comes_back_whole() {
+        let choices = [
+            Choice {
+                program: Some("/opt/bin/sbx".to_string()),
+                why: Why::Detected,
+            },
+            Choice {
+                program: Some(r"C:\Tools\sbx.exe".to_string()),
+                why: Why::Set,
+            },
+            Choice {
+                program: None,
+                why: Why::NotFound,
+            },
+            Choice {
+                program: None,
+                why: Why::Off,
+            },
+        ];
+        for choice in choices {
+            let mut cmd = Command::new("paja");
+            pass_to(&choice, &mut cmd);
+            let vars: Vec<_> = cmd.get_envs().collect();
+            // Only Paja's own variable: `PAJA_SBX` stays as the person set it.
+            assert_eq!(vars.len(), 1, "{vars:?}");
+            assert_eq!(vars[0].0, PASSED_VAR);
+            let value = vars[0].1.unwrap().to_string_lossy().into_owned();
+            assert_eq!(parse_passed(&value), Some(choice.clone()), "{value}");
+        }
+        for bad in [
+            "",
+            "maybe",
+            "off:/opt/bin/sbx",
+            "detected",
+            "detected:",
+            "not_found:sbx",
+        ] {
+            assert_eq!(parse_passed(bad), None, "{bad}");
         }
     }
 }

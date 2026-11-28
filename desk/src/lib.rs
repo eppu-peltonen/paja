@@ -161,6 +161,72 @@ fn checkout_within(home: &Home, repo: &str, cwd: &Path, asked: usize) -> anyhow:
     )
 }
 
+/// How long `gh` may take to say which repository a checkout is, when the list asks.
+const LIST_LOOKUP_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long the list reuses `gh`'s answer for a repository: the window refreshes every few
+/// seconds, and each fresh answer is a `gh repo view` that shares GitHub's rate limit with runs.
+const LIST_LOOKUP_TTL: Duration = Duration::from_secs(30);
+
+type Memo = std::collections::HashMap<
+    String,
+    (
+        std::time::Instant,
+        Vec<PathBuf>,
+        (Option<PathBuf>, Option<String>),
+    ),
+>;
+
+/// The checkout the repository list shows for `repo`, and why `gh` couldn't settle it: the same
+/// lookup as [`checkout_of`] (newest still-matching checkout, else `cwd`), but a failing or
+/// slow `gh` keeps the newest remembered checkout listed, with the error, rather than
+/// reporting no checkout. A memo of the last answer, kept for [`LIST_LOOKUP_TTL`], is not a
+/// store: the event log and `gh` stay the truth.
+fn listed_checkout(home: &Home, repo: &str, cwd: &Path) -> (Option<PathBuf>, Option<String>) {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Memo>> = std::sync::OnceLock::new();
+    let known = match jono::known_checkouts(home, repo) {
+        Ok(known) => known,
+        Err(err) => return (None, Some(format!("{err:#}"))),
+    };
+    let key = format!("{}\n{repo}\n{}", home.root().display(), cwd.display());
+    let memo = MEMO.get_or_init(Default::default);
+    // A new or changed remembered checkout makes the answer stale at once.
+    if let Some((at, remembered, answer)) = memo.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        if at.elapsed() < LIST_LOOKUP_TTL && remembered == known {
+            return answer;
+        }
+    }
+    let answer = lookup_listed_checkout(home, repo, cwd, &known);
+    if let Ok(mut m) = memo.lock() {
+        m.insert(key, (std::time::Instant::now(), known, answer.clone()));
+    }
+    answer
+}
+
+fn lookup_listed_checkout(
+    home: &Home,
+    repo: &str,
+    cwd: &Path,
+    known: &[PathBuf],
+) -> (Option<PathBuf>, Option<String>) {
+    let matches = |path: &Path| {
+        jono::repo_name_within(home, path, Some(LIST_LOOKUP_LIMIT))
+            .map(|name| name.eq_ignore_ascii_case(repo))
+    };
+    for path in known.iter().take(CHECKOUTS_ASKED) {
+        match matches(path) {
+            Ok(true) => return (Some(path.clone()), None),
+            Ok(false) => {}
+            // `gh` failed, so nothing says the newest checkout is wrong: keep it.
+            Err(err) => return (known.first().cloned(), Some(format!("{err:#}"))),
+        }
+    }
+    match matches(cwd) {
+        Ok(true) => (Some(cwd.to_path_buf()), None),
+        _ => (None, None),
+    }
+}
+
 /// The repositories Paja knows: every one with a work item or a remembered checkout, with the
 /// checkout Desk would use (null when it doesn't know one) and where its runs stand
 /// ([`Runner::status`]).
@@ -190,8 +256,13 @@ pub fn repos_in(home: &Home, runner: &Runner, cwd: &Path) -> Value {
         let repos: Vec<Value> = names
             .iter()
             .map(|repo| {
-                let checkout = jono::known_checkout(home, repo).ok().flatten();
-                json!({ "repo": repo, "checkout": checkout, "runs": runner.status(home, repo) })
+                let (checkout, checkout_error) = listed_checkout(home, repo, cwd);
+                json!({
+                    "repo": repo,
+                    "checkout": checkout,
+                    "checkout_error": checkout_error,
+                    "runs": runner.status(home, repo),
+                })
             })
             .collect();
         Ok(Value::Array(repos))
@@ -478,6 +549,34 @@ fn watch(app: tauri::AppHandle) {
     });
 }
 
+/// The window's size when it opens, in logical pixels (`desk/tauri.conf.json` holds the same).
+const WINDOW_SIZE: (f64, f64) = (1440.0, 900.0);
+
+/// The size to open at on a screen of `screen` logical pixels: [`WINDOW_SIZE`], or the screen's
+/// own when it is smaller.
+fn window_size_for(screen: (f64, f64)) -> (f64, f64) {
+    (WINDOW_SIZE.0.min(screen.0), WINDOW_SIZE.1.min(screen.1))
+}
+
+/// Shrink the window to the screen when the screen is smaller than the size it opens at.
+fn fit_window(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(Some(monitor)) = window.primary_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let screen = (
+        f64::from(monitor.size().width) / scale,
+        f64::from(monitor.size().height) / scale,
+    );
+    let (width, height) = window_size_for(screen);
+    if (width, height) != WINDOW_SIZE {
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    }
+}
+
 /// Start Desk's window.
 pub fn run() {
     // Desk has no console: the core's `gh` calls must not open one each.
@@ -513,6 +612,7 @@ pub fn run() {
         ])
         .setup(|app| {
             watch(app.handle().clone());
+            fit_window(app);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -522,6 +622,38 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_opens_big_or_as_big_as_the_screen() {
+        assert_eq!(window_size_for((2560.0, 1440.0)), (1440.0, 900.0));
+        assert_eq!(window_size_for((1366.0, 768.0)), (1366.0, 768.0));
+        assert_eq!(window_size_for((1920.0, 800.0)), (1440.0, 800.0));
+    }
+
+    /// The plain functions behind the screen (`desk/ui/view.js`) have their tests in
+    /// `desk/ui/view.test.js`, run by Node, so the desk CI job (`cargo test -p paja-desk`, on
+    /// runners that have Node) runs them. Without Node on `PATH` the test says so and passes.
+    #[test]
+    fn the_screens_view_functions_pass_their_node_tests() {
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let out = std::process::Command::new("node")
+            .arg("--test")
+            .arg("view.test.js")
+            .current_dir(&ui)
+            .output();
+        match out {
+            Ok(out) => assert!(
+                out.status.success(),
+                "node --test desk/ui/view.test.js failed:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(err) if std::env::var_os("CI").is_some() => panic!(
+                "no node on PATH to run desk/ui/view.test.js ({err}); install Node in the CI job"
+            ),
+            Err(err) => eprintln!("skipped: no node on PATH to run desk/ui/view.test.js ({err})"),
+        }
+    }
 
     fn import(home: &Home, repo: &str, number: u64, title: &str) {
         let lock = home.lock().unwrap();
@@ -918,6 +1050,97 @@ mod tests {
         );
     }
 
+    /// A newer checkout remembered for acme/app whose remote now names another repository.
+    #[cfg(unix)]
+    fn moved_checkout(home: &Home, dir: &Path) -> PathBuf {
+        let moved = dir.join("moved");
+        std::fs::create_dir_all(&moved).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&moved)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(moved.join("name"), r#"{"nameWithOwner": "acme/elsewhere"}"#).unwrap();
+        import(home, "acme/app", 4, "Add a logout page");
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                paja::ahjo::EV_CREATED,
+                json!({
+                    "name": jono::env_name("acme/app", 4),
+                    "repo": moved,
+                    "path": dir.join("env2"),
+                    "branch": "paja/y",
+                    "base_commit": "0",
+                    "port_base": 41010,
+                    "port_count": 10,
+                    "created_ms": 0,
+                }),
+            )
+            .unwrap();
+        moved
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_repository_list_names_the_older_checkout_when_the_newest_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        moved_checkout(&home, dir.path());
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let listed = repos_in(&home, &runner, dir.path());
+        assert_eq!(listed[0]["repo"], "acme/app", "{listed}");
+        assert_eq!(listed[0]["checkout"], json!(checkout), "{listed}");
+        assert_eq!(listed[0]["checkout_error"], Value::Null, "{listed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_added_between_two_lists_shows_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _) = escalated_with_checkout(dir.path());
+        import(&home, "acme/lib", 1, "Fix the parser");
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let first = repos_in(&home, &runner, dir.path());
+        assert_eq!(first[1]["checkout"], Value::Null, "{first}");
+        // A checkout of acme/lib, added under Repositories (a sync records `work.checkout`).
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&lib)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(lib.join("name"), r#"{"nameWithOwner": "acme/lib"}"#).unwrap();
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                jono::EV_CHECKOUT,
+                json!({ "repo": "acme/lib", "path": lib }),
+            )
+            .unwrap();
+        drop(lock);
+        let second = repos_in(&home, &runner, dir.path());
+        assert_eq!(second[1]["checkout"], json!(lib), "{second}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_gh_keeps_the_checkout_in_the_list_with_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, checkout) = escalated_with_checkout(dir.path());
+        std::fs::write(checkout.join("gh-down"), "").unwrap();
+        let runner = Runner::new(dir.path().join("no-paja"));
+        let listed = repos_in(&home, &runner, dir.path());
+        assert_eq!(listed[0]["checkout"], json!(checkout), "{listed}");
+        let error = listed[0]["checkout_error"].as_str().unwrap_or_default();
+        assert!(error.contains("HTTP 502"), "{listed}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_repository_name_differing_only_in_case_is_the_same_checkout() {
@@ -944,6 +1167,12 @@ mod tests {
     #[test]
     fn a_failing_doctor_check_blocks_starting_a_run() {
         let dir = tempfile::tempdir().unwrap();
+        // The doctor runs in this process: on the host, so a developer's own `sbx` on PATH is
+        // never probed (pinned for every test here, which none minds).
+        paja::sandbox::pin(&paja::sandbox::Choice {
+            program: None,
+            why: paja::sandbox::Why::Off,
+        });
         // The checkout has no `.paja/checks` on its default branch, which `paja doctor` fails.
         let (home, _) = escalated_with_checkout(dir.path());
         let runner = Runner::new(dir.path().join("no-paja"));

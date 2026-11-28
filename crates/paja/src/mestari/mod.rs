@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -84,12 +84,15 @@ pub const EV_ROUND: &str = "run.round";
 /// A step of a round starts: `{repo, number, round, role, model, reviewer, pr}`. The role is a
 /// `.paja/models` role for an agent step, `checks` for Vasara's checks, or `ci` (waiting for
 /// CI) or `land` (no CI) once the pull request `pr` is open. What a finished step spent is
-/// still in `run.round`.
+/// still in `run.round`. A review step also has `reviewers`, how many reviewers the round has.
 pub const EV_STEP: &str = "run.step";
+/// A reviewer's verdict (`land`, `changes` or `escalate`) is in: `{repo, number, round,
+/// reviewer, verdict}`.
+pub const EV_REVIEWED: &str = "run.reviewed";
 /// A builder session is about to start: its session id, recorded before it runs, so a run
 /// that is killed mid-session can resume it.
 pub const EV_STEP_STARTED: &str = "run.step_started";
-/// Vasara's checks passed on a commit: `{repo, number, round, commit, base}`.
+/// Vasara's checks passed on a commit: `{repo, number, round, commit, base, checks_passed}`.
 pub const EV_CHECKED: &str = "run.checked";
 /// A builder session's work was thrown away (the hook never ran), so it is never resumed.
 pub const EV_STEP_DISCARDED: &str = "run.step_discarded";
@@ -108,6 +111,15 @@ pub const EV_ARBITRATED: &str = "run.arbitrated";
 pub const EV_FOLLOW_UP: &str = "run.follow_up";
 /// The tamper lock lives in Ahjo, next to the git every command runs.
 pub use crate::ahjo::{Tampered, EV_TAMPERED, EV_TAMPER_CHECKED};
+
+/// One pass of `paja run`: how it ended, and whether it started a sandbox.
+#[derive(Debug, Clone)]
+pub struct Pass {
+    pub report: RunReport,
+    /// Whether the pass's agents and checks were to run in a sandbox. Kept here because the
+    /// sandbox is in use only while the pass runs, so it can't be read afterwards.
+    pub sandbox: bool,
+}
 
 /// How a run ended.
 #[derive(Debug, Clone, Serialize)]
@@ -399,8 +411,18 @@ struct Prior {
     reviewed: String,
     /// The blockers they named.
     blockers: String,
-    /// Their non-blocking findings, for the next reviewer to keep or drop.
+    /// Their findings outside the change, for the next reviewer to keep or drop. Findings in
+    /// the change are among the fixes asked for (`blockers`), which the next review checks.
     follow_ups: Vec<Finding>,
+}
+
+/// The findings outside the change, the ones a re-review is asked to keep or drop.
+fn outside(findings: &[Finding]) -> Vec<Finding> {
+    findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::Outside)
+        .cloned()
+        .collect()
 }
 
 pub struct RunOptions<'a> {
@@ -572,7 +594,14 @@ fn require_workflow(repo: &Path) -> Result<()> {
 }
 
 /// Take the next work item and run it to an outcome.
-pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
+pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<Pass> {
+    let mut sandbox = false;
+    let report = one_pass(home, opts, &mut sandbox)?;
+    Ok(Pass { report, sandbox })
+}
+
+/// [`run_once`]'s pass, which sets `sandbox` once it has started one.
+fn one_pass(home: &Home, opts: RunOptions<'_>, sandbox: &mut bool) -> Result<RunReport> {
     // The usage window is the account's: before it resets, nothing is claimed or resumed.
     if let Some(resets_at) = usage_pause(&home.events().read_all()?, crate::events::now_ms()) {
         progress(&format!(
@@ -607,7 +636,9 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     })?;
     // Before the queue is touched: a sandbox that can't start (or whose `.paja/setup` fails) is
     // the person's to fix, and must not park an item.
-    crate::sandbox::activate(start_sandbox(home, &repo, &base)?);
+    let sbx = start_sandbox(home, &repo, &base)?;
+    *sandbox = sbx.is_some();
+    let _sandbox = crate::sandbox::enter(sbx);
     let labels =
         jono::Labels::parse(&read_from_base(&repo, &base, jono::LABELS_FILE)?.unwrap_or_default())?;
     let queue = jono::QueueRules::parse(
@@ -625,7 +656,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // The work items of this checkout's repository only: other repositories' items sharing the
     // home are never claimed.
     let name = if opts.sync {
-        jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo
+        synced(jono::sync_with(home, &repo, Some(&labels), Some(&queue))?)
     } else {
         jono::repo_name(home, &repo)?
     };
@@ -651,10 +682,17 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
     // back on GitHub at every pass; only when something could be taken, so an idle pass never
     // calls GitHub for it; and before the build, because waiting for CI that will never run
     // fails after the whole build.
+    // With the window nearly used, no new item is claimed, so only an item left active counts:
+    // with none, the pass pauses below without calling GitHub, as an idle one does.
+    let wanted = |n: u64| opts.item.is_none_or(|only| only == n);
     if config.ci == CiMode::Required
-        && jono::runnable(home, &name)?
-            .iter()
-            .any(|i| opts.item.is_none_or(|n| n == i.number))
+        && if nearly.is_some() {
+            jono::left_active(home, &name)?.into_iter().any(wanted)
+        } else {
+            jono::runnable(home, &name)?
+                .iter()
+                .any(|i| wanted(i.number))
+        }
     {
         require_workflow(&repo)?;
     }
@@ -668,7 +706,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
         if let Some(resets_at) = nearly {
             let ready = jono::runnable(home, &name)?
                 .iter()
-                .any(|i| opts.item.is_none_or(|n| n == i.number));
+                .any(|i| wanted(i.number));
             if ready {
                 progress(&format!(
                     "the usage window is nearly used up, so no new item was started; `paja run` \
@@ -790,7 +828,7 @@ pub fn run_once(home: &Home, opts: RunOptions<'_>) -> Result<RunReport> {
                 item.number,
                 asked.err(),
             ));
-            let _ = ahjo::remove(home, &item.env_name(), true);
+            free_after_error(home, &repo, &item);
             Ok(RunReport::Escalated {
                 number: item.number,
                 question,
@@ -819,7 +857,24 @@ pub fn sync_queue(home: &Home, repo: &Path) -> Result<String> {
     let queue = jono::QueueRules::parse(
         &read_from_base(&repo, &base, jono::QUEUE_FILE)?.unwrap_or_default(),
     )?;
-    Ok(jono::sync_with(home, &repo, Some(&labels), Some(&queue))?.repo)
+    Ok(synced(jono::sync_with(
+        home,
+        &repo,
+        Some(&labels),
+        Some(&queue),
+    )?))
+}
+
+/// The repository a run's sync was of, after telling on stderr which environments of closed,
+/// parked items it freed or kept and why, since a run prints no sync report.
+fn synced(report: jono::SyncReport) -> String {
+    for env in &report.freed {
+        progress(&format!("freed {env}: its parked item's issue was closed"));
+    }
+    for kept in &report.kept {
+        progress(&format!("kept {}: {}", kept.env, kept.why));
+    }
+    report.repo
 }
 
 /// For `paja doctor`: the deny-list hook a builder would run under passes its self-test in
@@ -843,22 +898,76 @@ struct Unrecorded {
 /// Whether the repository has CI Paja waits for before landing (`.paja/ci` on the default
 /// branch).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CiMode {
+pub(crate) enum CiMode {
     /// Wait for the pull request's CI checks to pass (the default).
     Required,
     /// No CI: land on Vasara's checks and the reviewers alone.
     None,
 }
 
-impl CiMode {
-    fn parse(text: Option<&str>, branch: &str) -> Result<CiMode> {
-        let words = lines(text.unwrap_or_default());
+/// How long a run waits for a pull request's CI, in minutes, when `.paja/ci` names no `wait`.
+pub(crate) const CI_WAIT_MINUTES: u64 = 120;
+/// The longest `wait` `.paja/ci` may name, in minutes: a day.
+const CI_WAIT_MAX: u64 = 1440;
+
+/// `.paja/ci`'s text: `required` (also when the file is missing or empty) or `none`, and with
+/// `required` an optional `wait <minutes>` line, how long a pull request's CI may take before
+/// the run stops waiting and asks the person. Returns the mode and the wait in minutes; an
+/// error says what is wrong with the file, for the caller to name the branch it was read from.
+pub(crate) fn parse_ci(text: &str) -> std::result::Result<(CiMode, u64), String> {
+    let mut mode = None;
+    let mut wait = None;
+    for line in lines(text) {
+        let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
-            [] => Ok(CiMode::Required),
-            [w] if w == "required" => Ok(CiMode::Required),
-            [w] if w == "none" => Ok(CiMode::None),
-            _ => bail!("{CI_FILE} on {branch} must hold `required` or `none`; fix it on {branch}"),
+            [w @ ("required" | "none")] => {
+                if mode.is_some() {
+                    return Err(format!(
+                        "has `{line}` after an earlier `required` or `none` line; keep one"
+                    ));
+                }
+                mode = Some(if *w == "none" {
+                    CiMode::None
+                } else {
+                    CiMode::Required
+                });
+            }
+            ["wait", minutes] => {
+                if wait.is_some() {
+                    return Err(format!(
+                        "has `{line}` after an earlier `wait` line; keep one"
+                    ));
+                }
+                match minutes.parse::<u64>() {
+                    Ok(m) if (1..=CI_WAIT_MAX).contains(&m) => wait = Some(m),
+                    _ => {
+                        return Err(format!(
+                            "has `{line}`, but the wait is a whole number of minutes from 1 to \
+                             {CI_WAIT_MAX}"
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "must hold `required` or `none`, and with `required` an optional \
+                     `wait <minutes>` line; `{line}` is not one of them"
+                ))
+            }
         }
+    }
+    let mode = mode.unwrap_or(CiMode::Required);
+    if mode == CiMode::None && wait.is_some() {
+        return Err("says `none` and names a `wait`, which only `required` has".to_string());
+    }
+    Ok((mode, wait.unwrap_or(CI_WAIT_MINUTES)))
+}
+
+impl CiMode {
+    /// [`parse_ci`] of the file as `branch` has it, with an error naming the branch.
+    fn parse(text: Option<&str>, branch: &str) -> Result<(CiMode, u64)> {
+        parse_ci(text.unwrap_or_default())
+            .map_err(|why| anyhow!("{CI_FILE} on {branch} {why}; fix it on {branch}"))
     }
 }
 
@@ -928,6 +1037,8 @@ impl RepoSettings {
 /// has them.
 struct Config {
     ci: CiMode,
+    /// How long to wait for a pull request's CI, in minutes.
+    ci_wait: u64,
     checks: Vec<String>,
     high_risk: Vec<String>,
     models: Models,
@@ -956,9 +1067,10 @@ fn read_config(repo: &Path, base: &str, target: RepoSettings) -> Result<Config> 
     let commands = crate::hook::Commands::parse(
         read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
     )?;
-    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref(), branch)?;
+    let (ci, ci_wait) = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref(), branch)?;
     Ok(Config {
         ci,
+        ci_wait,
         checks,
         high_risk,
         models,
@@ -978,6 +1090,7 @@ fn run_item(
 ) -> Result<RunReport> {
     let Config {
         ci,
+        ci_wait,
         checks,
         high_risk,
         models,
@@ -998,7 +1111,14 @@ fn run_item(
     record(
         home,
         EV_STARTED,
-        json!({ "repo": item.repo, "number": item.number, "env": env.name, "base": base }),
+        json!({
+            "repo": item.repo,
+            "number": item.number,
+            "env": env.name,
+            "base": base,
+            "backend": if crate::sandbox::active().is_some() { "sandbox" } else { "host" },
+            "backend_why": crate::sandbox::backend_why().as_str(),
+        }),
     )?;
 
     let mut feedback = String::new();
@@ -1007,20 +1127,46 @@ fn run_item(
     // A resumed item goes on in the round that was cut off, with what that round was given.
     let mut start = 1;
     let mut reuse: Option<(String, String)> = None;
+    // The findings of a review that approved the cut-off round's change, which goes on to land
+    // without being reviewed again while it is still that change.
+    let mut approved: Option<Approval> = None;
     if resumed && kept {
         let point = resume_point(&home.events().read_all()?, &item.repo, item.number);
         start = point.round;
         feedback = point.feedback;
+        // With a prior, the earlier outside findings are its `follow_ups`; without, `noted`. They
+        // go in `follow_ups` either way: a round that drops the prior and ends before a review
+        // (a turn limit, say) records its `next.noted` from there.
+        follow_ups = match &point.prior {
+            Some(p) => p.follow_ups.clone(),
+            None => point.noted,
+        };
         prior = point.prior;
         reuse = point.checked;
-        let was = match (&reuse, &prior) {
-            (Some((commit, _)), _) => format!("the review of {} was interrupted", short(commit)),
-            (None, Some(p)) => format!(
+        // The approval holds only for the very commit it approved, untouched since.
+        if let (Some(approval), Some((commit, _))) = (point.approved, &reuse) {
+            if approval.commit == *commit && untouched_at(&env, commit)? {
+                follow_ups = approval.findings.clone();
+                // The approval settled the blockers of the rounds before it: a fix after the
+                // default branch is merged in reads the whole change, as at the turn to land.
+                prior = None;
+                approved = Some(approval);
+            }
+        }
+        let was = match (&reuse, &prior, &approved) {
+            (_, _, Some(approval)) => format!(
+                "the review approved {}, which was waiting to land",
+                short(&approval.reviewed)
+            ),
+            (Some((commit, _)), _, _) => {
+                format!("the review of {} was interrupted", short(commit))
+            }
+            (None, Some(p), _) => format!(
                 "the fix for the review of {} was interrupted",
                 short(&p.reviewed)
             ),
-            (None, None) if start > 1 => format!("{} before it", point.stopped_in),
-            (None, None) => "the build was interrupted".to_string(),
+            (None, None, _) if start > 1 => format!("{} before it", point.stopped_in),
+            (None, None, _) => "the build was interrupted".to_string(),
         };
         progress(&format!(
             "resuming #{} in round {start}: {was}",
@@ -1049,6 +1195,8 @@ fn run_item(
     let mut builder: Option<StepUsage> = None;
     // How often each kind of step hit its turn limit in this run: a second hit escalates.
     let (mut builder_limits, mut review_limits) = (0u32, 0u32);
+    // Whether the last round ended on a red CI, whose feedback holds a CI log.
+    let mut ci_red = false;
     progress(&format!("working in {}", env.path.display()));
     for round in start..=MAX_ROUNDS {
         run.round = round;
@@ -1065,13 +1213,22 @@ fn run_item(
         }
         let steps = &mut run.steps;
         steps.clear();
+        ci_red = false;
         // Only the round that was cut off may reuse what it had: the build, and the checks if
         // nothing has changed since they passed.
         let reused = if round == start { reuse.take() } else { None };
+        let approval = if round == start {
+            approved.take()
+        } else {
+            None
+        };
         let skip_build = match &reused {
             Some((commit, _)) => untouched_at(&env, commit)?,
             None => false,
         };
+        // An approval holds only while the build is skipped. Merging the default branch in
+        // below, which is Paja's own merge, is checked again as at the turn to land.
+        let mut approval = approval.filter(|_| skip_build);
         if skip_build {
             progress(&format!(
                 "round {round} of {MAX_ROUNDS}: the build is already committed; skipping it"
@@ -1106,7 +1263,7 @@ fn run_item(
         // An earlier run's session is offered to the first build only.
         let earlier = if skip_build { None } else { carried.take() };
         if !skip_build {
-            record_step(home, item, round, role, Some(&models), None)?;
+            record_step(home, item, round, role, Some(&models), None, None)?;
         }
         let built = (!skip_build).then(|| {
             build(
@@ -1189,6 +1346,7 @@ fn run_item(
                 let next = Next {
                     feedback: &feedback,
                     prior: prior.as_ref(),
+                    noted: &outside(&follow_ups),
                 };
                 record_round_next(home, item, round, "turn_limit", &note, steps, Some(next))?;
                 continue;
@@ -1211,13 +1369,32 @@ fn run_item(
                     item,
                     models: &models,
                 };
-                return settle(&scene, &question, "", round);
+                return settle(&scene, &question, "", "", round);
             }
         }
         // A merge Paja handed over must be finished, not committed with its conflicts. It stays
         // in progress, so the next round sees the files that still conflict.
-        if let Some(merge) = unfinished_merge(&env, &target.branch)? {
-            feedback = merge;
+        if unfinished_merge(&env, &target.branch)?.is_some() {
+            // The next round starts from the conflicts again: restart the merge, so the files
+            // hold markers for the builder to resolve.
+            git(&env.path, &["merge", "--abort"])?;
+            feedback = match catch_up(repo, &env, &target.branch)? {
+                CatchUp::Conflict(files) => format!(
+                    "The merge of {} isn't finished: these files still have conflicts: {}. \
+                     Paja started the merge again, so they hold conflict markers. Resolve each \
+                     one, keeping what both sides meant, then `git add` the files and `git \
+                     commit -m '<message>'` to finish the merge.",
+                    target.branch,
+                    files.join(", ")
+                ),
+                // The default branch moved so the merge is clean now, or the branch already
+                // holds it: nothing is left to resolve.
+                _ => format!(
+                    "The merge of {} wasn't finished and Paja has started it again. Make the \
+                     change and commit it.",
+                    target.branch
+                ),
+            };
             if let Some(p) = &prior {
                 feedback.push_str(&format!(
                     "\n\nThe review's blockers still need fixing too:\n\n{}",
@@ -1228,6 +1405,7 @@ fn run_item(
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(home, item, round, "conflict", &feedback, steps, Some(next))?;
             continue;
@@ -1243,6 +1421,7 @@ fn run_item(
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(home, item, round, "no_change", &feedback, steps, Some(next))?;
             continue;
@@ -1258,6 +1437,7 @@ fn run_item(
                 let next = Next {
                     feedback: &feedback,
                     prior: Some(prior),
+                    noted: &outside(&follow_ups),
                 };
                 record_round_next(home, item, round, "no_change", &feedback, steps, Some(next))?;
                 continue;
@@ -1276,13 +1456,15 @@ fn run_item(
             }
             CatchUp::Conflict(files) => {
                 let branch = &target.branch;
-                feedback = conflict_feedback(branch, &files, prior.as_ref());
+                // An approved change from the run that stopped meets main as at the turn to land.
+                feedback = conflict_feedback(branch, approval.is_some(), &files, prior.as_ref());
                 progress(&format!(
                     "the branch conflicts with {branch}; sending the merge to the builder"
                 ));
                 let next = Next {
                     feedback: &feedback,
                     prior: prior.as_ref(),
+                    noted: &outside(&follow_ups),
                 };
                 let detail = files.join(", ");
                 record_round_next(home, item, round, "conflict", &detail, steps, Some(next))?;
@@ -1304,8 +1486,15 @@ fn run_item(
         if !skip_checks {
             let failed = vasara(home, &env, item, round, &checks, &checked)?;
             if let Some(failure) = failed {
-                feedback =
-                    format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
+                feedback = if approval.is_some() {
+                    format!(
+                        "{} moved on after the review, and with it merged in Vasara's checks \
+                         fail. Fix the cause, not the check:\n\n{failure}",
+                        target.branch
+                    )
+                } else {
+                    format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}")
+                };
                 if let Some(prior) = &prior {
                     feedback.push_str(&format!(
                         "\n\nThe review's blockers still need fixing too:\n\n{}",
@@ -1316,6 +1505,7 @@ fn run_item(
                 let next = Next {
                     feedback: &feedback,
                     prior: prior.as_ref(),
+                    noted: &outside(&follow_ups),
                 };
                 record_round_next(
                     home,
@@ -1328,7 +1518,15 @@ fn run_item(
                 )?;
                 continue;
             }
-            record_checked(home, item, round, &checked, &base)?;
+            record_checked(
+                home,
+                item,
+                round,
+                &checked,
+                &base,
+                checks.len(),
+                approval.is_some(),
+            )?;
         }
         // --no-renames lists both sides of a rename, so moving a high-risk file keeps it high risk.
         let changed = git(
@@ -1354,6 +1552,22 @@ fn run_item(
         )?;
         let risky = paths.iter().any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
+        // `.paja/high-risk` on the default branch may have changed since the approval.
+        if let Some(fewer) = approval.as_ref().filter(|a| a.reviewers < reviewers) {
+            progress(&format!(
+                "the change is high risk now and needs {reviewers} reviewers, but {} approved it; \
+                 reviewing it again",
+                fewer.reviewers
+            ));
+            approval = None;
+        }
+        // A review that reads the whole change (high risk, a fix that isn't a plain diff, or the
+        // round after a conflict or failed checks at the turn to land) still hears what earlier
+        // reviews noted outside the change, so those findings aren't lost.
+        let noted: Vec<Finding> = match &prior {
+            Some(p) => p.follow_ups.clone(),
+            None => outside(&follow_ups),
+        };
         // A fix that merged or rewrote history isn't a plain diff on what was reviewed: read it all.
         if let Some(p) = &prior {
             let plain = git(
@@ -1378,7 +1592,11 @@ fn run_item(
         let mut i = 0;
         progress("Vasara's checks passed");
         stop_point()?;
-        while i < reviewers {
+        let approved_before = approval.is_some();
+        if approved_before {
+            progress("the review already approved this change; skipping it");
+        }
+        while i < reviewers && !approved_before {
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
             progress(&format!(
@@ -1392,7 +1610,15 @@ fn run_item(
             ));
             let role = review_role(risky, i, prior.is_some());
             let reviewer = i as u32 + 1;
-            record_step(home, item, round, role, Some(&models), Some(reviewer))?;
+            record_step(
+                home,
+                item,
+                round,
+                role,
+                Some(&models),
+                Some(reviewer),
+                Some(reviewers as u32),
+            )?;
             let reviewed = review(
                 home,
                 &env,
@@ -1400,6 +1626,7 @@ fn run_item(
                 &base,
                 &checked,
                 prior.as_ref().filter(|_| !risky),
+                &noted,
                 reviewer,
                 &models,
                 role,
@@ -1410,6 +1637,7 @@ fn run_item(
             match reviewed {
                 Ok((review, used)) => {
                     steps.push(used);
+                    record_reviewed(home, item, round, reviewer, &review.verdict)?;
                     reviews.push(review);
                     i += 1;
                 }
@@ -1484,27 +1712,36 @@ fn run_item(
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(home, item, round, "turn_limit", &note, steps, Some(next))?;
             continue;
         }
         // Only the latest review's findings count: an earlier round's may be about code the fix
-        // has since changed.
-        follow_ups.clear();
-        for review in &reviews {
-            for finding in &review.follow_ups {
-                if !finding.text.trim().is_empty() && !follow_ups.contains(finding) {
-                    follow_ups.push(finding.clone());
+        // has since changed. An approval from the run that stopped brings its own.
+        match approval {
+            Some(approval) => follow_ups = approval.findings,
+            None => {
+                follow_ups.clear();
+                for review in &reviews {
+                    for finding in &review.follow_ups {
+                        if !finding.text.trim().is_empty() && !follow_ups.contains(finding) {
+                            follow_ups.push(finding.clone());
+                        }
+                    }
                 }
             }
         }
+        // No reviews ran after an approval: it stands for every reviewer's `land`.
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
-        progress(&format!("review verdict: {}", verdicts.join(", ")));
+        if !approved_before {
+            progress(&format!("review verdict: {}", verdicts.join(", ")));
+        }
         // Every finding in the change is fixed in it: a clean `land` with some still open goes
         // back to the builder, until the last round, which lands with them listed.
         let all_land = verdicts.iter().all(|v| *v == "land");
         let fixes = to_fix(&follow_ups);
-        if all_land && !fixes.is_empty() && round < MAX_ROUNDS {
+        if !approved_before && all_land && !fixes.is_empty() && round < MAX_ROUNDS {
             let list = fixes
                 .iter()
                 .map(|f| f.shown())
@@ -1518,15 +1755,12 @@ fn run_item(
             prior = Some(Prior {
                 reviewed: checked,
                 blockers: list,
-                follow_ups: follow_ups
-                    .iter()
-                    .filter(|f| f.kind == FindingKind::Outside)
-                    .cloned()
-                    .collect(),
+                follow_ups: outside(&follow_ups),
             });
             let next = Next {
                 feedback: &feedback,
                 prior: prior.as_ref(),
+                noted: &outside(&follow_ups),
             };
             record_round_next(
                 home,
@@ -1542,14 +1776,23 @@ fn run_item(
         // A round that goes on is recorded below, with what the next one starts from.
         let ends =
             all_land || verdicts.contains(&"escalate") || (risky && verdicts.contains(&"land"));
-        if ends {
-            record_round(
+        if ends && !approved_before {
+            // The approved review's findings go in the log too: a run stopped at the turn to
+            // land, or in the CI wait, resumes with them and without reviewing again.
+            record_round_noted(
                 home,
                 item,
                 round,
                 &verdicts.join(","),
                 &summaries(&reviews),
                 steps,
+                &outside(&follow_ups),
+                all_land.then(|| Approval {
+                    reviewed: checked.clone(),
+                    commit: checked.clone(),
+                    reviewers,
+                    findings: follow_ups.clone(),
+                }),
             )?;
         }
 
@@ -1562,7 +1805,7 @@ fn run_item(
                 item,
                 models: &models,
             };
-            return settle(&scene, &esc.question, &summaries(&reviews), round);
+            return settle(&scene, &esc.question, "", &summaries(&reviews), round);
         }
         if verdicts.iter().all(|v| *v == "land") {
             // One change lands at a time per repository, each on the latest default branch: a
@@ -1591,6 +1834,7 @@ fn run_item(
                         let next = Next {
                             feedback: &feedback,
                             prior: None,
+                            noted: &outside(&follow_ups),
                         };
                         record_round_next(
                             home,
@@ -1603,12 +1847,12 @@ fn run_item(
                         )?;
                         continue;
                     }
-                    record_checked(home, item, round, &judged, &base)?;
+                    record_checked(home, item, round, &judged, &base, checks.len(), true)?;
                 }
                 CatchUp::Conflict(files) => {
                     drop(landing);
                     let branch = &target.branch;
-                    feedback = conflict_feedback(branch, &files, None);
+                    feedback = conflict_feedback(branch, true, &files, None);
                     prior = None;
                     progress(&format!(
                         "{branch} moved on after the review and conflicts with the branch; sending the merge to the builder"
@@ -1616,6 +1860,7 @@ fn run_item(
                     let next = Next {
                         feedback: &feedback,
                         prior: None,
+                        noted: &outside(&follow_ups),
                     };
                     let detail = files.join(", ");
                     record_round_next(home, item, round, "conflict", &detail, steps, Some(next))?;
@@ -1626,33 +1871,69 @@ fn run_item(
             // ones still open. No issue is filed; the pull request lists them.
             let left = unsettled(home, repo, &follow_ups);
             let notes: Vec<String> = left.iter().map(|(text, _)| text.clone()).collect();
-            let landed = land(home, repo, &env, item, round, &judged, ci, &target, &notes);
+            let landed = land(
+                home, repo, &env, item, round, &judged, ci, ci_wait, &target, &notes,
+            );
             drop(landing);
             let report = match landed {
                 Ok(Landing::Retry(why)) => {
                     progress("CI failed; sending the failure back to the builder");
+                    ci_red = true;
                     feedback = why.clone();
+                    // Every finding in the change was fixed before landing, so only those outside
+                    // it are left for the re-reviewer to keep or drop.
                     prior = Some(Prior {
                         reviewed: judged,
                         blockers: why.clone(),
-                        follow_ups: follow_ups.clone(),
+                        follow_ups: outside(&follow_ups),
                     });
                     let next = Next {
                         feedback: &feedback,
                         prior: prior.as_ref(),
+                        noted: &outside(&follow_ups),
                     };
                     record_round_next(home, item, round, "ci_failed", &why, steps, Some(next))?;
+                    // At the round limit no round follows and the run escalates: keep what it
+                    // would have landed without in the log, after the round is recorded so a
+                    // resumed run does not log them twice.
+                    if round == MAX_ROUNDS {
+                        for (text, _) in &left {
+                            record_follow_up(
+                                home,
+                                item,
+                                text,
+                                None,
+                                "not filed: the change did not land",
+                            );
+                        }
+                    }
                     continue;
                 }
                 Ok(Landing::Done(report)) => Ok(report),
                 Err(err) => Err(err),
             };
             match &report {
-                Ok(RunReport::Landed { .. }) => {
+                Ok(RunReport::Landed { pr, .. }) => {
                     for (text, why) in &left {
                         record_follow_up(home, item, text, None, why);
                     }
+                    // Findings in the change left at the round limit are for a person to read:
+                    // Posti tells them, since no issue holds them.
+                    let open = left.iter().filter(|(_, why)| *why == ROUND_LIMIT).count();
+                    if open > 0 {
+                        let notice = crate::posti::Notice::left_findings(
+                            &item.repo,
+                            item.number,
+                            &item.title,
+                            pr,
+                            open,
+                        );
+                        crate::posti::send(home, repo, &notice);
+                    }
                 }
+                // Stopped (`stop now` in the CI wait): the run that resumes the item records
+                // them, once.
+                Err(_) if crate::platform::interrupts() > 0 => {}
                 // Not landed after all: keep the findings in the log, for later.
                 _ => {
                     for (text, _) in &left {
@@ -1670,10 +1951,9 @@ fn run_item(
         }
         if risky && verdicts.contains(&"land") {
             // High-risk reviewers must agree; a split is a question, not another round.
-            let question = format!(
-                "The two reviewers disagree on this high-risk change.\n\n{}",
-                summaries(&reviews)
-            );
+            let said = summaries(&reviews);
+            let question =
+                format!("The two reviewers disagree on this high-risk change.\n\n{said}");
             let scene = Scene {
                 home,
                 repo,
@@ -1682,7 +1962,7 @@ fn run_item(
                 item,
                 models: &models,
             };
-            return settle(&scene, &question, "", round);
+            return settle(&scene, &question, &said, "", round);
         }
         // A `changes` verdict without comments still names something: its summary.
         let blockers = reviews
@@ -1709,15 +1989,24 @@ fn run_item(
                 others.join("\n\n")
             ));
         }
-        // Without named blockers there is nothing to narrow the next review to.
-        prior = (!blockers.is_empty()).then(|| Prior {
-            reviewed: checked,
-            blockers,
-            follow_ups: follow_ups.clone(),
+        // Without named blockers there is nothing to narrow the next review to. The other
+        // findings in the change join the fixes it checks; only those outside it are kept or
+        // dropped.
+        prior = (!blockers.is_empty()).then(|| {
+            let mut asked = blockers;
+            if !others.is_empty() {
+                asked.push_str(&format!("\n\n{}", others.join("\n\n")));
+            }
+            Prior {
+                reviewed: checked,
+                blockers: asked,
+                follow_ups: outside(&follow_ups),
+            }
         });
         let next = Next {
             feedback: &feedback,
             prior: prior.as_ref(),
+            noted: &outside(&follow_ups),
         };
         record_round_next(
             home,
@@ -1729,8 +2018,17 @@ fn run_item(
             Some(next),
         )?;
     }
+    // A CI log can hold anything the build printed, and the question goes to a public issue.
+    let (reason, feedback) = if ci_red {
+        (
+            "CI still failed",
+            follow_ups::redact_for_comment(&feedback, repo, home.root(), follow_ups::QUOTED_CHARS),
+        )
+    } else {
+        ("the change still isn't ready", feedback)
+    };
     let question = format!(
-        "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
+        "Paja tried {MAX_ROUNDS} rounds and {reason}. Last feedback:\n\n{feedback}\n\n\
          Answer with what should change, or what is out of scope."
     );
     let scene = Scene {
@@ -1741,7 +2039,7 @@ fn run_item(
         item,
         models: &models,
     };
-    settle(&scene, &question, "", MAX_ROUNDS)
+    settle(&scene, &question, &feedback, "", MAX_ROUNDS)
 }
 
 /// The latest reset time any usage-limit stop recorded, in milliseconds since the epoch, when it
@@ -1879,7 +2177,7 @@ fn turn_limit_twice(scene: &Scene, note: &str, round: u32) -> Result<RunReport> 
          be too big for one change: split it into smaller issues, or raise the limit with a \
          `max-turns` line in `{MODELS_FILE}` on the default branch, then answer with what you changed."
     );
-    settle(scene, &question, "", round)
+    settle(scene, &question, "", "", round)
 }
 
 /// The environment an earlier run made for the item in `repo`, if there is one: the one named
@@ -1889,10 +2187,7 @@ fn existing_environment(home: &Home, repo: &Path, item: &WorkItem) -> Result<Opt
     let name = item.env_name();
     // The name holds only a short hash of the repository, so two repositories could in
     // principle share it; never run one's item in the other's worktree.
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    };
+    let same = ahjo::same_repo;
     if let Ok(env) = ahjo::get(home, &name) {
         if !same(&env.repo, repo) {
             bail!(
@@ -1912,8 +2207,51 @@ fn existing_environment(home: &Home, repo: &Path, item: &WorkItem) -> Result<Opt
         .filter(|env| same(&env.repo, repo)))
 }
 
+/// Frees the environment a run that stopped on an error used: the item's, or the `work-<n>` it
+/// resumed. One whose name another repository's environment holds is that repository's, and
+/// stays. A `work-<n>` may hold uncommitted edits an older release's park kept (a builder's
+/// question, a usage limit), so it is removed only when clean and on its branch (commits made on
+/// a detached HEAD would be lost), and kept with a line saying why otherwise. Its branch stays
+/// either way, for the next run to resume.
+fn free_after_error(home: &Home, repo: &Path, item: &WorkItem) {
+    match existing_environment(home, repo, item) {
+        Ok(Some(env)) => {
+            let legacy = env.name == format!("work-{}", item.number);
+            let fix = format!(
+                "commit or clear the changes there, or run `paja env remove {} --force` to \
+                 discard them",
+                env.name
+            );
+            if legacy {
+                let head = git(&env.path, &["symbolic-ref", "-q", "HEAD"]);
+                let wanted = format!("refs/heads/{}", env.branch);
+                if !head.as_deref().is_ok_and(|head| head.trim() == wanted) {
+                    progress(&format!(
+                        "kept the environment {}: its worktree {} isn't on {}; {fix}",
+                        env.name,
+                        env.path.display(),
+                        env.branch
+                    ));
+                    return;
+                }
+            }
+            if let Err(err) = ahjo::remove(home, &env.name, !legacy) {
+                progress(&format!(
+                    "kept the environment {}: {err:#}; {fix}",
+                    env.name
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(err) => progress(&format!("kept the environment: {err:#}")),
+    }
+}
+
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
-/// run of the same item is resumed, so its work isn't thrown away.
+/// run of the same item is resumed, so its work isn't thrown away: the item's own, else the
+/// `paja/work-<n>` of a `work-<n>` environment an older release made and something removed
+/// since (a sync freeing a closed item, `paja env remove`), which is renamed to the item's own
+/// unless [`legacy_left_behind`] says it isn't the item's.
 /// The flag says whether the branch (and so the work on it) was kept from an earlier run, as
 /// opposed to made again from the base.
 fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<(Env, bool)> {
@@ -1921,17 +2259,90 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
     if let Some(env) = existing_environment(home, repo, item)? {
         return Ok((env, true));
     }
-    let branch = format!("refs/heads/paja/{name}");
-    let resume = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
+    let kept = |branch: &str| {
+        git(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok()
+    };
+    let own = format!("paja/{name}");
+    let legacy = format!("paja/work-{}", item.number);
+    // The old branch becomes the item's own, so it is carried over once: a later run (after a
+    // landing deleted the own branch, say) never finds work that already landed there. The
+    // builder session of the `work-<n>` run isn't resumed: it is recorded on the old branch, and
+    // it worked in the old worktree's path anyway.
+    let resume = kept(&own)
+        || (kept(&legacy)
+            && match legacy_left_behind(home, repo, item, &legacy)? {
+                None => {
+                    git(repo, &["branch", "-m", &legacy, &own])
+                        .with_context(|| format!("renaming {legacy} to {own} to resume it"))?;
+                    true
+                }
+                Some(why) => {
+                    progress(&format!(
+                        "not resuming {legacy}: {why}; starting fresh (the branch is kept: merge \
+                         it into {own} if it holds this item's work)"
+                    ));
+                    false
+                }
+            });
+    let base = if resume { None } else { Some(base) };
     let env = ahjo::create(
         home,
         CreateOptions {
             name: &name,
             repo,
-            base: if resume { None } else { Some(base) },
+            base,
         },
     )?;
     Ok((env, resume))
+}
+
+/// Why the `paja/work-<n>` branch an older release left in `repo` isn't the item's to carry
+/// over, or None when it is. It is the item's only when the log shows it: a run of the item
+/// started in the `work-<n>` environment, no run of the item landed after that, and no other
+/// item's run started in a `work-<n>` since (see [`jono::ran_in_work_n`]). It is also left when a
+/// `work-<n>` environment still exists (made from another checkout, or from a repository that
+/// has moved, as the caller already checked) or a worktree has the branch checked out (a
+/// person, or a worktree no environment records).
+fn legacy_left_behind(
+    home: &Home,
+    repo: &Path,
+    item: &WorkItem,
+    legacy: &str,
+) -> Result<Option<String>> {
+    let number = item.number;
+    let plain = format!("work-{number}");
+    if let Ok(env) = ahjo::get(home, &plain) {
+        return Ok(Some(format!(
+            "environment {plain} belongs to the repository at {}, not {}",
+            env.repo.display(),
+            repo.display()
+        )));
+    }
+    let worktrees = git(repo, &["worktree", "list", "--porcelain"])?;
+    let wanted = format!("branch refs/heads/{legacy}");
+    if worktrees.lines().any(|line| line.trim() == wanted) {
+        return Ok(Some(format!(
+            "a worktree has it checked out (see `git -C {repo} worktree list`; if its folder is \
+             gone, `git -C {repo} worktree prune` frees the branch)",
+            repo = repo.display()
+        )));
+    }
+    let events = home.events().read_all()?;
+    if !jono::ran_in_work_n(&events, &item.repo, number) {
+        return Ok(Some(format!(
+            "the log shows no unlanded run of #{number} in {plain} as the latest run there"
+        )));
+    }
+    Ok(None)
 }
 
 /// A builder session of an earlier run of the item, which the next run may resume.
@@ -2061,6 +2472,7 @@ fn record_step(
     role: &str,
     models: Option<&Models>,
     reviewer: Option<u32>,
+    reviewers: Option<u32>,
 ) -> Result<()> {
     let model = models.and_then(|m| m.chosen(role)).map(|c| c.model.clone());
     record(
@@ -2068,7 +2480,26 @@ fn record_step(
         EV_STEP,
         json!({
             "repo": item.repo, "number": item.number, "round": round, "role": role,
-            "model": model, "reviewer": reviewer,
+            "model": model, "reviewer": reviewer, "reviewers": reviewers,
+        }),
+    )
+}
+
+/// Record a reviewer's verdict as soon as it is in, so someone following the run sees which
+/// reviews of the round are still out.
+fn record_reviewed(
+    home: &Home,
+    item: &WorkItem,
+    round: u32,
+    reviewer: u32,
+    verdict: &str,
+) -> Result<()> {
+    record(
+        home,
+        EV_REVIEWED,
+        json!({
+            "repo": item.repo, "number": item.number, "round": round,
+            "reviewer": reviewer, "verdict": verdict,
         }),
     )
 }
@@ -2315,11 +2746,13 @@ fn build(
 
 /// What a reviewer is asked. `checked` is the commit Vasara's checks passed at, which is the
 /// commit the reviewer judges.
+#[allow(clippy::too_many_arguments)]
 fn review_prompt(
     item: &WorkItem,
     base: &str,
     checked: &str,
     prior: Option<&Prior>,
+    noted: &[Finding],
     diff: &str,
     checks: &[String],
     programs: &[String],
@@ -2327,9 +2760,19 @@ fn review_prompt(
     // A first review reads the whole change; a later one judges only the fix for the blockers
     // an earlier review named, so review rounds converge instead of starting over.
     let scope = match prior {
-        None => format!(
+        None if noted.is_empty() => format!(
             "The change is the diff above (`git diff {base}...HEAD`). Read it cold against the \
              issue."
+        ),
+        None => format!(
+            "The change is the diff above (`git diff {base}...HEAD`). Read it cold against the \
+             issue. An earlier review of it noted these findings outside the change; repeat in \
+             your `follow_ups` the ones that still apply:\n\n{}\n",
+            noted
+                .iter()
+                .map(Finding::shown)
+                .collect::<Vec<_>>()
+                .join("\n\n")
         ),
         Some(prior) => format!(
             "An earlier review of this change (at {reviewed}) asked for these fixes:\n\n{blockers}\n\n\
@@ -2508,6 +2951,7 @@ fn review(
     base: &str,
     checked: &str,
     prior: Option<&Prior>,
+    noted: &[Finding],
     reviewer: u32,
     models: &Models,
     role: &str,
@@ -2530,7 +2974,7 @@ fn review(
         Some(prior) => format!("{}..HEAD", prior.reviewed),
     };
     let diff = review_diff(&env.path, &range, REVIEW_DIFF_CAP)?;
-    let mut prompt = review_prompt(item, base, &before, prior, &diff, checks, programs);
+    let mut prompt = review_prompt(item, base, &before, prior, noted, &diff, checks, programs);
     if focused {
         prompt.push_str(&format!(
             "\nAn earlier review of this commit stopped at its turn limit of {} before giving a \
@@ -2653,8 +3097,6 @@ fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
     })
 }
 
-/// Run each check in the environment. Returns the first failure's command and output. The
-/// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 /// Run Vasara's checks on `checked` in the environment, under a `GitGuard`. The failure to send
 /// the builder, or None when they pass. The checks run the branch's code, which could change the
 /// tree or even commit: that is put back and fails them, so nothing lands that they didn't judge.
@@ -2682,7 +3124,7 @@ fn vasara(
         checks.len(),
         if checks.len() == 1 { "" } else { "s" }
     ));
-    record_step(home, item, round, "checks", None, None)?;
+    record_step(home, item, round, "checks", None, None, None)?;
     let result = run_checks(&env.path, checks);
     guard.check("Vasara's checks")?;
     let mut failed = result;
@@ -2702,6 +3144,8 @@ fn vasara(
     failed
 }
 
+/// Run each check in the environment. Returns the first failure's command and output. The
+/// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     // Read before any check runs: later, the branch's code may have changed the configuration.
     let identity = git_identity(dir);
@@ -2753,6 +3197,9 @@ struct Next<'a> {
     feedback: &'a str,
     /// What the reviewers asked for, which the next review narrows itself to.
     prior: Option<&'a Prior>,
+    /// The findings outside the change the latest review noted, kept for the next review to
+    /// keep or drop; recorded only with no `prior`, whose `follow_ups` hold them otherwise.
+    noted: &'a [Finding],
 }
 
 /// A round that ended without a next round: a question, a landing, an error or a stop.
@@ -2765,6 +3212,39 @@ fn record_round(
     steps: &mut Vec<StepUsage>,
 ) -> Result<()> {
     record_round_next(home, item, round, verdict, detail, steps, None)
+}
+
+/// A round that ended without a next round, with the findings outside the change its review
+/// noted (`noted`, an empty list when there are none), for a resumed run of that round. A round
+/// every reviewer approved also records `approved` (an [`Approval`]), so a resumed run lands it
+/// without another review.
+#[allow(clippy::too_many_arguments)]
+fn record_round_noted(
+    home: &Home,
+    item: &WorkItem,
+    round: u32,
+    verdict: &str,
+    detail: &str,
+    steps: &mut Vec<StepUsage>,
+    noted: &[Finding],
+    approved: Option<Approval>,
+) -> Result<()> {
+    let steps = std::mem::take(steps);
+    let mut data = json!({
+        "repo": item.repo,
+        "number": item.number,
+        "round": round,
+        "verdict": verdict,
+        "detail": clip(detail),
+        "steps": steps,
+    });
+    data["noted"] = json!(noted);
+    // Every reviewer approved: the commit, how many approved it, and the findings the change
+    // lands with, in it and outside it.
+    if let Some(approval) = approved {
+        data["approved"] = json!(approval);
+    }
+    record(home, EV_ROUND, data)
 }
 
 /// A round after which the loop goes on: `next` is what the following round needs.
@@ -2796,27 +3276,50 @@ fn record_round_next(
                 "follow_ups": p.follow_ups,
             })),
         });
+        // With a prior, its `follow_ups` hold them.
+        if next.prior.is_none() && !next.noted.is_empty() {
+            data["next"]["noted"] = json!(next.noted);
+        }
     }
     record(home, EV_ROUND, data)
 }
 
 /// Vasara's checks passed on `commit`, with the default branch at `base`: recorded before the
-/// review, so a run that stops in it can go straight to the review again.
+/// review, so a run that stops in it can go straight to the review again. `landing`: the commit
+/// is Paja's own merge of the default branch into an approved change, checked again before it
+/// lands, so the approval holds for it.
 fn record_checked(
     home: &Home,
     item: &WorkItem,
     round: u32,
     commit: &str,
     base: &str,
+    checks_passed: usize,
+    landing: bool,
 ) -> Result<()> {
     record(
         home,
         EV_CHECKED,
         json!({
             "repo": item.repo, "number": item.number, "round": round,
-            "commit": commit, "base": base,
+            "commit": commit, "base": base, "checks_passed": checks_passed,
+            "landing": landing,
         }),
     )
+}
+
+/// A round's review that every reviewer approved, as `run.round` records it in `approved`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Approval {
+    /// The commit the review read.
+    reviewed: String,
+    /// The commit the change lands as: the one reviewed, or Paja's own merge of the default
+    /// branch into it at the turn to land, checked again.
+    commit: String,
+    /// How many reviewers approved it: a change that needs more now is reviewed again.
+    reviewers: usize,
+    /// The findings it lands with, in the change and outside it.
+    findings: Vec<Finding>,
 }
 
 /// Where a run that stopped left an item, rebuilt from the item's events.
@@ -2826,9 +3329,13 @@ struct ResumePoint {
     /// What the builder is asked to address in it.
     feedback: String,
     prior: Option<Prior>,
+    /// With no `prior`, the findings outside the change an earlier review noted.
+    noted: Vec<Finding>,
     /// The commit the checks passed on in that round, and the default branch's tip they ran
     /// against.
     checked: Option<(String, String)>,
+    /// The round's review approved the change, as [`Approval::commit`] stands.
+    approved: Option<Approval>,
     /// Where the run left off, in words.
     stopped_in: String,
 }
@@ -2841,7 +3348,9 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
         round: 1,
         feedback: String::new(),
         prior: None,
+        noted: Vec::new(),
         checked: None,
+        approved: None,
         stopped_in: String::new(),
     };
     for event in jono::item_events(events, repo, number) {
@@ -2852,7 +3361,9 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                     round: 1,
                     feedback: String::new(),
                     prior: None,
+                    noted: Vec::new(),
                     checked: None,
+                    approved: None,
                     stopped_in: String::new(),
                 };
             }
@@ -2863,19 +3374,54 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                         point.round = round + 1;
                         point.feedback = next["feedback"].as_str().unwrap_or_default().to_string();
                         point.prior = serde_json::from_value(next["prior"].clone()).ok();
+                        point.noted =
+                            serde_json::from_value(next["noted"].clone()).unwrap_or_default();
                         point.checked = None;
+                        point.approved = None;
                         point.stopped_in = format!(
                             "round {round} ended with {}",
                             data["verdict"].as_str().unwrap_or("no verdict")
                         );
                     }
-                    None => point.round = point.round.max(round),
+                    None => {
+                        point.round = point.round.max(round);
+                        // A review that ended the round (it records `noted`) says whether
+                        // every reviewer approved: a later one that didn't (a split, an
+                        // escalation) takes back an earlier approval. A stop or an error records
+                        // no `noted` and leaves it; a new round, a fresh start or checks on
+                        // another commit take it back too.
+                        if data["noted"].is_array() {
+                            point.approved = serde_json::from_value(data["approved"].clone()).ok();
+                        }
+                        // A round that ended approved names the latest outside findings, newer
+                        // than what the round before it handed on, even when there are none. A
+                        // round recorded without the field (a stop, an error, an older log)
+                        // leaves the earlier ones.
+                        if let Ok(noted) =
+                            serde_json::from_value::<Vec<Finding>>(data["noted"].clone())
+                        {
+                            if let Some(prior) = &mut point.prior {
+                                prior.follow_ups = noted.clone();
+                            }
+                            point.noted = noted;
+                        }
+                    }
                 }
             }
             EV_CHECKED if data["round"].as_u64() == Some(point.round as u64) => {
                 if let (Some(commit), Some(base)) = (data["commit"].as_str(), data["base"].as_str())
                 {
                     point.checked = Some((commit.to_string(), base.to_string()));
+                    // Checks on Paja's own merge of the approved change (`landing`) move the
+                    // approval to it; checks on any other commit mean the approved one was
+                    // built on, so it no longer holds.
+                    if let Some(approval) = &mut point.approved {
+                        if data["landing"] == true {
+                            approval.commit = commit.to_string();
+                        } else if approval.commit != commit {
+                            point.approved = None;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -2991,10 +3537,21 @@ fn catch_up(repo: &Path, env: &Env, branch: &str) -> Result<CatchUp> {
 }
 
 /// What the builder is told when merging the latest `branch` conflicts in `files`, with the
-/// review's blockers when they still need fixing.
-fn conflict_feedback(branch: &str, files: &[String], prior: Option<&Prior>) -> String {
+/// review's blockers when they still need fixing. `after_review` is for a conflict at the turn to
+/// land, when `branch` moved on after the review rather than since the branch was made.
+fn conflict_feedback(
+    branch: &str,
+    after_review: bool,
+    files: &[String],
+    prior: Option<&Prior>,
+) -> String {
+    let when = if after_review {
+        "after the review"
+    } else {
+        "since this branch was made"
+    };
     let mut feedback = format!(
-        "{branch} moved on since this branch was made, and merging it conflicts in: {}. Paja \
+        "{branch} moved on {when}, and merging it conflicts in: {}. Paja \
          started the merge: the conflicted files hold conflict markers. Resolve each one, keeping \
          what both sides meant, then `git add` the files and `git commit -m '<message>'` to \
          finish the merge.",
@@ -3069,11 +3626,14 @@ fn git_command() -> Command {
 pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = format!(
-        "refs/paja/fetch/{}-{}-{n}",
-        std::process::id(),
-        crate::events::now_ms()
-    );
+    // One fetch at a time in this checkout, through to `origin/<branch>`, so the last fetch to
+    // move it is the latest one, whatever order the lanes' fetches would have ended in. (A
+    // remote that served an older tip than it had, as a lagging replica can, is followed back
+    // until the next fetch.)
+    let held = fetch_lock(repo);
+    let now = crate::events::now_ms();
+    let name = format!("refs/paja/fetch/{}-{now}-{n}", std::process::id());
+    sweep_fetch_refs(repo, now);
     let fetched = git(
         repo,
         &[
@@ -3091,15 +3651,23 @@ pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
         )
     });
     let _ = git(repo, &["update-ref", "-d", &name]);
+    // The fetch also writes FETCH_HEAD, which nothing here reads (`--no-write-fetch-head`, from
+    // git 2.29, would say so, but older gits refuse it).
+    //
     // `origin/<branch>` still follows, as a plain fetch would move it: Jono reads `.paja/labels`
-    // and the queue file from it outside runs. Only forward, and only from the value just read,
-    // so a slower lane never moves it back; one updating it at the same moment wins.
+    // and the queue file from it outside runs. Under the lock it goes to the tip just fetched,
+    // forward, back after a force-push rewound the branch, or onto rewritten history alike.
+    // Without the lock (its file couldn't be opened) a slower fetch can't be told from a
+    // rewind, so it then never goes back onto a commit it already holds. Either way it moves
+    // only from the value just read: a `git fetch` of the person's own at the same moment may
+    // win that compare-and-swap, which is left so on purpose, since the next fetch moves it on.
     if let Ok(tip) = &fetched {
         let tracking = format!("refs/remotes/origin/{branch}");
         match git(repo, &["rev-parse", "--verify", "-q", &tracking]) {
             Ok(old) if old == *tip => {}
             Ok(old) => {
-                if git(repo, &["merge-base", "--is-ancestor", &old, tip]).is_ok() {
+                if held.is_some() || git(repo, &["merge-base", "--is-ancestor", tip, &old]).is_err()
+                {
                     let _ = git(repo, &["update-ref", &tracking, tip, &old]);
                 }
             }
@@ -3108,7 +3676,81 @@ pub(super) fn fetch_tip(repo: &Path, branch: &str) -> Result<String> {
             }
         }
     }
+    drop(held);
     fetched
+}
+
+/// How long a [`fetch_tip`] waits for another one in the checkout before it goes ahead
+/// without the lock, so one fetch stalled on the network doesn't hold up every lane.
+const FETCH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The lock that makes [`fetch_tip`]s in the checkout `repo` take turns: `paja-fetch.lock` in
+/// its git directory, held until the returned file is dropped. None when the file can't be
+/// opened, or another fetch held it for [`FETCH_LOCK_WAIT`] (debug builds:
+/// `PAJA_TEST_FETCH_WAIT_MS`), and the fetch then goes ahead on its own.
+fn fetch_lock(repo: &Path) -> Option<std::fs::File> {
+    let common = git(repo, &["rev-parse", "--git-common-dir"]).ok()?;
+    let path = repo.join(common).join("paja-fetch.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .ok()?;
+    let wait = std::env::var("PAJA_TEST_FETCH_WAIT_MS")
+        .ok()
+        .filter(|_| cfg!(debug_assertions))
+        .and_then(|ms| ms.parse().ok())
+        .map_or(FETCH_LOCK_WAIT, std::time::Duration::from_millis);
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                progress(&format!(
+                    "another fetch held {} for {wait:?}; fetching without it",
+                    path.display()
+                ));
+                return None;
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                progress(&format!(
+                    "couldn't lock {}: {err}; fetching without it",
+                    path.display()
+                ));
+                return None;
+            }
+        }
+    }
+}
+
+/// Delete the `refs/paja/fetch/*` refs a run that was killed between its fetch and deleting
+/// the ref left behind: any made over an hour ago by the wall clock, which a fetch still in
+/// progress is assumed not to be. The sweep runs under the fetch lock when it has it, so no
+/// other locked fetch is in progress then: only a fetch that went ahead without the lock (or
+/// one from an older Paja), over an hour old by a clock set forward, could lose its ref, and
+/// that fetch then fails.
+fn sweep_fetch_refs(repo: &Path, now: u64) {
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+    let Ok(refs) = git(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "refs/paja/fetch/"],
+    ) else {
+        return;
+    };
+    for name in refs.lines() {
+        let made = name
+            .rsplit('/')
+            .next()
+            .and_then(|leaf| leaf.split('-').nth(1))
+            .and_then(|ms| ms.parse::<u64>().ok());
+        if made.is_some_and(|ms| ms.saturating_add(HOUR_MS) < now) {
+            let _ = git(repo, &["update-ref", "-d", name]);
+        }
+    }
 }
 
 /// Whether a long-running loop must stop on `err`: today only a tampered repository.
@@ -3141,7 +3783,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    fn repo_with_commit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    pub(super) fn repo_with_commit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::create_dir_all(&path).unwrap();
         let git = |args: &[&str]| {
@@ -3162,7 +3804,7 @@ mod tests {
         path
     }
 
-    fn work_item(repo: &str, number: u64) -> crate::jono::WorkItem {
+    pub(super) fn work_item(repo: &str, number: u64) -> crate::jono::WorkItem {
         crate::jono::WorkItem {
             repo: repo.into(),
             number,
@@ -3241,6 +3883,247 @@ mod tests {
     }
 
     #[test]
+    fn an_item_whose_work_n_environment_was_removed_resumes_its_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let a = repo_with_commit(tmp.path(), "a");
+        let old = crate::ahjo::create(
+            &home,
+            crate::ahjo::CreateOptions {
+                name: "work-7",
+                repo: &a,
+                base: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(old.path.join("draft.txt"), "the builder's work\n").unwrap();
+        for args in [
+            &["add", "draft.txt"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "draft",
+            ],
+        ] {
+            git(&old.path, args).unwrap();
+        }
+        crate::ahjo::remove(&home, "work-7", false).unwrap();
+        let item = work_item("o/a", 7);
+        // Without a run of the item recorded in `work-7`, the branch isn't known to be its.
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(!resumed);
+        crate::ahjo::remove(&home, &env.name, true).unwrap();
+        git(&a, &["branch", "-q", "-D", &env.branch]).unwrap();
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                EV_STARTED,
+                json!({ "repo": "o/a", "number": 7, "env": "work-7", "base": "HEAD" }),
+            )
+            .unwrap();
+        drop(lock);
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(resumed);
+        assert_eq!(env.name, item.env_name());
+        assert!(env.path.join("draft.txt").exists());
+        // Carried over once: the old branch is now the item's own.
+        assert!(git(
+            &a,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/paja/work-7"]
+        )
+        .is_err());
+        // So once the own branch goes (a landing deletes it), the next run starts fresh.
+        crate::ahjo::remove(&home, &env.name, true).unwrap();
+        git(&a, &["branch", "-q", "-D", &env.branch]).unwrap();
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(!resumed);
+        assert!(!env.path.join("draft.txt").exists());
+    }
+
+    #[test]
+    fn an_old_work_n_branch_is_carried_over_only_when_the_log_shows_it_is_the_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let a = repo_with_commit(tmp.path(), "a");
+        let item = work_item("o/a", 7);
+        let fresh = |home: &crate::home::Home| {
+            let (env, resumed) = super::environment(home, &a, "HEAD", &item).unwrap();
+            assert!(!resumed);
+            crate::ahjo::remove(home, &env.name, true).unwrap();
+            git(&a, &["branch", "-q", "-D", &env.branch]).unwrap();
+            git(
+                &a,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/paja/work-7"],
+            )
+            .unwrap();
+        };
+        let append = |kind: &str, data: Value| {
+            let lock = home.lock().unwrap();
+            home.events().append(&lock, kind, data).unwrap();
+        };
+        let started =
+            |repo: &str| json!({ "repo": repo, "number": 7, "env": "work-7", "base": "x" });
+        append(EV_STARTED, started("o/a"));
+        // Checked out in a worktree no environment records (its repository moved, say).
+        let stray = tmp.path().join("stray");
+        git(
+            &a,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "paja/work-7",
+                stray.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        fresh(&home);
+        git(&a, &["worktree", "remove", stray.to_str().unwrap()]).unwrap();
+        // Still held by a `work-7` environment from another checkout.
+        let elsewhere = tmp.path().join("elsewhere");
+        append(
+            crate::ahjo::EV_CREATED,
+            json!({
+                "name": "work-7", "repo": elsewhere, "path": elsewhere.join("w"),
+                "branch": "paja/work-7", "base_commit": "abc", "port_base": 20_000,
+                "port_count": 100, "created_ms": 1
+            }),
+        );
+        fresh(&home);
+        append(crate::ahjo::EV_REMOVED, json!({ "name": "work-7" }));
+        // The item landed after its run in `work-7`: the branch holds landed work.
+        append(EV_LANDED, json!({ "repo": "o/a", "number": 7 }));
+        fresh(&home);
+        // Reopened, it ran in `work-7` again, but another repository's #7 ran there since.
+        append(EV_STARTED, started("o/a"));
+        append(EV_STARTED, started("o/fork"));
+        fresh(&home);
+        // Its own run there is the latest again, after the landing: the branch is its.
+        append(EV_STARTED, started("o/a"));
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(resumed);
+        assert_eq!(env.name, item.env_name());
+    }
+
+    #[test]
+    fn a_run_that_errors_frees_only_an_environment_that_is_its_and_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let (a, b) = (
+            repo_with_commit(tmp.path(), "a"),
+            repo_with_commit(tmp.path(), "b"),
+        );
+        let item = work_item("o/a", 7);
+        let create = |name: &str, repo: &std::path::Path| {
+            crate::ahjo::create(
+                &home,
+                crate::ahjo::CreateOptions {
+                    name,
+                    repo,
+                    base: None,
+                },
+            )
+            .unwrap()
+        };
+        // A `work-7` with an edit an older release's park kept stays, edit and all.
+        let old = create("work-7", &a);
+        std::fs::write(old.path.join("draft.txt"), "the builder's edit\n").unwrap();
+        free_after_error(&home, &a, &item);
+        assert!(old.path.join("draft.txt").exists());
+        assert!(crate::ahjo::get(&home, "work-7").is_ok());
+        // Clean but off its branch (commits on a detached HEAD would be lost): it stays too.
+        std::fs::remove_file(old.path.join("draft.txt")).unwrap();
+        git(&old.path, &["checkout", "-q", "--detach"]).unwrap();
+        free_after_error(&home, &a, &item);
+        assert!(crate::ahjo::get(&home, "work-7").is_ok());
+        // Once clean and on its branch it goes, and its branch stays.
+        git(&old.path, &["checkout", "-q", "paja/work-7"]).unwrap();
+        free_after_error(&home, &a, &item);
+        assert!(crate::ahjo::get(&home, "work-7").is_err());
+        assert!(!old.path.exists());
+        git(
+            &a,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/paja/work-7"],
+        )
+        .unwrap();
+        // The item's name held by another repository's environment: that one stays.
+        let theirs = create(&item.env_name(), &b);
+        free_after_error(&home, &a, &item);
+        assert!(theirs.path.exists());
+        assert_eq!(
+            crate::ahjo::get(&home, &item.env_name()).unwrap().repo,
+            theirs.repo
+        );
+        // The item's own is removed, uncommitted edits too, as before.
+        crate::ahjo::remove(&home, &theirs.name, true).unwrap();
+        let own = create(&item.env_name(), &a);
+        std::fs::write(own.path.join("draft.txt"), "edit\n").unwrap();
+        free_after_error(&home, &a, &item);
+        assert!(crate::ahjo::get(&home, &own.name).is_err());
+    }
+
+    #[test]
+    fn an_items_own_branch_wins_over_an_old_work_n_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let a = repo_with_commit(tmp.path(), "a");
+        let item = work_item("o/a", 7);
+        git(&a, &["branch", "paja/work-7"]).unwrap();
+        let own = crate::ahjo::create(
+            &home,
+            crate::ahjo::CreateOptions {
+                name: &item.env_name(),
+                repo: &a,
+                base: None,
+            },
+        )
+        .unwrap();
+        crate::ahjo::remove(&home, &own.name, true).unwrap();
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(resumed);
+        assert_eq!(env.branch, own.branch);
+        // The old one is left alone.
+        git(
+            &a,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/paja/work-7"],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_work_n_environment_whose_repository_moved_is_neither_taken_nor_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let a = repo_with_commit(tmp.path(), "a");
+        // Recorded for a repository path that no longer exists, so it can't be canonicalized.
+        let gone = tmp.path().join("moved-away");
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                crate::ahjo::EV_CREATED,
+                json!({
+                    "name": "work-7", "repo": gone, "path": gone.join("w"), "branch": "paja/work-7",
+                    "base_commit": "abc", "port_base": 20_000, "port_count": 100, "created_ms": 1
+                }),
+            )
+            .unwrap();
+        drop(lock);
+        let item = work_item("o/a", 7);
+        assert!(existing_environment(&home, &a, &item).unwrap().is_none());
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(!resumed);
+        assert_eq!(env.name, item.env_name());
+        assert_eq!(crate::ahjo::get(&home, "work-7").unwrap().repo, gone);
+    }
+
+    #[test]
     fn reset_times_are_read_and_shown_in_utc() {
         // 2026-11-27 18:30:00 UTC.
         assert_eq!(super::format_utc(1_795_804_200_000), "2026-11-27 18:30 UTC");
@@ -3301,7 +4184,7 @@ mod tests {
         )
         .unwrap();
         let prefixes = super::lines(&text);
-        for file in ["agent.rs", "land.rs", "mod.rs"] {
+        for file in ["agent.rs", "land.rs", "mod.rs", "plan.rs"] {
             let path = format!("crates/paja/src/mestari/{file}");
             assert!(super::is_high_risk(&path, &prefixes), "{path}");
         }
@@ -3352,6 +4235,52 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_ci_file_names_a_mode_and_a_wait() {
+        let ok = |text: &str| parse_ci(text).unwrap();
+        assert_eq!(ok(""), (CiMode::Required, CI_WAIT_MINUTES));
+        assert_eq!(ok("# CI\nrequired\n"), (CiMode::Required, CI_WAIT_MINUTES));
+        assert_eq!(ok("none\n"), (CiMode::None, CI_WAIT_MINUTES));
+        assert_eq!(ok("required\nwait 30\n"), (CiMode::Required, 30));
+        // `wait` alone means `required`, the default; the order of the lines doesn't matter.
+        assert_eq!(ok("wait 1440\n"), (CiMode::Required, 1440));
+        assert_eq!(ok("wait  45\nrequired\n"), (CiMode::Required, 45));
+        let err = |text: &str| parse_ci(text).unwrap_err();
+        for bad in ["wait 0", "wait 1441", "wait -5", "wait 1.5", "wait soon"] {
+            assert!(
+                err(bad).contains("whole number of minutes from 1 to 1440"),
+                "{bad}"
+            );
+        }
+        for bad in ["wait", "wait 5 minutes", "optional", "required now"] {
+            assert!(
+                err(bad).contains("is not one of them"),
+                "{bad}: {}",
+                err(bad)
+            );
+        }
+        for bad in ["required\nrequired", "required\nnone", "none\nrequired"] {
+            let why = err(bad);
+            assert!(
+                why.contains("after an earlier `required` or `none` line; keep one"),
+                "{why}"
+            );
+        }
+        let why = err("wait 5\nwait 6");
+        assert!(
+            why.starts_with("has `wait 6` after an earlier `wait` line"),
+            "{why}"
+        );
+        assert!(err("none\nwait 5").contains("only `required` has"));
+        assert!(err("wait 5\nnone").contains("only `required` has"));
+        let branch = CiMode::parse(Some("none\nwait 5\n"), "trunk").unwrap_err();
+        assert!(
+            format!("{branch}").starts_with(".paja/ci on trunk says `none`")
+                && format!("{branch}").ends_with("fix it on trunk"),
+            "{branch}"
+        );
+    }
 
     #[test]
     fn lines_skip_blanks_and_comments() {
@@ -3476,7 +4405,16 @@ mod tests {
             .to_vec();
         let cargo = vec!["cargo".to_string()];
         let review_prompt = |item: &_, prior: Option<&super::Prior>| {
-            super::review_prompt(item, "base1", "abc123", prior, "DIFF-TEXT", &checks, &cargo)
+            super::review_prompt(
+                item,
+                "base1",
+                "abc123",
+                prior,
+                &[],
+                "DIFF-TEXT",
+                &checks,
+                &cargo,
+            )
         };
         let prompt = review_prompt(&item, None);
         assert!(
@@ -3491,7 +4429,7 @@ mod tests {
         assert!(builder.contains("only for local git and `cargo`"));
         assert!(builder.contains("`cargo fmt --all --check`, `cargo test`"));
         // No review programs: the reviewer is not told to run anything.
-        let bare = super::review_prompt(&item, "base1", "abc123", None, "D", &checks, &[]);
+        let bare = super::review_prompt(&item, "base1", "abc123", None, &[], "D", &checks, &[]);
         assert!(!bare.contains("run one named test"), "{bare}");
         assert!(bare.contains("limited to local git"), "{bare}");
         assert!(bare.contains("Read-only git is fine"), "{bare}");
@@ -3503,6 +4441,7 @@ mod tests {
             "base1",
             "abc123",
             None,
+            &[],
             "DIFF-TEXT",
             &["npm test".to_string()],
             &npm,
@@ -3721,6 +4660,7 @@ mod tests {
             "base1",
             "abc123",
             None,
+            &[],
             "D",
             &checks,
             &commands.reviewer,
@@ -3764,7 +4704,6 @@ mod tests {
             "mestari/builder.rs",
             "mestari/follow_ups.rs",
             "mestari/live.rs",
-            "mestari/plan.rs",
             "mestari/pool.rs",
             "mestari/progress.rs",
             "mestari/usage.rs",
@@ -3896,5 +4835,154 @@ mod tests {
         assert_eq!(at(&[ended(1), checked(1)]).2, None);
         // Checks from a round that later ended don't carry into the next one.
         assert_eq!(at(&[checked(1), ended(1)]).2, None);
+        // What a review noted outside the change carries into the round after a conflict at the
+        // turn to land, and no further.
+        let noted = (
+            EV_ROUND,
+            json!({"round": 1, "verdict": "conflict", "next": {"feedback": "merge",
+                "noted": [{"kind": "outside", "finding": "The parser drops a line"}]}}),
+        );
+        let point = super::resume_point(&item_log(std::slice::from_ref(&noted)), "o/r", 7);
+        assert_eq!(point.noted.len(), 1);
+        assert_eq!(point.noted[0].text, "The parser drops a line");
+        let point = super::resume_point(&item_log(&[noted.clone(), ended(2)]), "o/r", 7);
+        assert!(point.noted.is_empty());
+        // A round that ended approved, cut off at the turn to land, names the latest ones, which
+        // replace what the round before it handed on, prior or not.
+        let approved = (
+            EV_ROUND,
+            json!({"round": 2, "verdict": "land",
+                "noted": [{"kind": "outside", "finding": "The lexer drops a byte"}]}),
+        );
+        let point = super::resume_point(&item_log(&[noted.clone(), approved.clone()]), "o/r", 7);
+        assert_eq!(point.round, 2);
+        assert_eq!(point.noted[0].text, "The lexer drops a byte");
+        let with_prior = (
+            EV_ROUND,
+            json!({"round": 1, "verdict": "changes", "next": {"feedback": "fix it",
+                "prior": {"reviewed": "r1", "blockers": "b", "follow_ups": []}}}),
+        );
+        let point = super::resume_point(&item_log(&[with_prior.clone(), approved]), "o/r", 7);
+        assert_eq!(
+            point.prior.unwrap().follow_ups[0].text,
+            "The lexer drops a byte"
+        );
+        // An approved round that noted none clears the earlier ones; a stopped round, which
+        // records no `noted`, keeps them.
+        let none = (
+            EV_ROUND,
+            json!({"round": 2, "verdict": "land", "noted": []}),
+        );
+        let point = super::resume_point(&item_log(&[noted.clone(), none.clone()]), "o/r", 7);
+        assert!(point.noted.is_empty());
+        let point = super::resume_point(&item_log(&[with_prior, none]), "o/r", 7);
+        assert!(point.prior.unwrap().follow_ups.is_empty());
+        let stopped = (EV_ROUND, json!({"round": 2, "verdict": "stopped"}));
+        let point = super::resume_point(&item_log(&[noted, stopped.clone()]), "o/r", 7);
+        assert_eq!(point.noted.len(), 1);
+        // A round every reviewer approved keeps its commit and the findings it lands with, in
+        // the change and outside it, through a stop. Checks on Paja's merge at the turn to land
+        // move it to that commit; checks on any other commit, a round that went on, or a fresh
+        // start take it back; a round that only noted findings (a split, an escalation) never
+        // gave one.
+        let checked_as = |commit: &str, landing: bool| {
+            (
+                EV_CHECKED,
+                json!({"round": 5, "commit": commit, "base": "b1", "landing": landing}),
+            )
+        };
+        let landing = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "land,land", "noted": [],
+                "approved": {"reviewed": "c1", "commit": "c1", "reviewers": 2, "findings": [
+                    {"kind": "nit", "finding": "Rename x"},
+                    {"kind": "outside", "finding": "The lexer drops a byte"}]}}),
+        );
+        let resumed =
+            |events: &[(&str, serde_json::Value)]| super::resume_point(&item_log(events), "o/r", 7);
+        let point = resumed(&[
+            checked_as("c1", false),
+            landing.clone(),
+            checked_as("m1", true),
+            stopped.clone(),
+        ]);
+        let approval = point.approved.expect("approved");
+        assert_eq!(approval.findings.len(), 2);
+        assert_eq!(approval.findings[0].text, "Rename x");
+        assert_eq!(approval.reviewers, 2);
+        assert_eq!(
+            (approval.reviewed.as_str(), approval.commit.as_str()),
+            ("c1", "m1")
+        );
+        assert_eq!(point.round, 5);
+        assert_eq!(point.checked, Some(("m1".into(), "b1".into())));
+        // A rebuild after the approval, checked and then stopped in its review.
+        let point = resumed(&[
+            checked_as("c1", false),
+            landing.clone(),
+            checked_as("x1", false),
+            stopped.clone(),
+        ]);
+        assert!(point.approved.is_none());
+        // The same commit checked again (the default branch tip moved, nothing merged) keeps it.
+        let point = resumed(&[landing.clone(), checked_as("c1", false)]);
+        assert!(point.approved.is_some());
+        let red = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "ci_failed", "next": {"feedback": "red"}}),
+        );
+        let after = |event: (&str, serde_json::Value)| resumed(&[landing.clone(), event]).approved;
+        assert!(after(red).is_none());
+        assert!(after((jono::EV_STATUS, json!({}))).is_none());
+        assert!(after(stopped).is_some());
+        let split = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "land,changes", "noted": []}),
+        );
+        assert!(resumed(std::slice::from_ref(&split)).approved.is_none());
+        // A later review of the same round that didn't approve takes the approval back.
+        let escalated = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "escalate", "noted": []}),
+        );
+        assert!(after(escalated).is_none());
+        assert!(after(split).is_none());
+        // An older approval shape, or none, is no approval.
+        let older = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "land", "noted": [], "approved": []}),
+        );
+        assert!(resumed(&[older]).approved.is_none());
+    }
+
+    #[test]
+    fn a_full_review_hears_what_an_earlier_review_noted_outside_the_change() {
+        let item = WorkItem {
+            repo: "o/r".into(),
+            number: 7,
+            title: "Add a parser".into(),
+            body: "Please.".into(),
+            url: String::new(),
+            open: true,
+            status: crate::jono::Status::Active,
+            note: None,
+            usage: None,
+            answers: Vec::new(),
+            waiting_on: Vec::new(),
+            priority: Default::default(),
+            claim: None,
+        };
+        let noted = [Finding {
+            kind: FindingKind::Outside,
+            text: "The parser drops a line".into(),
+        }];
+        let prompt = super::review_prompt(&item, "base1", "abc123", None, &noted, "D", &[], &[]);
+        assert!(
+            prompt.contains("noted these findings outside the change")
+                && prompt.contains("The parser drops a line"),
+            "{prompt}"
+        );
+        let bare = super::review_prompt(&item, "base1", "abc123", None, &[], "D", &[], &[]);
+        assert!(!bare.contains("noted these findings"), "{bare}");
     }
 }

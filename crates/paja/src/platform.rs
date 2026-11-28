@@ -210,6 +210,26 @@ pub fn posix_shell() -> Result<PathBuf> {
         )
 }
 
+/// The program `name` on `PATH` (with `.exe` on Windows), as an absolute path, if there is one.
+pub fn program_on_path(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        find_on_path(&format!("{name}.exe"))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // As a shell does: a file nobody may run is not the program.
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(name))
+            .find(|path| {
+                std::fs::metadata(path)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+    }
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .filter(|dir| dir.is_absolute())
@@ -381,6 +401,20 @@ pub fn quote_hook_word(path: &Path) -> Result<String> {
     }
 }
 
+/// Write one line to stdout. Not `println!`, which panics when stdout is closed (the program
+/// that started Paja exited without redirecting it, a broken pipe on Unix, a closed pipe on
+/// Windows): the line is lost then, but the exit code still says how it went.
+pub fn print_line(text: impl std::fmt::Display) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{text}").and_then(|()| out.flush());
+}
+
+/// How the first stop's message says to stop now: 0 a second Ctrl-C, 1 a `stop now` line on
+/// stdin ([`stop_on_stdin`]), 2 not at all (a pool's lane: the pool says it), 3 no message at
+/// all (a pool's planner, which the pool stops without asking anyone).
+static STOP_HINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// How many times the person pressed Ctrl-C since [`catch_interrupts`].
 static INTERRUPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -404,11 +438,18 @@ fn announce(now: u32) {
     let say = |text: &str| {
         let _ = std::io::Write::write_all(&mut std::io::stderr(), text.as_bytes());
     };
-    if before < 1 && now >= 1 {
-        say("paja: stopping after this step; press Ctrl-C again to stop now\n");
+    let hint = STOP_HINT.load(std::sync::atomic::Ordering::SeqCst);
+    if before < 1 && now >= 1 && hint < 3 {
+        say(match hint {
+            0 => "paja: stopping after this step; press Ctrl-C again to stop now\n",
+            1 => "paja: stopping after this step; send `stop now` to stop now\n",
+            _ => "paja: stopping after this step\n",
+        });
     }
     if before < 2 && now >= 2 {
-        say("paja: stopping now\n");
+        if hint < 3 {
+            say("paja: stopping now\n");
+        }
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(10));
             std::process::exit(130);
@@ -417,16 +458,44 @@ fn announce(now: u32) {
 }
 
 fn interrupted() {
-    INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // A pool's planner never waits for a step to end: any interrupt it sees stops it now, before
+    // a git or agent the same Ctrl-Break ended could pass for a failed plan.
+    if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+        INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Who writes the stop requests [`stop_on_stdin`] reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopFrom {
+    /// A program a person drives, such as Paja Desk: the first stop says to send `stop now`.
+    Program,
+    /// A pool, to one of its lanes: the pool, not the lane, says how to stop now.
+    Pool,
+    /// A pool, to one of its planners: nothing is said, and stdin closing stops now, since a
+    /// plan is no use once its pool is gone.
+    PoolPlanner,
 }
 
 /// Read stop requests from stdin, for a `paja run` started by a program instead of a terminal
 /// (Paja Desk): a `stop` line counts as the first Ctrl-C (stop after this step) and `stop now`
 /// as the second. The same on every platform, since a windowed program has no console to send
 /// Ctrl-C through. Other lines are ignored, and stdin closing (the program that started the
-/// run exited) leaves the run going.
-pub fn stop_on_stdin() {
-    std::thread::spawn(|| {
+/// run exited) leaves the run going, except for a pool's planner. A pool's lane reads its stop
+/// requests the same way, but the pool, not the lane, says how to stop now: the pool's own
+/// stdin or a terminal's Ctrl-C, which reaches the lane too.
+pub fn stop_on_stdin(from: StopFrom) {
+    STOP_HINT.store(
+        match from {
+            StopFrom::Program => 1,
+            StopFrom::Pool => 2,
+            StopFrom::PoolPlanner => 3,
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut line = Vec::new();
         loop {
@@ -434,7 +503,13 @@ pub fn stop_on_stdin() {
             // Bytes, not text, so a line that isn't UTF-8 is skipped rather than ending the
             // reader; 0 bytes is stdin closing.
             match std::io::BufRead::read_until(&mut stdin, b'\n', &mut line) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => {
+                    if from == StopFrom::PoolPlanner {
+                        INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+                        interrupts();
+                    }
+                    return;
+                }
                 Ok(_) => {}
             }
             match String::from_utf8_lossy(&line).trim() {
@@ -585,6 +660,43 @@ pub fn output_until_stopped_with_input(
     cmd: &mut Command,
     input: Option<Vec<u8>>,
 ) -> std::io::Result<std::process::Output> {
+    output_until(cmd, input, None).map(|ended| ended.output)
+}
+
+/// How a step [`output_until_stopped_or`] ran ended.
+pub struct Bounded {
+    /// What it printed, also when it was ended at its deadline: whatever it had printed by
+    /// then. Its `status` means nothing when `timed_out` is set.
+    pub output: std::process::Output,
+    /// Whether it was still going at the deadline, and ended with everything it started.
+    pub timed_out: bool,
+}
+
+/// [`output_until_stopped`], also ended with everything it started once `deadline` passes:
+/// for a wait on something outside Paja that may never end, such as a pull request's CI.
+pub fn output_until_stopped_or(
+    cmd: &mut Command,
+    deadline: std::time::Instant,
+) -> std::io::Result<Bounded> {
+    output_until(cmd, None, Some(deadline))
+}
+
+/// The error a step ended by `stop now` (or a second Ctrl-C) returns, of kind
+/// [`std::io::ErrorKind::Interrupted`]: for a wait between steps to return the same.
+pub fn stopped_error() -> std::io::Error {
+    let why = if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+        "stopped by its pool"
+    } else {
+        "stopped by a second Ctrl-C"
+    };
+    std::io::Error::new(std::io::ErrorKind::Interrupted, why)
+}
+
+fn output_until(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<Bounded> {
     use std::io::{Read, Write};
     use std::process::Stdio;
     if input.is_some() {
@@ -602,15 +714,46 @@ pub fn output_until_stopped_with_input(
         })),
         _ => None,
     };
-    // Drain both pipes while waiting, so a chatty child can't fill one and stall.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+    // Drain both pipes while waiting, so a chatty child can't fill one and stall. What each
+    // reads is kept as it comes, and a message says its pipe closed: a step ended at its
+    // deadline is read from as far as it got, without waiting on a process it started that
+    // outlived it and holds the pipe open.
+    type Drained = (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (closed, done) = std::sync::mpsc::channel();
+        let kept = std::sync::Arc::clone(&bytes);
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Ok(mut kept) = kept.lock() {
+                                kept.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                        // Retried, as `read_to_end` does.
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
             }
-            bytes
-        })
+            let _ = closed.send(());
+        });
+        (bytes, done)
+    };
+    // What a drain has read, once its pipe closed or `wait` passed.
+    let read = |(bytes, done): Drained, wait: Option<std::time::Duration>| {
+        let _ = match wait {
+            Some(wait) => done.recv_timeout(wait).map_err(|_| ()),
+            None => done.recv().map_err(|_| ()),
+        };
+        bytes.lock().map(|b| b.clone()).unwrap_or_default()
     };
     let stdout = drain(
         child
@@ -631,25 +774,44 @@ pub fn output_until_stopped_with_input(
         if interrupts() >= 2 {
             kill_tree(&mut child);
             let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "stopped by a second Ctrl-C",
-            ));
+            return Err(stopped_error());
+        }
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            kill_tree(&mut child);
+            // Timed out either way: a wait that fails after the kill doesn't change that.
+            let status = child.wait().unwrap_or_default();
+            // A moment for the pipes to close; one held open by a process that outlived the
+            // kill gives what was read so far, rather than holding Paja up.
+            let late = Some(std::time::Duration::from_secs(2));
+            return Ok(Bounded {
+                output: std::process::Output {
+                    status,
+                    stdout: read(stdout, late),
+                    stderr: read(stderr, late),
+                },
+                timed_out: true,
+            });
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
     if let Some(writer) = writer {
         let _ = writer.join();
     }
-    Ok(std::process::Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+    Ok(Bounded {
+        output: std::process::Output {
+            status,
+            stdout: read(stdout, None),
+            stderr: read(stderr, None),
+        },
+        timed_out: false,
     })
 }
 
-/// End `child` and every process it started, so a second Ctrl-C leaves nothing running.
-fn kill_tree(child: &mut std::process::Child) {
+/// Kill `child`, which leads a process group of its own ([`own_process_group`]), and the rest of
+/// that group: on Windows every process it started (`taskkill /T`), on Unix the processes still
+/// in its group, not the ones it put in groups of their own. A second Ctrl-C leaves nothing
+/// running, since each of those is ended the same way by its own parent.
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         extern "C" {
@@ -673,6 +835,91 @@ fn kill_tree(child: &mut std::process::Child) {
             .status();
     }
     let _ = child.kill();
+}
+
+/// Kill `child` and every process it started, however they are grouped: for a `paja` that is
+/// stuck, whose agents and checks run in process groups of their own, so ending its group
+/// ([`kill_tree`]) would leave them running. On Windows, `taskkill /T`. On Unix, the processes
+/// are frozen (`SIGSTOP`) from the top down, so none can start another or be reparented away
+/// before it is found, and then killed from the bottom up, so each dies while its parent still
+/// holds its pid and nothing is woken by its group being orphaned; `ps` lists who started whom.
+/// Both follow parent ids, so a process already reparented away (a daemon that detached itself)
+/// is out of reach, and without a working `ps` only `child` is ended. A parent that has its
+/// children reaped for it (`SIGCHLD` ignored) leaves a brief window in which a child that just
+/// ended could have its pid reused before it is signalled. Does nothing once `child` has been
+/// waited for, so a reused pid is never signalled.
+pub fn kill_with_descendants(child: &mut std::process::Child) {
+    // Until it is waited for, an ended child keeps its pid, so the pid is still its own.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let signal = |pid: u32, sig: libc::c_int| {
+            if let Ok(pid) = libc::pid_t::try_from(pid) {
+                // SAFETY: a plain system call on a process id.
+                unsafe {
+                    libc::kill(pid, sig);
+                }
+            }
+        };
+        let mut frozen = vec![child.id()];
+        signal(child.id(), libc::SIGSTOP);
+        // Each pass freezes the children of what is frozen, until a pass finds none.
+        loop {
+            let found: Vec<u32> = children_of(&frozen)
+                .into_iter()
+                .filter(|pid| !frozen.contains(pid))
+                .collect();
+            if found.is_empty() {
+                break;
+            }
+            for &pid in &found {
+                signal(pid, libc::SIGSTOP);
+            }
+            frozen.extend(found);
+        }
+        for &pid in frozen.iter().rev() {
+            signal(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // From a windowed program such as Paja Desk, without a console window of its own.
+        let mut cmd = Command::new("taskkill");
+        let _ = no_console(&mut cmd)
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The processes whose parent is one of `parents`, as `ps` lists them; none when it can't
+/// within a few seconds, so a hung `ps` never leaves the tree frozen.
+#[cfg(unix)]
+fn children_of(parents: &[u32]) -> Vec<u32> {
+    let mut ps = Command::new("ps");
+    ps.args(["-A", "-o", "pid=", "-o", "ppid="]);
+    let Ok(out) = output_within(
+        own_process_group(&mut ps),
+        std::time::Duration::from_secs(5),
+    ) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let ppid = parts.next()?.parse::<u32>().ok()?;
+            // Never 0 (the caller's own group) or 1, whatever `ps` printed.
+            (pid > 1 && parents.contains(&ppid)).then_some(pid)
+        })
+        .collect()
 }
 
 /// The command that shows `title` and `text` as a desktop notification: a Windows toast through
@@ -819,6 +1066,119 @@ pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether process `pid` has ended (or is only a zombie left for its parent to reap).
+    #[cfg(unix)]
+    fn ended(pid: &str) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        stat.trim().is_empty() || stat.trim().starts_with('Z')
+    }
+
+    /// On Windows too, a step past its deadline is ended (`taskkill /T`) and reads as timed out
+    /// soon after.
+    #[cfg(windows)]
+    #[test]
+    fn a_step_past_its_deadline_is_ended_as_timed_out_on_windows() {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
+        let late = output_until_stopped_or(
+            Command::new("ping").args(["-n", "60", "127.0.0.1"]),
+            deadline,
+        )
+        .unwrap();
+        assert!(late.timed_out);
+        // Ended at the deadline: not before it, and not long after.
+        let took = started.elapsed();
+        assert!(took.as_secs() >= 2 && took.as_secs() < 20, "{took:?}");
+    }
+
+    /// A step past its deadline is ended, with what it started, and reads as timed out with what
+    /// it printed by then; one that ends first returns its output as usual.
+    #[cfg(unix)]
+    #[test]
+    fn a_step_past_its_deadline_is_ended_as_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("pid");
+        let script = format!("sleep 60 & echo $! > '{}'; wait", pid.display());
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(500);
+        let script = format!("echo started; {script}");
+        let late =
+            output_until_stopped_or(Command::new("sh").args(["-c", &script]), deadline).unwrap();
+        assert!(late.timed_out);
+        // What it printed before the deadline is kept.
+        assert_eq!(String::from_utf8_lossy(&late.output.stdout), "started\n");
+        assert!(started.elapsed().as_secs() < 20);
+        let sleeper = std::fs::read_to_string(&pid).unwrap();
+        let gone = std::time::Instant::now();
+        while !ended(sleeper.trim()) {
+            assert!(
+                gone.elapsed().as_secs() < 10,
+                "the step's child outlived it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let done =
+            output_until_stopped_or(Command::new("sh").args(["-c", "echo done"]), later).unwrap();
+        assert!(!done.timed_out);
+        assert_eq!(String::from_utf8_lossy(&done.output.stdout), "done\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killing_with_descendants_reaches_processes_in_groups_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        // bash's `set -m` puts each background job in a process group of its own even without a
+        // terminal, as `paja` does with its agents; the second job starts one more process
+        // below it.
+        let script = format!(
+            "set -m; sleep 60 & echo $! >> '{p}'; sh -c 'sleep 60 & echo $! >> \"$0\"; wait' \
+             '{p}' & echo $! >> '{p}'; wait",
+            p = pids.display()
+        );
+        let mut child = Command::new("bash").args(["-c", &script]).spawn().unwrap();
+        let started = std::time::Instant::now();
+        let read = || std::fs::read_to_string(&pids).unwrap_or_default();
+        while read().lines().count() < 3 {
+            assert!(
+                started.elapsed().as_secs() < 30,
+                "the processes never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let pids = read();
+        let pids: Vec<&str> = pids.lines().map(str::trim).collect();
+        assert!(pids.iter().all(|pid| !ended(pid)), "{pids:?}");
+        let group = |pid: &str| {
+            let out = Command::new("ps")
+                .args(["-o", "pgid=", "-p", pid])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let own = group(&child.id().to_string());
+        assert!(
+            pids.iter().all(|pid| group(pid) != own),
+            "not in groups of their own: {pids:?}"
+        );
+        kill_with_descendants(&mut child);
+        assert!(child.try_wait().unwrap().is_some());
+        // A second call once it has been waited for is harmless (that it signals nothing, a
+        // reused pid least of all, is checked by reading the guard: a stray signal to a stale
+        // pid can't be seen from here).
+        kill_with_descendants(&mut child);
+        let started = std::time::Instant::now();
+        while !pids.iter().all(|pid| ended(pid)) {
+            assert!(started.elapsed().as_secs() < 10, "left running: {pids:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn output_within_gives_the_output_or_stops_the_program_at_the_limit() {

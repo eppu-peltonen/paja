@@ -54,6 +54,9 @@ pub struct Report {
 pub const TROUBLESHOOTING_URL: &str =
     "https://github.com/eppu-peltonen/paja/blob/main/docs/troubleshooting.md";
 
+/// Where Paja's issues are filed.
+const ISSUES_URL: &str = "https://github.com/eppu-peltonen/paja/issues";
+
 fn ok(name: &str, detail: impl Into<String>) -> Check {
     Check {
         name: name.into(),
@@ -171,11 +174,16 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     }
     // claude
     let claude = std::env::var("PAJA_CLAUDE").unwrap_or_else(|_| "claude".to_string());
+    // Whether the account has a usage window, from `claude auth status`; assumed until it says.
+    let mut windowed = true;
     match run(Command::new(&claude).arg("--version")) {
         Ok(out) if out.status.success() => {
             checks.push(claude_version(&claude, text(&out)));
             match run(Command::new(&claude).args(["auth", "status"])) {
-                Ok(out) if out.status.success() => checks.push(ok("claude sign-in", "signed in")),
+                Ok(out) if out.status.success() => {
+                    windowed = has_window(&String::from_utf8_lossy(&out.stdout));
+                    checks.push(ok("claude sign-in", "signed in"));
+                }
                 Ok(out) => checks.push(failed(
                     "claude sign-in",
                     format!("`{claude} auth status` failed: {}", text(&out)),
@@ -234,23 +242,128 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             checks.push(failed("home folder", why, fix));
         }
     }
-    checks.push(left_over_environments(home));
+    checks.push(left_over_environments(home, repo));
+    checks.push(match home.events().read_all() {
+        Ok(events) => usage_window(&events, &claude, windowed),
+        Err(err) => warning(
+            "usage window",
+            format!("couldn't read the event log: {err:#}"),
+            format!("check {}", home.root().display()),
+        ),
+    });
+}
+
+/// How many of the latest agent steps the usage window check reads.
+const WINDOW_STEPS: usize = 5;
+
+/// Whether `claude auth status` (JSON) says the account has a usage window to report: signed
+/// in to a Claude subscription, not with an API key or through a cloud provider. Output that
+/// isn't the JSON expected counts as a subscription, so the check still runs.
+fn has_window(status: &str) -> bool {
+    let Ok(status) = serde_json::from_str::<Value>(status) else {
+        return true;
+    };
+    let provider = status["apiProvider"].as_str().unwrap_or("firstParty");
+    let method = status["authMethod"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    provider == "firstParty" && !method.contains("api")
+}
+
+/// Whether Claude Code's results tell Paja the usage window. The window comes from the
+/// `rate_limit_event` messages of `claude -p --output-format stream-json`, whose shape Paja
+/// assumes; if a Claude Code prints it differently, no step records a window and a nearly used
+/// one never holds a build back, silently. So the latest agent steps that ran a session are
+/// read: none at all is ok (nothing has run yet), and none of them with a window is a warning.
+/// `windowed` is false for an account with no window (an API key, a cloud provider).
+fn usage_window(events: &[crate::events::Event], claude: &str, windowed: bool) -> Check {
+    let name = "usage window";
+    if !windowed {
+        return ok(
+            name,
+            "signed in with an API key or through a cloud provider: there is no usage window to \
+             report",
+        );
+    }
+    let mut steps: Vec<_> = crate::mestari::StepUsage::recorded(events)
+        // A step that ran a session; one that never started has nothing to report.
+        .filter(|s| s.session_id.is_some())
+        .collect();
+    steps.drain(..steps.len().saturating_sub(WINDOW_STEPS));
+    let Some(latest) = steps.iter().rfind(|s| s.reports_window()) else {
+        if steps.is_empty() {
+            return ok(name, "no agent step has run yet");
+        }
+        return warning(
+            name,
+            format!(
+                "the latest {} agent step{} reported no usage window, so a nearly used window \
+                 can't hold a build back before Claude Code's limit cuts it off",
+                steps.len(),
+                if steps.len() == 1 { "" } else { "s" }
+            ),
+            format!(
+                "run `{claude} update`. If Claude Code is current, file an issue at {ISSUES_URL} \
+                 with the `rate_limit_event` line that `{claude} -p --output-format stream-json \
+                 --verbose hi` prints: Paja reads the window from its `rate_limit_info`. Billed \
+                 per token (an API key, a Console sign-in), there is no window and this warning \
+                 doesn't apply"
+            ),
+        );
+    };
+    let mut detail = format!(
+        "the latest step that reported a window had {}",
+        latest.window_status.as_deref().unwrap_or("no status")
+    );
+    if let Some(used) = latest.window_used_percent {
+        detail.push_str(&format!(", {used:.0}% used"));
+    }
+    ok(name, detail)
 }
 
 /// Environments whose work item's issue was closed: a parked item keeps its environment (so the
-/// builder's edits survive the question), and nothing removes it if the issue is closed instead
-/// of answered.
-fn left_over_environments(home: &Home) -> Check {
+/// builder's edits survive the question), and one with uncommitted changes is kept when its
+/// issue is closed instead of answered. An item still marked active counts once no run holds
+/// it (the run crashed or was killed). An item from a log written before items carried their
+/// repository, or of the repository whose checkout `repo` is in, matches the `work-<n>`
+/// environment of its number made there, as releases before names carried the repository did.
+fn left_over_environments(home: &Home, repo: &Path) -> Check {
     let name = "environments";
     let found = (|| -> Result<Vec<String>> {
         let events = home.events().read_all()?;
         let envs = ahjo::replay(&events)?;
-        let mut left: Vec<String> = jono::replay(&events, "")?
-            .values()
-            .filter(|item| !item.open && item.status != jono::Status::Active)
-            .map(|item| item.env_name())
-            .filter(|env| envs.contains_key(env))
-            .collect();
+        // Made in this checkout: doctor may run from a folder inside it.
+        let checkout = jono::checkout_top(repo)?;
+        let here = |env: &ahjo::Env| jono::same_dir(&env.repo, &checkout);
+        // A `work-<n>` is the item's only when the log shows the item last ran there.
+        let ours = |item: &jono::WorkItem| {
+            item.repo.is_empty() || jono::ran_in_work_n(&events, &item.repo, item.number)
+        };
+        let mut left = Vec::new();
+        for item in jono::replay(&events, "")?.values() {
+            if item.open {
+                continue;
+            }
+            // An item from before items carried their repository can't be held by a run, which
+            // records the repository first.
+            if item.status == jono::Status::Active
+                && !item.repo.is_empty()
+                && home.run_held(&item.repo, item.number)?
+            {
+                continue;
+            }
+            if !item.repo.is_empty() && envs.contains_key(&item.env_name()) {
+                left.push(item.env_name());
+            }
+            // Releases before names carried the repository named an item's environment
+            // `work-<n>`: the item's when it was made in this checkout and the log shows the item
+            // last ran there (or the log names no repository).
+            let plain = format!("work-{}", item.number);
+            if envs.get(&plain).is_some_and(&here) && ours(item) {
+                left.push(plain);
+            }
+        }
         left.sort();
         left.dedup();
         Ok(left)
@@ -279,7 +392,7 @@ fn left_over_environments(home: &Home) -> Check {
         ),
         Err(err) => warning(
             name,
-            format!("couldn't read the event log: {err:#}"),
+            format!("couldn't check: {err:#}"),
             format!("check {}", home.root().display()),
         ),
     }
@@ -449,37 +562,39 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
         )),
     }
 
-    // What `paja run` reads, from the default branch: the same refs, in the same order, as
-    // `ahjo::show_on_default_branch`, so a default branch with another name is found too.
-    // Resolved once, by exact ref name: every file below is read from that one commit, and
-    // messages name the branch by its short name.
-    let mut found = None;
-    for (full, short) in crate::ahjo::DEFAULT_REFS {
-        match crate::ahjo::ref_commit(proof.path(), full) {
-            Ok(Some(commit)) => {
-                found = Some((commit, short));
-                break;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                checks.push(failed(
-                    "default branch",
-                    format!("looking up {short}: {err:#}"),
-                    "run `git fsck` in this checkout and check that `git` runs",
-                ));
-                return;
-            }
+    // What `paja run` reads, from the default branch, found as `ahjo::show_on_default_branch`
+    // finds it, so a default branch with another name is found too. Resolved once: every file
+    // below is read from that one commit, and messages name the branch by its short name.
+    let found = match crate::ahjo::default_branch(&proof) {
+        Ok(found) => found,
+        Err(err) => {
+            checks.push(failed(
+                "default branch",
+                format!("{err:#}"),
+                "run the command the message names; if git itself failed, run `git fsck` here",
+            ));
+            return;
         }
-    }
+    };
     let Some((commit, rev)) = found else {
         checks.push(failed(
             "default branch",
-            "none of origin/HEAD, origin/main or main exists in this checkout",
-            "push the default branch (`git push -u origin main`), then run \
-             `git remote set-head origin -a` so Paja knows its name",
+            "gh can't name the default branch, and none of origin/HEAD, origin/main or main \
+             exists in this checkout",
+            "run `git fetch origin`; if the default branch isn't pushed yet, push it \
+             (`git push -u origin main`), then run `git remote set-head origin -a`",
         ));
         return;
     };
+    // GitHub named the branch, so origin/HEAD went unread: still say when it was moved, since
+    // something in this checkout moved it.
+    if let Err(err) = crate::ahjo::trusted_origin_head(&proof) {
+        checks.push(warning(
+            "origin/HEAD",
+            format!("{err:#}; Paja reads {rev} instead"),
+            "run `git remote set-head origin -a`",
+        ));
+    }
     // The work label.
     let labels = match show(proof.path(), &commit, jono::LABELS_FILE) {
         Ok(text) => jono::Labels::parse(&text.unwrap_or_default()).map_err(|e| format!("{e:#}")),
@@ -552,7 +667,7 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             "models",
             format!("no {models_file} on {rev}: every role runs on the account's default model"),
         )),
-        Ok(Some(text)) => match crate::mestari::Models::parse_on(&text, rev) {
+        Ok(Some(text)) => match crate::mestari::Models::parse_on(&text, &rev) {
             Err(err) => checks.push(failed(
                 "models",
                 format!("{err:#}"),
@@ -593,7 +708,8 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     }
     // CI.
     let ci_file = crate::mestari::CI_FILE;
-    let mode = show(proof.path(), &commit, ci_file).map(|t| lines(&t.unwrap_or_default()));
+    let mode = show(proof.path(), &commit, ci_file)
+        .map(|t| crate::mestari::parse_ci(&t.unwrap_or_default()));
     let required = || match gh_in_repo(&["workflow", "list"]) {
         Ok(list) if !list.is_empty() => ok("ci", "a GitHub Actions workflow is set up"),
         Ok(_) => failed(
@@ -617,42 +733,60 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             format!("reading {ci_file} on {rev}: {err}"),
             "check that the repository is intact (`git status`)",
         ),
-        Ok(words) => match words.as_slice() {
-            [w] if w == "none" => ok("ci", format!("{ci_file} says none")),
-            [] => required(),
-            [w] if w == "required" => required(),
-            _ => failed(
-                "ci",
-                format!("{ci_file} on {rev} must hold `required` or `none`"),
-                format!("fix {ci_file} on the default branch"),
-            ),
-        },
+        Ok(Ok((crate::mestari::CiMode::None, _))) => ok("ci", format!("{ci_file} says none")),
+        Ok(Ok((crate::mestari::CiMode::Required, _))) => required(),
+        Ok(Err(why)) => failed(
+            "ci",
+            format!("{ci_file} on {rev} {why}"),
+            format!("fix {ci_file} on the default branch"),
+        ),
     });
 }
 
 fn sandbox(checks: &mut Vec<Check>) {
+    use crate::sandbox::Why;
     let var = crate::sandbox::PROGRAM_VAR;
-    match crate::sandbox::configured() {
-        Some(program) => match run(Command::new(&program).arg("version")) {
-            Ok(out) if out.status.success() => {
-                checks.push(ok("sandbox", format!("{var} is {program}")))
+    let choice = crate::sandbox::chosen();
+    let said = choice.describe();
+    match (&choice.program, choice.why) {
+        (Some(program), Why::Detected) => {
+            match crate::sandbox::probe_within(program, crate::sandbox::PROBE_LIMIT) {
+                Ok(()) => checks.push(ok("sandbox", said)),
+                Err(cause) => checks.push(failed(
+                    "sandbox",
+                    format!("{said}, but {cause}"),
+                    crate::sandbox::probe_fix(program),
+                )),
             }
+        }
+        (Some(program), _) => match run(Command::new(program).arg("version")) {
+            Ok(out) if out.status.success() => checks.push(ok("sandbox", said)),
             // It started but failed: a broken or wrong `sbx` must not look set up.
             Ok(out) => checks.push(failed(
                 "sandbox",
                 format!("{var} is {program}, and `{program} version` failed: {}", text(&out)),
-                format!("fix or reinstall `sbx` and point {var} at it, or unset {var} to run without a sandbox"),
+                format!("fix or reinstall `sbx` and point {var} at it, or set {var}=off to run without a sandbox"),
             )),
             Err(err) => checks.push(failed(
                 "sandbox",
                 format!("{var} is {program}, which did not run: {err}"),
-                format!("install `sbx` and point {var} at it, or unset {var} to run without a sandbox"),
+                format!("install `sbx` and point {var} at it, or set {var}=off to run without a sandbox"),
             )),
         },
-        None => checks.push(warning(
+        (None, Why::NotFound) if crate::sandbox::detected_earlier() => checks.push(failed(
             "sandbox",
-            format!("{var} is not set, so agents and checks run as this user, with your files and sign-ins"),
-            format!("install `sbx` and set {var} to it for a sandbox (see docs/setup.md)"),
+            format!("{said}, though this Paja ran agents in it earlier"),
+            crate::sandbox::lost_sbx(),
+        )),
+        (None, Why::Off) => checks.push(warning(
+            "sandbox",
+            format!("{said}, so agents and checks run as this user, with your files and sign-ins"),
+            format!("unset {var} to use `sbx` when it is installed (see docs/setup.md)"),
+        )),
+        (None, _) => checks.push(warning(
+            "sandbox",
+            format!("{said}, so agents and checks run as this user, with your files and sign-ins"),
+            "install `sbx`, which Paja then uses (see docs/setup.md)".to_string(),
         )),
     }
 }
@@ -660,6 +794,74 @@ fn sandbox(checks: &mut Vec<Check>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rounds(steps: &[serde_json::Value]) -> Vec<crate::events::Event> {
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| crate::events::Event {
+                v: 1,
+                seq: i as u64 + 1,
+                ts_ms: 0,
+                kind: crate::mestari::EV_ROUND.to_string(),
+                data: serde_json::json!({ "steps": [step] }),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_usage_window_check_reads_the_latest_five_steps_that_ran() {
+        let windowed = serde_json::json!({"step": "build", "session_id": "s",
+            "window_status": "allowed", "window_used_percent": 40.0});
+        let bare = serde_json::json!({"step": "build", "session_id": "s"});
+        let unstarted = serde_json::json!({"step": "build"});
+        let check = |steps: &[serde_json::Value]| usage_window(&rounds(steps), "claude", true);
+        assert_eq!(check(&[]).status, Status::Ok);
+        assert_eq!(check(std::slice::from_ref(&unstarted)).status, Status::Ok);
+        // A window four steps back is among the latest five.
+        let mut steps = vec![windowed.clone()];
+        steps.extend(std::iter::repeat_n(bare.clone(), 4));
+        let ok = check(&steps);
+        assert_eq!(ok.status, Status::Ok);
+        assert!(ok.detail.contains("had allowed, 40% used"), "{}", ok.detail);
+        // Steps that never ran a session don't push it out.
+        steps.extend(std::iter::repeat_n(unstarted, 3));
+        assert_eq!(check(&steps).status, Status::Ok);
+        // Five steps since it, none with a window: a warning that names the configured claude.
+        steps.push(bare);
+        let warned = usage_window(&rounds(&steps), "my-claude", true);
+        assert_eq!(warned.status, Status::Warning);
+        assert!(
+            warned.detail.contains("latest 5 agent steps"),
+            "{}",
+            warned.detail
+        );
+        let fix = warned.fix.unwrap();
+        assert!(
+            fix.contains("`my-claude update`") && fix.contains(ISSUES_URL),
+            "{fix}"
+        );
+        // An account with no window is never warned.
+        assert_eq!(
+            usage_window(&rounds(&steps), "claude", false).status,
+            Status::Ok
+        );
+    }
+
+    #[test]
+    fn only_a_subscription_has_a_usage_window() {
+        assert!(has_window(
+            r#"{"authMethod": "oauth_token", "apiProvider": "firstParty"}"#
+        ));
+        assert!(has_window(r#"{"loggedIn": true}"#));
+        assert!(has_window("Logged in"));
+        assert!(!has_window(
+            r#"{"authMethod": "api_key", "apiProvider": "firstParty"}"#
+        ));
+        assert!(!has_window(
+            r#"{"authMethod": "oauth_token", "apiProvider": "bedrock"}"#
+        ));
+    }
 
     #[test]
     fn versions_of_different_lengths_compare_by_their_numbers() {

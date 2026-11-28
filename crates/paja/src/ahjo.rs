@@ -90,7 +90,8 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     if is_paja_name(opts.name) {
         bail!(
             "environment name {:?} has the shape Paja gives its own environments \
-             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`, where \
+             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-plan-<n>`, `<repo>-<hash>-triage`, \
+             `work-<n>`, `plan-<n>`, where \
              `<hash>` is any six hex digits), and Paja would reuse, reset and remove it; pick \
              another name",
             opts.name
@@ -100,9 +101,9 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
 }
 
 /// Whether `name` has the shape of a name Paja gives its own environments: what
-/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage` or
-/// `-work-<n>`), a plan's `plan-<n>`, or the `work-<n>` of releases before names carried the
-/// repository.
+/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage`,
+/// `-work-<n>` or a plan's `-plan-<n>`), or the `work-<n>` and `plan-<n>` of releases before
+/// names carried the repository.
 pub fn is_paja_name(name: &str) -> bool {
     let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
     if ["work-", "plan-"]
@@ -111,18 +112,26 @@ pub fn is_paja_name(name: &str) -> bool {
     {
         return true;
     }
-    let head = if let Some(head) = name.strip_suffix("-triage") {
-        head
-    } else if let Some((head, n)) = name.rsplit_once("-work-") {
-        if !number(n) {
-            return false;
-        }
-        head
-    } else {
-        return false;
+    // Each ending on its own: a repository named `home-work-app` puts `-work-` before the
+    // `-plan-<n>` its planner's name ends in.
+    let hashed = |head: &str| {
+        let hash = head.rsplit('-').next().unwrap_or(head);
+        hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
     };
-    let hash = head.rsplit('-').next().unwrap_or(head);
-    hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    name.strip_suffix("-triage").is_some_and(hashed)
+        || ["-work-", "-plan-"].iter().any(|what| {
+            name.rsplit_once(what)
+                .is_some_and(|(head, n)| number(n) && hashed(head))
+        })
+}
+
+/// Whether two repository paths are the same folder, as the file system resolves them; paths
+/// that can't be resolved (a repository that moved) are compared as written.
+pub(crate) fn same_repo(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
@@ -260,6 +269,19 @@ impl From<&Env> for RemoveReport {
 /// Remove an environment's worktree. The branch is kept, since it may hold work that has not
 /// landed yet. Without `force`, a worktree with uncommitted changes is refused.
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
+    remove_unless(home, name, force, |_, _, _| Ok(None))
+}
+
+/// [`remove`], unless `keep` names a reason to keep the environment, which is then the error.
+/// `keep` runs under the home lock, after the tamper check and before git touches anything, with
+/// the log as it stands, the environment and the tamper check's proof (None when the repository
+/// is gone, so no git may run), so what it decides can't change before the removal.
+pub(crate) fn remove_unless(
+    home: &Home,
+    name: &str,
+    force: bool,
+    keep: impl FnOnce(&[Event], &Env, Option<&Untampered>) -> Result<Option<String>>,
+) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
     let events = log.read_all()?;
@@ -276,6 +298,9 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     } else {
         None
     };
+    if let Some(why) = keep(&events, &env, checked.as_ref())? {
+        bail!("{why}");
+    }
 
     match checked {
         None => {
@@ -320,7 +345,7 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
                         repo = env.repo.display()
                     )
                 } else {
-                    format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
+                    format!("removing worktree {path}; git refuses one with uncommitted changes or untracked files (--force discards them), and a locked one or one with submodules")
                 }
             })?;
             }
@@ -841,50 +866,99 @@ pub(crate) const DEFAULT_REFS: [(&str, &str); 3] = [
     ("refs/heads/main", "main"),
 ];
 
-/// A file as it is on the default branch of the checkout `ok` proved safe: `origin/HEAD` (the
-/// remote's default branch, whatever its name), else `origin/main`, else a local `main`. None
-/// when the file isn't there, or when there is none of these. Never the branch checked out,
-/// which may be the change under review.
+/// The prefix of the branches Paja itself creates and pushes (`paja/<name>`), the change under
+/// review among them.
+const BRANCH_PREFIX: &str = "paja/";
+
+/// The default branch of the checkout `ok` proved safe, as its commit and the short name
+/// messages use, or None when no ref names it. Never the branch checked out, which may be the
+/// change under review.
 ///
-/// Errors when `origin/HEAD` points outside `refs/remotes/origin/` (code in a worktree can
-/// point it at the branch under review), and when the checkout has an `origin` remote but
-/// none of the three refs, so a default branch with another name isn't silently ignored.
-pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
-    let head = git_command()
-        .arg("-C")
-        .arg(ok.path())
-        .args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
-        .output()
-        .context("running git (is it installed?)")?;
-    if head.status.success() {
-        let target = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        if !target.starts_with("refs/remotes/origin/") {
-            bail!(
-                "origin/HEAD in {} points at {target}, outside refs/remotes/origin/, so it is not \
-                 trusted as the default branch; fix it with `git remote set-head origin -a`",
+/// GitHub's name for it decides when `gh repo view` names a usable branch within 15 seconds:
+/// Paja reads `origin/<name>` and nothing else, and errors when that isn't fetched. Code in a
+/// worktree can move `origin/HEAD` (`git remote set-head`, `git update-ref`), which would point
+/// inside `refs/remotes/origin/` once the branch under review is pushed, and can make a local
+/// `main`. Otherwise `origin/HEAD` (the remote's default branch, whatever its name), else
+/// `origin/main`, else a local `main`; `origin/HEAD` must then be a symbolic ref to a
+/// remote-tracking branch that isn't one of Paja's own (`paja/...`), or this errors.
+pub(crate) fn default_branch(ok: &Untampered) -> Result<Option<(String, String)>> {
+    if let Some(name) = github_default_branch(ok) {
+        // GitHub's branch, or an error: a local `main` or `origin/main` may be something else,
+        // and code in a worktree can make one.
+        return match ref_commit(ok.path(), &format!("refs/remotes/origin/{name}"))? {
+            Some(commit) => Ok(Some((commit, format!("origin/{name}")))),
+            None => bail!(
+                "GitHub's default branch is {name}, but {} has no origin/{name}; run `git fetch \
+                 origin {name}` there",
                 ok.path().display()
-            );
-        }
+            ),
+        };
     }
-    // The commit a ref names, so the file is read from it and the ref isn't looked up twice.
-    let resolves = |full: &str| ref_commit(ok.path(), full);
-    let at = |rev: &str, commit: &str| {
-        show_at(ok.path(), commit, path)
-            .with_context(|| format!("reading {path} from {rev}, the default branch"))
-    };
+    trusted_origin_head(ok)?;
     // Full ref names: a short one such as `origin/main` would let a tag or branch of that name
     // (`refs/tags/origin/main`) stand in for the default branch.
     for (full, rev) in DEFAULT_REFS {
-        if let Some(commit) = resolves(full)? {
-            return at(rev, &commit);
+        if let Some(commit) = ref_commit(ok.path(), full)? {
+            return Ok(Some((commit, rev.to_string())));
         }
     }
-    // No origin/HEAD and no main: ask GitHub for the default branch's name, as `RepoSettings`
-    // does, and read it from the remote-tracking ref.
-    if let Some(name) = github_default_branch(ok) {
-        if let Some(commit) = resolves(&format!("refs/remotes/origin/{name}"))? {
-            return at(&format!("origin/{name}"), &commit);
+    Ok(None)
+}
+
+/// Errors when `origin/HEAD` exists but can't be trusted to name the default branch: when it
+/// isn't a symbolic ref (one written with `git update-ref`), or points outside
+/// `refs/remotes/origin/` or at one of Paja's own branches.
+pub(crate) fn trusted_origin_head(ok: &Untampered) -> Result<()> {
+    let git = |args: &[&str]| {
+        git_command()
+            .arg("-C")
+            .arg(ok.path())
+            .args(args)
+            .output()
+            .context("running git (is it installed?)")
+    };
+    let fix = "fix it with `git remote set-head origin -a`";
+    let head = git(&["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])?;
+    if !head.status.success() {
+        // Not symbolic: refused if it exists at all.
+        let exists = git(&["show-ref", "--verify", "-q", "refs/remotes/origin/HEAD"])?;
+        if exists.status.success() {
+            bail!(
+                "origin/HEAD in {} is not a symbolic ref, so it is not trusted as the default \
+                 branch; {fix}",
+                ok.path().display()
+            );
         }
+        return Ok(());
+    }
+    let target = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let Some(branch) = target.strip_prefix("refs/remotes/origin/") else {
+        bail!(
+            "origin/HEAD in {} points at {target}, outside refs/remotes/origin/, so it is not \
+             trusted as the default branch; {fix}",
+            ok.path().display()
+        );
+    };
+    if branch.starts_with(BRANCH_PREFIX) {
+        bail!(
+            "origin/HEAD in {} points at {target}, one of Paja's own branches, so it is not \
+             trusted as the default branch; {fix}",
+            ok.path().display()
+        );
+    }
+    Ok(())
+}
+
+/// A file as it is on the default branch (see [`default_branch`]) of the checkout `ok` proved
+/// safe. None when the file isn't there, or when the checkout has no `origin` remote and no
+/// `main`.
+///
+/// Errors when `origin/HEAD` can't be trusted, and when the checkout has an `origin` remote but
+/// no default branch, so a default branch with another name isn't silently ignored.
+pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<String>> {
+    if let Some((commit, rev)) = default_branch(ok)? {
+        return show_at(ok.path(), &commit, path)
+            .with_context(|| format!("reading {path} from {rev}, the default branch"));
     }
     let has_origin = git_command()
         .arg("-C")
@@ -896,20 +970,83 @@ pub fn show_on_default_branch(ok: &Untampered, path: &str) -> Result<Option<Stri
         .success();
     if has_origin {
         bail!(
-            "{} has an origin remote but none of origin/HEAD, origin/main or main, so the \
-             default branch is unknown; run `git remote set-head origin -a` there",
+            "{} has an origin remote but gh can't name its default branch, and there is no \
+             origin/HEAD, origin/main or main; run `git fetch origin` and `git remote set-head \
+             origin -a` there",
             ok.path().display()
         );
     }
     Ok(None)
 }
 
-/// The default branch's name as `gh repo view` reports it, or None when gh can't say.
+/// How long a default branch name from `gh` is reused, so a `work sync`, which reads two
+/// files from the default branch, asks once; and how long gh's failure to say is, so a gh
+/// that hangs costs one wait, not two, while the next pass asks again.
+const NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const NO_NAME_REUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The default branch's name as `gh repo view` reports it, or None when gh can't say within 15
+/// seconds or names something that can't be a branch Paja would trust. The answer is reused
+/// per repository: a name for a few minutes, a None for half a minute.
 fn github_default_branch(ok: &Untampered) -> Option<String> {
-    let out = crate::jono::gh(ok, &["repo", "view", "--json", "defaultBranchRef"]).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-    let name = v["defaultBranchRef"]["name"].as_str()?.trim();
-    (!name.is_empty()).then(|| name.to_string())
+    // Unit tests run without `gh`, whatever the machine has (`GH_REPO`, a signed-in `gh`).
+    if cfg!(test) {
+        return None;
+    }
+    type Names = BTreeMap<String, (std::time::Instant, Option<String>)>;
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<Names>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(Default::default);
+    // A panic elsewhere while the lock was held leaves the map as it was, which is still right.
+    let lock = || {
+        names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some((at, name)) = lock().get(&ok.key) {
+        let reuse = if name.is_some() {
+            NAME_REUSE
+        } else {
+            NO_NAME_REUSE
+        };
+        if at.elapsed() < reuse {
+            return name.clone();
+        }
+    }
+    let name = crate::jono::gh_within(
+        ok,
+        &["repo", "view", "--json", "defaultBranchRef"],
+        Some(std::time::Duration::from_secs(15)),
+    )
+    .ok()
+    .and_then(|out| serde_json::from_str::<serde_json::Value>(&out).ok())
+    .and_then(|v| {
+        v["defaultBranchRef"]["name"]
+            .as_str()
+            .map(|n| n.trim().to_string())
+    })
+    .filter(|name| branch_like(name));
+    lock().insert(ok.key.clone(), (std::time::Instant::now(), name.clone()));
+    name
+}
+
+/// Whether `name` could be a branch's name (git's rules, roughly) that isn't one of Paja's own.
+fn branch_like(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        // Any letter case: on Windows and macOS `head` opens the same ref file as `HEAD`.
+        && !name.eq_ignore_ascii_case("HEAD")
+        && !name.starts_with(BRANCH_PREFIX)
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("/.")
+        && !name.contains(".lock/")
+        && !name.contains("@{")
+        && !name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
 }
 
 /// Run git in `dir`, a path in the repository the tamper lock allowed (`_ok`), and return
@@ -1264,6 +1401,83 @@ mod tests {
             err.contains("from origin/HEAD, the default branch"),
             "{err}"
         );
+        // origin/HEAD pointing at one of Paja's own branches, such as a pushed review branch,
+        // is refused.
+        git_unchecked(
+            repo,
+            &["update-ref", "refs/remotes/origin/paja/app-1", "HEAD"],
+        )
+        .unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/paja/app-1",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one of Paja's own branches"), "{err}");
+        // So is an origin/HEAD that isn't a symbolic ref.
+        git_unchecked(
+            repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        )
+        .unwrap();
+        git_unchecked(
+            repo,
+            &[
+                "update-ref",
+                "--no-deref",
+                "refs/remotes/origin/HEAD",
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        let err = show_on_default_branch(&ok, ".paja/labels")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a symbolic ref"), "{err}");
+        assert!(err.contains("git remote set-head origin -a"), "{err}");
+    }
+
+    #[test]
+    fn a_default_branch_name_from_gh_must_look_like_a_branch() {
+        for good in ["main", "trunk", "release/1.0", "dev-x"] {
+            assert!(branch_like(good), "{good}");
+        }
+        for bad in [
+            "",
+            "@",
+            "HEAD",
+            "head",
+            "paja/app-1",
+            "-x",
+            "/x",
+            ".x",
+            "x/",
+            "x.",
+            "x.lock",
+            "a..b",
+            "a//b",
+            "a/.b",
+            "a.lock/b",
+            "a@{1}",
+            "a b",
+            "a\tb",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?",
+            "a*",
+            "a[",
+            "a\\b",
+        ] {
+            assert!(!branch_like(bad), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1310,6 +1524,43 @@ mod tests {
     }
 
     #[test]
+    fn remove_unless_keeps_what_its_check_keeps_before_git_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_unchecked(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-q", "--allow-empty", "-m", "c"]);
+        git_unchecked(&repo, &args).unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let env = create(
+            &home,
+            CreateOptions {
+                name: "keep-me",
+                repo: &repo,
+                base: None,
+            },
+        )
+        .unwrap();
+        let before = home.events().read_all().unwrap().len();
+        let err = remove_unless(&home, "keep-me", false, |events, seen, ok| {
+            assert!(ok.is_some());
+            assert_eq!(events.len(), before);
+            assert_eq!(seen.name, "keep-me");
+            Ok(Some("the item was reopened".into()))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the item was reopened");
+        assert!(env.path.exists());
+        assert_eq!(home.events().read_all().unwrap().len(), before);
+        assert!(get(&home, "keep-me").is_ok());
+        // With nothing to keep it, it goes.
+        remove_unless(&home, "keep-me", false, |_, _, _| Ok(None)).unwrap();
+        assert!(!env.path.exists() && get(&home, "keep-me").is_err());
+    }
+
+    #[test]
     fn port_blocks_reuse_the_lowest_free_slot() {
         let mut envs = BTreeMap::new();
         assert_eq!(free_port_block(&envs).unwrap(), 20_000);
@@ -1338,8 +1589,14 @@ mod tests {
 
     #[test]
     fn paja_shaped_names_are_told_apart_from_a_persons() {
-        for repo in ["acme/app", "acme/a-very-long-repository-name", "acme/---"] {
-            for what in ["triage", "work-7", "work-12345"] {
+        for repo in [
+            "acme/app",
+            "acme/a-very-long-repository-name",
+            "acme/---",
+            "acme/home-work-app",
+            "acme/x-plan-y",
+        ] {
+            for what in ["triage", "work-7", "work-12345", "plan-7"] {
                 let name = crate::jono::env_name_for(repo, what);
                 assert!(is_paja_name(&name), "{name}");
             }
@@ -1358,6 +1615,8 @@ mod tests {
             "app-abcdef-work-",
             "app-abcdef-work-7a",
             "app-abcdef-worker",
+            "app-abcdef-plan-",
+            "app-abcdef-plan-x",
         ] {
             assert!(!is_paja_name(theirs), "{theirs}");
         }

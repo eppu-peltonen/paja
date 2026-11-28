@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::land::{EV_LANDING, EV_MERGING};
+use super::land::{turn_kind, EV_LANDING, EV_MERGING};
 use super::plan::{blocked_by, overlap, Plan, EV_POOL_PLANNED};
 use super::EV_CHANGED;
 use super::{progress, EV_LANDED, EV_ROUND, EV_STEP};
@@ -55,6 +55,9 @@ const TICK: Duration = Duration::from_millis(500);
 /// still going: longer than a lane's own run takes to stop at once, so only a stuck one is
 /// ended.
 const STOP_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a planner told to stop now has to end its agent and exit before it is killed.
+const PLANNER_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a `pool plan` may take before the pool ends it and counts the plan as failed, so a
 /// hung planner can't hold up planning and admission.
@@ -121,6 +124,10 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
              with `paja pool lanes <N>`, or stop it first"
         );
     };
+    // Chosen once, for every lane and planner and the pool's own triage: one that chose for
+    // itself could run on the host after another ran in the sandbox.
+    let backend = crate::sandbox::choose()?;
+    crate::sandbox::pin(&backend);
     record(
         home,
         EV_POOL_LANES,
@@ -132,17 +139,22 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         home.events().append(&lock, EV_POOL_STARTED, data)?.seq
     };
     progress(&format!(
-        "pool of {name}: up to {} lanes (`paja pool lanes <N>` changes it; Ctrl+C stops)",
-        opts.lanes
+        "pool of {name}: up to {} lanes, {} (`paja pool lanes <N>` changes it; Ctrl+C \
+         stops)",
+        opts.lanes,
+        backend.describe()
     ));
     let mut pool = Pool {
         home,
         repo: &repo,
+        backend: &backend,
         name: &name,
         key: &key,
         opts: &opts,
         lanes: BTreeMap::new(),
         planners: BTreeMap::new(),
+        elsewhere: BTreeMap::new(),
+        stopped: Vec::new(),
         since,
         held_back: BTreeSet::new(),
         retry_failed_to: 0,
@@ -153,6 +165,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
     if outcome.is_err() {
         pool.stop_all();
     }
+    pool.end_planners();
     let stopped = match &outcome {
         Ok(()) => json!({ "repo": name }),
         Err(err) => json!({ "repo": name, "error": format!("{err:#}") }),
@@ -165,6 +178,8 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
 struct Pool<'a> {
     home: &'a Home,
     repo: &'a Path,
+    /// Where lanes and planners run agents and checks ([`crate::sandbox::pass_to`]).
+    backend: &'a crate::sandbox::Choice,
     name: &'a str,
     /// The checkout's key in the tamper lock.
     key: &'a str,
@@ -172,6 +187,12 @@ struct Pool<'a> {
     lanes: BTreeMap<u32, Lane>,
     /// The `pool plan` runs going, by item, with the seq they started after and when.
     planners: BTreeMap<u64, (Child, u64, Instant)>,
+    /// Items another `paja pool plan` (one started by hand) was planning at the last tick, with
+    /// when the pool first saw it: the pool waits for that plan instead of starting one, counts
+    /// the item as being planned, isn't idle meanwhile, and stops waiting after `PLAN_LIMIT`.
+    elsewhere: BTreeMap<u64, Instant>,
+    /// Planners told `stop now`, with when, until they end or are killed.
+    stopped: Vec<(Child, Instant)>,
     /// The seq of this pool's `pool.started`: plans before it are an earlier pool's.
     since: u64,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
@@ -233,12 +254,14 @@ impl Pool<'_> {
                 }
                 told_fatal = true;
             }
-            self.reap_planners()?;
             let stopping = level > 0 || fatal.is_some();
             if stopping {
-                // A plan is only worth having for a lane that may start.
+                // A plan is only worth having for a lane that may start. Stopped before they
+                // are reaped, so one that the same Ctrl-C ended isn't counted as failed.
                 self.stop_planners();
             }
+            self.reap_planners()?;
+            reap_stopped(&mut self.stopped, PLANNER_GRACE);
             if stopping && self.lanes.is_empty() {
                 return fatal.map_or(Ok(()), Err);
             }
@@ -267,17 +290,18 @@ impl Pool<'_> {
                         }
                         match super::sync_queue(self.home, self.repo) {
                             Ok(_) => {}
-                            Err(err) if super::is_fatal(&err) => {
-                                fatal = Some(err);
-                                continue;
-                            }
+                            // The next tick tells the lanes and stops, after the usual sleep.
+                            Err(err) if super::is_fatal(&err) => fatal = Some(err),
                             Err(err) => self.say_error(&err),
                         }
                     }
+                }
+                if free > 0 && paused.is_none() && fatal.is_none() {
                     let admitted = self.admit(free)?;
                     if admitted == 0
                         && self.lanes.is_empty()
                         && self.planners.is_empty()
+                        && self.elsewhere.is_empty()
                         && !said_idle
                     {
                         said_idle = true;
@@ -300,8 +324,24 @@ impl Pool<'_> {
                 return Ok(0);
             }
         };
+        let (home, name) = (self.home, self.name);
+        // Probed before the log is read, as `reap` does. A probe that can't read the lock
+        // counts as free: the pool's own planner then says what is wrong.
+        let queued: BTreeSet<u64> = next.iter().map(|item| item.number).collect();
+        keep_waiting(&mut self.elsewhere, &queued, |n| {
+            home.plan_held(name, n).unwrap_or(false)
+        });
         let events = self.home.events().read_all()?;
         let mut plans = plans_since(&events, self.name, self.since);
+        for number in give_up(&mut self.elsewhere, &plans, PLAN_LIMIT) {
+            let why = format!(
+                "the other `paja pool plan {number}` took longer than {} minutes",
+                PLAN_LIMIT.as_secs() / 60
+            );
+            // Seen by this tick's choice too, so the item isn't planned again at once.
+            let failed = self.plan_failed(number, &why)?;
+            plans.insert(number, failed);
+        }
         let retry: BTreeSet<u64> = failed_by(&events, self.name, self.since, self.retry_failed_to)
             .into_iter()
             .filter(|n| !self.retried.contains(n))
@@ -315,9 +355,14 @@ impl Pool<'_> {
             .filter(|n| !busy.contains(n) && !self.held_back.contains(n))
             .collect();
         let running: Vec<&Plan> = self.lanes.values().map(|lane| &lane.plan).collect();
-        let planning: BTreeSet<u64> = self.planners.keys().copied().collect();
+        let planning: BTreeSet<u64> = self
+            .planners
+            .keys()
+            .chain(self.elsewhere.keys())
+            .copied()
+            .collect();
         // At most as many plans at once as there are free lanes to use them.
-        let room = free.saturating_sub(self.planners.len());
+        let room = free.saturating_sub(self.planners.len() + self.elsewhere.len());
         let (chosen, to_plan) = choose(&queue, &plans, &running, &planning, free, room);
         let chosen: Vec<Plan> = chosen.into_iter().cloned().collect();
         for number in to_plan {
@@ -341,7 +386,7 @@ impl Pool<'_> {
                     "source": plan.source, "high_risk": plan.high_risk,
                 }),
             )?;
-            match spawn(self.repo, lane, item.number) {
+            match spawn(self.repo, self.backend, lane, item.number) {
                 Ok((child, stdin, report)) => {
                     progress(&format!("lane {lane}: #{} {}", item.number, item.title));
                     self.lanes.insert(
@@ -373,7 +418,24 @@ impl Pool<'_> {
     }
 
     /// Plan item `number` in a `paja pool plan` of its own, so the pool's ticks go on meanwhile.
+    /// A plan of the item already running (one started by hand) is left to finish: the pool
+    /// takes the plan it records, and starts none of its own meanwhile.
     fn start_planner(&mut self, number: u64) -> Result<()> {
+        if self.home.plan_held(self.name, number).unwrap_or(false) {
+            if let std::collections::btree_map::Entry::Vacant(seen) = self.elsewhere.entry(number) {
+                seen.insert(Instant::now());
+                // Recorded, so `paja pool status` says the item is being planned.
+                record(
+                    self.home,
+                    EV_POOL_PLANNING,
+                    json!({ "repo": self.name, "number": number }),
+                )?;
+                progress(&format!(
+                    "#{number} is being planned by another `paja pool plan`; using its plan"
+                ));
+            }
+            return Ok(());
+        }
         let at = {
             let lock = self.home.lock()?;
             let data = json!({ "repo": self.name, "number": number });
@@ -383,25 +445,34 @@ impl Pool<'_> {
                 .seq
         };
         progress(&format!("planning which files #{number} touches"));
-        match spawn_planner(self.repo, number) {
+        match spawn_planner(self.repo, self.backend, number) {
             Ok(child) => {
                 self.planners.insert(number, (child, at, Instant::now()));
             }
-            Err(err) => self.plan_failed(number, &format!("{err:#}"))?,
+            Err(err) => {
+                self.plan_failed(number, &format!("{err:#}"))?;
+            }
         }
         Ok(())
     }
 
     /// Free the plans that ended; one that ended without recording a plan failed.
     fn reap_planners(&mut self) -> Result<()> {
-        for (number, why) in reap(self.home, self.name, &mut self.planners, PLAN_LIMIT)? {
+        for (number, why) in reap(
+            self.home,
+            self.name,
+            &mut self.planners,
+            &mut self.elsewhere,
+            PLAN_LIMIT,
+            PLANNER_GRACE,
+        )? {
             self.plan_failed(number, &why)?;
         }
         Ok(())
     }
 
     /// Record a failed plan, which the pool admits only to an otherwise idle pool.
-    fn plan_failed(&mut self, number: u64, error: &str) -> Result<()> {
+    fn plan_failed(&mut self, number: u64, error: &str) -> Result<Plan> {
         progress(&format!(
             "could not plan #{number} ({error}); it runs only when no other lane is busy"
         ));
@@ -413,16 +484,31 @@ impl Pool<'_> {
             high_risk: false,
             error: Some(error.to_string()),
         };
-        record(self.home, EV_POOL_PLANNED, serde_json::to_value(&failed)?).map(|_| ())
+        record(self.home, EV_POOL_PLANNED, serde_json::to_value(&failed)?)?;
+        Ok(failed)
     }
 
-    /// End the plans going: they are read-only, and an item left unplanned is planned again.
+    /// End the plans going: they are read-only, and an item left unplanned is planned again. Each
+    /// is told `stop now`, which ends its agent and records no plan, and is killed if it still
+    /// runs [`PLANNER_GRACE`] later: on a later tick ([`reap_stopped`]), or when the pool
+    /// ends ([`Pool::end_planners`]), so the pool never waits on one while lanes need it.
     fn stop_planners(&mut self) {
-        for (child, _, _) in self.planners.values_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        for (_, (mut child, _, _)) in std::mem::take(&mut self.planners) {
+            tell_planner(&mut child);
+            self.stopped.push((child, Instant::now()));
         }
-        self.planners.clear();
+    }
+
+    /// Stop every planner and wait for each to end, up to [`PLANNER_GRACE`]: the pool is ending,
+    /// and leaves none running unsupervised.
+    fn end_planners(&mut self) {
+        self.stop_planners();
+        let deadline = Instant::now() + PLANNER_GRACE;
+        while !self.stopped.is_empty() && Instant::now() < deadline {
+            reap_stopped(&mut self.stopped, PLANNER_GRACE);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        reap_stopped(&mut self.stopped, Duration::ZERO);
     }
 
     /// Record each step a busy lane's run started since the last tick.
@@ -473,9 +559,9 @@ impl Pool<'_> {
                 .or_insert(json!(lane.number));
         }
         if self.opts.json {
-            println!("{report}");
+            crate::platform::print_line(format_args!("{report}"));
         } else {
-            println!("{}", describe_report(n, lane.number, &report));
+            crate::platform::print_line(describe_report(n, lane.number, &report));
         }
         Ok(())
     }
@@ -488,18 +574,20 @@ impl Pool<'_> {
         match super::triage_if_due(self.home, self.repo) {
             Ok(Some(report)) => {
                 if self.opts.json {
-                    println!("{}", json!({ "outcome": "triage", "triage": report }));
+                    crate::platform::print_line(json!({ "outcome": "triage", "triage": report }));
                 } else {
-                    println!("triage: {}", serde_json::to_string(&report)?);
+                    crate::platform::print_line(format_args!(
+                        "triage: {}",
+                        serde_json::to_string(&report)?
+                    ));
                 }
             }
             Ok(None) => {}
             Err(err) if super::is_fatal(&err) => return Err(err),
             // Tagged, so a reader of the pool's lines can tell it from a lane's error.
             Err(err) if self.opts.json => {
-                println!(
-                    "{}",
-                    json!({ "outcome": "triage", "error": format!("{err:#}") })
+                crate::platform::print_line(
+                    json!({ "outcome": "triage", "error": format!("{err:#}") }),
                 );
             }
             Err(err) => self.say_error(&err),
@@ -514,10 +602,10 @@ impl Pool<'_> {
 
     /// Stop every lane's run at once and wait for it to end.
     fn stop_all(&mut self) {
-        self.stop_planners();
         for lane in self.lanes.values_mut() {
             lane.tell("stop now");
         }
+        self.stop_planners();
         stop_children(
             self.lanes.values_mut().map(|lane| &mut lane.child),
             STOP_GRACE,
@@ -527,9 +615,9 @@ impl Pool<'_> {
 
     fn say_error(&self, err: &anyhow::Error) {
         if self.opts.json {
-            println!("{}", json!({ "error": format!("{err:#}") }));
+            crate::platform::print_line(json!({ "error": format!("{err:#}") }));
         } else {
-            println!("error: {err:#}");
+            crate::platform::print_line(format_args!("error: {err:#}"));
         }
     }
 }
@@ -552,6 +640,52 @@ fn stop_children<'c>(children: impl Iterator<Item = &'c mut Child>, grace: Durat
     }
 }
 
+/// Forget the stopped planners in `stopped` that ended, and kill ([`crate::platform::kill_tree`])
+/// the ones still going `grace` after they were told to stop. A planner ends its own agent on
+/// `stop now`; this is for one wedged before it could.
+fn reap_stopped(stopped: &mut Vec<(Child, Instant)>, grace: Duration) {
+    stopped.retain_mut(|(child, told)| {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return false;
+        }
+        if told.elapsed() < grace {
+            return true;
+        }
+        crate::platform::kill_tree(child);
+        let _ = child.wait();
+        false
+    });
+}
+
+/// Keep waiting in `elsewhere` only on items still queued whose other plan still holds its lock.
+fn keep_waiting(
+    elsewhere: &mut BTreeMap<u64, Instant>,
+    queued: &BTreeSet<u64>,
+    held: impl Fn(u64) -> bool,
+) {
+    elsewhere.retain(|&n, _| queued.contains(&n) && held(n));
+}
+
+/// Take out of `elsewhere` the items waited on for longer than `limit`, and return the ones
+/// whose plan failed for it: not one the other plan recorded just now, before letting go.
+fn give_up(
+    elsewhere: &mut BTreeMap<u64, Instant>,
+    plans: &BTreeMap<u64, Plan>,
+    limit: Duration,
+) -> Vec<u64> {
+    let gone: Vec<u64> = elsewhere
+        .iter()
+        .filter(|(_, seen)| seen.elapsed() > limit)
+        .map(|(&n, _)| n)
+        .collect();
+    for number in &gone {
+        elsewhere.remove(number);
+    }
+    gone.into_iter()
+        .filter(|n| !plans.get(n).is_some_and(|plan| plan.source != "failed"))
+        .collect()
+}
+
 /// Take out of `planners` the plans that ended, ending first any going longer than `limit`, and
 /// return each that recorded no plan with why. A plan killed for its time may still have
 /// recorded one in the instant before, which counts like any other.
@@ -559,9 +693,11 @@ fn reap(
     home: &Home,
     repo: &str,
     planners: &mut BTreeMap<u64, (Child, u64, Instant)>,
+    elsewhere: &mut BTreeMap<u64, Instant>,
     limit: Duration,
+    grace: Duration,
 ) -> Result<Vec<(u64, String)>> {
-    let overdue = end_overdue(planners, limit);
+    let overdue = end_overdue(planners, limit, grace);
     let ended: Vec<(u64, u64)> = planners
         .iter_mut()
         .filter_map(|(&n, (child, at, _))| {
@@ -571,11 +707,18 @@ fn reap(
     if ended.is_empty() {
         return Ok(Vec::new());
     }
+    // Probed before the log is read: a plan by another `paja pool plan` is recorded before
+    // its lock is let go, so one that let go meanwhile is in the log read after.
+    let held: BTreeSet<u64> = ended
+        .iter()
+        .filter(|(n, _)| home.plan_held(repo, *n).unwrap_or(false))
+        .map(|(n, _)| *n)
+        .collect();
     // The plan may have been recorded after this tick read the log.
     let events = home.events().read_all()?;
     let mut failed = Vec::new();
     for (number, at) in ended {
-        planners.remove(&number);
+        let kept = planners.remove(&number);
         let planned = events.iter().any(|e| {
             e.seq > at
                 && e.kind == EV_POOL_PLANNED
@@ -583,6 +726,14 @@ fn reap(
                 && e.data["number"] == number
         });
         if planned {
+            continue;
+        }
+        drop(kept);
+        // Refused because another plan of the item is running (one started by hand): that one
+        // records the plan, so the pool waits for it as it does when it finds the lock held
+        // before starting a planner, under the same rules and time limit.
+        if !overdue.contains(&number) && held.contains(&number) {
+            elsewhere.entry(number).or_insert_with(Instant::now);
             continue;
         }
         let why = if overdue.contains(&number) {
@@ -598,15 +749,29 @@ fn reap(
     Ok(failed)
 }
 
-/// End the planners in `planners` that have run longer than `limit`, and return their items.
-/// They stay in the map, for [`reap`] to take out.
-fn end_overdue(planners: &mut BTreeMap<u64, (Child, u64, Instant)>, limit: Duration) -> Vec<u64> {
+/// End the planners in `planners` that have run longer than `limit`, and return their items,
+/// ended or not. One still going is told `stop now` on each tick, and killed once it has run
+/// `grace` past the limit, so the pool never waits on it. They stay in the map, for [`reap`] to
+/// take out once they have ended.
+fn end_overdue(
+    planners: &mut BTreeMap<u64, (Child, u64, Instant)>,
+    limit: Duration,
+    grace: Duration,
+) -> Vec<u64> {
     let mut overdue = Vec::new();
     for (&number, (child, _, started)) in planners.iter_mut() {
-        if started.elapsed() > limit && matches!(child.try_wait(), Ok(None)) {
-            let _ = child.kill();
-            let _ = child.wait();
-            overdue.push(number);
+        let age = started.elapsed();
+        if age <= limit {
+            continue;
+        }
+        overdue.push(number);
+        if matches!(child.try_wait(), Ok(None)) {
+            if age > limit + grace {
+                crate::platform::kill_tree(child);
+                let _ = child.wait();
+            } else {
+                tell_planner(child);
+            }
         }
     }
     overdue
@@ -730,16 +895,31 @@ fn drift(events: &[Event], repo: &str, n: u32, lane: &Lane) -> Option<Value> {
     })
 }
 
-/// `paja pool plan <number>` as a child of the pool; its progress lines go to the pool's stderr.
-fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
+/// Tell a planner to stop now: it ends its planning agent, with every process the agent
+/// started, and exits.
+fn tell_planner(child: &mut Child) {
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = writeln!(stdin, "stop now").and_then(|()| stdin.flush());
+    }
+}
+
+/// `paja pool plan <number>` as a child of the pool, reading `stop now` on stdin; its progress
+/// lines go to the pool's stderr.
+fn spawn_planner(repo: &Path, backend: &crate::sandbox::Choice, number: u64) -> Result<Child> {
     let exe = std::env::current_exe().context("finding the paja program to plan with")?;
-    let mut child = Command::new(exe)
-        .args(["--json", "pool", "plan"])
+    let mut cmd = Command::new(exe);
+    crate::sandbox::pass_to(backend, &mut cmd);
+    // Only the pool stops a planner: a terminal's Ctrl-C would end it at once and leave its
+    // agent, which runs in a process group of its own, going. A planner whose pool is gone
+    // stops anyway, when its stdin closes.
+    crate::platform::own_process_group(&mut cmd);
+    let mut child = cmd
+        .args(["--json", "pool", "plan", "--stop-on-stdin"])
         .arg(number.to_string())
         .arg("--repo")
         .arg(repo)
         .current_dir(repo)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -762,11 +942,14 @@ fn spawn_planner(repo: &Path, number: u64) -> Result<Child> {
 /// passed on to stderr with the lane in front; its report comes back on the channel.
 fn spawn(
     repo: &Path,
+    backend: &crate::sandbox::Choice,
     lane: u32,
     number: u64,
 ) -> Result<(Child, Option<ChildStdin>, mpsc::Receiver<String>)> {
     let exe = std::env::current_exe().context("finding the paja program to start a lane with")?;
-    let mut child = Command::new(exe)
+    let mut cmd = Command::new(exe);
+    crate::sandbox::pass_to(backend, &mut cmd);
+    let mut child = cmd
         .args(["--json", "run", "--yes", "--stop-on-stdin", "--lane"])
         .arg("--item")
         .arg(number.to_string())
@@ -912,8 +1095,9 @@ pub struct PoolStatus {
     pub repo: String,
     /// `running` or `stopped`.
     pub state: String,
-    /// The lane count the pool keeps.
-    pub target: Option<u32>,
+    /// The lane count the pool keeps: the latest set with `paja pool lanes`, or 1 for a
+    /// repository that never recorded one.
+    pub target: u32,
     /// How many lanes are working on an item.
     pub busy: usize,
     pub lanes: Vec<LaneStatus>,
@@ -928,8 +1112,15 @@ pub struct PoolStatus {
     /// What the repository's finished rounds spent since the running pool started, in US
     /// dollars (Claude Code's estimate).
     pub spent_usd: f64,
+    /// What those rounds used in tokens: input, output and cache, as `paja usage` counts them.
+    pub tokens: u64,
+    /// The latest items that left a lane, newest first.
+    pub out: Vec<LaneExit>,
     /// How many items landed since the running pool started.
     pub landed_since_start: usize,
+    /// How many items left a lane since the running pool started without landing and without
+    /// being held: failed, or closed.
+    pub retired_since_start: usize,
     /// How many open items are held, escalated and waiting on the person's answer.
     pub held: usize,
     /// How many waiting items are ready and wait only for a free lane.
@@ -954,8 +1145,20 @@ pub struct LaneStatus {
     /// What the item's finished rounds on this lane spent, in US dollars (Claude Code's
     /// estimate).
     pub spent_usd: f64,
+    /// What those rounds used in tokens (input, output and cache).
+    pub tokens: u64,
     /// The files the lane was admitted for, from its `pool.admitted`.
     pub paths: Vec<String>,
+    /// The item's main folder: the longest directory its paths share, else the first path's top
+    /// folder; empty without paths.
+    pub area: String,
+    /// The review round the item is in, 1 up to the most rounds a change gets.
+    pub round: u32,
+    /// When the lane took the item, in milliseconds since the Unix epoch.
+    pub admitted_ms: u64,
+    /// For an item in `review`: one entry per reviewer of the round, `pending`, `pass` or
+    /// `block`.
+    pub reviews: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -965,6 +1168,128 @@ pub struct WaitingItem {
     pub why: String,
     /// The files its plan names, once it has one.
     pub paths: Vec<String>,
+    /// The item's main folder, as [`LaneStatus::area`].
+    pub area: String,
+}
+
+/// An item that left a lane.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LaneExit {
+    pub number: u64,
+    pub title: String,
+    /// `landed`, `held` (escalated), `failed`, or `retired` (closed without landing).
+    pub outcome: String,
+    pub ts_ms: u64,
+}
+
+/// The longest directory all of `paths` share; when they share none, the first path's top
+/// folder; empty when there are no paths or the first is a file at the root.
+fn area(paths: &[String]) -> String {
+    let dirs: Vec<Vec<String>> = paths
+        .iter()
+        .map(|p| {
+            let p = p.replace('\\', "/");
+            let mut parts: Vec<String> = p
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            parts.pop();
+            parts
+        })
+        .collect();
+    let Some(first) = dirs.first() else {
+        return String::new();
+    };
+    let common = first
+        .iter()
+        .enumerate()
+        .take_while(|(i, part)| dirs.iter().all(|d| d.get(*i) == Some(*part)))
+        .count();
+    if common > 0 {
+        first[..common].join("/")
+    } else {
+        first.first().cloned().unwrap_or_default()
+    }
+}
+
+/// The tokens a round event's steps used; a step whose figures are partly missing adds nothing,
+/// as in `paja usage`.
+fn round_tokens(event: &Event) -> u64 {
+    event.data["steps"]
+        .as_array()
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(|step| {
+                    [
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    ]
+                    .iter()
+                    .map(|key| step[key].as_u64())
+                    .sum::<Option<u64>>()
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The review round an item's events say it is in, capped at the rounds a change gets.
+fn lane_round(mine: &[&Event]) -> u32 {
+    let mut round = 1;
+    for e in mine {
+        let n = e.data["round"].as_u64().unwrap_or(0) as u32;
+        match e.kind.as_str() {
+            EV_STEP => round = round.max(n),
+            // A round that goes on leaves the next one to start.
+            EV_ROUND if e.data.get("next").is_some_and(|next| !next.is_null()) => {
+                round = round.max(n + 1)
+            }
+            _ => {}
+        }
+    }
+    round.min(super::MAX_ROUNDS)
+}
+
+/// Where each reviewer of the round in progress stands, from the item's events in order.
+fn lane_reviews(mine: &[&Event], high_risk: bool) -> Vec<String> {
+    let mut reviews: Vec<String> = Vec::new();
+    for e in mine {
+        match e.kind.as_str() {
+            EV_STEP => match e.data["reviewer"].as_u64() {
+                Some(reviewer) => {
+                    let count = e.data["reviewers"]
+                        .as_u64()
+                        .unwrap_or(if high_risk { 2 } else { 1 })
+                        .max(reviewer) as usize;
+                    if reviews.len() < count {
+                        reviews.resize(count, "pending".to_string());
+                    }
+                    reviews[reviewer as usize - 1] = "pending".to_string();
+                }
+                None => reviews.clear(),
+            },
+            super::EV_REVIEWED => {
+                let reviewer = e.data["reviewer"].as_u64().unwrap_or(0) as usize;
+                if (1..=reviews.len()).contains(&reviewer) {
+                    reviews[reviewer - 1] = match e.data["verdict"].as_str() {
+                        Some("land") => "pass",
+                        _ => "block",
+                    }
+                    .to_string();
+                }
+            }
+            EV_ROUND => reviews.clear(),
+            _ => {}
+        }
+    }
+    if reviews.is_empty() {
+        reviews = vec!["pending".to_string(); if high_risk { 2 } else { 1 }];
+    }
+    reviews
 }
 
 /// Why a queued item isn't in a lane, which [`WaitingItem::why`] says in words.
@@ -977,6 +1302,8 @@ enum Why {
     /// Its files overlap this lane's item's, for this reason.
     Overlaps(u64, String),
     Planning,
+    /// Its last lane ended on an error; it waits for the next timed sync.
+    LaneErrored,
     /// Nothing but a busy pool: it is ready.
     NoFreeLane,
 }
@@ -992,6 +1319,10 @@ impl std::fmt::Display for Why {
             Why::NoPool => f.write_str("no pool is running"),
             Why::Overlaps(other, why) => write!(f, "overlaps #{other}: {why}"),
             Why::Planning => f.write_str("planning which files it touches"),
+            Why::LaneErrored => f.write_str(
+                "its last run ended on an error; it is held back until a timed sync (see --every), \
+                 and may have waited for a free lane since",
+            ),
             Why::NoFreeLane => f.write_str("no free lane"),
         }
     }
@@ -1013,7 +1344,7 @@ pub fn status(home: &Home, repo: &str) -> Result<PoolStatus> {
 }
 
 /// Which of `lanes` holds the repository's turn to land, and which wait for it, longest first.
-/// A lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed` since its item
+/// A lane's latest `run.merging`, `run.landing`, `run.round` or `run.landed` since its item
 /// started says: a round or a landing after the turn ends it.
 fn land_turns(
     events: &[Event],
@@ -1031,16 +1362,59 @@ fn land_turns(
             .find(|e| {
                 e.data["repo"] == repo
                     && e.data["number"] == lane.number
-                    && [EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&e.kind.as_str())
+                    && [EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&turn_kind(e))
             });
         match latest {
-            Some(e) if e.kind == EV_LANDING => landing = Some(lane.number),
-            Some(e) if e.kind == EV_MERGING => merging.push((e.seq, lane.number)),
+            Some(e) if turn_kind(e) == EV_LANDING => landing = Some(lane.number),
+            Some(e) if turn_kind(e) == EV_MERGING => merging.push((e.seq, lane.number)),
             _ => {}
         }
     }
     merging.sort();
     (landing, merging.into_iter().map(|(_, n)| n).collect())
+}
+
+/// The items that left a lane of `repo`, newest first, each with the seq of the event that
+/// freed the lane. A lane's `done` says how its run ended: `landed`, `escalated` (held), or
+/// `error` (failed); any other end of a run that left the item closed is `retired`. An item
+/// that went back to the queue (stopped, usage limit) did not leave.
+fn lane_exits(events: &[Event], repo: &str, title: &dyn Fn(u64) -> String) -> Vec<(u64, LaneExit)> {
+    let mut closed: BTreeSet<u64> = BTreeSet::new();
+    let mut exits = Vec::new();
+    for e in events.iter().filter(|e| e.data["repo"] == repo) {
+        let Some(number) = e.data["number"].as_u64() else {
+            continue;
+        };
+        match e.kind.as_str() {
+            jono::EV_CLOSED => {
+                closed.insert(number);
+            }
+            jono::EV_REOPENED => {
+                closed.remove(&number);
+            }
+            EV_POOL_LANE if e.data["stage"] == "done" => {
+                let outcome = match e.data["outcome"].as_str() {
+                    Some("landed") => "landed",
+                    Some("escalated") => "held",
+                    Some("error") => "failed",
+                    _ if closed.contains(&number) => "retired",
+                    _ => continue,
+                };
+                exits.push((
+                    e.seq,
+                    LaneExit {
+                        number,
+                        title: title(number),
+                        outcome: outcome.to_string(),
+                        ts_ms: e.ts_ms,
+                    },
+                ));
+            }
+            _ => {}
+        }
+    }
+    exits.reverse();
+    exits
 }
 
 /// How many landings [`status`] shows.
@@ -1091,20 +1465,22 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         .filter(|(_, (event, _))| event.data["stage"] != "done")
         .filter_map(|(lane, (event, begun))| {
             let number = event.data["number"].as_u64()?;
-            let spent_usd = events
-                .iter()
-                .filter(|e| {
+            let rounds = || {
+                events.iter().filter(|e| {
                     e.seq > begun
                         && e.kind == EV_ROUND
                         && e.data["repo"] == repo
                         && e.data["number"] == number
                 })
+            };
+            let tokens = rounds().map(round_tokens).sum::<u64>();
+            let spent_usd = rounds()
                 .flat_map(|e| e.data["steps"].as_array().cloned().unwrap_or_default())
                 .filter_map(|step| step["cost_usd"].as_f64())
                 .sum::<f64>()
                 // An empty sum is -0.0, which JSON shows as such.
                 + 0.0;
-            let plan = events
+            let admitted = events
                 .iter()
                 .rev()
                 .take_while(|e| e.seq >= begun)
@@ -1112,17 +1488,36 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
                     e.kind == EV_POOL_ADMITTED
                         && e.data["repo"] == repo
                         && e.data["number"] == number
-                })
-                .and_then(|e| serde_json::from_value::<Plan>(e.data.clone()).ok());
+                });
+            let plan = admitted.and_then(|e| serde_json::from_value::<Plan>(e.data.clone()).ok());
+            let admitted_ms = admitted
+                .or_else(|| events.iter().find(|e| e.seq == begun))
+                .map_or(event.ts_ms, |e| e.ts_ms);
+            let mine: Vec<&Event> = events
+                .iter()
+                .filter(|e| e.seq > begun && e.data["repo"] == repo && e.data["number"] == number)
+                .collect();
+            let stage = event.data["stage"].as_str().unwrap_or_default().to_string();
+            let high_risk = plan.as_ref().is_some_and(|p| p.high_risk);
+            let paths = plan.as_ref().map(|p| p.paths.clone()).unwrap_or_default();
             let lane = LaneStatus {
+                tokens,
+                area: area(&paths),
+                round: lane_round(&mine),
+                admitted_ms,
+                reviews: if stage == "review" {
+                    lane_reviews(&mine, high_risk)
+                } else {
+                    Vec::new()
+                },
                 lane,
                 number,
                 title: title(number),
-                stage: event.data["stage"].as_str().unwrap_or_default().to_string(),
+                stage,
                 step: event.data["step"].as_str().map(str::to_string),
                 since_ms: event.ts_ms,
                 spent_usd,
-                paths: plan.as_ref().map(|p| p.paths.clone()).unwrap_or_default(),
+                paths,
             };
             Some(((lane, plan), begun))
         })
@@ -1143,6 +1538,18 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             })
             .is_some_and(|e| e.kind == EV_POOL_PLANNING)
     };
+    // The item's latest lane since the pool started ended on an error: it waits for the next
+    // timed sync, as `--every` waits after a failed pass.
+    let errored = |number: u64| {
+        events
+            .iter()
+            .rev()
+            .take_while(|e| e.seq > since)
+            .find(|e| {
+                e.kind == EV_POOL_LANE && e.data["repo"] == repo && e.data["number"] == number
+            })
+            .is_some_and(|e| e.data["stage"] == "done" && e.data["outcome"] == "error")
+    };
     let admitted: Vec<u64> = lanes.iter().map(|lane| lane.number).collect();
     let (landing, merging) = land_turns(events, repo, &lanes, &begun);
     let why_waiting = |item: &WorkItem| {
@@ -1159,6 +1566,8 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             Why::Overlaps(other, why)
         } else if planning(item.number) {
             Why::Planning
+        } else if errored(item.number) {
+            Why::LaneErrored
         } else {
             Why::NoFreeLane
         }
@@ -1176,14 +1585,18 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         .count();
     let waiting: Vec<WaitingItem> = queued
         .into_iter()
-        .map(|(item, why)| WaitingItem {
-            number: item.number,
-            title: item.title.clone(),
-            why: why.to_string(),
-            paths: plans
+        .map(|(item, why)| {
+            let paths = plans
                 .get(&item.number)
                 .map(|plan| plan.paths.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default();
+            WaitingItem {
+                number: item.number,
+                title: item.title.clone(),
+                why: why.to_string(),
+                area: area(&paths),
+                paths,
+            }
         })
         .collect();
     let landed = events
@@ -1208,11 +1621,31 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         .filter_map(|step| step["cost_usd"].as_f64())
         .sum::<f64>()
         + 0.0;
+    let tokens = since
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e.kind == EV_ROUND && e.data["repo"] == repo)
+        .map(round_tokens)
+        .sum();
     let landed_since_start = since
         .unwrap_or_default()
         .iter()
         .filter(|e| e.kind == EV_LANDED && e.data["repo"] == repo)
         .count();
+    let exits = lane_exits(events, repo, &title);
+    let retired_since_start = since.map_or(0, |since| {
+        exits
+            .iter()
+            .filter(|(seq, exit)| {
+                *seq > since[0].seq && matches!(exit.outcome.as_str(), "retired" | "failed")
+            })
+            .count()
+    });
+    let out = exits
+        .into_iter()
+        .map(|(_, exit)| exit)
+        .take(LANDINGS)
+        .collect();
     let held = items
         .iter()
         .filter(|item| item.open && item.status == Status::Escalated)
@@ -1220,7 +1653,7 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
     PoolStatus {
         repo: repo.to_string(),
         state: if running { "running" } else { "stopped" }.to_string(),
-        target: target_lanes(events, repo),
+        target: target_lanes(events, repo).unwrap_or(1),
         busy: lanes.len(),
         admitted,
         lanes,
@@ -1228,7 +1661,10 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         landed,
         started_ms: since.map(|events| events[0].ts_ms),
         spent_usd,
+        tokens,
+        out,
         landed_since_start,
+        retired_since_start,
         held,
         ready,
         landing,
@@ -1239,9 +1675,7 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
 /// `paja pool status` as text: a line for the pool, a table of its lanes, then what waits and
 /// what landed. `now_ms` is the clock the times in step are read against.
 pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
-    let target = status
-        .target
-        .map_or("no lane count set".to_string(), |n| format!("{n} lanes"));
+    let target = format!("{} lanes", status.target);
     let mut out = vec![format!(
         "pool of {}: {}, {} busy of {target}",
         status.repo, status.state, status.busy
@@ -1403,7 +1837,16 @@ mod tests {
         planners.insert(5, (sleep(), at, Instant::now()));
         planned(2);
         planned(3);
-        let failed = reap(&home, "acme/app", &mut planners, Duration::from_secs(60)).unwrap();
+        let quick = Duration::from_millis(100);
+        let failed = reap(
+            &home,
+            "acme/app",
+            &mut planners,
+            &mut BTreeMap::new(),
+            Duration::from_secs(60),
+            quick,
+        )
+        .unwrap();
         let numbers: Vec<u64> = failed.iter().map(|(n, _)| *n).collect();
         assert_eq!(numbers, [1, 4], "{failed:?}");
         assert!(failed[0].1.contains("took longer than"), "{failed:?}");
@@ -1412,6 +1855,74 @@ mod tests {
         let (mut going, _, _) = planners.remove(&5).unwrap();
         let _ = going.kill();
         let _ = going.wait();
+    }
+
+    /// A planner refused because another `paja pool plan` of the item holds its lock waits for
+    /// that plan: no failure while the lock is held, the other plan's record counts, and with
+    /// the lock let go and nothing recorded it failed.
+    #[cfg(unix)]
+    #[test]
+    fn a_planner_refused_by_another_plan_waits_for_that_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let at = record(&home, "test.start", json!({})).unwrap().seq;
+        let ended = || {
+            let mut child = Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child
+        };
+        let long_ago = Instant::now() - Duration::from_secs(50);
+        let (limit, grace) = (Duration::from_secs(60), Duration::from_millis(100));
+        let mut planners = BTreeMap::new();
+        planners.insert(5, (ended(), at, long_ago));
+        planners.insert(6, (ended(), at, long_ago));
+        let other5 = home.try_plan_lock("acme/app", 5).unwrap().unwrap();
+        let other6 = home.try_plan_lock("acme/app", 6).unwrap().unwrap();
+        let mut elsewhere = BTreeMap::new();
+        let failed = reap(
+            &home,
+            "acme/app",
+            &mut planners,
+            &mut elsewhere,
+            limit,
+            grace,
+        )
+        .unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        // Both now wait on the other plan, as an item the pool found held before starting one
+        // does, with the wait counted from the refusal.
+        assert!(planners.is_empty());
+        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [5, 6]);
+        assert!(elsewhere[&5].elapsed() < Duration::from_secs(5));
+        // Once the other plans let go, or an item leaves the queue, the wait on it ends.
+        drop(other5);
+        // Another test's child forked at that moment holds the lock until it execs.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while home.plan_held("acme/app", 5).unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        keep_waiting(&mut elsewhere, &BTreeSet::from([5, 6, 7]), |n| {
+            home.plan_held("acme/app", n).unwrap_or(false)
+        });
+        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [6]);
+        keep_waiting(&mut elsewhere, &BTreeSet::from([5]), |_| true);
+        assert!(elsewhere.is_empty());
+        drop(other6);
+        // Past the limit, the wait ends and the plan fails, unless a plan was recorded just
+        // before; one not yet past it stays.
+        let old = Instant::now() - Duration::from_secs(120);
+        elsewhere.extend([(5, old), (6, old), (7, old), (8, Instant::now())]);
+        let plan = |number: u64, source: &str| Plan {
+            repo: "acme/app".into(),
+            number,
+            paths: vec!["src/".into()],
+            source: source.into(),
+            high_risk: false,
+            error: None,
+        };
+        let plans = BTreeMap::from([(5, plan(5, "plan")), (6, plan(6, "failed"))]);
+        assert_eq!(give_up(&mut elsewhere, &plans, limit), [6, 7]);
+        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [8]);
     }
 
     #[cfg(unix)]
@@ -1423,7 +1934,11 @@ mod tests {
         let fresh = Command::new("sleep").arg("60").spawn().unwrap();
         planners.insert(3, (hung, 0, long_ago));
         planners.insert(4, (fresh, 0, Instant::now()));
-        assert_eq!(end_overdue(&mut planners, Duration::from_secs(1)), [3]);
+        let quick = Duration::from_millis(100);
+        assert_eq!(
+            end_overdue(&mut planners, Duration::from_secs(1), quick),
+            [3]
+        );
         assert!(planners
             .get_mut(&3)
             .unwrap()
@@ -1432,6 +1947,86 @@ mod tests {
             .unwrap()
             .is_some());
         let young = &mut planners.get_mut(&4).unwrap().0;
+        assert!(young.try_wait().unwrap().is_none());
+        let _ = young.kill();
+        let _ = young.wait();
+    }
+
+    /// A planner just past its limit is told `stop now` and left to end by itself: the pool
+    /// doesn't wait for it, and once it has ended its plan failed for its time.
+    #[cfg(unix)]
+    #[test]
+    fn an_overdue_planner_is_told_to_stop_without_the_pool_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let at = record(&home, "test.start", json!({})).unwrap().seq;
+        let told = dir.path().join("told");
+        let planner = Command::new("sh")
+            .arg("-c")
+            .arg(format!("read line; echo \"$line\" > '{}'", told.display()))
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut planners = BTreeMap::new();
+        planners.insert(3, (planner, at, Instant::now() - Duration::from_secs(2)));
+        let started = Instant::now();
+        let limit = Duration::from_secs(1);
+        let grace = Duration::from_secs(60);
+        assert!(reap(
+            &home,
+            "acme/app",
+            &mut planners,
+            &mut BTreeMap::new(),
+            limit,
+            grace
+        )
+        .unwrap()
+        .is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failed = loop {
+            let failed = reap(
+                &home,
+                "acme/app",
+                &mut planners,
+                &mut BTreeMap::new(),
+                limit,
+                grace,
+            )
+            .unwrap();
+            if !failed.is_empty() || Instant::now() > deadline {
+                break failed;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(std::fs::read_to_string(&told).unwrap().trim(), "stop now");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].1.contains("took longer than"), "{failed:?}");
+        assert!(planners.is_empty());
+    }
+
+    /// A stopped planner is left alone through its grace, then killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_planner_still_going_past_its_grace_is_killed() {
+        let spawn = || {
+            let mut cmd = Command::new("sleep");
+            crate::platform::own_process_group(&mut cmd);
+            cmd.arg("60").stdin(Stdio::piped()).spawn().unwrap()
+        };
+        let mut stopped = vec![
+            (spawn(), Instant::now() - Duration::from_secs(10)),
+            (spawn(), Instant::now()),
+        ];
+        let old = stopped[0].0.id().to_string();
+        reap_stopped(&mut stopped, Duration::from_secs(5));
+        assert_eq!(stopped.len(), 1);
+        let alive = Command::new("kill").args(["-0", &old]).status().unwrap();
+        assert!(
+            !alive.success(),
+            "the planner past its grace is still running"
+        );
+        let (mut young, _) = stopped.pop().unwrap();
         assert!(young.try_wait().unwrap().is_none());
         let _ = young.kill();
         let _ = young.wait();
@@ -1491,7 +2086,7 @@ mod tests {
         let items = [item(7, &[]), item(8, &[5])];
         let status = from_events(&events, "acme/app", true, &items);
         assert_eq!(status.state, "running");
-        assert_eq!(status.target, Some(3));
+        assert_eq!(status.target, 3);
         assert_eq!(status.busy, 1);
         assert_eq!(status.admitted, vec![5]);
         let one = &status.lanes[0];
@@ -1512,6 +2107,180 @@ mod tests {
         let text = describe(&status, 67_000);
         assert!(text.contains("running, 1 busy of 3 lanes"), "{text}");
         assert!(text.contains("1m00s"), "{text}");
+    }
+
+    #[test]
+    fn the_area_is_the_longest_shared_directory_or_the_first_top_folder() {
+        let paths = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(area(&[]), "");
+        assert_eq!(area(&paths(&["crates/paja/src/a.rs"])), "crates/paja/src");
+        assert_eq!(
+            area(&paths(&["crates/paja/src/a.rs", "crates/paja/tests/b.rs"])),
+            "crates/paja"
+        );
+        assert_eq!(area(&paths(&["docs/a.md", "crates/b.rs"])), "docs");
+        assert_eq!(area(&paths(&["Cargo.toml"])), "");
+    }
+
+    #[test]
+    fn lanes_show_their_round_reviews_time_and_tokens_and_items_out_show_how_they_left() {
+        let r = "acme/app";
+        let admitted = |seq, lane, number, high_risk, paths: &[&str]| {
+            event(
+                seq,
+                EV_POOL_ADMITTED,
+                json!({"repo": r, "number": number, "lane": lane, "paths": paths,
+                       "source": "spec", "high_risk": high_risk}),
+            )
+        };
+        let tokens = |n: u64| {
+            json!({"input_tokens": n, "output_tokens": n,
+            "cache_read_input_tokens": n, "cache_creation_input_tokens": n})
+        };
+        let round = |seq, number, n, next: bool| {
+            let mut data = json!({"repo": r, "number": number, "round": n,
+                "steps": [tokens(10), {"input_tokens": 1}]});
+            if next {
+                data["next"] = json!({"feedback": "fix"});
+            }
+            event(seq, EV_ROUND, data)
+        };
+        let step = |seq, number, n, reviewer: Option<u32>, reviewers: Option<u32>| {
+            event(
+                seq,
+                EV_STEP,
+                json!({"repo": r, "number": number, "round": n,
+                       "role": if reviewer.is_some() { "review" } else { "build" },
+                       "reviewer": reviewer, "reviewers": reviewers}),
+            )
+        };
+        let reviewed = |seq, number, n, reviewer, verdict| {
+            event(
+                seq,
+                super::super::EV_REVIEWED,
+                json!({"repo": r, "number": number, "round": n, "reviewer": reviewer,
+                       "verdict": verdict}),
+            )
+        };
+        let closed =
+            |seq, number| event(seq, jono::EV_CLOSED, json!({"repo": r, "number": number}));
+        let done = |seq, lane, number, outcome| {
+            let mut data = record_lane_data(r, lane, number, "done", None);
+            data["outcome"] = json!(outcome);
+            event(seq, EV_POOL_LANE, data)
+        };
+        let events = vec![
+            event(1, EV_POOL_STARTED, json!({"repo": r, "lanes": 3})),
+            // Four items leave first: landed, held, failed and retired.
+            lane(2, 1, 11, "starting", None),
+            done(3, 1, 11, "landed"),
+            lane(4, 1, 12, "starting", None),
+            done(5, 1, 12, "escalated"),
+            lane(6, 1, 13, "starting", None),
+            done(7, 1, 13, "error"),
+            lane(8, 1, 14, "starting", None),
+            closed(9, 14),
+            done(10, 1, 14, "idle"),
+            // A stopped item went back to the queue: it did not leave.
+            lane(11, 1, 15, "starting", None),
+            done(12, 1, 15, "stopped"),
+            // Lane 1: #5, first round, building.
+            lane(20, 1, 5, "starting", None),
+            admitted(21, 1, 5, false, &["docs/a.md", "docs/b.md"]),
+            step(22, 5, 1, None, None),
+            lane(23, 1, 5, "build", Some("build")),
+            // Lane 2: #6, in its second round (rework 1), one reviewer still out.
+            lane(30, 2, 6, "starting", None),
+            admitted(31, 2, 6, false, &["crates/x/src/a.rs"]),
+            round(32, 6, 1, true),
+            step(33, 6, 2, None, None),
+            step(34, 6, 2, Some(1), Some(1)),
+            lane(35, 2, 6, "review", Some("review")),
+            // Lane 3: #7, high risk, third round, one of two reviewers passed.
+            lane(40, 3, 7, "starting", None),
+            admitted(41, 3, 7, true, &["a.rs"]),
+            round(42, 7, 1, true),
+            round(43, 7, 2, true),
+            step(44, 7, 3, Some(1), Some(2)),
+            reviewed(45, 7, 3, 1, "land"),
+            step(46, 7, 3, Some(2), Some(2)),
+            lane(47, 3, 7, "review", Some("review")),
+        ];
+        let items = [item(11, &[]), item(14, &[])];
+        let status = from_events(&events, r, true, &items);
+        let by = |n: u64| status.lanes.iter().find(|l| l.number == n).unwrap();
+        assert_eq!((by(5).round, by(6).round, by(7).round), (1, 2, 3));
+        assert_eq!(by(5).admitted_ms, 21_000);
+        assert_eq!(by(5).area, "docs");
+        assert_eq!(by(5).tokens, 0);
+        // A finished round's complete steps count; the step with figures missing adds nothing.
+        assert_eq!(by(6).tokens, 40);
+        assert_eq!(by(7).tokens, 80);
+        assert!(by(5).reviews.is_empty());
+        assert_eq!(by(6).reviews, ["pending"]);
+        assert_eq!(by(7).reviews, ["pass", "pending"]);
+        assert_eq!(status.tokens, 120);
+        // No lane count was ever recorded: a new pool starts with one lane.
+        assert_eq!(status.target, 1);
+        let out: Vec<(u64, &str)> = status
+            .out
+            .iter()
+            .map(|o| (o.number, o.outcome.as_str()))
+            .collect();
+        assert_eq!(
+            out,
+            [
+                (14, "retired"),
+                (13, "failed"),
+                (12, "held"),
+                (11, "landed")
+            ]
+        );
+        assert_eq!(status.out[0].ts_ms, 10_000);
+        assert_eq!(status.out[3].title, "item 11");
+        // Failed (#13) and retired (#14) both left without landing or being held.
+        assert_eq!(status.retired_since_start, 2);
+        // A reviewer's block shows, and a stopped pool has no lanes and none since its start.
+        let mut more = events.clone();
+        more.push(reviewed(48, 7, 3, 2, "changes"));
+        let status = from_events(&more, r, true, &items);
+        assert_eq!(
+            status.lanes.iter().find(|l| l.number == 7).unwrap().reviews,
+            ["pass", "block"]
+        );
+        let stopped = from_events(&events, r, false, &items);
+        assert_eq!(stopped.retired_since_start, 0);
+        assert_eq!(stopped.tokens, 0);
+        // Only the latest five are out.
+        let mut many = events.clone();
+        many.extend([
+            lane(50, 1, 16, "starting", None),
+            done(51, 1, 16, "landed"),
+            lane(52, 1, 17, "starting", None),
+            done(53, 1, 17, "landed"),
+        ]);
+        let status = from_events(&many, r, true, &items);
+        assert_eq!(status.out.len(), 5);
+        assert_eq!(status.out[0].number, 17);
+    }
+
+    #[test]
+    fn an_item_whose_lane_errored_says_it_waits_for_the_next_timed_sync() {
+        let mut done = lane(4, 1, 5, "done", None);
+        done.data["outcome"] = json!("error");
+        let events = vec![
+            event(1, EV_POOL_STARTED, json!({"repo": "acme/app", "lanes": 1})),
+            lane(2, 1, 5, "starting", None),
+            lane(3, 1, 5, "build", Some("build")),
+            done,
+        ];
+        let status = from_events(&events, "acme/app", true, &[item(5, &[]), item(6, &[])]);
+        assert!(
+            status.waiting[0].why.contains("timed sync"),
+            "{:?}",
+            status.waiting
+        );
+        assert_eq!(status.waiting[1].why, "no free lane");
     }
 
     #[test]
@@ -1554,6 +2323,31 @@ mod tests {
         events.extend([round(11, 5), turn(12, EV_LANDING, 7)]);
         let status = from_events(&events, "acme/app", true, &[]);
         assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
+        // A log written before the rename names them `pool.landing` and `pool.merging`.
+        use super::super::land::{OLD_LANDING, OLD_MERGING};
+        let mut old = events.clone();
+        for e in &mut old {
+            e.kind = match e.kind.as_str() {
+                EV_LANDING => OLD_LANDING.to_string(),
+                EV_MERGING => OLD_MERGING.to_string(),
+                _ => e.kind.clone(),
+            };
+        }
+        let status = from_events(&old, "acme/app", true, &[]);
+        assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
+        // Upgraded midway: #5 took the turn and #6 began to wait under the old names, #7 began
+        // to wait after the upgrade; then #6 takes the turn under the new name.
+        events.truncate(7);
+        events.extend([
+            turn(8, OLD_LANDING, 5),
+            turn(9, OLD_MERGING, 6),
+            turn(10, EV_MERGING, 7),
+        ]);
+        let status = from_events(&events, "acme/app", true, &[]);
+        assert_eq!((status.landing, status.merging), (Some(5), vec![6, 7]));
+        events.extend([round(11, 5), turn(12, EV_LANDING, 6)]);
+        let status = from_events(&events, "acme/app", true, &[]);
+        assert_eq!((status.landing, status.merging), (Some(6), vec![7]));
     }
 
     #[test]

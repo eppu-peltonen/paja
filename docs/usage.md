@@ -37,7 +37,9 @@ window is used. Expect cheaper items that sometimes need more rounds; if it does
 
 When a step stops because the plan's usage limit is reached, the run stops, keeps the work and resumes after the
 reset. When the recorded usage window is nearly used up (90% by default, `window <percent>` in `.paja/models`),
-Mestari starts no build or claim until the reset; reviews still start.
+Mestari starts no build or claim until the reset; reviews still start. The used share is the fullest of the plan's
+windows (five-hour, seven-day), and while Claude Code warns, the one it warns of. `paja doctor` warns when none of the
+latest five steps reported a window.
 
 ## Watching spend
 

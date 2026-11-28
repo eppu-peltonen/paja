@@ -432,9 +432,9 @@ def _one_case(case, paja, fake_tool, base_env, scratch):
     # see the same files, never the caller's real XDG config.
     env.pop("XDG_CONFIG_HOME", None)
     git_env = dict(env)
-    env.pop("PAJA_SBX", None)
-    if case["sandbox"]:
-        env["PAJA_SBX"] = case["sandbox"]
+    # Without a sandbox, `off`: unset, Paja would use an `sbx` it finds on PATH.
+    env["PAJA_SBX"] = case["sandbox"] or "off"
+    env.pop("PAJA_SBX_PASSED", None)
 
     ctx = {"tmp": tmp, "origin": origin, "repo": repo, "home": home, "canary": canary,
            "refs_before": refs(origin),
@@ -493,13 +493,15 @@ def main():
     paja = os.path.join(target, "debug", "paja" + exe)
     fake_tool = os.path.join(target, "debug", "examples", "fake_tool.exe")
 
-    sbx = os.environ.get("PAJA_SBX") or shutil.which("sbx")
+    # `off` (or empty) in the caller's shell is not a sandbox program: look on PATH then.
+    named = os.environ.get("PAJA_SBX", "").strip()
+    sbx = (named if named.lower() != "off" else "") or shutil.which("sbx")
     cases = [{"name": "with the sandbox", "sandbox": sbx},
              {"name": "without the sandbox", "sandbox": None}]
     results = {}
     for case in cases:
         if case["name"] == "with the sandbox" and not sbx:
-            result = {"passed": False, "error": "`sbx` is not on PATH and PAJA_SBX is not set, so "
+            result = {"passed": False, "error": "`sbx` is not on PATH and PAJA_SBX names no program, so "
                       "the sandbox case can't run; install Docker Sandboxes (sbx), then rerun"}
         else:
             try:

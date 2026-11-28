@@ -408,11 +408,20 @@ fn workflow_file(stacks: &[Stack], d: &Detected) -> String {
     text
 }
 
-/// A plain YAML scalar when it is safe, else a single-quoted one.
+/// A plain YAML scalar when it is safe, else a single-quoted one. A leading `~`, `-`, `?` or `,`
+/// would be read as something else, and so would a word YAML reads as a bool or null, or a number.
 fn yaml_scalar(text: &str) -> String {
-    if text.contains([
-        ':', '#', '\'', '"', '{', '}', '[', ']', '&', '*', '!', '|', '>', '%', '@', '`',
-    ]) {
+    let reserved = ["true", "false", "yes", "no", "on", "off", "null", "y", "n"];
+    if text.is_empty()
+        || text.starts_with(['~', '-', '?', ',', ' '])
+        || text.ends_with(' ')
+        || reserved.contains(&text.to_ascii_lowercase().as_str())
+        || text.replace('_', "").parse::<f64>().is_ok()
+        || text.starts_with(['.', '0']) && text.len() > 1 && !text.contains(' ')
+        || text.contains([
+            ':', '#', '\'', '"', '{', '}', '[', ']', '&', '*', '!', '|', '>', '%', '@', '`',
+        ])
+    {
         format!("'{}'", text.replace('\'', "''"))
     } else {
         text.to_string()
@@ -637,8 +646,12 @@ fn find_stacks(
             .collect()
     };
     let mut d = detected(&stacks);
-    d.environment.toolchains = accepted.toolchains;
-    d.environment.services = accepted.services;
+    // The agent's toolchains and services go with its stacks: on fallback the table's stacks
+    // are used alone, so the environment isn't half the agent's.
+    if why.is_none() {
+        d.environment.toolchains = accepted.toolchains;
+        d.environment.services = accepted.services;
+    }
     d.dropped = accepted.dropped;
     d.fallback = why.map(|why| {
         format!(
@@ -885,6 +898,27 @@ fn prepare_and_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_working_directory_yaml_would_misread_is_quoted() {
+        let step = detect::Step {
+            uses: String::new(),
+            with: Vec::new(),
+            run: "npm ci".to_string(),
+        };
+        let at = |dir: &str| detect::render_setup(std::slice::from_ref(&step), dir, &yaml_scalar);
+        assert!(at("@scope/pkg").contains("working-directory: '@scope/pkg'\n"));
+        assert!(at("apps/web").contains("working-directory: apps/web\n"));
+        assert_eq!(yaml_scalar("~x"), "'~x'");
+        assert_eq!(yaml_scalar("a~b"), "a~b");
+        for misread in [
+            "-x", "?x", ",x", "true", "Null", "off", "2024", "1.5", "", "1_000", "0x10", "0o7",
+            ".inf",
+        ] {
+            assert_eq!(yaml_scalar(misread), format!("'{misread}'"), "{misread}");
+        }
+        assert_eq!(yaml_scalar("npm ci"), "npm ci");
+    }
 
     #[test]
     fn node_checks_follow_the_scripts_and_the_lockfile() {

@@ -199,7 +199,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed. Names shaped like the ones Paja gives its own environments (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`) are refused."
+        description = "Ahjo: create an isolated environment, a git worktree on branch paja/<name> with its own block of 100 ports. A branch kept from an earlier environment of the same name is resumed. Names shaped like the ones Paja gives its own environments (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-plan-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`) are refused."
     )]
     async fn env_create(&self, Parameters(args): Parameters<CreateArgs>) -> Result<String, String> {
         let home = self.home.clone();
@@ -244,7 +244,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: import open GitHub issues with the repository's work label (.paja/labels on the default branch, factory when missing) into the work queue (uses gh)."
+        description = "Jono: import open GitHub issues with the repository's work label (.paja/labels on the default branch, factory when missing) into the work queue (uses gh). Removes the clean environment (worktree, not branch) of a parked item whose issue was closed, listed under freed; one it keeps is listed under kept with the reason."
     )]
     async fn work_sync(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
         let home = self.home.clone();

@@ -31,10 +31,20 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   has nothing left to fix, CI is green and, for a high-risk change, both reviewers agree. A re-review reads the fix
   and checks the earlier findings are settled (high risk: the whole change). Mestari files no follow-up issue.
 - **At the round limit.** An open blocker escalates, as before. Any other finding still open lands with the change,
-  recorded as `run.follow_up` (`not filed: round limit`) and listed in the pull request's description. An `outside`
-  finding is not fixed here, since one concern goes in each pull request: it is recorded (`not filed: outside the
-  change`) and listed in the pull request the same way. Each re-reviewer sees the earlier `outside` findings and
-  repeats the ones that still apply.
+  recorded as `run.follow_up` (`not filed: round limit`) and listed in the pull request's description, and Posti tells
+  the person (`left_findings`), since no issue holds them. An `outside` finding is not fixed here, since one concern
+  goes in each pull request: it is recorded (`not filed: outside the change`) and listed in the pull request the same
+  way. Each re-reviewer checks the earlier findings in the change as fixes, and sees the earlier `outside` findings
+  (also after a red CI) and repeats the ones that still apply. Every review that reads the whole change after an
+  earlier one sees them too, such as a high-risk one, one of a fix that merged or rewrote history, and the one after a
+  conflict or failed checks at the turn to land. The log keeps them for a resumed run: a round recorded with no `prior`
+  as `next.noted`, and a round whose review approved as `noted` (empty when none) and as `approved`, with the findings
+  in the change too and the commit it approved, so a run stopped at the turn to land or in the CI wait lands on resume
+  without another review while the change is still that commit. A red CI at the round limit escalates, and what the
+  change would have landed without is recorded as `not filed: the change did not land`. The
+  description goes to `gh` in a file, since ten findings are past Windows' command-line limit, and is cut at GitHub's
+  65,536 characters; a reused pull request gets the new round's description (if that edit fails, the landing goes on
+  with the old one).
 - **The follow-up label stays.** Jono still takes the follow-up issues that are already open, oldest first, and `paja
   triage` still closes duplicates and already-fixed ones. New ones are made only by people. The pull request's
   description is public, so reviewers never copy secrets, environment details or run output into findings, and Mestari
@@ -64,8 +74,11 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
 - **Each review is a fresh, short session.** Reviewers never share context with the builder or with each other, which
   keeps them independent and keeps each session small.
 - **One change lands at a time, on the latest default branch.** A change the reviewers approved waits for the
-  repository's turn to land, merges in whatever landed meanwhile, and lands only if Vasara's checks pass again on
-  that merge. A conflict, or checks that fail there, is a round for the builder like any other.
+  repository's turn to land, in the order the changes began to wait, merges in whatever landed meanwhile, and lands
+  only if Vasara's checks pass again on that merge. A conflict, or checks that fail there, is a round for the builder
+  like any other, and the change then waits again from the back. It holds the turn through the CI wait, which has a
+  limit (120 minutes, or `.paja/ci`'s `wait <minutes>`): CI still going at the limit escalates, since another round
+  can't unstick it, so one hung CI doesn't hold up every landing in the repository.
 
 ## Escalate, don't wait
 
@@ -85,11 +98,29 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
 - **`escalate`** goes to the person as before, but the arbiter's question replaces the raw one: what is undecided,
   two to four options and a recommendation, so one line answers it.
 - **Always escalated, enforced in code:** an answer is overruled to `escalate` when the item already has an arbiter
-  answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk` or the
-  deny-list hook, or when the escalation or the answer is about weakening a check (editing the failing test, those
-  files, the hook's rules). The person then gets the raw question and the reason. The prompt also tells the arbiter
-  to escalate anything that changes the issue's intent or scope, secrets, actions outside the repository and any
-  question that asks for the person's preference.
+  answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk`,
+  `.paja/models`, `.paja/commands`, the deny-list hook or anything under `.github/workflows/`, or when the escalation
+  or the answer may weaken a check. The arbiter's own `weakens_a_check` flag is the main defence against that, and an
+  answer stands only when it gives it as `false`. Word and path rules back it up:
+  - weakening phrases (relax the test, skip the check, drop the assert and the like) in the question, the reviewers'
+    summaries or the answer. In the answer any mention counts, even a denial, and the prompt says so. The question
+    and the summaries are written by reviewers, who are asked whether a change weakens a check, so one kind of
+    sentence is left out of them first: a closing sentence (the last of the text, or of one reviewer's part) that
+    says word for word, with only letters, apostrophes and a final `.` or `!`, that the change weakens no check ("It
+    doesn't weaken any check."). Anything more ("apart from the flaky case" on the next line or in the next sentence,
+    "don't skip the test", a question) still counts;
+  - a guard file or rule named in the question itself (Paja's framing, or the builder's or a reviewer's escalation
+    question) or in the answer, but not in the reviewers' summaries or in what a question quotes (the summaries in a
+    split, the last round's feedback after five rounds), which name them only to say what a change is about or where
+    a test failed;
+  - in the answer alone, markers of a changed test or a skipped check (`#[ignore`, `--skip`, `.skip(`, an expected
+    value, a snapshot, the CI config), any test file or test code, and a `.paja/checks` command with arguments in an
+    answer that also has a word for not running something (skip, drop, stop and the like, anywhere in it).
+
+  So an answer that only adds a test ("add a case in tests/smoke.rs") escalates too; that errs toward asking the
+  person. The person then gets the raw question and the reason. The prompt also tells the arbiter to escalate anything
+  that changes the issue's intent or scope, secrets, actions outside the repository and any question that asks for
+  the person's preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not
   decisions (a usage limit, an error Mestari can't fix, landing, CI and merge problems) skip the arbiter.
 
