@@ -211,8 +211,11 @@ run event of the item since it was last queued, claimed or answered, not only th
 again before it records a round keeps its round count and blockers: the round, the feedback for the builder, and the
 reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on the branch's HEAD
 (`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no index flags, it skips
-the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. Any other
-state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
+the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. When every
+reviewer had already approved that commit (a run stopped waiting for the turn to land, or in the CI wait), it skips the
+review as well ("resuming #5 in round 1: the review approved abc1234, which was waiting to land") and goes on to land
+with the findings that review approved with; if the default branch moved, Paja merges it in and runs the checks again
+first, as at the turn to land. Any other state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
 and gh run in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the
 terminal's Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build,
 the checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
@@ -452,7 +455,9 @@ of the earlier ones and the steps of both. A `run.round` of a round after which 
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
 like `detail`) or null, and with no `prior` the `noted` findings outside the change the latest review named, for the
 next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list
-when there are none, which a resumed run of that round takes over the earlier ones; a round stopped or ended on an
+when there are none, which a resumed run of that round takes over the earlier ones. A round every reviewer approved
+also carries `approved`: all the findings the change lands with, in it and outside it, so a resumed run lands it
+without reviewing again; a round stopped or ended on an
 error has no `noted`, and older events without these fields stay readable. Each `run.round` event also lists the
 round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
 Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,

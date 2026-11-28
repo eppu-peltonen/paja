@@ -5128,10 +5128,11 @@ fn review_prompts(f: &Factory) -> Vec<String> {
         .collect()
 }
 
-/// A run stopped in the CI wait after its review approved resumes with that review's outside
-/// findings: the approved round's `run.round` keeps them, and the review run again hears them.
+/// A run stopped in the CI wait after its review approved resumes straight to landing: the
+/// approved round's `run.round` keeps the review's findings, so the review isn't run again, the
+/// build and the checks aren't either, and the findings are still listed once.
 #[test]
-fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
+fn a_run_stopped_after_its_review_approved_lands_on_resume_without_reviewing_again() {
     let f = Factory::new("true\n", "land");
     let dir = f.tmp.path();
     f.reviewer_finds(
@@ -5150,16 +5151,58 @@ fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
         approved["data"]["noted"][0]["finding"], "The parser drops a line",
         "{approved}"
     );
+    assert_eq!(
+        approved["data"]["approved"][0]["finding"], "The parser drops a line",
+        "{approved}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1);
     let (report, stderr) = f.run_with_stderr();
     assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
-    let reviews = review_prompts(&f);
-    let last = reviews.last().unwrap_or_else(|| panic!("{stderr}"));
-    assert!(reviews.len() >= 2, "{stderr}");
     assert!(
-        last.contains("noted these findings outside the change")
-            && last.contains("The parser drops a line"),
-        "{last}"
+        stderr.contains("resuming #5 in round 1: the review approved "),
+        "{stderr}"
     );
+    assert!(
+        stderr.contains("the review already approved this change; skipping it"),
+        "{stderr}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1, "reviewed again\n{stderr}");
+    assert_eq!(builds(&f), 1, "built again\n{stderr}");
+    let left: Vec<Value> = events_of(&f, "run.follow_up");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["data"]["error"], "not filed: outside the change");
+    let log = f.gh_log();
+    let last = log.rfind("pr create").expect(&log);
+    assert_eq!(
+        log[last..].matches("The parser drops a line").count(),
+        1,
+        "{log}"
+    );
+}
+
+/// A change approved before the run stopped is still checked and reviewed again on resume when
+/// its worktree changed since: the approval holds only for the commit it approved.
+#[test]
+fn an_approval_does_not_carry_to_a_worktree_changed_since() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let env = f
+        .home
+        .join("envs")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(env.join("stray.txt"), "changed").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(!stderr.contains("the review already approved"), "{stderr}");
+    assert_eq!(review_prompts(&f).len(), 2, "{stderr}");
 }
 
 /// A run stopped in the round after a conflict at the turn to land resumes with the outside
