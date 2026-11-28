@@ -95,9 +95,11 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
 - **Always escalated, enforced in code:** an answer is overruled to `escalate` when the item already has an arbiter
   answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk` or the
   deny-list hook, or when the escalation or the answer is about weakening a check (editing the failing test, those
-  files, the hook's rules). A wording counts only where no negator ("not", "doesn't", "never", ...) comes in the few
-  words before it in the same clause, so "this doesn't weaken any check" is not a request to weaken one. The person
-  then gets the raw question and the reason. The prompt also tells the arbiter
+  files, the hook's rules). The person then gets the raw question and the reason. The wording check fails closed: a
+  wording is let go only when a negator ("not", "doesn't", "don't", "never", ...) is the word right before it, it is
+  the clause's only negator, and the clause asks nothing ("why", "if", "unless", a closing `?`), so "this doesn't
+  weaken any check" is not a request to weaken one while "don't hesitate to edit the failing test" is. A mention of
+  `.paja/checks`, `.paja/high-risk`, `hook.rs` or the deny-list always counts, negated or not. The prompt also tells the arbiter
   to escalate anything that changes the issue's intent or scope, secrets, actions outside the repository and any
   question that asks for the person's preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not

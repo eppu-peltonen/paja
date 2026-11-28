@@ -59,66 +59,88 @@ const WEAKENING: [&str; 14] = [
     "edit the test",
 ];
 
-/// Words that, just before a wording, say it is not happening: "it doesn't weaken a check".
-const NEGATORS: [&str; 15] = [
-    "not", "no", "never", "without", "nor", "nothing", "none", "doesn't", "don't", "didn't",
-    "won't", "isn't", "aren't", "wasn't", "neither",
+/// The wordings in [`WEAKENING`] that name a guarded file or the hook rather than an act. A
+/// negator never makes them harmless: an answer or escalation that names them goes to the person.
+const NAMED_GUARDS: [&str; 4] = [".paja/checks", ".paja/high-risk", "deny-list", "hook.rs"];
+
+/// Words that negate a wording when they come right before it: "it doesn't weaken a check",
+/// "don't edit the failing test", "never skip the test".
+const NEGATORS: [&str; 7] = [
+    "not", "never", "doesn't", "don't", "didn't", "won't", "mustn't",
 ];
 
-/// How many words before a wording a negator still applies to it.
-const NEGATION_REACH: usize = 4;
+/// Words that turn a negated wording in the same clause back into a request or a doubt: "why
+/// don't we skip the test", "if not, weaken the gate", "no reason not to weaken it".
+const ASKING: [&str; 6] = ["why", "how", "if", "unless", "reason", "need"];
 
-/// Whether `text` talks about weakening a check. A wording only counts where no negator comes
-/// shortly before it in the same clause, so a reviewer's "this doesn't weaken any check" or an
-/// answer's "don't edit the failing test" isn't taken for a request to weaken one. "Why not"
-/// still asks for it, and one wording said plainly anywhere is enough.
+/// Whether `text` talks about weakening a check. It fails closed: a wording counts unless one
+/// of [`NEGATORS`] is the word right before it, that is the clause's only negator, the clause
+/// asks nothing ([`ASKING`], or a closing `?`), and the wording is an act, not one of
+/// [`NAMED_GUARDS`]. So a reviewer's "this doesn't weaken any check" or an answer's "don't edit
+/// the failing test" is not a request to weaken one, while "don't hesitate to edit the failing
+/// test" still is.
 fn names_a_weaker_check(text: &str) -> bool {
-    let text = text.to_lowercase().replace('\u{2019}', "'");
-    let found = clauses(&text).any(|clause| {
+    let text = text
+        .to_lowercase()
+        .replace(['\u{2018}', '\u{2019}', '\u{2bc}'], "'");
+    let clauses = clauses(&text);
+    clauses.iter().any(|&(clause, asks)| {
         WEAKENING.iter().any(|w| {
             clause
                 .match_indices(w)
-                .any(|(at, _)| !negated(&clause[..at]))
+                .any(|(at, _)| asks || NAMED_GUARDS.contains(w) || !negated(&clause[..at]))
         })
-    });
-    found
+    })
 }
 
-/// `text` cut into clauses: at `,`, `;`, `:`, `!`, `?`, a line break, and a `.` that ends a
-/// sentence (one followed by whitespace or the end), so `.paja/checks` and `hook.rs` stay whole.
-fn clauses(text: &str) -> impl Iterator<Item = &str> {
-    let mut cuts = Vec::new();
+/// `text` cut into clauses, each with whether it ends in a `?`. Cuts fall at `,`, `;`, `:`,
+/// `!`, `?`, brackets, dashes, a line break, and a `.` not followed by a letter or digit, so
+/// `.paja/checks` and `hook.rs` stay whole while "matter.weaken" is cut.
+fn clauses(text: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         let ends = match c {
-            ',' | ';' | ':' | '!' | '?' | '\n' => true,
-            '.' => chars.peek().is_none_or(|(_, next)| next.is_whitespace()),
+            ',' | ';' | ':' | '!' | '?' | '\n' | '(' | ')' | '[' | ']' | '\u{2013}'
+            | '\u{2014}' => true,
+            '.' => chars.peek().is_none_or(|(_, next)| !next.is_alphanumeric()),
+            // A spaced hyphen is a dash; one inside a word ("no-verify") is not.
+            '-' => text[..at].ends_with(' ') && chars.peek().is_some_and(|(_, n)| *n == ' '),
             _ => false,
         };
         if ends {
-            cuts.push(at);
+            out.push((&text[start..at], c == '?'));
+            start = at + c.len_utf8();
         }
     }
-    let mut start = 0;
-    cuts.into_iter()
-        .chain(std::iter::once(text.len()))
-        .map(move |end| {
-            let clause = &text[start..end];
-            start = (end + 1).min(text.len());
-            clause
-        })
+    out.push((&text[start..], false));
+    out
 }
 
-/// Whether the words just before a wording (`before` is its clause up to it) negate it.
+/// Whether the clause up to a wording (`before`) negates it: its last word is a negator, it is
+/// the only negator in the clause so far, and nothing in the clause asks or doubts.
 fn negated(before: &str) -> bool {
     let words: Vec<&str> = before
-        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '\'')))
         .filter(|w| !w.is_empty())
         .collect();
-    let from = words.len().saturating_sub(NEGATION_REACH);
-    (from..words.len()).any(|i| {
-        NEGATORS.contains(&words[i]) && !(words[i] == "not" && i > 0 && words[i - 1] == "why")
-    })
+    let negators = words.iter().filter(|w| is_negator(w)).count();
+    words.last().is_some_and(|w| NEGATORS.contains(w))
+        && negators == 1
+        && !words.iter().any(|w| ASKING.contains(w))
+}
+
+/// Any word that negates, for counting double negatives: [`NEGATORS`] and the other `n't`s,
+/// "no", "nothing" and the like.
+fn is_negator(word: &str) -> bool {
+    NEGATORS.contains(&word)
+        || word.ends_with("n't")
+        || [
+            "no", "nothing", "none", "nor", "neither", "without", "cannot",
+        ]
+        .contains(&word)
 }
 
 /// Why Mestari won't let the arbiter answer this escalation, if it won't.
@@ -478,38 +500,52 @@ mod tests {
     #[test]
     fn a_negated_wording_is_not_a_request_to_weaken_a_check() {
         // What reviewers and the arbiter say about a change that only adds tests.
-        assert!(!names_a_weaker_check(
-            "It adds two smoke cases and doesn't weaken any check."
-        ));
-        assert!(!names_a_weaker_check(
-            "This does not in any way weaken the gate."
-        ));
-        assert!(!names_a_weaker_check(
-            "Add tests only; don't edit the failing test."
-        ));
-        assert!(!names_a_weaker_check(
-            "The change doesn\u{2019}t touch hook.rs."
-        ));
-        assert!(!names_a_weaker_check("Nothing here would loosen a rule"));
-        assert!(!names_a_weaker_check("Never skip the test."));
+        for text in [
+            "It adds two smoke cases and doesn't weaken any check.",
+            "This does not weaken the gate.",
+            "Add tests only; don't edit the failing test.",
+            "The change doesn\u{2019}t weaken anything.",
+            "Never skip the test.",
+            "The builder won't loosen a rule here",
+        ] {
+            assert!(!names_a_weaker_check(text), "{text}");
+        }
     }
 
     #[test]
-    fn a_wording_said_plainly_still_counts_next_to_a_negated_one() {
-        // A negator reaches only its own clause and the few words before the wording.
-        assert!(names_a_weaker_check(
-            "Don't add a test, edit the failing test instead."
-        ));
-        assert!(names_a_weaker_check(
-            "It doesn't weaken the hook. Edit .paja/checks to drop clippy."
-        ));
-        assert!(names_a_weaker_check(
-            "No reviewer agreed on the round, so we should simply skip the test"
-        ));
-        assert!(names_a_weaker_check("Why not skip the test?"));
-        // `.paja/checks` and `hook.rs` are never cut at their dots.
-        assert!(names_a_weaker_check("Change .paja/checks."));
-        assert!(names_a_weaker_check("Allow it in hook.rs"));
+    fn a_request_to_weaken_a_check_counts_whatever_negators_are_near() {
+        // Each of these asks for, or reports, a weaker check: the guard must still catch it.
+        for text in [
+            // A negator on another verb, or before the wording but not right before it.
+            "Don't hesitate to edit the failing test.",
+            "The assertion is not needed so delete the test.",
+            "It isn't flaky so skip the test.",
+            "The builder didn't fix it and weakened clippy.",
+            "Without delay edit the failing test.",
+            "Doesn't matter.Weaken the gate",
+            "Not fixable \u{2014} skip the test.",
+            "Not a real bug - loosen the rule.",
+            "Not flaky (skip the test)",
+            // Double negatives, questions and doubts.
+            "There's no reason not to weaken the gate.",
+            "Why don't we just skip the test?",
+            "Why not skip the test?",
+            "Isn't it simpler to weaken the check?",
+            "If not, weaken the gate",
+            "If you don't edit the test it stays red",
+            "Unless it's flaky, don't skip the test, edit the failing test instead.",
+            // Hyphenated words aren't negators.
+            "Commit with --no-verify to skip the check",
+            // The guarded files count even when negated.
+            "Edit the no-unwrap rule in .paja/checks",
+            "Change nothing except .paja/checks.",
+            "Don't touch anything but hook.rs.",
+            "It doesn't touch the deny-list hook.",
+            "Change .paja/checks.",
+            "Allow it in hook.rs",
+        ] {
+            assert!(names_a_weaker_check(text), "{text}");
+        }
     }
 
     #[test]

@@ -6095,6 +6095,27 @@ fn the_arbiter_answers_when_it_only_says_no_check_is_weakened() {
 }
 
 #[test]
+fn the_arbiter_is_overruled_when_a_negator_is_not_on_the_weakening() {
+    let f = Factory::new("true\n", "escalate");
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "Don't hesitate to edit the failing test.",
+            "reason": "It is flaky."
+        }),
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("weakening a check"), "{question}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
+    assert!(item["answers"].as_array().unwrap().is_empty(), "{item}");
+}
+
+#[test]
 fn the_arbiter_answers_an_item_only_once() {
     let f = Factory::new("true\n", "escalate");
     arbiter_says(
