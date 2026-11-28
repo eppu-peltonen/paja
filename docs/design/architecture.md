@@ -77,14 +77,16 @@ between sees them under one label or the other.
 `work.closed` and `work.reopened` events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than
 the last one recorded, as the file system resolves them (a symlink or a Windows short name to the same folder is the
 same checkout) (every `paja run` syncs first, so runs record it too); it never touches another repository's items, even
-when their issue numbers are the same. When it closes a parked (escalated) item whose issue GitHub says is closed, it
-removes that item's Ahjo environment (the hashed name, or the `work-<n>` of older releases) if it was made in this
-checkout, keeping the branch, and lists it under `freed`: nothing else frees the worktree and port block of an item
-closed instead of answered, and a reopened item resumes from the branch. It keeps the environment, listed under `kept`
-with the reason, when the issue is still open (its label changed, or `follow-ups = off` hides it), when a run holds the
-item or the item is no longer closed and parked once the home lock is taken for the removal (`ahjo::remove_unless`
-decides under the same lock as the removal), when the worktree isn't on the environment's branch, or when git refuses:
-uncommitted changes or untracked files. Ignored files, such as build output, go with the worktree.
+when their issue numbers are the same. Each sync also frees the environments of closed, parked (escalated) items whose
+issue GitHub says is closed: it removes the item's Ahjo environment, by its hashed name, if it was made in this
+checkout, keeping the branch, and lists it under `freed`, since nothing else frees the worktree and port block of an
+item closed instead of answered, and a reopened item resumes from the branch. An older release's `work-<n>` environment
+isn't freed: a reopened item would not resume that name's branch. An environment is kept, listed under `kept` with the
+reason and tried again by the next sync, when the issue is still open (its label changed, or `follow-ups = off` hides
+it), when a run holds the item or the item is no longer closed and parked once the home lock is taken for the removal
+(`ahjo::remove_unless` decides under the same lock as the removal), when the worktree isn't on the environment's branch,
+or when git refuses: uncommitted changes or untracked files. Ignored files, such as build output or a local `.env`, go
+with the worktree. `paja run` prints what its sync freed and kept on stderr.
 `paja work list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout
 they run in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with
 its `repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no

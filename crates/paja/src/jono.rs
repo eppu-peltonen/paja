@@ -2019,15 +2019,18 @@ pub fn sync_with(
     apply_claims(home, &name, &seen, &held)?;
     let top = checkout_top(repo)?;
     record_checkout(home, &name, &top)?;
-    (report.freed, report.kept) = free_closed(home, &ok, &name, &top, &report.closed);
+    (report.freed, report.kept) = free_closed(home, &ok, &name, &top);
     Ok(report)
 }
 
-/// Remove the environments of the parked (escalated) items among `closed`, the items of `repo`
-/// a sync just closed, that were made in the checkout `top`. A parked item keeps its environment
-/// so the builder's edits survive the question; once its issue is closed on GitHub instead of
-/// answered, nothing else frees the worktree and port block. The branch stays, so a reopened
-/// item resumes from it. An environment is kept, with the reason, when:
+/// Remove the environments of the closed, parked (escalated) items of `repo` that were made in
+/// the checkout `top`; every sync tries again, so one kept once is freed once nothing keeps it. A
+/// parked item keeps its environment so the builder's edits survive the question; once its issue
+/// is closed on GitHub instead of answered, nothing else frees the worktree and port block. The
+/// branch stays, so a reopened item resumes from it. Only the environment named by
+/// [`WorkItem::env_name`] is freed: a reopened item resumes from that name's branch only, so an
+/// older release's `work-<n>` stays for `paja doctor` to name. An environment is kept, with the
+/// reason, when:
 ///
 /// - its issue is still open on GitHub (the item left the queue because its label changed, or
 ///   `follow-ups = off` hides it), or `gh` can't say;
@@ -2035,48 +2038,28 @@ pub fn sync_with(
 ///   is taken for the removal;
 /// - its worktree isn't on the item's branch, so commits made there could be lost;
 /// - git refuses to remove it: uncommitted changes or untracked files. Ignored files (build
-///   output) go with the worktree.
+///   output, a local `.env`) go with the worktree.
 ///
-/// Both lists are what the sync reports; `paja doctor` names a kept one until it is removed.
-fn free_closed(
-    home: &Home,
-    ok: &Untampered,
-    repo: &str,
-    top: &Path,
-    closed: &[u64],
-) -> (Vec<String>, Vec<Kept>) {
+/// Both lists are what the sync reports; `paja doctor` names a kept one until it is removed. A
+/// log that can't be read frees nothing and says so on stderr.
+fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<String>, Vec<Kept>) {
     let (mut freed, mut kept) = (Vec::new(), Vec::new());
-    if closed.is_empty() {
-        return (freed, kept);
-    }
     let found = (|| -> Result<Vec<(u64, String)>> {
         let events = home.events().read_all()?;
-        let items = replay_repo(&events, repo)?;
         let envs = crate::ahjo::replay(&events)?;
-        let mut found = Vec::new();
-        for number in closed {
-            let Some(item) = items.get(number) else {
-                continue;
-            };
-            if item.open || item.status != Status::Escalated {
-                continue;
-            }
-            // The environment releases before repositories were recorded named `work-<n>`.
-            for name in [item.env_name(), format!("work-{number}")] {
-                if envs.get(&name).is_some_and(|env| same_dir(&env.repo, top)) {
-                    found.push((*number, name));
-                }
-            }
-        }
-        Ok(found)
+        Ok(replay_repo(&events, repo)?
+            .values()
+            .filter(|item| !item.open && item.status == Status::Escalated)
+            .map(|item| (item.number, item.env_name()))
+            .filter(|(_, name)| envs.get(name).is_some_and(|env| same_dir(&env.repo, top)))
+            .collect())
     })();
     let found = match found {
         Ok(found) => found,
         Err(err) => {
-            kept.push(Kept {
-                env: String::new(),
-                why: format!("couldn't read the event log: {err:#}"),
-            });
+            eprintln!(
+                "paja: freed no environment of a closed item: couldn't read the event log: {err:#}"
+            );
             return (freed, kept);
         }
     };
@@ -2128,7 +2111,8 @@ fn still_free(
     if home.run_held(repo, number)? {
         return Ok(Some(format!("a run holds item #{number}")));
     }
-    if env.path.exists() {
+    // Without its repository git can't read the worktree; the removal says why it stops.
+    if env.path.exists() && env.repo.exists() {
         let head = crate::ahjo::git_command()
             .arg("-C")
             .arg(&env.path)
@@ -3071,6 +3055,37 @@ mod tests {
             fold_parents(&top.join(path(&["a", ".", "b"]))),
             top.join(path(&["a", "b"]))
         );
+    }
+
+    #[test]
+    fn a_closed_items_environment_is_kept_once_the_item_moves_on_or_a_run_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        // Gone from disk, so only the item's state decides.
+        let env = crate::ahjo::Env {
+            name: env_name(R, 5),
+            repo: dir.path().join("gone"),
+            path: dir.path().join("gone-tree"),
+            branch: format!("paja/{}", env_name(R, 5)),
+            base_commit: "abc".into(),
+            port_base: 20_000,
+            port_count: 100,
+            created_ms: 1,
+        };
+        let why =
+            |home: &Home| still_free(home, &home.events().read_all().unwrap(), R, 5, &env).unwrap();
+        apply(&home, &[issue(5, "A")]).unwrap();
+        set_status(&home, 5, Status::Escalated, Some("Which API?")).unwrap();
+        // Parked but open: answered rather than closed.
+        assert!(why(&home).unwrap().contains("no longer closed and parked"));
+        apply(&home, &[]).unwrap();
+        assert_eq!(why(&home), None);
+        let lock = home.try_run_lock(R, 5).unwrap().expect("run lock");
+        assert!(why(&home).unwrap().contains("a run holds item #5"));
+        drop(lock);
+        // Claimed again while closed.
+        set_status(&home, 5, Status::Active, None).unwrap();
+        assert!(why(&home).unwrap().contains("no longer closed and parked"));
     }
 
     #[cfg(unix)]

@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -342,13 +342,11 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
             }
             // An item from before items carried their repository can't be held by a run, which
             // records the repository first.
-            if item.status == jono::Status::Active && !item.repo.is_empty() {
-                let _home = home
-                    .lock()
-                    .context("taking the home lock to see whether a run holds an active item")?;
-                if home.run_held(&item.repo, item.number)? {
-                    continue;
-                }
+            if item.status == jono::Status::Active
+                && !item.repo.is_empty()
+                && home.run_held(&item.repo, item.number)?
+            {
+                continue;
             }
             if item.repo.is_empty() {
                 // Named `work-<n>` by the releases that wrote such logs, or `<name>-<hash>-work-<n>`.

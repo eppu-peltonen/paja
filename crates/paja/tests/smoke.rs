@@ -3316,7 +3316,7 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
     init_repo(&repo);
-    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12];
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13];
     let issues: Vec<Value> = numbers
         .iter()
         .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
@@ -3393,8 +3393,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let other = tmp.path().join("other");
     init_repo(&other);
     tree(&other, &env(11));
-    // 12 still has the `work-<n>` environment an older release made.
+    // 12 still has the `work-<n>` environment an older release made: a reopened item wouldn't
+    // resume that name's branch, so it stays for doctor to name.
     let legacy = tree(&repo, "work-12");
+    // 13 has a change to a tracked file.
+    let changed = tree(&repo, &env(13));
+    std::fs::write(changed.join("hello.txt"), "changed\n").unwrap();
 
     // The issues are closed instead of answered.
     std::fs::write(tmp.path().join("issues.json"), "[]").unwrap();
@@ -3402,12 +3406,8 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     drop(lock);
     assert!(ok, "{report}");
     assert_eq!(report["closed"], serde_json::json!(numbers), "{report}");
-    assert_eq!(
-        report["freed"],
-        serde_json::json!([WORK_5, "work-12"]),
-        "{report}"
-    );
-    assert!(!clean.exists() && !legacy.exists());
+    assert_eq!(report["freed"], serde_json::json!([WORK_5]), "{report}");
+    assert!(!clean.exists() && legacy.exists() && changed.exists());
     assert!(dirty.join("draft.txt").exists());
     let kept: Vec<(String, String)> = report["kept"]
         .as_array()
@@ -3432,10 +3432,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
         why(10).contains("is not on") && why(10).contains("--force"),
         "{report}"
     );
-    assert!(!why(6).is_empty());
-    assert_eq!(kept.len(), 4, "{report}");
-    // The branches stay, so a reopened item resumes from them.
-    git(
+    for n in [6, 13] {
+        assert!(why(n).contains("uncommitted changes"), "{report}");
+    }
+    assert_eq!(kept.len(), 5, "{report}");
+    // The branch stays, so a reopened item resumes from it.
+    git_out(
         &repo,
         &[
             "rev-parse",
@@ -3443,10 +3445,6 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
             "-q",
             &format!("refs/heads/paja/{WORK_5}"),
         ],
-    );
-    git(
-        &repo,
-        &["rev-parse", "--verify", "-q", "refs/heads/paja/work-12"],
     );
     // The kept ones are what doctor names.
     let (_, doctor) = paja(&home, &repo, &["doctor"]);
@@ -3458,10 +3456,32 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
         .unwrap_or_else(|| panic!("no environments check in {doctor}"))
         .clone();
     let detail = check["detail"].as_str().unwrap();
+    for n in [6, 7, 8, 9, 10, 13] {
+        assert!(detail.contains(&env(n)), "{check}");
+    }
+    assert!(!detail.contains(WORK_5), "{check}");
+
+    // Every sync tries again: with the run gone and the draft cleared, 9 and 6 go. The text
+    // output says what was freed and kept.
+    std::fs::remove_file(dirty.join("draft.txt")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&repo)
+        .env("PAJA_HOME", &home)
+        .env("PAJA_GH", &gh)
+        .args(["work", "sync"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
     assert!(
-        detail.contains(&env(6)) && detail.contains(&env(7)) && !detail.contains(WORK_5),
-        "{check}"
+        text.contains(&format!("freed {}, {}", env(6), env(9))),
+        "{text}"
     );
+    assert!(
+        text.contains(&format!("kept {}: issue #8 is still open", env(8))),
+        "{text}"
+    );
+    assert!(!dirty.exists());
 }
 
 #[test]

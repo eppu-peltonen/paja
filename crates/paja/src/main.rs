@@ -249,7 +249,8 @@ enum PoolCommand {
 
 #[derive(Subcommand)]
 enum WorkCommand {
-    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`).
+    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`),
+    /// and remove the clean environment of a parked item whose issue was closed (the branch stays).
     Sync {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]

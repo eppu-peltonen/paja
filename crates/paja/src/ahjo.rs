@@ -1514,6 +1514,42 @@ mod tests {
     }
 
     #[test]
+    fn remove_unless_keeps_what_its_check_keeps_before_git_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_unchecked(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-q", "--allow-empty", "-m", "c"]);
+        git_unchecked(&repo, &args).unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let env = create(
+            &home,
+            CreateOptions {
+                name: "keep-me",
+                repo: &repo,
+                base: None,
+            },
+        )
+        .unwrap();
+        let before = home.events().read_all().unwrap().len();
+        let err = remove_unless(&home, "keep-me", false, |events, seen| {
+            assert_eq!(events.len(), before);
+            assert_eq!(seen.name, "keep-me");
+            Ok(Some("the item was reopened".into()))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the item was reopened");
+        assert!(env.path.exists());
+        assert_eq!(home.events().read_all().unwrap().len(), before);
+        assert!(get(&home, "keep-me").is_ok());
+        // With nothing to keep it, it goes.
+        remove_unless(&home, "keep-me", false, |_, _| Ok(None)).unwrap();
+        assert!(!env.path.exists() && get(&home, "keep-me").is_err());
+    }
+
+    #[test]
     fn port_blocks_reuse_the_lowest_free_slot() {
         let mut envs = BTreeMap::new();
         assert_eq!(free_port_block(&envs).unwrap(), 20_000);
