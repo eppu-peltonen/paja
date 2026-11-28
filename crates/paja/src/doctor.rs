@@ -708,7 +708,8 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     }
     // CI.
     let ci_file = crate::mestari::CI_FILE;
-    let mode = show(proof.path(), &commit, ci_file).map(|t| lines(&t.unwrap_or_default()));
+    let mode = show(proof.path(), &commit, ci_file)
+        .map(|t| crate::mestari::parse_ci(&t.unwrap_or_default()));
     let required = || match gh_in_repo(&["workflow", "list"]) {
         Ok(list) if !list.is_empty() => ok("ci", "a GitHub Actions workflow is set up"),
         Ok(_) => failed(
@@ -732,16 +733,13 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             format!("reading {ci_file} on {rev}: {err}"),
             "check that the repository is intact (`git status`)",
         ),
-        Ok(words) => match words.as_slice() {
-            [w] if w == "none" => ok("ci", format!("{ci_file} says none")),
-            [] => required(),
-            [w] if w == "required" => required(),
-            _ => failed(
-                "ci",
-                format!("{ci_file} on {rev} must hold `required` or `none`"),
-                format!("fix {ci_file} on the default branch"),
-            ),
-        },
+        Ok(Ok((crate::mestari::CiMode::None, _))) => ok("ci", format!("{ci_file} says none")),
+        Ok(Ok((crate::mestari::CiMode::Required, _))) => required(),
+        Ok(Err(why)) => failed(
+            "ci",
+            format!("{ci_file} on {rev} {why}"),
+            format!("fix {ci_file} on the default branch"),
+        ),
     });
 }
 

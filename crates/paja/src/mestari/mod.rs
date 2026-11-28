@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -898,22 +898,76 @@ struct Unrecorded {
 /// Whether the repository has CI Paja waits for before landing (`.paja/ci` on the default
 /// branch).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CiMode {
+pub(crate) enum CiMode {
     /// Wait for the pull request's CI checks to pass (the default).
     Required,
     /// No CI: land on Vasara's checks and the reviewers alone.
     None,
 }
 
-impl CiMode {
-    fn parse(text: Option<&str>, branch: &str) -> Result<CiMode> {
-        let words = lines(text.unwrap_or_default());
+/// How long a run waits for a pull request's CI, in minutes, when `.paja/ci` names no `wait`.
+pub(crate) const CI_WAIT_MINUTES: u64 = 120;
+/// The longest `wait` `.paja/ci` may name, in minutes: a day.
+const CI_WAIT_MAX: u64 = 1440;
+
+/// `.paja/ci`'s text: `required` (also when the file is missing or empty) or `none`, and with
+/// `required` an optional `wait <minutes>` line, how long a pull request's CI may take before
+/// the run stops waiting and asks the person. Returns the mode and the wait in minutes; an
+/// error says what is wrong with the file, for the caller to name the branch it was read from.
+pub(crate) fn parse_ci(text: &str) -> std::result::Result<(CiMode, u64), String> {
+    let mut mode = None;
+    let mut wait = None;
+    for line in lines(text) {
+        let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
-            [] => Ok(CiMode::Required),
-            [w] if w == "required" => Ok(CiMode::Required),
-            [w] if w == "none" => Ok(CiMode::None),
-            _ => bail!("{CI_FILE} on {branch} must hold `required` or `none`; fix it on {branch}"),
+            [w @ ("required" | "none")] => {
+                if mode.is_some() {
+                    return Err(format!(
+                        "has `{line}` after an earlier `required` or `none` line; keep one"
+                    ));
+                }
+                mode = Some(if *w == "none" {
+                    CiMode::None
+                } else {
+                    CiMode::Required
+                });
+            }
+            ["wait", minutes] => {
+                if wait.is_some() {
+                    return Err(format!(
+                        "has `{line}` after an earlier `wait` line; keep one"
+                    ));
+                }
+                match minutes.parse::<u64>() {
+                    Ok(m) if (1..=CI_WAIT_MAX).contains(&m) => wait = Some(m),
+                    _ => {
+                        return Err(format!(
+                            "has `{line}`, but the wait is a whole number of minutes from 1 to \
+                             {CI_WAIT_MAX}"
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "must hold `required` or `none`, and with `required` an optional \
+                     `wait <minutes>` line; `{line}` is not one of them"
+                ))
+            }
         }
+    }
+    let mode = mode.unwrap_or(CiMode::Required);
+    if mode == CiMode::None && wait.is_some() {
+        return Err("says `none` and names a `wait`, which only `required` has".to_string());
+    }
+    Ok((mode, wait.unwrap_or(CI_WAIT_MINUTES)))
+}
+
+impl CiMode {
+    /// [`parse_ci`] of the file as `branch` has it, with an error naming the branch.
+    fn parse(text: Option<&str>, branch: &str) -> Result<(CiMode, u64)> {
+        parse_ci(text.unwrap_or_default())
+            .map_err(|why| anyhow!("{CI_FILE} on {branch} {why}; fix it on {branch}"))
     }
 }
 
@@ -983,6 +1037,8 @@ impl RepoSettings {
 /// has them.
 struct Config {
     ci: CiMode,
+    /// How long to wait for a pull request's CI, in minutes.
+    ci_wait: u64,
     checks: Vec<String>,
     high_risk: Vec<String>,
     models: Models,
@@ -1011,9 +1067,10 @@ fn read_config(repo: &Path, base: &str, target: RepoSettings) -> Result<Config> 
     let commands = crate::hook::Commands::parse(
         read_from_base(repo, base, crate::hook::COMMANDS_FILE)?.as_deref(),
     )?;
-    let ci = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref(), branch)?;
+    let (ci, ci_wait) = CiMode::parse(read_from_base(repo, base, CI_FILE)?.as_deref(), branch)?;
     Ok(Config {
         ci,
+        ci_wait,
         checks,
         high_risk,
         models,
@@ -1033,6 +1090,7 @@ fn run_item(
 ) -> Result<RunReport> {
     let Config {
         ci,
+        ci_wait,
         checks,
         high_risk,
         models,
@@ -1714,7 +1772,9 @@ fn run_item(
             // ones still open. No issue is filed; the pull request lists them.
             let left = unsettled(home, repo, &follow_ups);
             let notes: Vec<String> = left.iter().map(|(text, _)| text.clone()).collect();
-            let landed = land(home, repo, &env, item, round, &judged, ci, &target, &notes);
+            let landed = land(
+                home, repo, &env, item, round, &judged, ci, ci_wait, &target, &notes,
+            );
             drop(landing);
             let report = match landed {
                 Ok(Landing::Retry(why)) => {
@@ -1771,6 +1831,9 @@ fn run_item(
                         crate::posti::send(home, repo, &notice);
                     }
                 }
+                // Stopped (`stop now` in the CI wait): the run that resumes the item records
+                // them, once.
+                Err(_) if crate::platform::interrupts() > 0 => {}
                 // Not landed after all: keep the findings in the log, for later.
                 _ => {
                     for (text, _) in &left {
@@ -4016,6 +4079,52 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_ci_file_names_a_mode_and_a_wait() {
+        let ok = |text: &str| parse_ci(text).unwrap();
+        assert_eq!(ok(""), (CiMode::Required, CI_WAIT_MINUTES));
+        assert_eq!(ok("# CI\nrequired\n"), (CiMode::Required, CI_WAIT_MINUTES));
+        assert_eq!(ok("none\n"), (CiMode::None, CI_WAIT_MINUTES));
+        assert_eq!(ok("required\nwait 30\n"), (CiMode::Required, 30));
+        // `wait` alone means `required`, the default; the order of the lines doesn't matter.
+        assert_eq!(ok("wait 1440\n"), (CiMode::Required, 1440));
+        assert_eq!(ok("wait  45\nrequired\n"), (CiMode::Required, 45));
+        let err = |text: &str| parse_ci(text).unwrap_err();
+        for bad in ["wait 0", "wait 1441", "wait -5", "wait 1.5", "wait soon"] {
+            assert!(
+                err(bad).contains("whole number of minutes from 1 to 1440"),
+                "{bad}"
+            );
+        }
+        for bad in ["wait", "wait 5 minutes", "optional", "required now"] {
+            assert!(
+                err(bad).contains("is not one of them"),
+                "{bad}: {}",
+                err(bad)
+            );
+        }
+        for bad in ["required\nrequired", "required\nnone", "none\nrequired"] {
+            let why = err(bad);
+            assert!(
+                why.contains("after an earlier `required` or `none` line; keep one"),
+                "{why}"
+            );
+        }
+        let why = err("wait 5\nwait 6");
+        assert!(
+            why.starts_with("has `wait 6` after an earlier `wait` line"),
+            "{why}"
+        );
+        assert!(err("none\nwait 5").contains("only `required` has"));
+        assert!(err("wait 5\nnone").contains("only `required` has"));
+        let branch = CiMode::parse(Some("none\nwait 5\n"), "trunk").unwrap_err();
+        assert!(
+            format!("{branch}").starts_with(".paja/ci on trunk says `none`")
+                && format!("{branch}").ends_with("fix it on trunk"),
+            "{branch}"
+        );
+    }
 
     #[test]
     fn lines_skip_blanks_and_comments() {

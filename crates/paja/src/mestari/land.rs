@@ -59,6 +59,7 @@ pub(super) fn land(
     rounds: u32,
     judged: &str,
     ci: CiMode,
+    ci_wait: u64,
     target: &RepoSettings,
     unsettled: &[String],
 ) -> Result<Landing> {
@@ -164,7 +165,15 @@ pub(super) fn land(
         progress(&format!("opened {pr}; waiting for CI"));
         // A red CI is the builder's to fix, like a failed check: the pull request stays open
         // and the next round pushes to it.
-        if let Err(err) = wait_for_ci(repo, &pr) {
+        if let Err(err) = wait_for_ci(repo, &pr, ci_wait) {
+            // `stop now` ended the wait: the run stops, and the next one resumes the item.
+            if stopped(&err) {
+                return Err(err);
+            }
+            if let Some(late) = err.downcast_ref::<CiTimedOut>() {
+                let question = late.to_string();
+                return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+            }
             let err = format!("{err:#}");
             // Only a failed check, or checks that never start because the default branch moved
             // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
@@ -444,22 +453,136 @@ pub(super) fn comment(home: &Home, repo: &Path, item: &WorkItem, question: &str)
     follow_ups::comment_on_issue(home, repo, item.number, &body)
 }
 
-/// Wait until GitHub has registered checks on the pull request, then until they finish.
-/// A pull request that gets no checks at all is not treated as green.
-pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
+/// Whether `err` is a step that `stop now` (or a second Ctrl-C) ended.
+fn stopped(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+    })
+}
+
+/// CI still going at the limit `.paja/ci`'s `wait` sets: the question for the person. Never
+/// the builder's to fix, so the run escalates it whatever else happened during the wait.
+#[derive(Debug)]
+pub(super) struct CiTimedOut(pub(super) String);
+
+impl std::fmt::Display for CiTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CiTimedOut {}
+
+/// Wait until GitHub has registered checks on the pull request, then until they finish, for
+/// at most `minutes` in all (`.paja/ci`'s `wait`; debug builds: `PAJA_TEST_CI_WAIT_MS`). A
+/// pull request that gets no checks at all is not treated as green, and neither is CI still
+/// going at the limit, which is a [`CiTimedOut`]: the run holds the repository's turn to land
+/// while it waits, so a CI that hangs would otherwise hold up every landing there. `stop now`
+/// ends the wait at once.
+pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
     const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
+    const AGAIN: std::time::Duration = std::time::Duration::from_secs(10);
+    let limit = std::env::var("PAJA_TEST_CI_WAIT_MS")
+        .ok()
+        .filter(|_| cfg!(debug_assertions))
+        .and_then(|ms| ms.parse().ok())
+        .map_or(
+            std::time::Duration::from_secs(minutes * 60),
+            std::time::Duration::from_millis,
+        );
     let start = std::time::Instant::now();
+    let deadline = start + limit;
+    let gh = jono::gh_program();
+    let args = ["pr", "checks", pr, "--watch", "--fail-fast"];
     loop {
-        match run_gh(repo, &["pr", "checks", pr, "--watch", "--fail-fast"]) {
-            Ok(_) => return Ok(()),
-            Err(err) if format!("{err:#}").contains("no checks reported") => {
-                if start.elapsed() > APPEAR {
-                    bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
-                }
-                std::thread::sleep(std::time::Duration::from_secs(10));
-            }
-            Err(err) => return Err(err),
+        let mut cmd = Command::new(&gh);
+        cmd.env("GH_PROMPT_DISABLED", "1")
+            .current_dir(repo)
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        let ended =
+            crate::platform::output_until_stopped_or(&mut cmd, deadline).with_context(|| {
+                format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+            })?;
+        if ended.timed_out {
+            // The table is on stdout; stderr's lines would run into it.
+            let table = clip(String::from_utf8_lossy(&ended.output.stdout).trim());
+            return Err(still_going(pr, limit, minutes, &table).into());
         }
+        if ended.output.status.success() {
+            return Ok(());
+        }
+        let err = format!("`{gh} {}` failed: {}", args.join(" "), tail(&ended.output));
+        if !err.contains("no checks reported") {
+            bail!(err);
+        }
+        // No checks yet: that is the workflows' to fix, not a hung CI, so it keeps its own
+        // message, cut to the limit when that is shorter.
+        let waited = start.elapsed();
+        if waited > APPEAR || waited + AGAIN >= limit {
+            bail!(
+                "no CI checks appeared on {pr} within {}; check the workflows",
+                long(APPEAR.min(limit))
+            );
+        }
+        // In short steps, so `stop now` isn't left waiting between two tries.
+        let next = std::time::Instant::now() + AGAIN;
+        while std::time::Instant::now() < next {
+            if crate::platform::interrupts() >= 2 {
+                return Err(crate::platform::stopped_error().into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// The question for CI on `pr` still going after `limit`, with the checks as `gh` last showed
+/// them.
+fn still_going(pr: &str, limit: std::time::Duration, minutes: u64, checks: &str) -> CiTimedOut {
+    let mut text = format!(
+        "CI on {pr} was still going after {}, so Paja stopped waiting for it and did not land \
+         it. Look at the pull request's checks on GitHub: a job may be stuck, or queued with no \
+         runner to take it. If this repository's CI takes longer, put `wait <minutes>` in \
+         {CI_FILE} on the default branch (it is now {}).\n\nThe change itself needs nothing: \
+         once the checks are unstuck or the wait is raised, answer, and Paja checks this pull \
+         request's CI again before it lands.",
+        long(limit),
+        long(std::time::Duration::from_secs(minutes * 60))
+    );
+    let checks = last_table(checks);
+    if !checks.is_empty() {
+        // A fence longer than any run of backticks in the table, so none can end it.
+        let mut fence = "```".to_string();
+        while checks.contains(fence.as_str()) {
+            fence.push('`');
+        }
+        text.push_str(&format!(
+            "\n\nThe checks when Paja stopped waiting:\n\n{fence}\n{checks}\n{fence}"
+        ));
+    }
+    CiTimedOut(text)
+}
+
+/// The last table in `gh pr checks --watch`'s output: without a terminal it prints the whole
+/// table again at each refresh, with a blank line between them.
+fn last_table(output: &str) -> &str {
+    output
+        .trim()
+        .rsplit("\n\n")
+        .map(str::trim)
+        .find(|table| !table.is_empty())
+        .unwrap_or_default()
+}
+
+/// `limit` as a person reads it: whole minutes, or seconds below one.
+fn long(limit: std::time::Duration) -> String {
+    match limit.as_secs() {
+        1 => "1 second".to_string(),
+        s if s < 60 => format!("{s} seconds"),
+        60..=119 => "1 minute".to_string(),
+        s => format!("{} minutes", s / 60),
     }
 }
 
@@ -518,6 +641,37 @@ mod tests {
         // Another method being off says nothing about this one.
         let v = json!({"viewerPermission": "ADMIN", "rebaseMergeAllowed": false});
         assert_eq!(why(v, super::SQUASH), None);
+    }
+
+    #[test]
+    fn the_timeout_question_shows_only_the_last_table_in_a_fence_it_cannot_end() {
+        let watched = "Refreshing checks status every 10 seconds.\n\ncheck\tpending\t0\n\n\
+                       check\tpending\t10s\nlint\tpass\t5s\n";
+        assert_eq!(
+            super::last_table(watched),
+            "check\tpending\t10s\nlint\tpass\t5s"
+        );
+        assert_eq!(super::last_table("  \n"), "");
+        let question = super::still_going(
+            "https://example.com/pull/1",
+            std::time::Duration::from_secs(60),
+            1,
+            "odd ``` name\tpending\t0",
+        )
+        .to_string();
+        assert!(question.contains("after 1 minute,") && question.contains("(it is now 1 minute)"));
+        assert!(
+            question.ends_with("\n````\nodd ``` name\tpending\t0\n````"),
+            "{question}"
+        );
+        let quiet = super::still_going(
+            "https://example.com/pull/1",
+            std::time::Duration::from_secs(1),
+            1,
+            "",
+        );
+        assert!(!quiet.to_string().contains("The checks when"), "{quiet}");
+        assert!(quiet.to_string().contains("after 1 second,"), "{quiet}");
     }
 
     #[test]

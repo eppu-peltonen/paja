@@ -179,8 +179,8 @@ as normal risk on purpose.
 
 `paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
-and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, or `none` for a
-repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims
+and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, with an optional
+`wait <minutes>` for CI, or `none` for a repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims
 anything, once an item is ready to take, so nothing is claimed on GitHub (with the usage window nearly used, only an
 item left active to resume counts, so a pass that pauses with only new items ready skips the check); with `none` landing
 skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and creates an
@@ -414,7 +414,10 @@ the builder resolves them and commits, which finishes the merge. A merge it leav
 and goes back to it, naming the files that still conflict and any review blockers.
 
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
-for CI with `gh pr checks --watch`, merges it and marks the item landed. A red CI goes back to the builder as another
+for CI with `gh pr checks --watch`, merges it and marks the item landed. The wait has a limit, 120 minutes unless
+`.paja/ci` names a `wait <minutes>` and counting the wait for checks to appear, since the run holds the repository's
+turn to land through it: CI still going at the limit always escalates, with the checks as `gh` last showed them, and
+`stop now` ends the wait like any other step. A red CI goes back to the builder as another
 round, like a failed check, with the failing checks and the end of the first failed job's log (`gh run view --job <id>
 --log-failed`); the pull request stays open and the next round pushes to it. So do checks that never start because the
 default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
