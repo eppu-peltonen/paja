@@ -276,7 +276,9 @@ commit, and only that commit lands. A conflict, or checks that fail on it, sends
 another round (`conflict` or `checks_failed`) within the five rounds, and the next review reads the whole change.
 A pool admits an item to a lane only when the files it will touch don't overlap a running item's
 (`crates/paja/src/mestari/plan.rs`). Before a lane starts it, the pool plans the item in a `paja pool plan <number>` of
-its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; recorded as `pool.planning`):
+its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; with every lane busy, it
+looks every 5 seconds and plans ahead until as many items as it has lanes have a plan ready or on its way, so a lane
+that frees has its next plan waiting; recorded as `pool.planning`):
 the item's `Touches:` line names the paths when it has one (`source: spec`; the words `and`, `or`, `none` and
 `nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
 `plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). That
@@ -285,7 +287,7 @@ name made from another repository stops the plan with the `paja env remove <name
 `plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an OS lock for its
 item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs is refused
 within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no planner of its
-own, records `pool.planning`, says so, counts the item as being planned (it takes one of the free lanes' planning
+own, records `pool.planning`, says so, counts the item as being planned (it takes one of the pool's planning
 slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A planner of
 the pool's refused because a plan started by hand took the lock just after the pool looked waits the same way. An item
 that leaves the queue meanwhile is no longer waited for. The pool looks only when it is about to plan an item: one that

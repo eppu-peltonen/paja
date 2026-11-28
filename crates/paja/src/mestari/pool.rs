@@ -63,6 +63,11 @@ const PLANNER_GRACE: Duration = Duration::from_secs(5);
 /// hung planner can't hold up planning and admission.
 const PLAN_LIMIT: Duration = Duration::from_secs(10 * 60);
 
+/// How often a pool whose every lane is busy looks for items to plan ahead, so the next free
+/// lane has its plan waiting. Less often than a tick: each look reads the queue under the
+/// home lock.
+const AHEAD_EVERY: Duration = Duration::from_secs(5);
+
 pub struct PoolOptions<'a> {
     /// Any path inside the repository's main checkout.
     pub repo: &'a Path,
@@ -211,6 +216,7 @@ impl Pool<'_> {
         let every = Duration::from_secs(self.opts.every.saturating_mul(60));
         // The first sync was the one that named the repository.
         let mut last_sync = Instant::now();
+        let mut last_ahead = Instant::now();
         let mut need_sync = false;
         let mut said_idle = false;
         let mut said_paused: Option<u64> = None;
@@ -296,8 +302,14 @@ impl Pool<'_> {
                         }
                     }
                 }
-                if free > 0 && paused.is_none() && fatal.is_none() {
-                    let admitted = self.admit(free)?;
+                // With every lane busy, the next items are planned ahead now and then.
+                let ahead =
+                    free == 0 && !self.lanes.is_empty() && last_ahead.elapsed() >= AHEAD_EVERY;
+                if (free > 0 || ahead) && paused.is_none() && fatal.is_none() {
+                    if ahead {
+                        last_ahead = Instant::now();
+                    }
+                    let admitted = self.admit(free, target as usize)?;
                     if admitted == 0
                         && self.lanes.is_empty()
                         && self.planners.is_empty()
@@ -314,8 +326,9 @@ impl Pool<'_> {
     }
 
     /// Hand up to `free` lanes the next items a run could take whose files don't overlap a
-    /// running item's, planning each first. Returns how many started.
-    fn admit(&mut self, free: usize) -> Result<usize> {
+    /// running item's, planning each first, and plan ahead for a pool of `target` lanes.
+    /// Returns how many started.
+    fn admit(&mut self, free: usize, target: usize) -> Result<usize> {
         let busy: BTreeSet<u64> = self.lanes.values().map(|lane| lane.number).collect();
         let next: Vec<WorkItem> = match jono::runnable(self.home, self.name) {
             Ok(items) => items,
@@ -361,8 +374,18 @@ impl Pool<'_> {
             .chain(self.elsewhere.keys())
             .copied()
             .collect();
-        // At most as many plans at once as there are free lanes to use them.
-        let room = free.saturating_sub(self.planners.len() + self.elsewhere.len());
+        // Waiting items with a plan to be admitted on; a failed plan is no plan to wait with.
+        let ready = queue
+            .iter()
+            .filter(|n| !planning.contains(n))
+            .filter(|n| plans.get(n).is_some_and(|plan| plan.source != "failed"))
+            .count();
+        let room = plan_room(
+            free,
+            target,
+            self.planners.len() + self.elsewhere.len(),
+            ready,
+        );
         let (chosen, to_plan) = choose(&queue, &plans, &running, &planning, free, room);
         let chosen: Vec<Plan> = chosen.into_iter().cloned().collect();
         for number in to_plan {
@@ -800,6 +823,17 @@ fn follow_lane(home: &Home, repo: &str, n: u32, lane: &mut Lane, events: &[Event
         }
     }
     Ok(())
+}
+
+/// How many plans to start: with a lane free, one for each free lane that no running plan is
+/// for already; with every lane busy, enough that `target` items have a plan ready or on its
+/// way, so the next lane to free has one waiting.
+fn plan_room(free: usize, target: usize, in_flight: usize, ready: usize) -> usize {
+    if free > 0 {
+        free.saturating_sub(in_flight)
+    } else {
+        target.saturating_sub(in_flight + ready)
+    }
 }
 
 /// The items to admit this tick and the ones to start planning, from the runnable `queue` in
@@ -1744,6 +1778,23 @@ pub fn describe(status: &PoolStatus, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_busy_pool_plans_ahead_only_as_many_items_as_it_has_lanes() {
+        // A free lane gets a plan of its own, less the ones on their way.
+        assert_eq!(plan_room(2, 3, 0, 5), 2);
+        assert_eq!(plan_room(2, 3, 1, 0), 1);
+        // Every lane busy: plans ready or on their way make up the pool's lanes, and no more.
+        assert_eq!(plan_room(0, 3, 0, 0), 3);
+        assert_eq!(plan_room(0, 3, 1, 1), 1);
+        assert_eq!(plan_room(0, 3, 1, 2), 0);
+        assert_eq!(plan_room(0, 2, 1, 4), 0);
+        // With every lane busy, an unplanned item is planned though none can be admitted.
+        let plans = BTreeMap::new();
+        let (chosen, to_plan) = choose(&[6, 7], &plans, &[], &BTreeSet::new(), 0, 1);
+        assert!(chosen.is_empty());
+        assert_eq!(to_plan, [6]);
+    }
 
     #[test]
     fn an_item_being_planned_again_waits_for_its_new_plan() {
