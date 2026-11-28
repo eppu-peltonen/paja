@@ -711,6 +711,91 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Kill `child` and every process it started, however they are grouped: for a `paja` that is
+/// stuck, whose agents and checks run in process groups of their own, so ending its group
+/// ([`kill_tree`]) would leave them running. On Windows, `taskkill /T`. On Unix, the processes
+/// are frozen (`SIGSTOP`) from the top down, so none can start another or be reparented away
+/// before it is found, and then killed from the bottom up, so each dies while its parent still
+/// holds its pid and nothing is woken by its group being orphaned; `ps` lists who started whom.
+/// Both follow parent ids, so a process already reparented away (a daemon that detached itself)
+/// is out of reach, and without a working `ps` only `child` is ended. A parent that has its
+/// children reaped for it (`SIGCHLD` ignored) leaves a brief window in which a child that just
+/// ended could have its pid reused before it is signalled. Does nothing once `child` has been
+/// waited for, so a reused pid is never signalled.
+pub fn kill_with_descendants(child: &mut std::process::Child) {
+    // Until it is waited for, an ended child keeps its pid, so the pid is still its own.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let signal = |pid: u32, sig: libc::c_int| {
+            if let Ok(pid) = libc::pid_t::try_from(pid) {
+                // SAFETY: a plain system call on a process id.
+                unsafe {
+                    libc::kill(pid, sig);
+                }
+            }
+        };
+        let mut frozen = vec![child.id()];
+        signal(child.id(), libc::SIGSTOP);
+        // Each pass freezes the children of what is frozen, until a pass finds none.
+        loop {
+            let found: Vec<u32> = children_of(&frozen)
+                .into_iter()
+                .filter(|pid| !frozen.contains(pid))
+                .collect();
+            if found.is_empty() {
+                break;
+            }
+            for &pid in &found {
+                signal(pid, libc::SIGSTOP);
+            }
+            frozen.extend(found);
+        }
+        for &pid in frozen.iter().rev() {
+            signal(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // From a windowed program such as Paja Desk, without a console window of its own.
+        let mut cmd = Command::new("taskkill");
+        let _ = no_console(&mut cmd)
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The processes whose parent is one of `parents`, as `ps` lists them; none when it can't
+/// within a few seconds, so a hung `ps` never leaves the tree frozen.
+#[cfg(unix)]
+fn children_of(parents: &[u32]) -> Vec<u32> {
+    let mut ps = Command::new("ps");
+    ps.args(["-A", "-o", "pid=", "-o", "ppid="]);
+    let Ok(out) = output_within(
+        own_process_group(&mut ps),
+        std::time::Duration::from_secs(5),
+    ) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let ppid = parts.next()?.parse::<u32>().ok()?;
+            // Never 0 (the caller's own group) or 1, whatever `ps` printed.
+            (pid > 1 && parents.contains(&ppid)).then_some(pid)
+        })
+        .collect()
+}
+
 /// The command that shows `title` and `text` as a desktop notification: a Windows toast through
 /// Windows PowerShell, `osascript` on macOS, `notify-send` elsewhere. The texts travel as
 /// environment variables or arguments, never inside a script, so nothing in them is run.
@@ -855,6 +940,68 @@ pub fn run_briefly(cmd: &mut Command, limit: std::time::Duration) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether process `pid` has ended (or is only a zombie left for its parent to reap).
+    #[cfg(unix)]
+    fn ended(pid: &str) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        stat.trim().is_empty() || stat.trim().starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killing_with_descendants_reaches_processes_in_groups_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        // bash's `set -m` puts each background job in a process group of its own even without a
+        // terminal, as `paja` does with its agents; the second job starts one more process
+        // below it.
+        let script = format!(
+            "set -m; sleep 60 & echo $! >> '{p}'; sh -c 'sleep 60 & echo $! >> \"$0\"; wait' \
+             '{p}' & echo $! >> '{p}'; wait",
+            p = pids.display()
+        );
+        let mut child = Command::new("bash").args(["-c", &script]).spawn().unwrap();
+        let started = std::time::Instant::now();
+        let read = || std::fs::read_to_string(&pids).unwrap_or_default();
+        while read().lines().count() < 3 {
+            assert!(
+                started.elapsed().as_secs() < 30,
+                "the processes never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let pids = read();
+        let pids: Vec<&str> = pids.lines().map(str::trim).collect();
+        assert!(pids.iter().all(|pid| !ended(pid)), "{pids:?}");
+        let group = |pid: &str| {
+            let out = Command::new("ps")
+                .args(["-o", "pgid=", "-p", pid])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let own = group(&child.id().to_string());
+        assert!(
+            pids.iter().all(|pid| group(pid) != own),
+            "not in groups of their own: {pids:?}"
+        );
+        kill_with_descendants(&mut child);
+        assert!(child.try_wait().unwrap().is_some());
+        // A second call once it has been waited for is harmless (that it signals nothing, a
+        // reused pid least of all, is checked by reading the guard: a stray signal to a stale
+        // pid can't be seen from here).
+        kill_with_descendants(&mut child);
+        let started = std::time::Instant::now();
+        while !pids.iter().all(|pid| ended(pid)) {
+            assert!(started.elapsed().as_secs() < 10, "left running: {pids:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn output_within_gives_the_output_or_stops_the_program_at_the_limit() {
