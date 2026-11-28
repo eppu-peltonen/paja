@@ -2311,15 +2311,23 @@ mod tests {
         let status = from_events(&events, "acme/app", true, &[]);
         assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
         // A log written before the rename names them `pool.landing` and `pool.merging`.
-        for e in &mut events {
+        use super::super::land::{OLD_LANDING, OLD_MERGING};
+        let mut old = events.clone();
+        for e in &mut old {
             e.kind = match e.kind.as_str() {
-                EV_LANDING => "pool.landing".to_string(),
-                EV_MERGING => "pool.merging".to_string(),
+                EV_LANDING => OLD_LANDING.to_string(),
+                EV_MERGING => OLD_MERGING.to_string(),
                 _ => e.kind.clone(),
             };
         }
-        let status = from_events(&events, "acme/app", true, &[]);
+        let status = from_events(&old, "acme/app", true, &[]);
         assert_eq!((status.landing, status.merging), (Some(7), vec![6]));
+        // Upgraded midway: #6 waited under the old name and takes the turn under the new one.
+        events.truncate(10);
+        events[9].kind = OLD_MERGING.to_string();
+        events.extend([round(11, 5), turn(12, EV_LANDING, 6)]);
+        let status = from_events(&events, "acme/app", true, &[]);
+        assert_eq!((status.landing, status.merging), (Some(6), vec![7]));
     }
 
     #[test]

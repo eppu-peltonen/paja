@@ -6,10 +6,10 @@ pub(super) const EV_MERGING: &str = "run.merging";
 /// A run that takes its turn to land: `{repo, number, round}`. It holds the turn until the
 /// change lands, or goes back to its builder.
 pub(super) const EV_LANDING: &str = "run.landing";
-/// The names [`EV_MERGING`] and [`EV_LANDING`] had in logs written before they were renamed,
-/// read as those.
-const OLD_MERGING: &str = "pool.merging";
-const OLD_LANDING: &str = "pool.landing";
+/// The name [`EV_MERGING`] had in logs written before the rename, read as it.
+pub(super) const OLD_MERGING: &str = "pool.merging";
+/// The name [`EV_LANDING`] had in logs written before the rename, read as it.
+pub(super) const OLD_LANDING: &str = "pool.landing";
 
 /// An event's kind with the turn-to-land events under their current names, so a log written
 /// before the rename reads the same.
@@ -20,6 +20,7 @@ pub(super) fn turn_kind(event: &crate::events::Event) -> &str {
         other => other,
     }
 }
+
 /// GitHub's limit for a pull request's description, in characters.
 const PR_BODY_CHARS: usize = 65_536;
 
@@ -795,12 +796,20 @@ mod tests {
         };
         let old = renamed(&events);
         assert_eq!(waiting_ahead(&old, "o/r", 5, Some(6), all), [6, 7]);
-        let mut landed = events.clone();
-        landed.push(ev(8, EV_LANDING, 6));
+        let mut took_turn = events.clone();
+        took_turn.push(ev(8, EV_LANDING, 6));
         assert_eq!(
-            waiting_ahead(&renamed(&landed), "o/r", 5, Some(6), all),
+            waiting_ahead(&renamed(&took_turn), "o/r", 5, Some(6), all),
             [7]
         );
+        // A log upgraded midway: #6 began to wait before the rename, #7 and #5 after.
+        let mut mixed = events.clone();
+        mixed[3].kind = OLD_MERGING.to_string();
+        assert_eq!(waiting_ahead(&mixed, "o/r", 5, Some(6), all), [6, 7]);
+        assert_eq!(waiting_ahead(&mixed, "o/r", 7, Some(5), all), [6]);
+        // #6 then takes the turn under the new name, and waits no more.
+        mixed.push(ev(8, EV_LANDING, 6));
+        assert_eq!(waiting_ahead(&mixed, "o/r", 5, Some(6), all), [7]);
     }
 
     #[test]
