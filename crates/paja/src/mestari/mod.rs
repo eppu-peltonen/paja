@@ -825,7 +825,10 @@ fn one_pass(home: &Home, opts: RunOptions<'_>, sandbox: &mut bool) -> Result<Run
                 item.number,
                 asked.err(),
             ));
-            let _ = ahjo::remove(home, &item.env_name(), true);
+            // The environment the run used: the item's, or the `work-<n>` it resumed.
+            if let Ok(Some(env)) = existing_environment(home, &repo, &item) {
+                let _ = ahjo::remove(home, &env.name, true);
+            }
             Ok(RunReport::Escalated {
                 number: item.number,
                 question,
@@ -2028,7 +2031,9 @@ fn existing_environment(home: &Home, repo: &Path, item: &WorkItem) -> Result<Opt
 }
 
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
-/// run of the same item is resumed, so its work isn't thrown away.
+/// run of the same item is resumed, so its work isn't thrown away: the item's own, else the
+/// `paja/work-<n>` of a `work-<n>` environment an older release made and something removed
+/// since (a sync freeing a closed item, `paja env remove`), which the new branch starts from.
 /// The flag says whether the branch (and so the work on it) was kept from an earlier run, as
 /// opposed to made again from the base.
 fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<(Env, bool)> {
@@ -2036,14 +2041,21 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
     if let Some(env) = existing_environment(home, repo, item)? {
         return Ok((env, true));
     }
-    let branch = format!("refs/heads/paja/{name}");
-    let resume = git(repo, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
+    let kept = |branch: &str| git(repo, &["rev-parse", "--verify", "--quiet", branch]).is_ok();
+    let legacy = format!("refs/heads/paja/work-{}", item.number);
+    let (base, resume) = if kept(&format!("refs/heads/paja/{name}")) {
+        (None, true)
+    } else if kept(&legacy) {
+        (Some(legacy.as_str()), true)
+    } else {
+        (Some(base), false)
+    };
     let env = ahjo::create(
         home,
         CreateOptions {
             name: &name,
             repo,
-            base: if resume { None } else { Some(base) },
+            base,
         },
     )?;
     Ok((env, resume))
@@ -3513,6 +3525,70 @@ mod tests {
         let (other, resumed) = super::environment(&home, &b, "HEAD", &work_item("o/b", 7)).unwrap();
         assert!(!resumed);
         assert_ne!(other.name, "work-7");
+    }
+
+    #[test]
+    fn an_item_whose_work_n_environment_was_removed_resumes_its_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let a = repo_with_commit(tmp.path(), "a");
+        let old = crate::ahjo::create(
+            &home,
+            crate::ahjo::CreateOptions {
+                name: "work-7",
+                repo: &a,
+                base: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(old.path.join("draft.txt"), "the builder's work\n").unwrap();
+        for args in [
+            &["add", "draft.txt"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "draft",
+            ],
+        ] {
+            git(&old.path, args).unwrap();
+        }
+        crate::ahjo::remove(&home, "work-7", false).unwrap();
+        let item = work_item("o/a", 7);
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(resumed);
+        assert_eq!(env.name, item.env_name());
+        assert!(env.path.join("draft.txt").exists());
+    }
+
+    #[test]
+    fn a_work_n_environment_whose_repository_moved_is_neither_taken_nor_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let a = repo_with_commit(tmp.path(), "a");
+        // Recorded for a repository path that no longer exists, so it can't be canonicalized.
+        let gone = tmp.path().join("moved-away");
+        let lock = home.lock().unwrap();
+        home.events()
+            .append(
+                &lock,
+                crate::ahjo::EV_CREATED,
+                json!({
+                    "name": "work-7", "repo": gone, "path": gone.join("w"), "branch": "paja/work-7",
+                    "base_commit": "abc", "port_base": 20_000, "port_count": 100, "created_ms": 1
+                }),
+            )
+            .unwrap();
+        drop(lock);
+        let item = work_item("o/a", 7);
+        assert!(existing_environment(&home, &a, &item).unwrap().is_none());
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(!resumed);
+        assert_eq!(env.name, item.env_name());
+        assert_eq!(crate::ahjo::get(&home, "work-7").unwrap().repo, gone);
     }
 
     #[test]

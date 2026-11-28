@@ -78,12 +78,12 @@ between sees them under one label or the other.
 the last one recorded, as the file system resolves them (a symlink or a Windows short name to the same folder is the
 same checkout) (every `paja run` syncs first, so runs record it too); it never touches another repository's items, even
 when their issue numbers are the same. Each sync also frees the environments of closed, parked (escalated) items whose
-issue GitHub says is closed: it removes the item's Ahjo environment, by its hashed name, if it was made in this
-checkout, keeping the branch, and lists it under `freed`, since nothing else frees the worktree and port block of an
-item closed instead of answered, and a reopened item resumes from the branch. An older release's `work-<n>` environment
-isn't freed: a reopened item would not resume that name's branch. An environment is kept, listed under `kept` with the
-reason and tried again by the next sync, when the issue is still open (its label changed, or `follow-ups = off` hides
-it), when a run holds the item or the item is no longer closed and parked once the home lock is taken for the removal
+issue GitHub says is closed: it removes the item's Ahjo environment (its hashed name, or the `work-<n>` an older release
+made) if it was made in this checkout, keeping the branch, and lists it under `freed`, since nothing else frees the
+worktree and port block of an item closed instead of answered. A reopened item resumes from the kept branch: its own,
+else `paja/work-<n>`, which its new branch starts from. An environment is kept, listed under `kept` with the reason and
+tried again by the next sync, when the issue is still open (its label changed, or `follow-ups = off` hides it), when a
+run holds the item or the item is no longer closed and parked once the home lock is taken for the removal
 (`ahjo::remove_unless` decides under the same lock as the removal), when the worktree folder is already gone (removing
 it would prune every missing worktree of the repository), when the worktree isn't on the environment's branch or git
 can't read its HEAD, or when git refuses: uncommitted changes, untracked files, a locked worktree or submodules. One

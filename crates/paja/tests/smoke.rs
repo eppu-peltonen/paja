@@ -3334,7 +3334,7 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
     init_repo(&repo);
-    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let issues: Vec<Value> = numbers
         .iter()
         .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
@@ -3411,9 +3411,11 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let other = tmp.path().join("other");
     init_repo(&other);
     tree(&other, &env(11));
-    // 12 still has the `work-<n>` environment an older release made: a reopened item wouldn't
-    // resume that name's branch, so it stays (#523).
+    // 12 still has the `work-<n>` environment an older release made, freed the same way.
     let legacy = tree(&repo, "work-12");
+    // 16's is one too, with an untracked file.
+    let legacy_dirty = tree(&repo, "work-16");
+    std::fs::write(legacy_dirty.join("draft.txt"), "edit\n").unwrap();
     // 13 has a change to a tracked file.
     let changed = tree(&repo, &env(13));
     std::fs::write(changed.join("hello.txt"), "changed\n").unwrap();
@@ -3429,8 +3431,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     drop(lock);
     assert!(ok, "{report}");
     assert_eq!(report["closed"], serde_json::json!(numbers), "{report}");
-    assert_eq!(report["freed"], serde_json::json!([WORK_5]), "{report}");
-    assert!(!clean.exists() && legacy.exists() && changed.exists());
+    assert_eq!(
+        report["freed"],
+        serde_json::json!([WORK_5, "work-12"]),
+        "{report}"
+    );
+    assert!(!clean.exists() && !legacy.exists() && changed.exists());
     assert!(dirty.join("draft.txt").exists());
     let kept: Vec<(String, String)> = report["kept"]
         .as_array()
@@ -3461,7 +3467,12 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     assert!(why(14).contains("git couldn't read the HEAD"), "{report}");
     assert!(why(15).contains("is already gone"), "{report}");
     assert!(unreadable.join("hello.txt").exists());
-    assert_eq!(kept.len(), 7, "{report}");
+    assert!(
+        kept.iter()
+            .any(|(e, w)| e == "work-16" && w.contains("uncommitted changes")),
+        "{report}"
+    );
+    assert_eq!(kept.len(), 8, "{report}");
     // The branch stays, so a reopened item resumes from it.
     git_out(
         &repo,
@@ -3485,6 +3496,8 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     for n in [6, 7, 8, 9, 10, 13, 14, 15] {
         assert!(detail.contains(&env(n)), "{check}");
     }
+    // The sync recorded this checkout as acme/app's, so its `work-<n>` is named too.
+    assert!(detail.contains("work-16"), "{check}");
     assert!(!detail.contains(WORK_5), "{check}");
 
     // Every sync tries again: with the run gone and the draft cleared, 9 and 6 go. The text
@@ -7373,6 +7386,34 @@ fn a_run_that_errors_parks_the_item_even_if_github_is_down() {
         log.contains("run.follow_up") && log.contains("not filed: the change did not land"),
         "{log}"
     );
+}
+
+#[test]
+fn a_run_that_errors_frees_the_work_n_environment_it_resumed() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("gh-down"), "").unwrap();
+    // Item 5 was started by a release that named its environment `work-5`.
+    std::fs::create_dir_all(&f.home).unwrap();
+    std::fs::write(f.home.join("events.jsonl"), "").unwrap();
+    let path = f.tmp.path().join("work-5");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "paja/work-5",
+            path.to_str().unwrap(),
+        ],
+    );
+    record_env(&f.home, "work-5", &f.repo, &path);
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
+    assert_eq!(envs, serde_json::json!([]), "the worktree it used is freed");
+    assert!(!path.exists());
 }
 
 #[test]

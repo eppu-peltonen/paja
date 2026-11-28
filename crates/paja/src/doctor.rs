@@ -326,7 +326,8 @@ fn usage_window(events: &[crate::events::Event], claude: &str, windowed: bool) -
 /// builder's edits survive the question), and one with uncommitted changes is kept when its
 /// issue is closed instead of answered. An item still marked active counts once no run holds
 /// it (the run crashed or was killed). An item from a log written before items carried their
-/// repository matches the `work-<n>` environment of its number made in the checkout `repo` is in.
+/// repository, or of the repository whose checkout `repo` is in, matches the `work-<n>`
+/// environment of its number made there, as releases before names carried the repository did.
 fn left_over_environments(home: &Home, repo: &Path) -> Check {
     let name = "environments";
     let found = (|| -> Result<Vec<String>> {
@@ -335,6 +336,16 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
         // Made in this checkout: doctor may run from a folder inside it.
         let checkout = jono::checkout_top(repo)?;
         let here = |env: &ahjo::Env| jono::same_dir(&env.repo, &checkout);
+        let ours = |repo: &str| {
+            repo.is_empty()
+                || events.iter().any(|e| {
+                    e.kind == jono::EV_CHECKOUT
+                        && e.data["repo"] == repo
+                        && e.data["path"]
+                            .as_str()
+                            .is_some_and(|path| jono::same_dir(Path::new(path), &checkout))
+                })
+        };
         let mut left = Vec::new();
         for item in jono::replay(&events, "")?.values() {
             if item.open {
@@ -348,16 +359,16 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
             {
                 continue;
             }
-            if item.repo.is_empty() {
-                // The releases that wrote such logs named an item's environment `work-<n>`.
-                let plain = format!("work-{}", item.number);
-                left.extend(
-                    envs.get(&plain)
-                        .filter(|env| here(env))
-                        .map(|env| env.name.clone()),
-                );
-            } else if envs.contains_key(&item.env_name()) {
+            if envs.contains_key(&item.env_name()) && !item.repo.is_empty() {
                 left.push(item.env_name());
+            }
+            // Releases before names carried the repository named an item's environment
+            // `work-<n>`: the item's when it was made in this checkout and this checkout is the
+            // item's repository (an item from a log that names none, or one a sync here
+            // recorded).
+            let plain = format!("work-{}", item.number);
+            if envs.get(&plain).is_some_and(&here) && ours(&item.repo) {
+                left.push(plain);
             }
         }
         left.sort();

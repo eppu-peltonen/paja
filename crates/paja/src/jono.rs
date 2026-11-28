@@ -2028,11 +2028,9 @@ pub fn sync_with(
 /// the checkout `top`; every sync tries again, so one kept once is freed once nothing keeps it. A
 /// parked item keeps its environment so the builder's edits survive the question; once its issue
 /// is closed on GitHub instead of answered, nothing else frees the worktree and port block. The
-/// branch stays, so a reopened item resumes from it. Only the environment named by
-/// [`WorkItem::env_name`] is freed: a reopened item resumes from that name's branch only, so an
-/// older release's `work-<n>` stays (`paja doctor` names it only in a log no sync has pinned
-/// to a repository yet; #523 covers the rest). An environment is kept, with the
-/// reason, when:
+/// branch stays, so a reopened item resumes from it, also from the `paja/work-<n>` of the
+/// `work-<n>` environment an older release made, which is freed the same way. An environment
+/// is kept, with the reason, when:
 ///
 /// - its issue is still open on GitHub (the item left the queue because its label changed, or
 ///   `follow-ups = off` hides it), or `gh` can't say;
@@ -2055,7 +2053,12 @@ fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<Str
         Ok(replay_repo(&events, repo)?
             .values()
             .filter(|item| !item.open && item.status == Status::Escalated)
-            .map(|item| (item.number, item.env_name()))
+            .flat_map(|item| {
+                [
+                    (item.number, item.env_name()),
+                    (item.number, format!("work-{}", item.number)),
+                ]
+            })
             .filter(|(_, name)| envs.get(name).is_some_and(|env| same_dir(&env.repo, top)))
             .collect())
     })();
