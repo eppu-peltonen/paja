@@ -507,7 +507,9 @@ pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
                 format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
             })?;
         if ended.timed_out {
-            return Err(still_going(pr, limit, minutes, &tail(&ended.output)).into());
+            // The table is on stdout; stderr's lines would run into it.
+            let table = clip(String::from_utf8_lossy(&ended.output.stdout).trim());
+            return Err(still_going(pr, limit, minutes, &table).into());
         }
         if ended.output.status.success() {
             return Ok(());

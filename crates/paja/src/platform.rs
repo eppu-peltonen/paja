@@ -622,7 +622,7 @@ pub fn output_until_stopped_with_input(
 /// How a step [`output_until_stopped_or`] ran ended.
 pub struct Bounded {
     /// What it printed, also when it was ended at its deadline: whatever it had printed by
-    /// then.
+    /// then. Its `status` means nothing when `timed_out` is set.
     pub output: std::process::Output,
     /// Whether it was still going at the deadline, and ended with everything it started.
     pub timed_out: bool,
@@ -685,9 +685,17 @@ fn output_until(
         std::thread::spawn(move || {
             if let Some(mut pipe) = pipe {
                 let mut chunk = [0u8; 8192];
-                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
-                    if let Ok(mut kept) = kept.lock() {
-                        kept.extend_from_slice(&chunk[..n]);
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Ok(mut kept) = kept.lock() {
+                                kept.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                        // Retried, as `read_to_end` does.
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
                     }
                 }
             }
