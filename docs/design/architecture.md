@@ -252,7 +252,7 @@ the item's `Touches:` line names the paths when it has one (`source: spec`; the 
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
-`error`; a planner still going after 10 minutes is ended and fails) overlaps everything, so its item runs only in an otherwise idle pool,
+`error`) overlaps everything, so its item runs only in an otherwise idle pool,
 unless it is planned again: after the next timed sync, once per pool run. The pool takes items in queue order and
 admits one only once every item before it has a plan, so a plan that finishes first never puts a later item ahead;
 it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording `pool.admitted` (`repo`,
@@ -260,6 +260,14 @@ it skips one that overlaps a busy lane's plan, or one admitted in the same tick,
 when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`, `admitted`), so the planner's
 accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows each lane's `paths` and each
 waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning which files it touches`).
+
+A planner runs in a process group of its own, so a terminal's Ctrl-C reaches only the pool, and any interrupt a
+planner does get (a Ctrl-Break on Windows, a hangup) stops it at once. One still going after 10 minutes is ended and
+its plan fails. Then, and on every planner when the pool stops, the pool writes `stop now` to the planner's `paja
+pool plan --stop-on-stdin`. That ends the planning agent with every process it started and records no plan, so the
+pool's own reason stands. If a planner is still running 5 seconds later, the pool kills it (on Windows with every
+process it started), and it never waits on one while it runs lanes. A planner whose stdin closes, because its pool
+is gone, stops the same way.
 
 `paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
 from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
@@ -659,17 +667,24 @@ while it starts.
 - **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
   which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
-  of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current
-  directory or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not
-  spelling). Git passes the git directory down to every process it starts (hooks, `!` aliases, submodule commands),
-  so the shim clears an inherited `GIT_DIR` and `GIT_WORK_TREE` that name the worktree's git directory for git
-  commands aimed outside the worktree. A caller's own `GIT_DIR`, `--git-dir` or `--work-tree` is left alone, and other
-  git commands run unchanged. The `.git` file on the host is never rewritten. Only the git
-  found on `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses
-  it. The unit tests run the shim against a fake git on the host; the check against real `sbx` is manual. On
-  Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status` and
-  `git -c k=v -C <worktree> log -1` must succeed, `command -v git` must name `$HOME/.paja-shim/git`, and
-  `git -C /tmp status` must not be redirected to the worktree.
+  of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current directory
+  or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not spelling); a
+  caller that chose its own work tree gets only `--git-dir`, and one that chose its own repository gets nothing added. A
+  git directory passed this way reaches the processes git starts as `GIT_DIR` and `GIT_WORK_TREE`, so each is decided on
+  its own, by identity (another spelling, a symlink or a mount path of the same directory counts): an inherited
+  `GIT_DIR` that is the worktree's git directory is cleared for git commands aimed outside the worktree, and an
+  inherited `GIT_WORK_TREE` that is the worktree is cleared for those and for another repository the caller chose, and
+  so is an inherited `GIT_INDEX_FILE` in the worktree's git directory. A value naming any other directory is the
+  caller's own and left alone; one set to the worktree's own, for any of the three, can't be told from git handing it
+  down, so it is treated the same way. Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a
+  git called there usually runs the real git, not the shim. A relative value is read, as git reads it, against the
+  directory after any `-C`; git hands down absolute ones, except the `GIT_WORK_TREE=.` a hook gets, which a hook that
+  runs git in another directory makes its own. The `.git` file on the host is never rewritten. Only the git found on
+  `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses it. The unit
+  tests run the shim against a fake git on the host; the check against real `sbx` is manual. On Windows, in a sandboxed
+  worktree, run through `sbx exec` the way Mestari does: `git status` and `git -c k=v -C <worktree> log -1` must
+  succeed, `command -v git` must name `$HOME/.paja-shim/git`, and `git -C /tmp status` must not be redirected to the
+  worktree.
 - **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
   Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The
   other worktrees under `envs/` are mounted too, so code in one worktree can reach another.

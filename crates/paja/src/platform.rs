@@ -391,7 +391,8 @@ pub fn print_line(text: impl std::fmt::Display) {
 }
 
 /// How the first stop's message says to stop now: 0 a second Ctrl-C, 1 a `stop now` line on
-/// stdin ([`stop_on_stdin`]), 2 not at all (a pool's lane: the pool says it).
+/// stdin ([`stop_on_stdin`]), 2 not at all (a pool's lane: the pool says it), 3 no message at
+/// all (a pool's planner, which the pool stops without asking anyone).
 static STOP_HINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// How many times the person pressed Ctrl-C since [`catch_interrupts`].
@@ -417,15 +418,18 @@ fn announce(now: u32) {
     let say = |text: &str| {
         let _ = std::io::Write::write_all(&mut std::io::stderr(), text.as_bytes());
     };
-    if before < 1 && now >= 1 {
-        say(match STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) {
+    let hint = STOP_HINT.load(std::sync::atomic::Ordering::SeqCst);
+    if before < 1 && now >= 1 && hint < 3 {
+        say(match hint {
             0 => "paja: stopping after this step; press Ctrl-C again to stop now\n",
             1 => "paja: stopping after this step; send `stop now` to stop now\n",
             _ => "paja: stopping after this step\n",
         });
     }
     if before < 2 && now >= 2 {
-        say("paja: stopping now\n");
+        if hint < 3 {
+            say("paja: stopping now\n");
+        }
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(10));
             std::process::exit(130);
@@ -434,22 +438,44 @@ fn announce(now: u32) {
 }
 
 fn interrupted() {
-    INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // A pool's planner never waits for a step to end: any interrupt it sees stops it now, before
+    // a git or agent the same Ctrl-Break ended could pass for a failed plan.
+    if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+        INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Who writes the stop requests [`stop_on_stdin`] reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopFrom {
+    /// A program a person drives, such as Paja Desk: the first stop says to send `stop now`.
+    Program,
+    /// A pool, to one of its lanes: the pool, not the lane, says how to stop now.
+    Pool,
+    /// A pool, to one of its planners: nothing is said, and stdin closing stops now, since a
+    /// plan is no use once its pool is gone.
+    PoolPlanner,
 }
 
 /// Read stop requests from stdin, for a `paja run` started by a program instead of a terminal
 /// (Paja Desk): a `stop` line counts as the first Ctrl-C (stop after this step) and `stop now`
 /// as the second. The same on every platform, since a windowed program has no console to send
 /// Ctrl-C through. Other lines are ignored, and stdin closing (the program that started the
-/// run exited) leaves the run going. A pool's `lane` reads its stop requests the same way, but
-/// the pool, not the lane, says how to stop now: the pool's own stdin or a terminal's Ctrl-C,
-/// which reaches the lane too.
-pub fn stop_on_stdin(lane: bool) {
+/// run exited) leaves the run going, except for a pool's planner. A pool's lane reads its stop
+/// requests the same way, but the pool, not the lane, says how to stop now: the pool's own
+/// stdin or a terminal's Ctrl-C, which reaches the lane too.
+pub fn stop_on_stdin(from: StopFrom) {
     STOP_HINT.store(
-        if lane { 2 } else { 1 },
+        match from {
+            StopFrom::Program => 1,
+            StopFrom::Pool => 2,
+            StopFrom::PoolPlanner => 3,
+        },
         std::sync::atomic::Ordering::SeqCst,
     );
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut line = Vec::new();
         loop {
@@ -457,7 +483,13 @@ pub fn stop_on_stdin(lane: bool) {
             // Bytes, not text, so a line that isn't UTF-8 is skipped rather than ending the
             // reader; 0 bytes is stdin closing.
             match std::io::BufRead::read_until(&mut stdin, b'\n', &mut line) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => {
+                    if from == StopFrom::PoolPlanner {
+                        INTERRUPTS.fetch_max(2, std::sync::atomic::Ordering::SeqCst);
+                        interrupts();
+                    }
+                    return;
+                }
                 Ok(_) => {}
             }
             match String::from_utf8_lossy(&line).trim() {
@@ -630,10 +662,12 @@ pub fn output_until_stopped_with_input(
         if interrupts() >= 2 {
             kill_tree(&mut child);
             let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "stopped by a second Ctrl-C",
-            ));
+            let why = if STOP_HINT.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+                "stopped by its pool"
+            } else {
+                "stopped by a second Ctrl-C"
+            };
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, why));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -647,8 +681,11 @@ pub fn output_until_stopped_with_input(
     })
 }
 
-/// End `child` and every process it started, so a second Ctrl-C leaves nothing running.
-fn kill_tree(child: &mut std::process::Child) {
+/// Kill `child`, which leads a process group of its own ([`own_process_group`]), and the rest of
+/// that group: on Windows every process it started (`taskkill /T`), on Unix the processes still
+/// in its group, not the ones it put in groups of their own. A second Ctrl-C leaves nothing
+/// running, since each of those is ended the same way by its own parent.
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         extern "C" {
