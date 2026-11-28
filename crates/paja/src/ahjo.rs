@@ -260,6 +260,18 @@ impl From<&Env> for RemoveReport {
 /// Remove an environment's worktree. The branch is kept, since it may hold work that has not
 /// landed yet. Without `force`, a worktree with uncommitted changes is refused.
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
+    remove_unless(home, name, force, |_, _| Ok(None))
+}
+
+/// [`remove`], unless `keep` names a reason to keep the environment, which is then the error.
+/// `keep` runs under the home lock, after the tamper check and before git touches anything, with
+/// the log as it stands and the environment, so what it decides can't change before the removal.
+pub(crate) fn remove_unless(
+    home: &Home,
+    name: &str,
+    force: bool,
+    keep: impl FnOnce(&[Event], &Env) -> Result<Option<String>>,
+) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
     let events = log.read_all()?;
@@ -276,6 +288,9 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     } else {
         None
     };
+    if let Some(why) = keep(&events, &env)? {
+        bail!("{why}");
+    }
 
     match checked {
         None => {

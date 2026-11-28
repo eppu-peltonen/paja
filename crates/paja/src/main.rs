@@ -724,10 +724,17 @@ fn run(cli: &Cli) -> Result<()> {
             WorkCommand::Sync { repo } => {
                 let report = jono::sync(&home, repo)?;
                 emit(cli, serde_json::to_value(&report)?, || {
-                    format!(
+                    let mut text = format!(
                         "imported {:?}, changed {:?}, closed {:?}, reopened {:?}",
                         report.imported, report.changed, report.closed, report.reopened
-                    )
+                    );
+                    if !report.freed.is_empty() {
+                        text.push_str(&format!("\nfreed {}", report.freed.join(", ")));
+                    }
+                    for kept in &report.kept {
+                        text.push_str(&format!("\nkept {}: {}", kept.env, kept.why));
+                    }
+                    text
                 });
             }
             WorkCommand::List { all, repo } => {

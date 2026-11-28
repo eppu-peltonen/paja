@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -332,26 +332,35 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
     let found = (|| -> Result<Vec<String>> {
         let events = home.events().read_all()?;
         let envs = ahjo::replay(&events)?;
-        let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         // Made in this checkout: doctor may run from a folder inside it.
-        let checkout = real(repo);
-        let here = |env: &ahjo::Env| checkout.starts_with(real(&env.repo));
+        let checkout = jono::checkout_top(repo)?;
+        let here = |env: &ahjo::Env| jono::same_dir(&env.repo, &checkout);
         let mut left = Vec::new();
         for item in jono::replay(&events, "")?.values() {
             if item.open {
                 continue;
             }
-            if item.status == jono::Status::Active {
-                let _home = home.lock()?;
+            // An item from before items carried their repository can't be held by a run, which
+            // records the repository first.
+            if item.status == jono::Status::Active && !item.repo.is_empty() {
+                let _home = home
+                    .lock()
+                    .context("taking the home lock to see whether a run holds an active item")?;
                 if home.run_held(&item.repo, item.number)? {
                     continue;
                 }
             }
             if item.repo.is_empty() {
-                let suffix = format!("-work-{}", item.number);
+                // Named `work-<n>` by the releases that wrote such logs, or `<name>-<hash>-work-<n>`.
+                let (plain, suffix) = (
+                    format!("work-{}", item.number),
+                    format!("-work-{}", item.number),
+                );
                 left.extend(
                     envs.values()
-                        .filter(|env| env.name.ends_with(&suffix) && here(env))
+                        .filter(|env| {
+                            (env.name == plain || env.name.ends_with(&suffix)) && here(env)
+                        })
                         .map(|env| env.name.clone()),
                 );
             } else if envs.contains_key(&item.env_name()) {
@@ -386,7 +395,7 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
         ),
         Err(err) => warning(
             name,
-            format!("couldn't read the event log: {err:#}"),
+            format!("couldn't check: {err:#}"),
             format!("check {}", home.root().display()),
         ),
     }

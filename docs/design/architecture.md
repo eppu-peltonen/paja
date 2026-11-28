@@ -77,13 +77,18 @@ between sees them under one label or the other.
 `work.closed` and `work.reopened` events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than
 the last one recorded, as the file system resolves them (a symlink or a Windows short name to the same folder is the
 same checkout) (every `paja run` syncs first, so runs record it too); it never touches another repository's items, even
-when their issue numbers are the same. When it closes a parked (escalated) item, it removes that item's Ahjo environment
-if it was made in this checkout and has no uncommitted changes, keeping the branch, and lists it under `freed`: nothing
-else frees the worktree and port block of an item closed instead of answered, and a reopened item resumes from the
-branch. `paja work list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the
-checkout they run in (`--repo`, default the current directory); `paja work list --all` lists every repository's items,
-each with its `repo`, and works outside a checkout unless the log still holds events from before items carried a
-repository and no `work.*` event names one yet. Whether an issue is open is kept apart from
+when their issue numbers are the same. When it closes a parked (escalated) item whose issue GitHub says is closed, it
+removes that item's Ahjo environment (the hashed name, or the `work-<n>` of older releases) if it was made in this
+checkout, keeping the branch, and lists it under `freed`: nothing else frees the worktree and port block of an item
+closed instead of answered, and a reopened item resumes from the branch. It keeps the environment, listed under `kept`
+with the reason, when the issue is still open (its label changed, or `follow-ups = off` hides it), when a run holds the
+item or the item is no longer closed and parked once the home lock is taken for the removal (`ahjo::remove_unless`
+decides under the same lock as the removal), when the worktree isn't on the environment's branch, or when git refuses:
+uncommitted changes or untracked files. Ignored files, such as build output, go with the worktree.
+`paja work list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout
+they run in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with
+its `repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no
+`work.*` event names one yet. Whether an issue is open is kept apart from
 the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
 survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
 oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.

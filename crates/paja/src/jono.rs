@@ -576,6 +576,15 @@ pub struct SyncReport {
     /// The environments removed because their parked item's issue was closed, each with no
     /// uncommitted changes (its branch is kept).
     pub freed: Vec<String>,
+    /// The environments of parked items this sync closed that it kept, and why.
+    pub kept: Vec<Kept>,
+}
+
+/// An environment a sync could have freed but kept.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Kept {
+    pub env: String,
+    pub why: String,
 }
 
 #[derive(Deserialize)]
@@ -2010,53 +2019,141 @@ pub fn sync_with(
     apply_claims(home, &name, &seen, &held)?;
     let top = checkout_top(repo)?;
     record_checkout(home, &name, &top)?;
-    report.freed = free_closed(home, &name, &top, &report.closed)?;
+    (report.freed, report.kept) = free_closed(home, &ok, &name, &top, &report.closed);
     Ok(report)
 }
 
 /// Remove the environments of the parked (escalated) items among `closed`, the items of `repo`
-/// a sync just closed, that were made in the checkout `top` and have no uncommitted changes. A
-/// parked item keeps its environment so the builder's edits survive the question; once its
-/// issue is closed instead of answered nothing else frees the worktree and port block. The
-/// branch stays, so a reopened item resumes from it. One with uncommitted changes is kept, and
-/// `paja doctor` names it. A follow-up closed only by `follow-ups = off` is still open on
-/// GitHub, so its environment stays too.
-fn free_closed(home: &Home, repo: &str, top: &Path, closed: &[u64]) -> Result<Vec<String>> {
+/// a sync just closed, that were made in the checkout `top`. A parked item keeps its environment
+/// so the builder's edits survive the question; once its issue is closed on GitHub instead of
+/// answered, nothing else frees the worktree and port block. The branch stays, so a reopened
+/// item resumes from it. An environment is kept, with the reason, when:
+///
+/// - its issue is still open on GitHub (the item left the queue because its label changed, or
+///   `follow-ups = off` hides it), or `gh` can't say;
+/// - a run holds the item, or the item is no longer closed and parked by the time the home lock
+///   is taken for the removal;
+/// - its worktree isn't on the item's branch, so commits made there could be lost;
+/// - git refuses to remove it: uncommitted changes or untracked files. Ignored files (build
+///   output) go with the worktree.
+///
+/// Both lists are what the sync reports; `paja doctor` names a kept one until it is removed.
+fn free_closed(
+    home: &Home,
+    ok: &Untampered,
+    repo: &str,
+    top: &Path,
+    closed: &[u64],
+) -> (Vec<String>, Vec<Kept>) {
+    let (mut freed, mut kept) = (Vec::new(), Vec::new());
     if closed.is_empty() {
-        return Ok(Vec::new());
+        return (freed, kept);
     }
-    let events = home.events().read_all()?;
-    let (items, hidden) = replay_with_hidden(&events, repo)?;
-    let envs = crate::ahjo::replay(&events)?;
-    let mut freed = Vec::new();
-    for number in closed {
-        let key = (repo.to_string(), *number);
-        let Some(item) = items.get(&key) else {
-            continue;
+    let found = (|| -> Result<Vec<(u64, String)>> {
+        let events = home.events().read_all()?;
+        let items = replay_repo(&events, repo)?;
+        let envs = crate::ahjo::replay(&events)?;
+        let mut found = Vec::new();
+        for number in closed {
+            let Some(item) = items.get(number) else {
+                continue;
+            };
+            if item.open || item.status != Status::Escalated {
+                continue;
+            }
+            // The environment releases before repositories were recorded named `work-<n>`.
+            for name in [item.env_name(), format!("work-{number}")] {
+                if envs.get(&name).is_some_and(|env| same_dir(&env.repo, top)) {
+                    found.push((*number, name));
+                }
+            }
+        }
+        Ok(found)
+    })();
+    let found = match found {
+        Ok(found) => found,
+        Err(err) => {
+            kept.push(Kept {
+                env: String::new(),
+                why: format!("couldn't read the event log: {err:#}"),
+            });
+            return (freed, kept);
+        }
+    };
+    for (number, name) in found {
+        let why = match issue_is_open(ok, number) {
+            Ok(false) => None,
+            Ok(true) => Some(format!(
+                "issue #{number} is still open on GitHub (or `{} api` couldn't say)",
+                gh_program()
+            )),
+            Err(err) => Some(format!(
+                "couldn't ask GitHub about issue #{number}: {err:#}"
+            )),
         };
-        if item.open || item.status != Status::Escalated || hidden.contains(&key) {
+        if let Some(why) = why {
+            kept.push(Kept { env: name, why });
             continue;
         }
-        let env_name = item.env_name();
-        if !envs
-            .get(&env_name)
-            .is_some_and(|env| same_dir(&env.repo, top))
-        {
-            continue;
-        }
-        // A refusal (uncommitted changes, a tampered checkout) keeps the environment.
-        if crate::ahjo::remove(home, &env_name, false).is_ok() {
-            freed.push(env_name);
+        let removed = crate::ahjo::remove_unless(home, &name, false, |events, env| {
+            still_free(home, events, repo, number, env)
+        });
+        match removed {
+            Ok(_) => freed.push(name),
+            Err(err) => kept.push(Kept {
+                env: name,
+                why: format!("{err:#}"),
+            }),
         }
     }
-    Ok(freed)
+    (freed, kept)
+}
+
+/// Why item `number` of `repo` must keep `env` after all, read under the home lock: it was
+/// reopened, queued or claimed since the sync closed it, a run holds it, or the worktree isn't on
+/// the environment's branch.
+fn still_free(
+    home: &Home,
+    events: &[Event],
+    repo: &str,
+    number: u64,
+    env: &crate::ahjo::Env,
+) -> Result<Option<String>> {
+    let item = replay_repo(events, repo)?.remove(&number);
+    if !item.is_some_and(|item| !item.open && item.status == Status::Escalated) {
+        return Ok(Some(format!(
+            "item #{number} is no longer closed and parked"
+        )));
+    }
+    if home.run_held(repo, number)? {
+        return Ok(Some(format!("a run holds item #{number}")));
+    }
+    if env.path.exists() {
+        let head = crate::ahjo::git_command()
+            .arg("-C")
+            .arg(&env.path)
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .output()
+            .with_context(|| format!("running git in {}", env.path.display()))?;
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if head != format!("refs/heads/{}", env.branch) {
+            return Ok(Some(format!(
+                "{} is not on {}, so removing it could lose commits; check it out there or run \
+                 `paja env remove {} --force`",
+                env.path.display(),
+                env.branch,
+                env.name
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// The top level of the checkout `path` is in (the nearest folder holding `.git`), so a sync
 /// from a subdirectory names the same checkout as one from its root. Found from the path's own
 /// spelling, not from git, so it compares equal to the path an environment records; `..` parts
 /// are folded first, so `/a/b/../c` is `/a/c`.
-fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
+pub(crate) fn checkout_top(path: &Path) -> Result<std::path::PathBuf> {
     let path = fold_parents(&std::path::absolute(path)?);
     Ok(path
         .ancestors()
@@ -2571,7 +2668,7 @@ pub fn known_checkouts(home: &Home, repo: &str) -> Result<Vec<std::path::PathBuf
 /// Whether `a` and `b` name the same directory: as resolved by the file system (symlinks,
 /// Windows short names and letter case where it is ignored), or spelled alike when either
 /// can't be resolved.
-fn same_dir(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
