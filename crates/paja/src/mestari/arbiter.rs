@@ -42,28 +42,52 @@ struct Ruling {
 }
 
 /// Files whose change would weaken the checks that judge a change: Vasara's commands, the
-/// high-risk paths and the deny-list hook.
-const GUARDS: [&str; 3] = [CHECKS_FILE, HIGH_RISK_FILE, "crates/paja/src/hook.rs"];
+/// high-risk paths, the model and the programs each agent gets, and the deny-list hook. A path
+/// that ends in `/` covers everything under it, such as the CI workflows a branch's own pull
+/// request runs.
+const GUARDS: [&str; 6] = [
+    CHECKS_FILE,
+    HIGH_RISK_FILE,
+    MODELS_FILE,
+    crate::hook::COMMANDS_FILE,
+    "crates/paja/src/hook.rs",
+    ".github/workflows/",
+];
 
-/// The files and rules that judge a change, named in the question or the answer: a decision
-/// about them is a person's. The reviewers' summaries (`context`) are not searched for them,
-/// because a review names them only to say what the change is about, and touching them is
-/// caught from the diff.
-const GUARD_NAMES: [&str; 5] = [
+/// Whether the diff path `path` is one of [`GUARDS`].
+fn is_guard(path: &str) -> bool {
+    let path = path.to_lowercase();
+    GUARDS.iter().any(|g| match g.strip_suffix('/') {
+        Some(dir) => path.starts_with(&format!("{dir}/")),
+        None => path == *g,
+    })
+}
+
+/// The files and rules that judge a change, named in Paja's own words of the question or in the
+/// answer: a decision about them is a person's. What reviewers or a check wrote (`context`, and
+/// the part of the question that quotes them) is not searched for them, because it names them
+/// only to say what the change is about or where a test failed; touching them is caught from
+/// the diff. `.paja/models` is left out: Paja's own turn-limit question names it as the place to
+/// raise a limit, which weakens no check.
+const GUARD_NAMES: [&str; 6] = [
     ".paja/checks",
     ".paja/high-risk",
+    ".paja/commands",
     "deny-list",
     "hook.rs",
     ".github/workflows",
 ];
 
-/// Wordings that say an escalation, or an answer to it, is about weakening a check. A word list
-/// misses paraphrases, so it is one of several rules: the arbiter's own `weakens_a_check` flag,
-/// test files and check commands named in the answer, and the guard files in the diff.
-const WEAKENING: [&str; 22] = [
+/// Wordings that say an escalation, or an answer to it, is about weakening a check, searched in
+/// all of it. A word list misses paraphrases, so it is one of several rules: the arbiter's own
+/// `weakens_a_check` flag, the markers and names searched in the answer alone, and the guard
+/// files in the diff.
+const WEAKENING: [&str; 21] = [
     "weaken",
     "loosen",
-    "relax",
+    "relax the test",
+    "relax the check",
+    "relax the assert",
     "skip the check",
     "skip the test",
     "disable the test",
@@ -76,13 +100,61 @@ const WEAKENING: [&str; 22] = [
     "delete the assert",
     "drop the check",
     "remove the check",
+    "stop running the",
+    "skip ci",
+    "comment out the",
+    "update the snapshot",
+];
+
+/// What, in an answer to the builder, changes a test or a check, though the same words in a
+/// check's output or a review (a pytest `xfailed` line, a relaxed parser) are no sign of it.
+const ANSWER_MARKERS: [&str; 29] = [
+    "relax",
+    "change the test",
     "ci config",
     "ci workflow",
-    "skip ci",
+    "#[ignore",
+    "#[test]",
+    "#[cfg(test)]",
+    "mod tests",
+    "--skip",
+    ".skip(",
+    "mark.skip",
+    "skipif",
+    "xfail",
+    ".only(",
+    "t.skip",
+    "@disabled",
+    "@ignore",
     "continue-on-error",
     "allow_failure",
-    "#[ignore]",
-    "xfail",
+    "allow-failure",
+    "expected value",
+    "expected output",
+    "expected string",
+    "expected result",
+    "expected count",
+    "the expectation",
+    "snapshot",
+    "golden file",
+    "fixture",
+];
+
+/// Words that, beside a check command in an answer, mean not running it as it is.
+const NOT_RUNNING: [&str; 13] = [
+    "skip",
+    "drop",
+    "remove",
+    "stop",
+    "don't run",
+    "do not run",
+    "disable",
+    "delete",
+    "comment out",
+    "relax",
+    "loosen",
+    "weaken",
+    "ignore",
 ];
 
 /// Whether `text` talks about weakening a check.
@@ -91,12 +163,13 @@ fn names_a_weaker_check(text: &str) -> bool {
     WEAKENING.iter().any(|w| text.contains(w))
 }
 
-/// The path-like words in `text`: what is left of a word, without quotes, brackets and trailing
-/// punctuation, that holds a `/` or a `.` between other characters.
+/// The path-like words in `text`: each run of letters, digits and `/`, `\`, `.`, `_`, `-`
+/// (so any quote, bracket or punctuation around a path is dropped), without trailing dots, that
+/// holds a `/` or a `.` between other characters.
 fn paths_in(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| c.is_whitespace() || "`'\"()[]{}<>,;".contains(c))
-        .map(|w| w.trim_end_matches(['.', ':', '!', '?']))
-        .filter(|w| w.contains('/') || w.trim_start_matches('.').contains('.') && !w.ends_with('.'))
+    text.split(|c: char| !(c.is_alphanumeric() || "/\\._-".contains(c)))
+        .map(|w| w.trim_end_matches('.'))
+        .filter(|w| w.contains('/') || w.trim_start_matches('.').contains('.'))
 }
 
 /// Whether `path` looks like a test: a `test`, `tests`, `spec` or `__tests__` folder, or a file
@@ -126,12 +199,20 @@ fn names_a_guard(text: &str) -> Option<&'static str> {
     GUARD_NAMES.iter().copied().find(|g| text.contains(g))
 }
 
-/// What in an answer would have a person decide: a test file, or one of Vasara's check commands
-/// (a line of `.paja/checks` with arguments, matched as whole words).
+/// What in an answer would have a person decide: a marker of a test or a skipped check, a test
+/// file, or one of Vasara's check commands (a line of `.paja/checks` with arguments, matched as
+/// whole words) beside a word for not running it. An answer that only says a check should pass
+/// stands.
 fn answer_names_a_check(answer: &str, checks: &[String]) -> Option<String> {
     let lower = answer.to_lowercase();
+    if let Some(marker) = ANSWER_MARKERS.iter().find(|m| lower.contains(*m)) {
+        return Some(format!("the answer says `{marker}`"));
+    }
     if let Some(path) = paths_in(answer).find(|p| is_test_path(p)) {
         return Some(format!("the answer names the test file {path}"));
+    }
+    if !NOT_RUNNING.iter().any(|w| lower.contains(w)) {
+        return None;
     }
     checks
         .iter()
@@ -150,7 +231,14 @@ fn contains_words(text: &str, needle: &str) -> bool {
 }
 
 /// Why Mestari won't let the arbiter answer this escalation, if it won't.
-fn overruled(scene: &Scene, question: &str, context: &str, ruling: &Ruling) -> Option<String> {
+/// `quoted` is the part of `question` that reviewers or a check wrote.
+fn overruled(
+    scene: &Scene,
+    question: &str,
+    quoted: &str,
+    context: &str,
+    ruling: &Ruling,
+) -> Option<String> {
     if scene.item.answers.iter().any(jono::Answer::by_arbiter) {
         return Some(
             "the arbiter already answered this item once, and it answers at most once".into(),
@@ -169,10 +257,7 @@ fn overruled(scene: &Scene, question: &str, context: &str, ruling: &Ruling) -> O
             &format!("{}...HEAD", scene.base),
         ],
     ) {
-        if let Some(path) = names
-            .split('\0')
-            .find(|p| GUARDS.iter().any(|g| p.eq_ignore_ascii_case(g)))
-        {
+        if let Some(path) = names.split('\0').find(|p| is_guard(p)) {
             return Some(format!(
                 "the change touches {path}, so a person decides anything about it"
             ));
@@ -189,7 +274,13 @@ fn overruled(scene: &Scene, question: &str, context: &str, ruling: &Ruling) -> O
     {
         return Some("the escalation or the answer is about weakening a check".into());
     }
-    if let Some(name) = names_a_guard(question).or_else(|| names_a_guard(&ruling.answer)) {
+    // Paja's own words of the question, without what it quotes.
+    let own = if quoted.is_empty() {
+        question.to_string()
+    } else {
+        question.replacen(quoted, "", 1)
+    };
+    if let Some(name) = names_a_guard(&own).or_else(|| names_a_guard(&ruling.answer)) {
         return Some(format!(
             "the escalation or the answer is about weakening a check (it names {name})"
         ));
@@ -366,10 +457,13 @@ fn consult(
 }
 
 /// Settle an escalation of the item, or take it to the person. `question` is what the person
-/// would be asked; `context` is what led to it (the reviewers' verdicts, say).
+/// would be asked, and `quoted` the part of it that reviewers or a check wrote (their summaries
+/// or the last feedback), searched as `context` is; `context` is what led to it (the reviewers'
+/// verdicts, say).
 pub(super) fn settle(
     scene: &Scene,
     question: &str,
+    quoted: &str,
     context: &str,
     round: u32,
 ) -> Result<RunReport> {
@@ -402,7 +496,7 @@ pub(super) fn settle(
         return escalated(home, repo, env, item, question, round);
     };
     let refusal = if ruling.verdict == "answer" {
-        overruled(scene, question, context, &ruling)
+        overruled(scene, question, quoted, context, &ruling)
     } else {
         None
     };
@@ -517,8 +611,8 @@ mod tests {
     }
 
     #[test]
-    fn weakening_wordings_are_found_in_any_case() {
-        assert!(names_a_guard("Edit .paja/checks to drop clippy").is_some());
+    fn weakening_wordings_and_guard_names_are_found_in_any_case() {
+        assert!(names_a_guard("Edit .PAJA/Checks to drop clippy").is_some());
         assert!(names_a_guard("Change the rule in crates/paja/src/hook.rs").is_some());
         assert!(names_a_guard("Edit .github/workflows/ci.yml").is_some());
         assert!(names_a_weaker_check("Should we Weaken the gate?"));
@@ -526,12 +620,18 @@ mod tests {
         assert!(!names_a_weaker_check("Use `Part of` for a bundle issue"));
         // Paraphrases the old list let through.
         assert!(names_a_weaker_check("Relax the assertion so it passes"));
-        assert!(names_a_weaker_check("Drop that line from the CI config"));
         assert!(names_a_weaker_check("Drop the assert_eq on line 40"));
-        // A file name alone is not wording: a review may name the hook only to say what changed.
-        assert!(!names_a_weaker_check(
-            "The change touches hook.rs and adds a rule"
-        ));
+        // Words a check's output or a review may use without meaning it stay out of this list,
+        // which searches them too; they are searched in the answer alone.
+        for said in [
+            "3 passed, 1 xfailed",
+            "The parser is relaxed to accept commas, as asked",
+            "It removes a stale #[ignore] from the test",
+            "The CI config is untouched",
+        ] {
+            assert!(!names_a_weaker_check(said), "{said}");
+            assert!(answer_names_a_check(said, &[]).is_some(), "{said}");
+        }
     }
 
     #[test]
@@ -539,7 +639,7 @@ mod tests {
         let checks = vec!["cargo test".to_string(), "true".to_string()];
         let found = |a: &str| answer_names_a_check(a, &checks);
         for answer in [
-            "Change the expected value in tests/smoke.rs.",
+            "Change line 3 in tests/smoke.rs.",
             "Update `src/parser_test.go`",
             "see (web/app.test.ts)",
             "fix spec/models/user_spec.rb, then go on",
@@ -549,13 +649,57 @@ mod tests {
             let why = found(answer).unwrap_or_default();
             assert!(why.contains("test file"), "{answer}: {why}");
         }
-        let why = found("Run `cargo test --release` instead").unwrap_or_default();
+        // Curly quotes are no part of a path.
+        let why = found("Edit \u{2018}tests/smoke.rs\u{2019} now").unwrap_or_default();
+        assert!(why.contains("test file tests/smoke.rs"), "{why}");
+        let why = found("See \u{201c}test_api.py\u{201d}").unwrap_or_default();
+        assert!(why.contains("test file test_api.py"), "{why}");
+        for answer in [
+            "Put #[ignore = \"flaky\"] on it",
+            "Run it with -- --skip slow_case",
+            "Add @pytest.mark.skip above it",
+            "Use it.skip( for now",
+            "Change the expected value to 4",
+            "Update the snapshot",
+            "Change the expected string in the test in arbiter.rs",
+            "Edit the mod tests block in parser.rs",
+            "Relax it a little",
+            "Drop that line from the CI config",
+        ] {
+            let why = found(answer).unwrap_or_default();
+            assert!(why.contains("the answer says"), "{answer}: {why}");
+        }
+        // A check command beside a word for not running it; only saying it should pass stands.
+        let why = found("Skip `cargo test --release` for now").unwrap_or_default();
         assert!(why.contains("`cargo test`"), "{why}");
+        assert_eq!(found("Fix it so `cargo test` passes."), None);
         // Whole words only, and one-word checks are left to the other rules.
         assert_eq!(found("Use cargo testing tools"), None);
         assert_eq!(found("Use v2; it is true that the issue names it."), None);
         assert_eq!(found("Rename src/latest.rs and bump to v2.1."), None);
         assert_eq!(found("Use `Part of` for a bundle issue."), None);
+    }
+
+    #[test]
+    fn a_guard_in_the_diff_is_the_file_or_anything_in_its_folder() {
+        for path in [
+            ".paja/checks",
+            ".paja/models",
+            ".paja/commands",
+            "crates/paja/src/hook.rs",
+            ".github/workflows/ci.yml",
+            ".GitHub/Workflows/x.yml",
+        ] {
+            assert!(is_guard(path), "{path}");
+        }
+        for path in [
+            ".paja/checks.bak",
+            ".github/workflows",
+            ".github/dependabot.yml",
+            "src/hook.rs",
+        ] {
+            assert!(!is_guard(path), "{path}");
+        }
     }
 
     #[test]

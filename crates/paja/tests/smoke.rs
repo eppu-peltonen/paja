@@ -2459,6 +2459,7 @@ impl Factory {
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  v=$(cat {d}/verdict.txt); f='[]'; s=$(cat {d}/review-summary 2>/dev/null || echo 'fake review')\n\
+                 if [ -f {d}/verdict-second.txt ]; then r=$(cat {d}/review-count 2>/dev/null || echo 0); r=$((r+1)); echo $r > {d}/review-count; [ $((r % 2)) = 0 ] && v=$(cat {d}/verdict-second.txt); fi\n\
                  if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"$s\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
@@ -2484,6 +2485,7 @@ impl Factory {
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
+                 if [ -f {d}/cheat-ci ]; then mkdir -p .github/workflows; echo 'on: push' > .github/workflows/ci.yml; git add .github; fi\n\
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add $file\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
@@ -5673,15 +5675,59 @@ fn the_arbiter_answers_a_builder_question() {
 #[test]
 fn the_arbiter_answers_after_five_failed_rounds() {
     let f = Factory::new("test -f never.txt\n", "land");
-    arbiter_answers(&f, "Leave never.txt out of scope; finish the feature file.");
+    arbiter_answers(&f, "Create feature.txt as the issue says.");
     let (ok, report) = f.run();
     assert!(ok, "{report}");
-    assert_arbitrated(
-        &f,
-        &report,
-        "Leave never.txt out of scope; finish the feature file.",
-    );
+    assert_arbitrated(&f, &report, "Create feature.txt as the issue says.");
     assert_eq!(report["rounds"], 5, "{report}");
+}
+
+#[test]
+fn the_arbiter_answers_after_five_rounds_whose_check_output_names_the_hook() {
+    // The last feedback quotes a check's output, which names a guard file and says `xfailed`:
+    // Paja's question quotes it, but only what Paja wrote is searched for guard names.
+    let f = Factory::new(
+        "echo panicked at crates/paja/src/hook.rs:3, 1 xfailed && false\n",
+        "land",
+    );
+    arbiter_answers(&f, "Create feature.txt as the issue says.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Create feature.txt as the issue says.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hook.rs:3"),
+        "{item}"
+    );
+}
+
+#[test]
+fn the_arbiter_answers_a_high_risk_split_whose_summaries_name_the_hook() {
+    // One reviewer lands, the other asks for changes; both name the hook only to say what the
+    // change is about, and the diff doesn't touch it.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    std::fs::write(f.tmp.path().join("verdict-second.txt"), "changes").unwrap();
+    std::fs::write(
+        f.tmp.path().join("review-summary"),
+        "The change calls the rule in hook.rs and the deny-list it reads",
+    )
+    .unwrap();
+    arbiter_answers(&f, "Land it; the issue asks for exactly this.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Land it; the issue asks for exactly this.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("The two reviewers disagree"),
+        "{item}"
+    );
 }
 
 #[test]
@@ -5722,6 +5768,21 @@ fn the_arbiter_is_overruled_when_the_change_touches_a_guard_file() {
 }
 
 #[test]
+fn the_arbiter_is_overruled_when_the_change_touches_a_ci_workflow() {
+    let f = Factory::new("true\n", "escalate");
+    std::fs::write(f.tmp.path().join("cheat-ci"), "").unwrap();
+    arbiter_answers(&f, "Use v2.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("touches .github/workflows/ci.yml"),
+        "{question}"
+    );
+}
+
+#[test]
 fn the_arbiter_is_overruled_for_any_answer_that_may_weaken_a_check() {
     let cases = [
         // No flag at all: a missing `weakens_a_check` never reads as "no".
@@ -5737,13 +5798,13 @@ fn the_arbiter_is_overruled_for_any_answer_that_may_weaken_a_check() {
         // Paraphrases, each with the flag saying no.
         (
             serde_json::json!({"verdict": "answer", "weakens_a_check": false,
-                "answer": "Change the expected count in tests/smoke.rs to match."}),
+                "answer": "Change line 3 in tests/smoke.rs to match."}),
             "test file tests/smoke.rs",
         ),
         (
             serde_json::json!({"verdict": "answer", "weakens_a_check": false,
                 "answer": "Drop that line from the CI config."}),
-            "weakening a check",
+            "the answer says `ci config`",
         ),
         (
             serde_json::json!({"verdict": "answer", "weakens_a_check": false,

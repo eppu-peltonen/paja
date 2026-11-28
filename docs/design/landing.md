@@ -89,15 +89,23 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
 - **`escalate`** goes to the person as before, but the arbiter's question replaces the raw one: what is undecided,
   two to four options and a recommendation, so one line answers it.
 - **Always escalated, enforced in code:** an answer is overruled to `escalate` when the item already has an arbiter
-  answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk` or the
-  deny-list hook, or when the escalation or the answer may weaken a check. A word list alone misses paraphrases, so
-  that takes any of: the arbiter's own `weakens_a_check` flag, which an answer must give as `false`; weakening
-  wording (relax, skip, drop the assert, the CI config and the like) in the question, the reviewers' summaries or the
-  answer; a guard file or rule (those files, the hook, `.github/workflows`) named in the question or the answer, but
-  not in the summaries, which name them only to say what a change is about; and a test file, or a `.paja/checks`
-  command with arguments, named in the answer. The person then gets the raw question and the reason. The prompt also tells the arbiter
-  to escalate anything that changes the issue's intent or scope, secrets, actions outside the repository and any
-  question that asks for the person's preference.
+  answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk`,
+  `.paja/models`, `.paja/commands`, the deny-list hook or anything under `.github/workflows/`, or when the escalation
+  or the answer may weaken a check. The arbiter's own `weakens_a_check` flag is the main defence against that, and an
+  answer stands only when it gives it as `false`. Word and path rules back it up:
+  - weakening phrases (relax the test, skip the check, drop the assert and the like) in the question, the reviewers'
+    summaries or the answer;
+  - a guard file or rule named in Paja's own words of the question or in the answer, but not in what reviewers or a
+    check wrote (their summaries, the last feedback a question quotes), which names them only to say what a change is
+    about or where a test failed;
+  - in the answer alone, markers of a changed test or a skipped check (`#[ignore`, `--skip`, `.skip(`, an expected
+    value, a snapshot, the CI config), any test file, and a `.paja/checks` command with arguments next to a word for
+    not running it.
+
+  So an answer that only says "add a case in tests/smoke.rs" escalates too; that errs toward asking the person. The
+  person then gets the raw question and the reason. The prompt also tells the arbiter to escalate anything that
+  changes the issue's intent or scope, secrets, actions outside the repository and any question that asks for the
+  person's preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not
   decisions (a usage limit, an error Mestari can't fix, landing, CI and merge problems) skip the arbiter.
 
