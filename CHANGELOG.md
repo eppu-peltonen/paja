@@ -5,7 +5,11 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
 
 ## Unreleased
 
+- `paja --version` built inside some other git repository (a `cargo install` under a home directory that is one) says `unknown` instead of naming that repository's commit, and a build without a reflog no longer rebuilds every time.
+- Review findings are fixed in the change that drew them (up to five rounds) instead of being filed as follow-up issues; what is left at the round limit, or lies outside the change, is listed in the pull request.
+- `paja doctor` warns of an environment left over from a closed item (a parked item keeps its worktree and ports), and names the `paja env remove` that frees it.
 - `paja usage` gives the 90th percentile of wall time per landed item in its summary line, next to the median.
+- `paja doctor` quotes and escapes the role words it names as skipped in `.paja/models`, so a control character in the file never reaches the terminal.
 
 ## 0.1.0
 

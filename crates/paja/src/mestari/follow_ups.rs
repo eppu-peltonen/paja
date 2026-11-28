@@ -4,17 +4,19 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingKind {
-    /// A wrong result outside what the issue asks.
+    /// A wrong result in the change that is not a blocker.
     Bug,
     /// A security or data-loss risk, or a missing test for behaviour that could break.
     Risk,
-    /// Style, naming, comment wording or a small refactor: fixed in a round that runs anyway,
-    /// never filed.
+    /// Style, naming, comment wording or a small refactor.
     Nit,
+    /// A real problem in code the change doesn't touch: not fixed here, since one concern goes
+    /// in each pull request. Recorded in the log and the pull request's description.
+    Outside,
 }
 
 /// One non-blocking review finding. A plain string, as reviewers wrote them before findings
-/// were marked, reads as a `risk`, so it is still filed rather than lost.
+/// were marked, reads as a `risk`, so it is still fixed rather than lost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
     pub kind: FindingKind,
@@ -50,156 +52,180 @@ impl Finding {
             FindingKind::Bug => "bug",
             FindingKind::Risk => "risk",
             FindingKind::Nit => "nit",
+            FindingKind::Outside => "outside",
         };
         format!("[{kind}] {}", self.text)
     }
 }
 
-/// At most this many findings go in a change's follow-up issue; the rest stay in the log.
-pub(super) const MAX_FILED: usize = 10;
-
-/// The findings worth an issue (bugs and risks) and the nits, which are never filed.
-pub(super) fn worth_filing(findings: &[Finding]) -> (Vec<&Finding>, Vec<&Finding>) {
-    findings.iter().partition(|f| f.kind != FindingKind::Nit)
+/// The findings the builder is sent back to fix: everything but what lies outside the change.
+pub(super) fn to_fix(findings: &[Finding]) -> Vec<&Finding> {
+    findings
+        .iter()
+        .filter(|f| f.kind != FindingKind::Outside)
+        .collect()
 }
 
-/// File the landed change's bugs and risks together as one issue with the repository's
-/// follow-up label, so one change asks for at most one more round of work. Nits are recorded in
-/// the log and dropped; with nothing else, no issue is filed. Jono imports only the work label,
-/// so the follow-up waits until a person relabels it: reviewers suggest work, people set intent.
-/// A failure here is recorded, never turned into an escalation: the change is already merged.
-pub(super) fn file_follow_ups(
+/// Why a finding in the change is left: it was still open at the round limit.
+pub(super) const ROUND_LIMIT: &str = "not filed: round limit";
+
+/// The findings a change lands without, each as text fit for a pull request's description and
+/// the log, with why it is left: outside the change, or still open at the round limit. No issue
+/// is filed: a finding is fixed in the change that drew it, and what is left is for a person to
+/// read in the pull request.
+pub(super) fn unsettled(
     home: &Home,
     repo: &Path,
-    item: &WorkItem,
-    pr: &str,
     findings: &[Finding],
-    labels: &jono::Labels,
-) {
+) -> Vec<(String, &'static str)> {
     // Review text came from an agent that read untrusted code: keep each finding short, never
-    // let it mention anyone, and keep tokens and local paths out of a public issue and the log.
-    let user_home = ["HOME", "USERPROFILE"]
+    // let it mention anyone, and keep tokens and local paths out of a public pull request and
+    // the log.
+    let user_home = user_homes();
+    let places = public_places(home.root(), repo, &user_home);
+    findings
         .iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let mut places = vec![(home.root(), "<factory home>"), (repo, "<repository>")];
-    places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
-    let (filed, nits) = worth_filing(findings);
-    for nit in &nits {
-        record_follow_up(
-            home,
-            item,
-            &redact(&nit.shown(), &places),
-            None,
-            "not filed: a nit",
-        );
-    }
-    let (filed, left) = filed.split_at(filed.len().min(MAX_FILED));
-    for finding in left {
-        record_follow_up(
-            home,
-            item,
-            &redact(&finding.shown(), &places),
-            None,
-            &format!("not filed: the issue holds the first {MAX_FILED} findings"),
-        );
-    }
-    if filed.is_empty() {
-        return;
-    }
-    let shown: Vec<String> = filed
-        .iter()
-        .map(|finding| defang(&redact(&finding.shown(), &places)))
-        .collect();
-    let first: String = shown[0]
-        .lines()
-        .map(|line| {
-            line.trim()
-                .trim_start_matches("[bug]")
-                .trim_start_matches("[risk]")
-                .trim_matches(['#', '-', '*', '_', '`', ' '])
-                .trim()
+        .map(|finding| {
+            // Mentions are made inert before the cut, so a cut can't leave a bare `@` behind.
+            let text = redact(&finding.shown(), &places).replace('@', "@\u{200b}");
+            let mut cut: String = text.chars().take(4000).collect();
+            if cut.len() < text.len() {
+                cut.push_str("\n\n(cut short)");
+            }
+            let why = if finding.kind == FindingKind::Outside {
+                "not filed: outside the change"
+            } else {
+                ROUND_LIMIT
+            };
+            (cut, why)
         })
-        .find(|line| !line.is_empty())
-        .unwrap_or("Review follow-up")
-        .chars()
-        .take(90)
-        .collect();
-    let title = match shown.len() {
-        1 => first,
-        n => format!("{first} (+{} more)", n - 1),
-    };
-    let body = format!(
-        "{}\n\nReviewers found these while reviewing #{number} ({pr}). They did not block \
-         landing. Relabel this issue `{work}` to queue them as one piece of work.",
-        shown.join("\n\n---\n\n"),
-        number = item.number,
-        work = labels.work
-    );
-    // The body goes in a file: up to ten findings would not fit a Windows command line.
-    let body_file = home.root().join(format!(
-        "follow-ups-{}-{}.md",
-        item.number,
-        std::process::id()
-    ));
-    let issue = std::fs::write(&body_file, &body)
-        .with_context(|| format!("writing {}", body_file.display()))
-        .and_then(|()| {
-            run_gh(
-                repo,
-                &[
-                    "issue",
-                    "create",
-                    "--label",
-                    &labels.follow_up,
-                    "--title",
-                    &title,
-                    "--body-file",
-                    &body_file.to_string_lossy(),
-                ],
-            )
-        });
-    let _ = std::fs::remove_file(&body_file);
-    for finding in &shown {
-        match &issue {
-            Ok(issue) => record_follow_up(home, item, finding, Some(issue.as_str()), ""),
-            Err(err) => record_follow_up(
-                home,
-                item,
-                finding,
-                None,
-                &format!(
-                    "{err:#}; if the label is missing, create it with `gh label create \
-                     {}` and file this finding by hand",
-                    labels.follow_up
-                ),
-            ),
-        }
-    }
+        .collect()
 }
 
-/// Agent text made safe to post: cut to 4000 characters and with every `@` broken, so it never
-/// mentions anyone. Findings and escalation questions share it.
-pub(super) fn defang(text: &str) -> String {
-    let mut cut: String = text.chars().take(4000).collect();
-    if cut.len() < text.len() {
-        cut.push_str("\n\n(cut short)");
-    }
-    cut.replace('@', "@\u{200b}")
-}
-
-/// `text` made fit for a public issue comment: tokens redacted, and the repository's and the
-/// user's home paths (the factory home is under the latter by default) named, not shown.
-pub(super) fn redact_for_issue(text: &str, repo: &Path) -> String {
-    let user_home = ["HOME", "USERPROFILE"]
+/// The user's home folders (`HOME`, and `USERPROFILE` on Windows), which a public text names
+/// as `<home>`.
+fn user_homes() -> Vec<PathBuf> {
+    ["HOME", "USERPROFILE"]
         .iter()
         .filter_map(std::env::var_os)
         .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let mut places = vec![(repo, "<repository>")];
+        .collect()
+}
+
+/// The places a text Paja posts on a public issue names instead of showing: the factory home,
+/// the repository and the user's home folders.
+fn public_places<'a>(
+    factory_home: &'a Path,
+    repo: &'a Path,
+    user_home: &'a [PathBuf],
+) -> Vec<(&'a Path, &'a str)> {
+    let mut places = vec![(factory_home, "<factory home>"), (repo, "<repository>")];
     places.extend(user_home.iter().map(|dir| (dir.as_path(), "<home>")));
-    redact(text, &places)
+    places
+}
+
+/// `text` made fit for a comment on a public issue: tokens redacted, the factory home, the
+/// repository and the user's home named, not shown, mentions made inert so a quoted log or
+/// review can't ping anyone, code fences made plain text, and cut to `max` characters. All
+/// that is done first, so the cut counts the characters it adds. For the parts of a comment
+/// that quote agent text or logs, so the frame around them (how to answer, how to undo) is
+/// never what gets cut, and never renders as code.
+pub(crate) fn redact_for_comment(
+    text: &str,
+    repo: &Path,
+    factory_home: &Path,
+    max: usize,
+) -> String {
+    let user_home = user_homes();
+    // `<!--` would hide the rest of the comment, the frame's instructions too.
+    let text = redact(text, &public_places(factory_home, repo, &user_home))
+        .replace('@', "@\u{200b}")
+        .replace("<!--", "<\u{200b}!--");
+    let text = without_fences(&text);
+    let count = text.chars().count();
+    if count <= max {
+        return text;
+    }
+    // The middle goes: a question's start says what it is about, and its end often holds the
+    // root cause and what to do.
+    let head: String = text.chars().take(max / 2).collect();
+    let tail: String = text.chars().skip(count - max / 2).collect();
+    // The tail can start mid-line, just before backticks that were not at a line's start.
+    format!("{head}\n\n(cut short)\n\n{}", without_fences(&tail))
+}
+
+/// `text` with every line that would open or close a code fence (`` ``` `` or `~~~`, of any
+/// length, after any indent) broken by a zero-width space, so quoted text can't leave a fence
+/// open over what follows it, however it is cut.
+fn without_fences(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let indent = line.len() - line.trim_start().len();
+            let rest = &line[indent..];
+            if rest.starts_with("```") || rest.starts_with("~~~") {
+                format!("{}{}\u{200b}{}", &line[..indent], &rest[..1], &rest[1..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The most of one quoted part (a question, an answer, a reason) a comment shows: two or three
+/// fit GitHub's limit with the frame around them.
+pub(crate) const QUOTED_CHARS: usize = 20_000;
+
+/// Write `body` to a new file of its own in the factory home's `tmp`, out of the way of its
+/// state, for a `gh ... --body-file`: a long body would not fit a Windows command line. The name
+/// is unique to this call (the process id and a counter), and the file is created new, so two
+/// posts at once, in one process or two, never share one. The caller removes it.
+pub(crate) fn body_file(home: &Home, stem: &str, body: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = home.root().join("tmp");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("{stem}-{}-{n}.md", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    if let Err(err) = file.write_all(body.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(err).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(path)
+}
+
+/// GitHub's limit for a comment, in characters.
+const GITHUB_COMMENT_CHARS: usize = 65_536;
+
+// Three cut parts and a frame fit a GitHub comment.
+const _: () = assert!(3 * (QUOTED_CHARS + 30) + 1_000 < GITHUB_COMMENT_CHARS);
+
+/// Post `body`, whose quoted parts went through [`redact_for_comment`], as a comment on issue
+/// `number`, from a [`body_file`] removed once `gh` is done. A body past GitHub's limit is cut
+/// to it, so the comment still posts.
+pub(super) fn comment_on_issue(home: &Home, repo: &Path, number: u64, body: &str) -> Result<()> {
+    // Never reached while each comment quotes at most three parts of `QUOTED_CHARS`; a check
+    // at build time holds that sum under the limit.
+    let body: String = body.chars().take(GITHUB_COMMENT_CHARS).collect();
+    let file = body_file(home, &format!("comment-{number}"), &body)?;
+    let posted = run_gh(
+        repo,
+        &[
+            "issue",
+            "comment",
+            &number.to_string(),
+            "--body-file",
+            &file.to_string_lossy(),
+        ],
+    );
+    let _ = std::fs::remove_file(&file);
+    posted.map(|_| ())
 }
 
 /// Tokens that look like credentials become `<redacted>`, and each path in `places` (and
@@ -273,27 +299,76 @@ fn match_at(text: &str, needle: &str, fold: bool) -> Option<usize> {
 }
 
 /// `text` with each `path` that ends at a boundary (anything but a letter or digit) replaced by
-/// `label`. With `fold`, the path matches in any letter case, as Windows itself does.
+/// `label`. With `fold`, the path matches in any letter case, as Windows itself does: each
+/// character of the text against the path's, by its lowercase form (so `İ` or the Kelvin sign
+/// fold as Unicode says, not only ASCII letters).
+///
+/// Its cost is linear in the text: matches are found with `str::find`, in a lowercased copy
+/// when folding, whose offsets are mapped back to the text's, and each is confirmed character by
+/// character.
 fn replace_path(text: &str, path: &str, label: &str, fold: bool) -> String {
+    let matches = if fold {
+        folded_matches(text, path)
+    } else {
+        text.match_indices(path)
+            .map(|(at, found)| (at, found.len()))
+            .collect()
+    };
     let mut out = String::with_capacity(text.len());
     let mut from = 0;
-    let mut at = 0;
-    while at < text.len() {
-        let Some(len) = match_at(&text[at..], path, fold) else {
-            at += text[at..].chars().next().map_or(1, char::len_utf8);
-            continue;
-        };
-        let end = at + len;
+    for (start, len) in matches {
+        let end = start + len;
         // Only a letter or digit continues a name: `_` and `-` may be Markdown or punctuation
         // around the path, so a path before one is still redacted.
         let ends = !text[end..].starts_with(char::is_alphanumeric);
-        out.push_str(&text[from..at]);
-        out.push_str(if ends { label } else { &text[at..end] });
+        out.push_str(&text[from..start]);
+        out.push_str(if ends { label } else { &text[start..end] });
         from = end;
-        at = end;
     }
     out.push_str(&text[from..]);
     out
+}
+
+/// Where `path` is in `text`, letters in any case, left to right and not overlapping: each
+/// match's start and length in `text`.
+fn folded_matches(text: &str, path: &str) -> Vec<(usize, usize)> {
+    let needle: String = path.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    // The lowercased text, and for each of its offsets that starts a character of the text,
+    // that character's offset in `text` (`NONE` elsewhere); and back from `text`'s offsets.
+    const NONE: usize = usize::MAX;
+    let mut folded = String::with_capacity(text.len());
+    let mut to_text = Vec::with_capacity(text.len() + 1);
+    let mut to_folded = vec![NONE; text.len() + 1];
+    for (at, c) in text.char_indices() {
+        to_folded[at] = folded.len();
+        let before = folded.len();
+        folded.extend(c.to_lowercase());
+        to_text.push(at);
+        to_text.resize(folded.len(), NONE);
+        debug_assert!(folded.len() > before);
+    }
+    to_text.push(text.len());
+    to_folded[text.len()] = folded.len();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(i) = folded[from..].find(&needle) {
+        let at = from + i;
+        let confirmed = match to_text[at] {
+            NONE => None,
+            start => match_at(&text[start..], path, true).map(|len| (start, len)),
+        };
+        match confirmed {
+            Some((start, len)) => {
+                found.push((start, len));
+                from = to_folded[start + len];
+            }
+            None => from = at + folded[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    found
 }
 
 /// Prefixes of credentials that are safe to recognise by their start.
@@ -366,6 +441,32 @@ fn ends_lead(gap: &str) -> bool {
     })
 }
 
+/// Whether `rest`, after `gap`, is the info string of a code fence opening on its own line: the
+/// gap's last line is three or more backticks (after spaces) and the line's rest holds no
+/// backtick (else it is a code span), or the line starts with three or more tildes.
+fn opens_fence(gap: &str, rest: &str) -> bool {
+    let Some(at) = gap.rfind('\n') else {
+        return false;
+    };
+    let tail = gap[at + 1..].trim_start_matches(' ');
+    let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+    let backticks = tail.len() >= 3 && tail.chars().all(|c| c == '`') && !line.contains('`');
+    let tildes = tail.is_empty() && line.starts_with("~~~");
+    backticks || tildes
+}
+
+/// Whether `word` reads as a fence's language name (`text`, `sh`, `c++`, `objective-c`): up to
+/// 15 lowercase ASCII letters and `+`, `#`, `-` or `.`, with no digit, so a value written after
+/// the fence (`hunter2`, a random string) isn't taken for one. `python3` is redacted, which is
+/// the side to err on.
+fn language_tag(word: &str) -> bool {
+    word.len() <= 15
+        && word.starts_with(|c: char| c.is_ascii_lowercase())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || matches!(c, '+' | '#' | '-' | '.'))
+}
+
 /// The scan visits each word once, so its cost is linear in the text. A redacted value runs on
 /// through `.`, `+`, `/` and `=`, so a dotted token (a JWT) or a base64 secret goes whole; after
 /// a lead it runs to the next space, quote, backtick, comma or backslash, so symbols stay inside.
@@ -401,6 +502,28 @@ fn redact_tokens(text: &str) -> String {
         rest = &rest[start..];
         if rest.is_empty() {
             break;
+        }
+        // A fence opened after a lead: its info string (```` ```text ````, `~~~ sh`) names the
+        // language, and the value is on the lines after it, so the lead carries on past the
+        // line. A first word that doesn't look like a language name may be the value written
+        // on the fence's own line, so it goes; the rest of the line is scanned on its own.
+        if led.is_some() && opens_fence(gap, rest) {
+            let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+            let tag_at = line.len() - line.trim_start_matches(['~', ' ', '\t']).len();
+            let tag_end = line[tag_at..]
+                .find(char::is_whitespace)
+                .map_or(line.len(), |i| tag_at + i);
+            let tag = &line[tag_at..tag_end];
+            out.push_str(&line[..tag_at]);
+            out.push_str(if tag.is_empty() || language_tag(tag) {
+                tag
+            } else {
+                "<redacted>"
+            });
+            out.push_str(&redact_tokens(&line[tag_end..]));
+            rest = &rest[line.len()..];
+            delimited = true;
+            continue;
         }
         if let Some(strong) = led {
             // Only a lead starts this scan, and a redacted value is skipped, so each character
@@ -485,20 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn only_bugs_and_risks_are_worth_an_issue() {
-        let nits = [
-            finding(FindingKind::Nit, "Rename x"),
-            finding(FindingKind::Nit, "Reword y"),
-        ];
-        assert!(worth_filing(&nits).0.is_empty());
+    fn every_finding_in_the_change_is_fixed_and_only_outside_ones_are_left() {
         let mixed = [
             finding(FindingKind::Nit, "Rename x"),
-            finding(FindingKind::Bug, "Off by one in z"),
-            finding(FindingKind::Nit, "Reword y"),
+            finding(FindingKind::Outside, "Off by one in z"),
+            finding(FindingKind::Risk, "No test for y"),
         ];
-        let (filed, dropped) = worth_filing(&mixed);
-        assert_eq!(filed, [&mixed[1]]);
-        assert_eq!(dropped.len(), 2);
+        assert_eq!(to_fix(&mixed), [&mixed[0], &mixed[2]]);
     }
 
     #[test]
@@ -506,7 +622,7 @@ mod tests {
         let marked: Finding =
             serde_json::from_value(json!({"kind": "nit", "finding": "Rename x"})).unwrap();
         assert_eq!(marked, finding(FindingKind::Nit, "Rename x"));
-        // A reviewer that still writes plain strings has them filed, not lost.
+        // A reviewer that still writes plain strings has them fixed, not lost.
         let plain: Finding = serde_json::from_value(json!("Off by one")).unwrap();
         assert_eq!(plain, finding(FindingKind::Risk, "Off by one"));
         assert!(
@@ -668,23 +784,95 @@ mod tests {
     }
 
     #[test]
-    fn agent_text_is_cut_and_mentions_nobody() {
-        assert_eq!(defang("ping @bob"), "ping @\u{200b}bob");
-        let long = "é".repeat(5000);
-        let shown = defang(&long);
-        assert!(shown.starts_with(&"é".repeat(4000)), "cut on characters");
-        assert!(shown.ends_with("(cut short)"));
-    }
-
-    #[test]
     fn an_issue_comment_names_the_repository_and_hides_tokens() {
         let repo = Path::new("/work/acme-app");
         let token = format!("ghp_{}", "A1".repeat(12));
         let text = format!("test failed in /work/acme-app/src/lib.rs with {token}");
-        let shown = redact_for_issue(&text, repo);
+        let shown = redact_for_comment(&text, repo, Path::new("/srv/paja-home"), 1_000);
         assert_eq!(
             shown,
             "test failed in <repository>/src/lib.rs with <redacted>"
+        );
+    }
+
+    #[test]
+    fn an_escalation_comment_names_the_factory_home_and_mentions_no_one() {
+        let repo = Path::new("/work/acme-app");
+        let factory = Path::new("/srv/paja-home");
+        let text = "see /srv/paja-home/envs/app-1/log and /work/acme-app/x, cc @octocat";
+        assert_eq!(
+            redact_for_comment(text, repo, factory, 100),
+            "see <factory home>/envs/app-1/log and <repository>/x, cc @\u{200b}octocat"
+        );
+        // Inert mentions count toward the cut, so a log full of them still fits a comment.
+        let mentions = redact_for_comment(&"@".repeat(65_536), repo, factory, 1_000);
+        assert!(mentions.chars().count() <= 1_020, "too long");
+        // The middle is cut: the start and the end stay.
+        let long = format!("start\n{}\nend", "a".repeat(2_000));
+        let shown = redact_for_comment(&long, repo, factory, 1_000);
+        assert!(shown.starts_with("start\n"), "{shown}");
+        assert!(shown.ends_with("\nend"), "{shown}");
+        assert!(shown.contains("\n\n(cut short)\n\n"), "{shown}");
+        assert!(shown.chars().count() <= 1_030, "too long");
+        // No line of quoted text opens a fence, of any kind or length, so however it is cut
+        // the frame after it never renders as code. Inline backticks stay.
+        for fence in ["```", "````rust", "  ~~~", "~~~~"] {
+            let shown = redact_for_comment(&format!("x\n{fence}\ny"), repo, factory, 100);
+            assert!(
+                !shown
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("``") || l.trim_start().starts_with("~~")),
+                "{shown:?}"
+            );
+        }
+        // A cut that lands just before backticks in the middle of a line doesn't open one.
+        let aimed = format!("{}x```yz", "a".repeat(1_000));
+        let shown = redact_for_comment(&aimed, repo, factory, 10);
+        assert!(!shown.lines().any(|l| l.starts_with("``")), "{shown:?}");
+        assert_eq!(
+            redact_for_comment("run `cargo test` ```now```", repo, factory, 100),
+            "run `cargo test` ```now```"
+        );
+        // A comment marker can't hide the frame.
+        assert!(!redact_for_comment("a <!-- b", repo, factory, 100).contains("<!--"));
+    }
+
+    #[test]
+    fn a_fence_info_string_after_a_lead_is_not_the_value() {
+        let short = "hunter2x";
+        let text = format!(
+            "password:\n```text\n{short}\n```\nsecret:\n  ~~~ sh\n{short}\n~~~\ntoken:\n```\n{short}\n```"
+        );
+        assert_eq!(
+            redact_tokens(&text),
+            "password:\n```text\n<redacted>\n```\nsecret:\n  ~~~ sh\n<redacted>\n~~~\ntoken:\n```\n\
+             <redacted>\n```"
+        );
+        // A token in the info line still goes; a one-line code span is the value itself.
+        let gh = format!("{}{}", "ghp_", "a".repeat(36));
+        assert_eq!(
+            redact_tokens(&format!("password:\n```{gh}\n{short}\n```")),
+            "password:\n```<redacted>\n<redacted>\n```"
+        );
+        assert_eq!(
+            redact_tokens(&format!("password:\n```text {gh}\n{short}\n```")),
+            "password:\n```text <redacted>\n<redacted>\n```"
+        );
+        // A value written on the fence's own line isn't a language name, so it goes, short or
+        // long, after backticks or tildes, and the lead still reaches the next line.
+        let long = "AbCdEfGh12345678ZZ";
+        for fence in ["```", "~~~", "~~~ "] {
+            for value in [short, long, "python3"] {
+                assert_eq!(
+                    redact_tokens(&format!("password:\n{fence}{value}\n{short}\n")),
+                    format!("password:\n{fence}<redacted>\n<redacted>\n"),
+                    "{fence}{value}"
+                );
+            }
+        }
+        assert_eq!(
+            redact_tokens(&format!("password:\n```{short}```")),
+            "password:\n```<redacted>```"
         );
     }
 
@@ -698,6 +886,51 @@ mod tests {
         assert_eq!(redact_tokens(&dotted), "token <redacted>.");
         // A scan that re-read the text for every word would take minutes here.
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn redacting_paths_in_a_long_text_stays_fast() {
+        // A path that matches part of itself, over text that nearly matches it at every
+        // place: a scan that compared the path at each character reads the text a hundred
+        // times over, which takes many seconds here even in a release build.
+        let path = format!("{}/b", "/a".repeat(100));
+        let text = format!("{}{path} x", "/a".repeat(1_000_000));
+        let started = std::time::Instant::now();
+        let shown = replace_path(&text, &path, "<home>", false);
+        assert!(shown.ends_with("<home> x"));
+        let upper = text.to_uppercase();
+        let shown = replace_path(&upper, &path, "<home>", true);
+        assert!(shown.ends_with("<home> X"));
+        // Other letters than ASCII ones fold the same linear way.
+        let path = format!("{}/ö", "/ä".repeat(100));
+        let text = format!("{}{} x", "/Ä".repeat(500_000), path.to_uppercase());
+        let shown = replace_path(&text, &path, "<home>", true);
+        assert!(shown.ends_with("<home> x"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A folded path with other letters still matches in any case.
+        assert_eq!(
+            replace_path(r"C:\USERS\JÖHN\x", r"C:\Users\Jöhn", "<home>", true),
+            r"<home>\x"
+        );
+        // Characters whose lowercase is longer (`İ`), before and after a folded path, keep
+        // every offset right; the Kelvin sign folds to `k`, as before.
+        assert_eq!(
+            replace_path("İÄ C:\\USERS\\ME\\x İ end", r"C:\Users\me", "<home>", true),
+            "İÄ <home>\\x İ end"
+        );
+        assert_eq!(
+            replace_path("İC:\\USERS\\MİKE x", r"C:\Users\mike", "<home>", true),
+            "İC:\\USERS\\MİKE x"
+        );
+        assert_eq!(
+            replace_path(
+                "at C:\\Users\\Mi\u{212A}e x",
+                r"C:\Users\mike",
+                "<home>",
+                true
+            ),
+            "at <home> x"
+        );
     }
 
     #[test]

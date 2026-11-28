@@ -27,11 +27,108 @@ const NEVER: &[&str] = &[
     "fish",
     "csh",
     "tcsh",
+    "ash",
+    "mksh",
+    "yash",
+    "oksh",
+    "rbash",
+    "xonsh",
+    "elvish",
+    "nu",
     "cmd",
     "powershell",
     "pwsh",
     "env",
     "xargs",
+    // Runners that start whatever command they are given.
+    "busybox",
+    "wsl",
+    "conhost",
+    "start",
+    "nohup",
+    "timeout",
+    "nice",
+    "time",
+    "setsid",
+    "stdbuf",
+    "script",
+    "watch",
+    "strace",
+    "cscript",
+    "wscript",
+    "mshta",
+    "rundll32",
+    "chroot",
+    "unshare",
+    "nsenter",
+    "flock",
+    "taskset",
+    "runuser",
+    "pkexec",
+    "expect",
+    "screen",
+    "tmux",
+    "osascript",
+    "open",
+    "runas",
+    "schtasks",
+    "wmic",
+    "forfiles",
+    "regsvr32",
+    "msiexec",
+    "certutil",
+    "psexec",
+    "xdg-open",
+    "newgrp",
+    // Also ast-grep's short name, which a stack names as `ast-grep` instead.
+    "sg",
+    "systemd-run",
+    "bwrap",
+    "firejail",
+    "proot",
+    "fakeroot",
+    "gdb",
+    "wine",
+    "bitsadmin",
+    "ionice",
+    "chrt",
+    "setpriv",
+    "toybox",
+    "parallel",
+    "xvfb-run",
+    "dbus-run-session",
+    "ssh-agent",
+    "unbuffer",
+    "lldb",
+    "ltrace",
+    "valgrind",
+    "arch",
+    "caffeinate",
+    "sandbox-exec",
+    "launchctl",
+    "explorer",
+    "cmstp",
+    "setarch",
+    "linux32",
+    "linux64",
+    "numactl",
+    "prlimit",
+    "cpulimit",
+    "faketime",
+    "eatmydata",
+    "nocache",
+    "rlwrap",
+    "sshpass",
+    "torsocks",
+    "proxychains",
+    "daemonize",
+    "start-stop-daemon",
+    "at",
+    "batch",
+    "run0",
+    "sudoedit",
+    "gdb-multiarch",
+    "gdbserver",
     "sudo",
     "su",
     "doas",
@@ -44,12 +141,17 @@ const NEVER: &[&str] = &[
     "sftp",
     "nc",
     "ncat",
+    "netcat",
+    "socat",
+    "rsync",
     "telnet",
     "gh",
     "git",
     "cd",
     "pwd",
     "rm",
+    "unlink",
+    "shred",
     "rmdir",
     "mv",
     "cp",
@@ -58,8 +160,15 @@ const NEVER: &[&str] = &[
     "find",
     "awk",
     "sed",
+    "gawk",
+    "mawk",
+    "nawk",
+    "gsed",
     "perl",
     "make",
+    "mingw32-make",
+    "gmake",
+    "nmake",
 ];
 
 /// A stack name as the person typed it, trimmed, or the fix when it can't be used. It goes into
@@ -126,8 +235,7 @@ pub fn parse_programs(answer: Value, stack: &str) -> Result<Vec<String>> {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "_-.+".contains(c));
-        let lower = name.to_ascii_lowercase();
-        if plain && !NEVER.contains(&lower.as_str()) && !programs.contains(&name) {
+        if plain && !never(&name) && !programs.contains(&name) {
             programs.push(name);
         }
     }
@@ -139,6 +247,23 @@ pub fn parse_programs(answer: Value, stack: &str) -> Result<Vec<String>> {
         );
     }
     Ok(programs)
+}
+
+/// Whether [`NEVER`] lists a plain (ASCII) program name, compared without any extension or
+/// version, so `bash.exe`, `cmd.bat`, `perl5.36.0` and `rundll325` are still what they are.
+fn never(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.split('.').next().unwrap_or_default();
+    let mut form = stem;
+    loop {
+        if NEVER.contains(&form) {
+            return true;
+        }
+        match form.strip_suffix(|c: char| c.is_ascii_digit() || "-_".contains(c)) {
+            Some(shorter) => form = shorter,
+            None => return false,
+        }
+    }
 }
 
 pub fn skeleton_prompt(name: &str, stack: &str, programs: &[String]) -> String {
@@ -186,7 +311,9 @@ mod tests {
     #[test]
     fn only_plain_program_names_the_agent_may_not_misuse_are_allowed() {
         let answer = json!({"programs": [
-            "go", "gofmt", " go ", "bash", "curl", "../go", "-x", "", "a b", "GIT", "staticcheck"
+            "go", "gofmt", " go ", "bash", "curl", "../go", "-x", "", "a b", "GIT", "staticcheck",
+            "bash.exe", "CMD.EXE", "powershell.exe", "sh.exe", "cmd.bat", "pwsh.cmd", "git.exe",
+            "busybox", "wsl.exe", "nohup", "timeout", "mshta", "cscript"
         ]});
         assert_eq!(
             parse_programs(answer, "go").unwrap(),
@@ -197,6 +324,51 @@ mod tests {
             .to_string();
         assert!(error.contains("no program Paja can allow"), "{error}");
         assert!(parse_programs(json!({"stack": "go"}), "go").is_err());
+    }
+
+    #[test]
+    fn toolchain_programs_with_versions_and_pluses_are_kept() {
+        let names = [
+            "python3",
+            "pip3",
+            "go1.22",
+            "gcc-13",
+            "clang-format-17",
+            "g++",
+            "c++",
+            "node",
+            "cargo",
+            "rustfmt",
+            "cmake",
+        ];
+        let answer = json!({ "programs": names });
+        assert_eq!(parse_programs(answer, "c").unwrap(), names.to_vec());
+        let names = [
+            "python3.12",
+            "clang-format-18",
+            "rebar3",
+            "ast-grep",
+            "g++-13",
+        ];
+        let answer = json!({ "programs": names });
+        assert_eq!(parse_programs(answer, "c").unwrap(), names.to_vec());
+    }
+
+    #[test]
+    fn no_program_the_never_list_names_is_allowed_with_any_extension_version_or_case() {
+        for name in NEVER {
+            for given in [
+                name.to_string(),
+                format!("{name}.exe"),
+                format!("{name}.cmd"),
+                format!("{name}5.36.0"),
+                format!("{name}-2"),
+                name.to_ascii_uppercase(),
+            ] {
+                let allowed = parse_programs(json!({"programs": ["go", given]}), "go").unwrap();
+                assert_eq!(allowed, ["go"], "{given} was allowed");
+            }
+        }
     }
 
     #[test]

@@ -169,7 +169,9 @@ pub fn blocked_by(plan: &Plan, running: &[&Plan]) -> Option<(u64, String)> {
 }
 
 /// Plan item `number` of the repository checked out at `repo`, and record it as
-/// `pool.planned`. A plan that fails is recorded as `failed` before the error is returned.
+/// `pool.planned`. A plan that fails is recorded as `failed` before the error is returned; one
+/// stopped now (a second Ctrl-C, or `stop now` from the pool) records nothing, so whoever stopped
+/// it says why.
 pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     let repo = std::path::absolute(repo)?;
     let name = jono::repo_name(home, &repo)?;
@@ -186,7 +188,7 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
                 error: Some(format!("{err:#}")),
             };
             // A tampered repository gets no more git or gh, and no event that could hide it.
-            if !is_tampered(&err) {
+            if !is_tampered(&err) && crate::platform::interrupts() < 2 {
                 let _ = record(home, EV_POOL_PLANNED, serde_json::to_value(&failed)?);
             }
             return Err(err);
@@ -220,7 +222,7 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
                 &read_from_base(repo, &base, MODELS_FILE)?.unwrap_or_default(),
                 branch,
             )?;
-            crate::sandbox::activate(start_sandbox(home, repo, &base)?);
+            let _sandbox = crate::sandbox::enter(start_sandbox(home, repo, &base)?);
             (ask(home, repo, &base, &item, &models)?, "plan")
         }
     };
@@ -383,6 +385,11 @@ mod tests {
                 "src/app/(b)/c.ts".into(),
                 "(a)/(b)".into()
             ])
+        );
+        // A quoted path wrapped in brackets, and a parenthetical that ends a sentence.
+        assert_eq!(
+            touches_line("Touches: (\"src/a.rs\") (see src/b.rs)."),
+            Some(vec!["src/a.rs".into(), "see".into(), "src/b.rs".into()])
         );
         assert_eq!(touches_line("Touches: `.`"), Some(vec![WHOLE.into()]));
     }
