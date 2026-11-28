@@ -241,11 +241,13 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   names another source: an `http(s)` URL or a file holding the version.
 - The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
 - No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it is
-  answered; if its issue is closed instead, `paja work sync` (and `paja run`) removes it, keeping the branch, unless the
-  worktree has uncommitted changes or untracked files, isn't on its branch, or a run holds the item; the sync lists what
-  it kept and why, and tries again each time. Ignored files in the worktree, such as a local `.env`, go with it. One
-  kept that way, an older release's `work-<n>` one, or one whose run crashed or was killed after its issue was closed,
-  is a warning that names the environment and the `paja env remove <name>` that frees it (the branch is kept).
+  answered; if its issue is closed on GitHub instead, `paja work sync` (and `paja run`) in the checkout that made it
+  removes it, keeping the branch. It is kept while the issue is still open (its label was removed, say) or `gh` can't
+  say, while a run holds the item, and while the worktree has uncommitted changes or untracked files or isn't on its
+  branch. The sync lists what it kept and why, and tries again each time, so `paja run` repeats a kept line until the
+  reason is gone. Ignored files in the worktree, such as a local `.env`, go with it. One kept that way, an older
+  release's `work-<n>` one, or one whose run crashed or was killed after its issue was closed, is a warning that names
+  the environment and the `paja env remove <name>` that frees it (the branch is kept).
 - Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
   `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
   warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it

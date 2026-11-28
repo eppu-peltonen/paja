@@ -260,17 +260,18 @@ impl From<&Env> for RemoveReport {
 /// Remove an environment's worktree. The branch is kept, since it may hold work that has not
 /// landed yet. Without `force`, a worktree with uncommitted changes is refused.
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
-    remove_unless(home, name, force, |_, _| Ok(None))
+    remove_unless(home, name, force, |_, _, _| Ok(None))
 }
 
 /// [`remove`], unless `keep` names a reason to keep the environment, which is then the error.
 /// `keep` runs under the home lock, after the tamper check and before git touches anything, with
-/// the log as it stands and the environment, so what it decides can't change before the removal.
+/// the log as it stands, the environment and the tamper check's proof (None when the repository
+/// is gone, so no git may run), so what it decides can't change before the removal.
 pub(crate) fn remove_unless(
     home: &Home,
     name: &str,
     force: bool,
-    keep: impl FnOnce(&[Event], &Env) -> Result<Option<String>>,
+    keep: impl FnOnce(&[Event], &Env, Option<&Untampered>) -> Result<Option<String>>,
 ) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
@@ -288,7 +289,7 @@ pub(crate) fn remove_unless(
     } else {
         None
     };
-    if let Some(why) = keep(&events, &env)? {
+    if let Some(why) = keep(&events, &env, checked.as_ref())? {
         bail!("{why}");
     }
 
@@ -1534,7 +1535,8 @@ mod tests {
         )
         .unwrap();
         let before = home.events().read_all().unwrap().len();
-        let err = remove_unless(&home, "keep-me", false, |events, seen| {
+        let err = remove_unless(&home, "keep-me", false, |events, seen, ok| {
+            assert!(ok.is_some());
             assert_eq!(events.len(), before);
             assert_eq!(seen.name, "keep-me");
             Ok(Some("the item was reopened".into()))
@@ -1545,7 +1547,7 @@ mod tests {
         assert_eq!(home.events().read_all().unwrap().len(), before);
         assert!(get(&home, "keep-me").is_ok());
         // With nothing to keep it, it goes.
-        remove_unless(&home, "keep-me", false, |_, _| Ok(None)).unwrap();
+        remove_unless(&home, "keep-me", false, |_, _, _| Ok(None)).unwrap();
         assert!(!env.path.exists() && get(&home, "keep-me").is_err());
     }
 

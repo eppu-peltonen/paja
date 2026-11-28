@@ -3485,6 +3485,48 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
 }
 
 #[test]
+fn a_run_says_which_environments_of_closed_items_its_sync_kept() {
+    let f = Factory::new("true\n", "land");
+    let issues = f.tmp.path().join("issues.json");
+    std::fs::write(
+        &issues,
+        r#"[{"number": 9, "title": "T", "body": "", "url": "https://example.com/9"}]"#,
+    )
+    .unwrap();
+    let with_gh = [("PAJA_GH", f.gh.as_path())];
+    let (ok, report) = paja_with(&f.home, &f.repo, &["work", "sync"], &with_gh);
+    assert!(ok, "{report}");
+    let (ok, set) = paja(
+        &f.home,
+        &f.repo,
+        &["work", "set", "9", "escalated", "--note", "Which API?"],
+    );
+    assert!(ok, "{set}");
+    let name = WORK_5.replace("work-5", "work-9");
+    let path = f.tmp.path().join("tree-9");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("paja/{name}"),
+            path.to_str().unwrap(),
+        ],
+    );
+    record_env(&f.home, &name, &f.repo, &path);
+    // Closed in the queue, but this gh can't say the issue is closed on GitHub.
+    std::fs::write(&issues, "[]").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert!(
+        stderr.contains(&format!("kept {name}: issue #9 is still open on GitHub")),
+        "{report}\n{stderr}"
+    );
+    assert!(path.exists());
+}
+
+#[test]
 fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds() {
     let tmp = tempfile::tempdir().unwrap();
     let doctor = |home: &Path| -> Value {
@@ -3509,7 +3551,13 @@ fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds()
     ];
     std::fs::write(old.join("events.jsonl"), events.join("\n") + "\n").unwrap();
     record_env(&old, "work-5", tmp.path(), &tmp.path().join("tree-5"));
-    record_env(&old, WORK_5, tmp.path(), &tmp.path().join("tree-5b"));
+    // A person's own environment whose name merely ends the same way isn't the item's.
+    record_env(
+        &old,
+        "spike-work-5",
+        tmp.path(),
+        &tmp.path().join("tree-5b"),
+    );
     let six = WORK_5.replace("work-5", "work-6");
     record_env(
         &old,
@@ -3521,7 +3569,7 @@ fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds()
     assert_eq!(check["status"], "warning", "{check}");
     let detail = check["detail"].as_str().unwrap();
     assert!(
-        detail.contains("work-5, ") && detail.contains(WORK_5) && !detail.contains(&six),
+        detail.contains("work-5") && !detail.contains("spike") && !detail.contains(&six),
         "{check}"
     );
 

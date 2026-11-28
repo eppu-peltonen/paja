@@ -326,7 +326,7 @@ fn usage_window(events: &[crate::events::Event], claude: &str, windowed: bool) -
 /// builder's edits survive the question), and one with uncommitted changes is kept when its
 /// issue is closed instead of answered. An item still marked active counts once no run holds
 /// it (the run crashed or was killed). An item from a log written before items carried their
-/// repository matches the environment of its number made in the checkout `repo` is in.
+/// repository matches the `work-<n>` environment of its number made in the checkout `repo` is in.
 fn left_over_environments(home: &Home, repo: &Path) -> Check {
     let name = "environments";
     let found = (|| -> Result<Vec<String>> {
@@ -349,16 +349,11 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
                 continue;
             }
             if item.repo.is_empty() {
-                // Named `work-<n>` by the releases that wrote such logs, or `<name>-<hash>-work-<n>`.
-                let (plain, suffix) = (
-                    format!("work-{}", item.number),
-                    format!("-work-{}", item.number),
-                );
+                // The releases that wrote such logs named an item's environment `work-<n>`.
+                let plain = format!("work-{}", item.number);
                 left.extend(
-                    envs.values()
-                        .filter(|env| {
-                            (env.name == plain || env.name.ends_with(&suffix)) && here(env)
-                        })
+                    envs.get(&plain)
+                        .filter(|env| here(env))
                         .map(|env| env.name.clone()),
                 );
             } else if envs.contains_key(&item.env_name()) {

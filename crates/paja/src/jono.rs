@@ -573,10 +573,11 @@ pub struct SyncReport {
     pub changed: Vec<u64>,
     pub closed: Vec<u64>,
     pub reopened: Vec<u64>,
-    /// The environments removed because their parked item's issue was closed, each with no
-    /// uncommitted changes (its branch is kept).
+    /// The environments this sync removed because their parked item's issue was closed, each
+    /// with no uncommitted changes (its branch is kept).
     pub freed: Vec<String>,
-    /// The environments of parked items this sync closed that it kept, and why.
+    /// The environments of closed, parked items, whenever they were closed, that this sync
+    /// kept, and why; every sync tries them again.
     pub kept: Vec<Kept>,
 }
 
@@ -2078,8 +2079,8 @@ fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<Str
             kept.push(Kept { env: name, why });
             continue;
         }
-        let removed = crate::ahjo::remove_unless(home, &name, false, |events, env| {
-            still_free(home, events, repo, number, env)
+        let removed = crate::ahjo::remove_unless(home, &name, false, |events, env, checked| {
+            still_free(home, events, repo, number, env, checked)
         });
         match removed {
             Ok(_) => freed.push(name),
@@ -2101,6 +2102,7 @@ fn still_free(
     repo: &str,
     number: u64,
     env: &crate::ahjo::Env,
+    checked: Option<&Untampered>,
 ) -> Result<Option<String>> {
     let item = replay_repo(events, repo)?.remove(&number);
     if !item.is_some_and(|item| !item.open && item.status == Status::Escalated) {
@@ -2111,15 +2113,25 @@ fn still_free(
     if home.run_held(repo, number)? {
         return Ok(Some(format!("a run holds item #{number}")));
     }
-    // Without its repository git can't read the worktree; the removal says why it stops.
-    if env.path.exists() && env.repo.exists() {
-        let head = crate::ahjo::git_command()
+    // git runs only in a repository the tamper check passed; without one the removal says
+    // why it stops.
+    if checked.is_some() && env.path.exists() {
+        let out = crate::ahjo::git_command()
             .arg("-C")
             .arg(&env.path)
             .args(["symbolic-ref", "-q", "HEAD"])
             .output()
             .with_context(|| format!("running git in {}", env.path.display()))?;
-        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Exit 1 with no output is a detached HEAD; anything else is git failing to read it.
+        if !out.status.success() && (out.status.code() != Some(1) || !head.is_empty()) {
+            return Ok(Some(format!(
+                "git couldn't read the HEAD of {}: {}; check the worktree with `git -C {} status`",
+                env.path.display(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                env.path.display()
+            )));
+        }
         if head != format!("refs/heads/{}", env.branch) {
             return Ok(Some(format!(
                 "{} is not on {}, so removing it could lose commits; check it out there or run \
@@ -3072,8 +3084,9 @@ mod tests {
             port_count: 100,
             created_ms: 1,
         };
-        let why =
-            |home: &Home| still_free(home, &home.events().read_all().unwrap(), R, 5, &env).unwrap();
+        let why = |home: &Home| {
+            still_free(home, &home.events().read_all().unwrap(), R, 5, &env, None).unwrap()
+        };
         apply(&home, &[issue(5, "A")]).unwrap();
         set_status(&home, 5, Status::Escalated, Some("Which API?")).unwrap();
         // Parked but open: answered rather than closed.
