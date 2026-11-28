@@ -1054,6 +1054,8 @@ enum Why {
     /// Its files overlap this lane's item's, for this reason.
     Overlaps(u64, String),
     Planning,
+    /// Its last lane ended on an error; it waits for the next timed sync.
+    LaneErrored,
     /// Nothing but a busy pool: it is ready.
     NoFreeLane,
 }
@@ -1069,6 +1071,10 @@ impl std::fmt::Display for Why {
             Why::NoPool => f.write_str("no pool is running"),
             Why::Overlaps(other, why) => write!(f, "overlaps #{other}: {why}"),
             Why::Planning => f.write_str("planning which files it touches"),
+            Why::LaneErrored => f.write_str(
+                "its last run ended on an error; it is held back until a timed sync (see --every), \
+                 and may have waited for a free lane since",
+            ),
             Why::NoFreeLane => f.write_str("no free lane"),
         }
     }
@@ -1220,6 +1226,18 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             })
             .is_some_and(|e| e.kind == EV_POOL_PLANNING)
     };
+    // The item's latest lane since the pool started ended on an error: it waits for the next
+    // timed sync, as `--every` waits after a failed pass.
+    let errored = |number: u64| {
+        events
+            .iter()
+            .rev()
+            .take_while(|e| e.seq > since)
+            .find(|e| {
+                e.kind == EV_POOL_LANE && e.data["repo"] == repo && e.data["number"] == number
+            })
+            .is_some_and(|e| e.data["stage"] == "done" && e.data["outcome"] == "error")
+    };
     let admitted: Vec<u64> = lanes.iter().map(|lane| lane.number).collect();
     let (landing, merging) = land_turns(events, repo, &lanes, &begun);
     let why_waiting = |item: &WorkItem| {
@@ -1236,6 +1254,8 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
             Why::Overlaps(other, why)
         } else if planning(item.number) {
             Why::Planning
+        } else if errored(item.number) {
+            Why::LaneErrored
         } else {
             Why::NoFreeLane
         }
@@ -1666,6 +1686,25 @@ mod tests {
         let text = describe(&status, 67_000);
         assert!(text.contains("running, 1 busy of 3 lanes"), "{text}");
         assert!(text.contains("1m00s"), "{text}");
+    }
+
+    #[test]
+    fn an_item_whose_lane_errored_says_it_waits_for_the_next_timed_sync() {
+        let mut done = lane(4, 1, 5, "done", None);
+        done.data["outcome"] = json!("error");
+        let events = vec![
+            event(1, EV_POOL_STARTED, json!({"repo": "acme/app", "lanes": 1})),
+            lane(2, 1, 5, "starting", None),
+            lane(3, 1, 5, "build", Some("build")),
+            done,
+        ];
+        let status = from_events(&events, "acme/app", true, &[item(5, &[]), item(6, &[])]);
+        assert!(
+            status.waiting[0].why.contains("timed sync"),
+            "{:?}",
+            status.waiting
+        );
+        assert_eq!(status.waiting[1].why, "no free lane");
     }
 
     #[test]
