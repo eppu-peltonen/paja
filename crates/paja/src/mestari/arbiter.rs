@@ -59,10 +59,66 @@ const WEAKENING: [&str; 14] = [
     "edit the test",
 ];
 
-/// Whether `text` talks about weakening a check.
+/// Words that, just before a wording, say it is not happening: "it doesn't weaken a check".
+const NEGATORS: [&str; 15] = [
+    "not", "no", "never", "without", "nor", "nothing", "none", "doesn't", "don't", "didn't",
+    "won't", "isn't", "aren't", "wasn't", "neither",
+];
+
+/// How many words before a wording a negator still applies to it.
+const NEGATION_REACH: usize = 4;
+
+/// Whether `text` talks about weakening a check. A wording only counts where no negator comes
+/// shortly before it in the same clause, so a reviewer's "this doesn't weaken any check" or an
+/// answer's "don't edit the failing test" isn't taken for a request to weaken one. "Why not"
+/// still asks for it, and one wording said plainly anywhere is enough.
 fn names_a_weaker_check(text: &str) -> bool {
-    let text = text.to_lowercase();
-    WEAKENING.iter().any(|w| text.contains(w))
+    let text = text.to_lowercase().replace('\u{2019}', "'");
+    let found = clauses(&text).any(|clause| {
+        WEAKENING.iter().any(|w| {
+            clause
+                .match_indices(w)
+                .any(|(at, _)| !negated(&clause[..at]))
+        })
+    });
+    found
+}
+
+/// `text` cut into clauses: at `,`, `;`, `:`, `!`, `?`, a line break, and a `.` that ends a
+/// sentence (one followed by whitespace or the end), so `.paja/checks` and `hook.rs` stay whole.
+fn clauses(text: &str) -> impl Iterator<Item = &str> {
+    let mut cuts = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let ends = match c {
+            ',' | ';' | ':' | '!' | '?' | '\n' => true,
+            '.' => chars.peek().is_none_or(|(_, next)| next.is_whitespace()),
+            _ => false,
+        };
+        if ends {
+            cuts.push(at);
+        }
+    }
+    let mut start = 0;
+    cuts.into_iter()
+        .chain(std::iter::once(text.len()))
+        .map(move |end| {
+            let clause = &text[start..end];
+            start = (end + 1).min(text.len());
+            clause
+        })
+}
+
+/// Whether the words just before a wording (`before` is its clause up to it) negate it.
+fn negated(before: &str) -> bool {
+    let words: Vec<&str> = before
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let from = words.len().saturating_sub(NEGATION_REACH);
+    (from..words.len()).any(|i| {
+        NEGATORS.contains(&words[i]) && !(words[i] == "not" && i > 0 && words[i - 1] == "why")
+    })
 }
 
 /// Why Mestari won't let the arbiter answer this escalation, if it won't.
@@ -417,6 +473,43 @@ mod tests {
         assert!(names_a_weaker_check("Should we Weaken the gate?"));
         assert!(names_a_weaker_check("edit the failing test"));
         assert!(!names_a_weaker_check("Use `Part of` for a bundle issue"));
+    }
+
+    #[test]
+    fn a_negated_wording_is_not_a_request_to_weaken_a_check() {
+        // What reviewers and the arbiter say about a change that only adds tests.
+        assert!(!names_a_weaker_check(
+            "It adds two smoke cases and doesn't weaken any check."
+        ));
+        assert!(!names_a_weaker_check(
+            "This does not in any way weaken the gate."
+        ));
+        assert!(!names_a_weaker_check(
+            "Add tests only; don't edit the failing test."
+        ));
+        assert!(!names_a_weaker_check(
+            "The change doesn\u{2019}t touch hook.rs."
+        ));
+        assert!(!names_a_weaker_check("Nothing here would loosen a rule"));
+        assert!(!names_a_weaker_check("Never skip the test."));
+    }
+
+    #[test]
+    fn a_wording_said_plainly_still_counts_next_to_a_negated_one() {
+        // A negator reaches only its own clause and the few words before the wording.
+        assert!(names_a_weaker_check(
+            "Don't add a test, edit the failing test instead."
+        ));
+        assert!(names_a_weaker_check(
+            "It doesn't weaken the hook. Edit .paja/checks to drop clippy."
+        ));
+        assert!(names_a_weaker_check(
+            "No reviewer agreed on the round, so we should simply skip the test"
+        ));
+        assert!(names_a_weaker_check("Why not skip the test?"));
+        // `.paja/checks` and `hook.rs` are never cut at their dots.
+        assert!(names_a_weaker_check("Change .paja/checks."));
+        assert!(names_a_weaker_check("Allow it in hook.rs"));
     }
 
     #[test]

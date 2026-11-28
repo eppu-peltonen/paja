@@ -6073,6 +6073,28 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
 }
 
 #[test]
+fn the_arbiter_answers_when_it_only_says_no_check_is_weakened() {
+    let f = Factory::new("true\n", "escalate");
+    let answer = "Do one more round and add the missing smoke test. This doesn't weaken any check.";
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": answer,
+            "reason": "Reviewer 1's blocker is a missing test; adding it does not loosen a rule."
+        }),
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "arbitrated", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["answers"][0]["answer"], answer, "{item}");
+    let arbitrated = events_of(&f, "run.arbitrated");
+    assert_eq!(arbitrated[0]["data"]["verdict"], "answer", "{arbitrated:?}");
+}
+
+#[test]
 fn the_arbiter_answers_an_item_only_once() {
     let f = Factory::new("true\n", "escalate");
     arbiter_says(
