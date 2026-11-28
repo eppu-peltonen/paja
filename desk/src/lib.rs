@@ -190,7 +190,7 @@ pub fn repos_in(home: &Home, runner: &Runner, cwd: &Path) -> Value {
         let repos: Vec<Value> = names
             .iter()
             .map(|repo| {
-                let checkout = jono::known_checkout(home, repo).ok().flatten();
+                let checkout = checkout_of(home, repo, cwd).ok();
                 json!({ "repo": repo, "checkout": checkout, "runs": runner.status(home, repo) })
             })
             .collect();
