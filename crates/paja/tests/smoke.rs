@@ -3334,7 +3334,7 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, home) = (tmp.path().join("app"), tmp.path().join("home"));
     init_repo(&repo);
-    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let numbers = [5u64, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
     let issues: Vec<Value> = numbers
         .iter()
         .map(|n| serde_json::json!({"number": n, "title": "T", "body": "", "url": format!("https://example.com/{n}")}))
@@ -3411,6 +3411,8 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     let other = tmp.path().join("other");
     init_repo(&other);
     tree(&other, &env(11));
+    // So does 17's `work-<n>` one.
+    tree(&other, "work-17");
     // 12 still has the `work-<n>` environment an older release made, freed the same way.
     let legacy = tree(&repo, "work-12");
     // 16's is one too, with an untracked file.
@@ -3609,6 +3611,29 @@ fn doctor_names_the_environments_of_old_logs_and_of_a_closed_item_no_run_holds()
     let detail = check["detail"].as_str().unwrap();
     assert!(
         detail.contains("work-5") && !detail.contains("spike") && !detail.contains(&six),
+        "{check}"
+    );
+
+    // A log a sync pinned: this checkout was last recorded as acme/fork's, so a closed acme/app
+    // item's `work-<n>` here isn't named, and a closed acme/fork item's is.
+    let pinned = tmp.path().join("pinned");
+    std::fs::create_dir_all(&pinned).unwrap();
+    let here = serde_json::to_string(tmp.path().to_str().unwrap()).unwrap();
+    let events = [
+        format!(r#"{{"v":1,"seq":1,"ts_ms":1,"kind":"work.checkout","data":{{"repo":"acme/app","path":{here}}}}}"#),
+        format!(r#"{{"v":1,"seq":2,"ts_ms":1,"kind":"work.checkout","data":{{"repo":"acme/fork","path":{here}}}}}"#),
+        r#"{"v":1,"seq":3,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/app","number":7,"title":"A","body":"","url":"https://example.com/7"}}"#.to_string(),
+        r#"{"v":1,"seq":4,"ts_ms":1,"kind":"work.imported","data":{"repo":"acme/fork","number":8,"title":"B","body":"","url":"https://example.com/8"}}"#.to_string(),
+        r#"{"v":1,"seq":5,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":7}}"#.to_string(),
+        r#"{"v":1,"seq":6,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/fork","number":8}}"#.to_string(),
+    ];
+    std::fs::write(pinned.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+    record_env(&pinned, "work-7", tmp.path(), &tmp.path().join("tree-7"));
+    record_env(&pinned, "work-8", tmp.path(), &tmp.path().join("tree-8"));
+    let check = doctor(&pinned);
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("work-8") && !detail.contains("work-7"),
         "{check}"
     );
 
@@ -7411,9 +7436,16 @@ fn a_run_that_errors_frees_the_work_n_environment_it_resumed() {
     let (ok, report) = f.run();
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "escalated", "{report}");
+    let started = events_of(&f, "run.started");
+    assert_eq!(started[0]["data"]["env"], "work-5", "{started:?}");
     let (_, envs) = paja(&f.home, &f.repo, &["env", "list"]);
     assert_eq!(envs, serde_json::json!([]), "the worktree it used is freed");
     assert!(!path.exists());
+    // Its branch stays for the next run to resume.
+    git_out(
+        &f.repo,
+        &["rev-parse", "--verify", "-q", "refs/heads/paja/work-5"],
+    );
 }
 
 #[test]

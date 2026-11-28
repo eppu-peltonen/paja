@@ -336,16 +336,18 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
         // Made in this checkout: doctor may run from a folder inside it.
         let checkout = jono::checkout_top(repo)?;
         let here = |env: &ahjo::Env| jono::same_dir(&env.repo, &checkout);
-        let ours = |repo: &str| {
-            repo.is_empty()
-                || events.iter().any(|e| {
-                    e.kind == jono::EV_CHECKOUT
-                        && e.data["repo"] == repo
-                        && e.data["path"]
-                            .as_str()
-                            .is_some_and(|path| jono::same_dir(Path::new(path), &checkout))
-                })
-        };
+        // The repository the last sync here recorded for this checkout, if any.
+        let here_repo = events
+            .iter()
+            .rev()
+            .find(|e| {
+                e.kind == jono::EV_CHECKOUT
+                    && e.data["path"]
+                        .as_str()
+                        .is_some_and(|path| jono::same_dir(Path::new(path), &checkout))
+            })
+            .and_then(|e| e.data["repo"].as_str());
+        let ours = |repo: &str| repo.is_empty() || here_repo == Some(repo);
         let mut left = Vec::new();
         for item in jono::replay(&events, "")?.values() {
             if item.open {
@@ -359,13 +361,13 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
             {
                 continue;
             }
-            if envs.contains_key(&item.env_name()) && !item.repo.is_empty() {
+            if !item.repo.is_empty() && envs.contains_key(&item.env_name()) {
                 left.push(item.env_name());
             }
             // Releases before names carried the repository named an item's environment
             // `work-<n>`: the item's when it was made in this checkout and this checkout is the
-            // item's repository (an item from a log that names none, or one a sync here
-            // recorded).
+            // item's repository (an item from a log that names none, or the repository the last
+            // sync here recorded).
             let plain = format!("work-{}", item.number);
             if envs.get(&plain).is_some_and(&here) && ours(&item.repo) {
                 left.push(plain);

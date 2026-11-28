@@ -825,9 +825,14 @@ fn one_pass(home: &Home, opts: RunOptions<'_>, sandbox: &mut bool) -> Result<Run
                 item.number,
                 asked.err(),
             ));
-            // The environment the run used: the item's, or the `work-<n>` it resumed.
-            if let Ok(Some(env)) = existing_environment(home, &repo, &item) {
-                let _ = ahjo::remove(home, &env.name, true);
+            // The environment the run used: the item's, or the `work-<n>` it resumed. One whose
+            // name another repository's environment holds is that repository's, and stays.
+            match existing_environment(home, &repo, &item) {
+                Ok(Some(env)) => {
+                    let _ = ahjo::remove(home, &env.name, true);
+                }
+                Ok(None) => {}
+                Err(err) => progress(&format!("kept the environment: {err:#}")),
             }
             Ok(RunReport::Escalated {
                 number: item.number,
@@ -2033,7 +2038,7 @@ fn existing_environment(home: &Home, repo: &Path, item: &WorkItem) -> Result<Opt
 /// A fresh environment for the item, branched from the base. A branch kept from an earlier
 /// run of the same item is resumed, so its work isn't thrown away: the item's own, else the
 /// `paja/work-<n>` of a `work-<n>` environment an older release made and something removed
-/// since (a sync freeing a closed item, `paja env remove`), which the new branch starts from.
+/// since (a sync freeing a closed item, `paja env remove`), which is renamed to the item's own.
 /// The flag says whether the branch (and so the work on it) was kept from an earlier run, as
 /// opposed to made again from the base.
 fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<(Env, bool)> {
@@ -2041,15 +2046,29 @@ fn environment(home: &Home, repo: &Path, base: &str, item: &WorkItem) -> Result<
     if let Some(env) = existing_environment(home, repo, item)? {
         return Ok((env, true));
     }
-    let kept = |branch: &str| git(repo, &["rev-parse", "--verify", "--quiet", branch]).is_ok();
-    let legacy = format!("refs/heads/paja/work-{}", item.number);
-    let (base, resume) = if kept(&format!("refs/heads/paja/{name}")) {
-        (None, true)
-    } else if kept(&legacy) {
-        (Some(legacy.as_str()), true)
-    } else {
-        (Some(base), false)
+    let kept = |branch: &str| {
+        git(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok()
     };
+    let own = format!("paja/{name}");
+    let legacy = format!("paja/work-{}", item.number);
+    // The old branch becomes the item's own, so it is carried over once: a later run (after a
+    // landing deleted the own branch, say) never finds work that already landed there.
+    let resume = kept(&own)
+        || (kept(&legacy) && {
+            git(repo, &["branch", "-m", &legacy, &own])
+                .with_context(|| format!("renaming {legacy} to {own} to resume it"))?;
+            true
+        });
+    let base = if resume { None } else { Some(base) };
     let env = ahjo::create(
         home,
         CreateOptions {
@@ -3562,6 +3581,46 @@ mod tests {
         assert!(resumed);
         assert_eq!(env.name, item.env_name());
         assert!(env.path.join("draft.txt").exists());
+        // Carried over once: the old branch is now the item's own.
+        assert!(git(
+            &a,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/paja/work-7"]
+        )
+        .is_err());
+        // So once the own branch goes (a landing deletes it), the next run starts fresh.
+        crate::ahjo::remove(&home, &env.name, true).unwrap();
+        git(&a, &["branch", "-q", "-D", &env.branch]).unwrap();
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(!resumed);
+        assert!(!env.path.join("draft.txt").exists());
+    }
+
+    #[test]
+    fn an_items_own_branch_wins_over_an_old_work_n_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(tmp.path().join("home")).unwrap();
+        let a = repo_with_commit(tmp.path(), "a");
+        let item = work_item("o/a", 7);
+        git(&a, &["branch", "paja/work-7"]).unwrap();
+        let own = crate::ahjo::create(
+            &home,
+            crate::ahjo::CreateOptions {
+                name: &item.env_name(),
+                repo: &a,
+                base: None,
+            },
+        )
+        .unwrap();
+        crate::ahjo::remove(&home, &own.name, true).unwrap();
+        let (env, resumed) = super::environment(&home, &a, "HEAD", &item).unwrap();
+        assert!(resumed);
+        assert_eq!(env.branch, own.branch);
+        // The old one is left alone.
+        git(
+            &a,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/paja/work-7"],
+        )
+        .unwrap();
     }
 
     #[test]

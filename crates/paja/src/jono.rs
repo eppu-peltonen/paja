@@ -2071,16 +2071,20 @@ fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<Str
             return (freed, kept);
         }
     };
+    // Asked once per issue, though an item may have both names.
+    let mut asked: BTreeMap<u64, std::result::Result<bool, String>> = BTreeMap::new();
     for (number, name) in found {
-        let why = match issue_is_open(ok, number) {
+        let state = asked
+            .entry(number)
+            .or_insert_with(|| issue_is_open(ok, number).map_err(|err| format!("{err:#}")))
+            .clone();
+        let why = match state {
             Ok(false) => None,
             Ok(true) => Some(format!(
                 "issue #{number} is still open on GitHub (or `{} api` couldn't say)",
                 gh_program()
             )),
-            Err(err) => Some(format!(
-                "couldn't ask GitHub about issue #{number}: {err:#}"
-            )),
+            Err(err) => Some(format!("couldn't ask GitHub about issue #{number}: {err}")),
         };
         if let Some(why) = why {
             kept.push(Kept { env: name, why });
