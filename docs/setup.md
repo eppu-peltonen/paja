@@ -311,6 +311,12 @@ or on a schedule passes it and then waits five minutes for checks that never app
 checks and the reviewers alone, and says so in the pull request body. If the default branch's protection still requires
 status checks, GitHub refuses the merge and the error says so.
 
+A run waits for CI for at most 120 minutes, holding the repository's turn to land, so other runs there wait too. CI
+still going then escalates the item, naming the pull request, so a stuck job or one queued with no runner doesn't hold
+up every landing. A repository whose CI takes longer puts a `wait <minutes>` line (1 to 1440) in `.paja/ci` next to
+`required`, for example `wait 240`; `none` takes no `wait`. `stop now` (or a second Ctrl-C) ends the wait at once, and
+the next run resumes the item.
+
 ## Paja Desk
 
 Paja Desk shows the queue of every repository Paja knows in one window, with what waits on you first, and follows the

@@ -59,6 +59,7 @@ pub(super) fn land(
     rounds: u32,
     judged: &str,
     ci: CiMode,
+    ci_wait: u64,
     target: &RepoSettings,
     unsettled: &[String],
 ) -> Result<Landing> {
@@ -164,7 +165,11 @@ pub(super) fn land(
         progress(&format!("opened {pr}; waiting for CI"));
         // A red CI is the builder's to fix, like a failed check: the pull request stays open
         // and the next round pushes to it.
-        if let Err(err) = wait_for_ci(repo, &pr) {
+        if let Err(err) = wait_for_ci(repo, &pr, ci_wait) {
+            // `stop now` ended the wait: the run stops, and the next one resumes the item.
+            if stopped(&err) {
+                return Err(err);
+            }
             let err = format!("{err:#}");
             // Only a failed check, or checks that never start because the default branch moved
             // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
@@ -444,22 +449,79 @@ pub(super) fn comment(home: &Home, repo: &Path, item: &WorkItem, question: &str)
     follow_ups::comment_on_issue(home, repo, item.number, &body)
 }
 
-/// Wait until GitHub has registered checks on the pull request, then until they finish.
-/// A pull request that gets no checks at all is not treated as green.
-pub(super) fn wait_for_ci(repo: &Path, pr: &str) -> Result<()> {
+/// Whether `err` is a step that `stop now` (or a second Ctrl-C) ended.
+fn stopped(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+    })
+}
+
+/// Wait until GitHub has registered checks on the pull request, then until they finish, for
+/// at most `minutes` in all (`.paja/ci`'s `wait`; debug builds: `PAJA_TEST_CI_WAIT_MS`). A
+/// pull request that gets no checks at all is not treated as green, and neither is CI still
+/// going at the limit: the run holds the repository's turn to land while it waits, so a CI
+/// that hangs would otherwise hold up every landing there. `stop now` ends the wait at once.
+pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
     const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
+    const AGAIN: std::time::Duration = std::time::Duration::from_secs(10);
+    let limit = std::env::var("PAJA_TEST_CI_WAIT_MS")
+        .ok()
+        .filter(|_| cfg!(debug_assertions))
+        .and_then(|ms| ms.parse().ok())
+        .map_or(
+            std::time::Duration::from_secs(minutes * 60),
+            std::time::Duration::from_millis,
+        );
     let start = std::time::Instant::now();
+    let deadline = start + limit;
+    let too_long = || {
+        anyhow!(
+            "CI on {pr} was still going after {}, so Paja stopped waiting for it. Look at the \
+             pull request's checks on GitHub: a job may be stuck, or queued with no runner to \
+             take it. If this repository's CI takes longer, put `wait <minutes>` in {CI_FILE} \
+             on the default branch (it is now {minutes} minutes)",
+            long(limit)
+        )
+    };
+    let gh = jono::gh_program();
+    let args = ["pr", "checks", pr, "--watch", "--fail-fast"];
     loop {
-        match run_gh(repo, &["pr", "checks", pr, "--watch", "--fail-fast"]) {
-            Ok(_) => return Ok(()),
-            Err(err) if format!("{err:#}").contains("no checks reported") => {
-                if start.elapsed() > APPEAR {
-                    bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
-                }
-                std::thread::sleep(std::time::Duration::from_secs(10));
-            }
-            Err(err) => return Err(err),
+        let mut cmd = Command::new(&gh);
+        cmd.env("GH_PROMPT_DISABLED", "1")
+            .current_dir(repo)
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        let output = match crate::platform::output_until_stopped_or(&mut cmd, deadline) {
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => return Err(too_long()),
+            other => other.with_context(|| {
+                format!("running `{gh}` (install the GitHub CLI and run `gh auth login`)")
+            })?,
+        };
+        if output.status.success() {
+            return Ok(());
         }
+        let err = format!("`{gh} {}` failed: {}", args.join(" "), tail(&output));
+        if !err.contains("no checks reported") {
+            bail!(err);
+        }
+        if start.elapsed() > APPEAR {
+            bail!("no CI checks appeared on {pr} within 5 minutes; check the workflows");
+        }
+        if std::time::Instant::now() + AGAIN >= deadline {
+            return Err(too_long());
+        }
+        std::thread::sleep(AGAIN);
+    }
+}
+
+/// `limit` as a person reads it: whole minutes, or seconds below one.
+fn long(limit: std::time::Duration) -> String {
+    match limit.as_secs() {
+        s if s < 60 => format!("{s} seconds"),
+        60..=119 => "1 minute".to_string(),
+        s => format!("{} minutes", s / 60),
     }
 }
 

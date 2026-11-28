@@ -616,6 +616,24 @@ pub fn output_until_stopped_with_input(
     cmd: &mut Command,
     input: Option<Vec<u8>>,
 ) -> std::io::Result<std::process::Output> {
+    output_until(cmd, input, None)
+}
+
+/// [`output_until_stopped`], also ended with everything it started once `deadline` passes,
+/// which returns an error of kind [`std::io::ErrorKind::TimedOut`]: for a wait on something
+/// outside Paja that may never end, such as a pull request's CI.
+pub fn output_until_stopped_or(
+    cmd: &mut Command,
+    deadline: std::time::Instant,
+) -> std::io::Result<std::process::Output> {
+    output_until(cmd, None, Some(deadline))
+}
+
+fn output_until(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<std::process::Output> {
     use std::io::{Read, Write};
     use std::process::Stdio;
     if input.is_some() {
@@ -668,6 +686,14 @@ pub fn output_until_stopped_with_input(
                 "stopped by a second Ctrl-C"
             };
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, why));
+        }
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            kill_tree(&mut child);
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ended at its time limit",
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -950,6 +976,35 @@ mod tests {
             .unwrap();
         let stat = String::from_utf8_lossy(&out.stdout);
         stat.trim().is_empty() || stat.trim().starts_with('Z')
+    }
+
+    /// A step past its deadline is ended, with what it started, and reads as timed out; one
+    /// that ends first returns its output as usual.
+    #[cfg(unix)]
+    #[test]
+    fn a_step_past_its_deadline_is_ended_as_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("pid");
+        let script = format!("sleep 60 & echo $! > '{}'; wait", pid.display());
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(500);
+        let err = output_until_stopped_or(Command::new("sh").args(["-c", &script]), deadline)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed().as_secs() < 20);
+        let sleeper = std::fs::read_to_string(&pid).unwrap();
+        let gone = std::time::Instant::now();
+        while !ended(sleeper.trim()) {
+            assert!(
+                gone.elapsed().as_secs() < 10,
+                "the step's child outlived it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let out =
+            output_until_stopped_or(Command::new("sh").args(["-c", "echo done"]), later).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
     }
 
     #[cfg(unix)]

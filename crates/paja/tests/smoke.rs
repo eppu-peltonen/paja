@@ -11392,6 +11392,118 @@ fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
     );
 }
 
+/// CI still going at `.paja/ci`'s `wait` escalates, naming the setting, instead of holding the
+/// repository's turn to land for as long as the CI hangs. The `gh` that was waiting is ended.
+#[test]
+fn ci_still_going_at_its_wait_escalates_naming_the_setting() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let dir = f.tmp.path();
+    f.on_main(".paja/ci", "required\nwait 30\n");
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PAJA_TEST_CI_WAIT_MS", "2000")
+        .args(["--json", "run"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = output_within(output, std::time::Duration::from_secs(300));
+    let _ = std::fs::remove_file(dir.join("ci-hold"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert!(dir.join("ci-waiting").exists(), "{stderr}");
+    let question = report["question"].as_str().unwrap_or_default();
+    assert!(
+        question.contains("was still going after 2 seconds")
+            && question.contains("put `wait <minutes>` in .paja/ci")
+            && question.contains("it is now 30 minutes"),
+        "{question}"
+    );
+    assert!(
+        !stderr.contains("sending the failure back to the builder"),
+        "{stderr}"
+    );
+    // The whole run, builds and reviews included, is far shorter than the wait it was given.
+    assert!(started.elapsed().as_secs() < 240, "{stderr}");
+}
+
+/// `stop now` during the CI wait stops the run at once, leaving the item to resume, rather
+/// than escalating the wait it cut short.
+// Unix only, like `stop_now_on_stdin_stops_at_once_and_ends_the_agent`: on Windows the fake
+// `gh`'s Git Bash loop can outlive `taskkill /T`.
+#[cfg(unix)]
+#[test]
+fn stop_now_in_the_ci_wait_stops_the_run_instead_of_escalating() {
+    use std::io::Write as _;
+    let f = Factory::new("test -f feature.txt\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .args(["--json", "run", "--stop-on-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let guard = EndOnPanic(run.id());
+    let started = std::time::Instant::now();
+    while !dir.join("ci-waiting").exists() {
+        if let Some(status) = run.try_wait().unwrap() {
+            panic!("`paja run` exited ({status}) before it waited for CI");
+        }
+        assert!(
+            started.elapsed().as_secs() < 300,
+            "the run never waited for CI"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut stdin = run.stdin.take().unwrap();
+    writeln!(stdin, "stop now").unwrap();
+    stdin.flush().unwrap();
+    let stopping = std::time::Instant::now();
+    std::mem::forget(guard);
+    let output = output_within(run, std::time::Duration::from_secs(120));
+    let _ = std::fs::remove_file(dir.join("ci-hold"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stopping.elapsed().as_secs() < 30,
+        "paja didn't stop at once\n{stderr}"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(report["outcome"], "stopped", "{report}\n{stderr}");
+    let (_, work) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(work["status"], "active", "{work}");
+}
+
+/// A `.paja/ci` that names a `wait` with `none` stops the run before anything is claimed,
+/// naming the file, the branch and what is wrong.
+#[test]
+fn a_ci_file_with_none_and_a_wait_is_an_error_naming_the_file() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    f.on_main(".paja/ci", "none\nwait 30\n");
+    let (ok, report) = f.run();
+    assert!(!ok, "{report}");
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(".paja/ci on main says `none` and names a `wait`")
+            && error.contains("fix it on main"),
+        "{report}"
+    );
+    let (_, work) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_ne!(work["status"], "active", "{work}");
+}
+
 #[test]
 fn a_merge_github_refuses_escalates_naming_the_setting() {
     let f = Factory::new("test -f feature.txt\n", "land");
