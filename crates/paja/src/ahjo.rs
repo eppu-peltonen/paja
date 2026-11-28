@@ -90,7 +90,8 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     if is_paja_name(opts.name) {
         bail!(
             "environment name {:?} has the shape Paja gives its own environments \
-             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`, where \
+             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-plan-<n>`, `<repo>-<hash>-triage`, \
+             `work-<n>`, `plan-<n>`, where \
              `<hash>` is any six hex digits), and Paja would reuse, reset and remove it; pick \
              another name",
             opts.name
@@ -100,9 +101,9 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
 }
 
 /// Whether `name` has the shape of a name Paja gives its own environments: what
-/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage` or
-/// `-work-<n>`), a plan's `plan-<n>`, or the `work-<n>` of releases before names carried the
-/// repository.
+/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage`,
+/// `-work-<n>` or a plan's `-plan-<n>`), or the `work-<n>` and `plan-<n>` of releases before
+/// names carried the repository.
 pub fn is_paja_name(name: &str) -> bool {
     let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
     if ["work-", "plan-"]
@@ -111,18 +112,26 @@ pub fn is_paja_name(name: &str) -> bool {
     {
         return true;
     }
-    let head = if let Some(head) = name.strip_suffix("-triage") {
-        head
-    } else if let Some((head, n)) = name.rsplit_once("-work-") {
-        if !number(n) {
-            return false;
-        }
-        head
-    } else {
-        return false;
+    // Each ending on its own: a repository named `home-work-app` puts `-work-` before the
+    // `-plan-<n>` its planner's name ends in.
+    let hashed = |head: &str| {
+        let hash = head.rsplit('-').next().unwrap_or(head);
+        hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
     };
-    let hash = head.rsplit('-').next().unwrap_or(head);
-    hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    name.strip_suffix("-triage").is_some_and(hashed)
+        || ["-work-", "-plan-"].iter().any(|what| {
+            name.rsplit_once(what)
+                .is_some_and(|(head, n)| number(n) && hashed(head))
+        })
+}
+
+/// Whether two repository paths are the same folder, as the file system resolves them; paths
+/// that can't be resolved (a repository that moved) are compared as written.
+pub(crate) fn same_repo(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
@@ -1580,8 +1589,14 @@ mod tests {
 
     #[test]
     fn paja_shaped_names_are_told_apart_from_a_persons() {
-        for repo in ["acme/app", "acme/a-very-long-repository-name", "acme/---"] {
-            for what in ["triage", "work-7", "work-12345"] {
+        for repo in [
+            "acme/app",
+            "acme/a-very-long-repository-name",
+            "acme/---",
+            "acme/home-work-app",
+            "acme/x-plan-y",
+        ] {
+            for what in ["triage", "work-7", "work-12345", "plan-7"] {
                 let name = crate::jono::env_name_for(repo, what);
                 assert!(is_paja_name(&name), "{name}");
             }
@@ -1600,6 +1615,8 @@ mod tests {
             "app-abcdef-work-",
             "app-abcdef-work-7a",
             "app-abcdef-worker",
+            "app-abcdef-plan-",
+            "app-abcdef-plan-x",
         ] {
             assert!(!is_paja_name(theirs), "{theirs}");
         }

@@ -2148,10 +2148,7 @@ fn existing_environment(home: &Home, repo: &Path, item: &WorkItem) -> Result<Opt
     let name = item.env_name();
     // The name holds only a short hash of the repository, so two repositories could in
     // principle share it; never run one's item in the other's worktree.
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    };
+    let same = ahjo::same_repo;
     if let Ok(env) = ahjo::get(home, &name) {
         if !same(&env.repo, repo) {
             bail!(
@@ -3747,7 +3744,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    fn repo_with_commit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    pub(super) fn repo_with_commit(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::create_dir_all(&path).unwrap();
         let git = |args: &[&str]| {
@@ -3768,7 +3765,7 @@ mod tests {
         path
     }
 
-    fn work_item(repo: &str, number: u64) -> crate::jono::WorkItem {
+    pub(super) fn work_item(repo: &str, number: u64) -> crate::jono::WorkItem {
         crate::jono::WorkItem {
             repo: repo.into(),
             number,

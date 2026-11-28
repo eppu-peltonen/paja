@@ -196,7 +196,8 @@ run that stops on an error removes the environment it used, but a `work-<issue>`
 changes, since an older release's park may have kept the builder's edits there; one that belongs to another repository
 is never taken, and a hashed name found to belong to another repository stops the run with the `paja env remove <name>`
 fix. `paja env create` and the MCP tool refuse names of that shape (and the triage pass's `<repo>-<hash>-triage`, a
-plan's `plan-<issue>` and the old `work-<issue>`), so Paja never reuses, resets or removes an environment a person made.
+plan's `<repo>-<hash>-plan-<issue>`, and the old `work-<issue>` and `plan-<issue>`), so Paja never reuses, resets or
+removes an environment a person made.
 A mistake in that configuration stops the pass before it claims anything, with an error naming the file and line, so one
 fix on the default branch is all it takes. That holds even when the queue is empty: the pass reports the error, not
 `idle`. A `--every` loop reports it and tries again after its wait. While it works on an item the run holds an OS file
@@ -277,7 +278,17 @@ A pool admits an item to a lane only when the files it will touch don't overlap 
 its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; recorded as `pool.planning`):
 the item's `Touches:` line names the paths when it has one (`source: spec`; the words `and`, `or`, `none` and
 `nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
-`plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). The plan,
+`plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). That
+environment is `<repo>-<hash>-plan-<issue>`, so two repositories sharing a home never plan in one checkout; one of that
+name made from another repository stops the plan with the `paja env remove <name>` fix, and an older release's
+`plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an OS lock for its
+item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs is refused
+within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no planner of its
+own, records `pool.planning`, says so, counts the item as being planned (it takes one of the free lanes' planning
+slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A planner of
+the pool's refused because a plan started by hand took the lock just after the pool looked waits the same way. An item
+that leaves the queue meanwhile is no longer waited for. The pool looks only when it is about to plan an item: one that
+already has a plan from this pool run can be admitted on it while a plan started by hand re-plans it. The plan,
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
@@ -338,9 +349,13 @@ Then, for at most five rounds:
    "Usage limit" below. Reviewers never resume: each review is a fresh session reading cold.
    A resumed step records `resumed: true` and only its own share of the session's running `total_cost_usd` and
    `modelUsage`. When the issue leaves a decision only the person can make, the builder commits
-   nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
-   and its recommendation. Mestari then escalates at once with that question: no checks run and no more rounds are
-   spent, and the round is recorded with verdict `question`.
+   nothing and puts a line starting `PAJA-QUESTION:` in its final message (the first such line counts, and the
+   question runs to the end of the message), followed by the question, the options and its recommendation. Mestari
+   then escalates at once with that question: no checks run and no more rounds are spent, and the round is recorded
+   with verdict `question`. Commits the builder made stay on the branch for the next run; uncommitted edits are
+   dropped. Every escalation question, the builder's and a reviewer's alike, is redacted, has its mentions, code
+   fences and comment markers made inert, and has its middle cut (marked "(cut short)") if it runs past 20,000
+   characters (`QUOTED_CHARS`), before it goes on the issue.
 2. Vasara runs each command in `.paja/checks`, read from the default
    branch. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
