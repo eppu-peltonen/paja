@@ -168,6 +168,21 @@ pub fn blocked_by(plan: &Plan, running: &[&Plan]) -> Option<(u64, String)> {
     None
 }
 
+/// Take item `number`'s plan lock, trying for a moment, since a pool probing whether a plan
+/// runs holds it for an instant. None when another plan holds it still, or once a stop comes.
+fn plan_lock(home: &Home, repo: &str, number: u64) -> Result<Option<crate::home::RunLock>> {
+    for _ in 0..20 {
+        if let Some(lock) = home.try_plan_lock(repo, number)? {
+            return Ok(Some(lock));
+        }
+        if crate::platform::interrupts() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(None)
+}
+
 /// Plan item `number` of the repository checked out at `repo`, and record it as
 /// `pool.planned`. A plan that fails is recorded as `failed` before the error is returned; one
 /// stopped now (a second Ctrl-C, or `stop now` from the pool) records nothing, so whoever stopped
@@ -177,16 +192,7 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     let name = jono::repo_name(home, &repo)?;
     // Taken before anything is recorded: a plan that finds another one running records nothing,
     // so it never replaces that plan's result.
-    // Tried for a moment: a pool probing whether a plan runs holds the lock for an instant.
-    let mut lock = home.try_plan_lock(&name, number)?;
-    for _ in 0..20 {
-        if lock.is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        lock = home.try_plan_lock(&name, number)?;
-    }
-    let Some(_lock) = lock else {
+    let Some(_lock) = plan_lock(home, &name, number)? else {
         bail!(
             "another `paja pool plan {number}` of {name} is running (a pool's planner, or one \
              started by hand); wait for it, then `paja pool status` shows its plan"
@@ -382,6 +388,21 @@ fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_lock_held_for_a_moment_is_waited_for_and_one_held_on_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("home")).unwrap();
+        let probe = home.try_plan_lock("o/a", 7).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(probe);
+        });
+        assert!(plan_lock(&home, "o/a", 7).unwrap().is_some());
+        release.join().unwrap();
+        let _other = home.try_plan_lock("o/a", 8).unwrap().unwrap();
+        assert!(plan_lock(&home, "o/a", 8).unwrap().is_none());
+    }
 
     #[test]
     fn a_planner_checkout_another_repository_holds_is_refused_and_an_old_one_of_ours_goes() {

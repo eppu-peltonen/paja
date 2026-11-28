@@ -308,27 +308,6 @@ impl Pool<'_> {
     /// running item's, planning each first. Returns how many started.
     fn admit(&mut self, free: usize) -> Result<usize> {
         let busy: BTreeSet<u64> = self.lanes.values().map(|lane| lane.number).collect();
-        let (home, name) = (self.home, self.name);
-        // A probe that can't read the lock counts as free: the pool's own planner then says
-        // what is wrong.
-        self.elsewhere
-            .retain(|&n, _| home.plan_held(name, n).unwrap_or(false));
-        let overdue: Vec<u64> = self
-            .elsewhere
-            .iter()
-            .filter(|(_, seen)| seen.elapsed() > PLAN_LIMIT)
-            .map(|(&n, _)| n)
-            .collect();
-        for number in overdue {
-            self.elsewhere.remove(&number);
-            self.plan_failed(
-                number,
-                &format!(
-                    "the other `paja pool plan {number}` took longer than {} minutes",
-                    PLAN_LIMIT.as_secs() / 60
-                ),
-            )?;
-        }
         let next: Vec<WorkItem> = match jono::runnable(self.home, self.name) {
             Ok(items) => items,
             Err(err) => {
@@ -336,8 +315,38 @@ impl Pool<'_> {
                 return Ok(0);
             }
         };
+        let (home, name) = (self.home, self.name);
+        // Waiting on another plan only while it holds the lock and the item is still queued. A
+        // probe that can't read the lock counts as free: the pool's own planner then says what
+        // is wrong. Probed before the log is read, as `reap` does.
+        self.elsewhere.retain(|&n, _| {
+            next.iter().any(|item| item.number == n) && home.plan_held(name, n).unwrap_or(false)
+        });
         let events = self.home.events().read_all()?;
         let mut plans = plans_since(&events, self.name, self.since);
+        let overdue = expired(&mut self.elsewhere, PLAN_LIMIT);
+        let mut gave_up = false;
+        for number in overdue {
+            // The other plan may have recorded its plan just now, before letting go.
+            if plans
+                .get(&number)
+                .is_some_and(|plan| plan.source != "failed")
+            {
+                continue;
+            }
+            self.plan_failed(
+                number,
+                &format!(
+                    "the other `paja pool plan {number}` took longer than {} minutes",
+                    PLAN_LIMIT.as_secs() / 60
+                ),
+            )?;
+            gave_up = true;
+        }
+        // The next tick reads the failed plans, so the items aren't planned again at once.
+        if gave_up {
+            return Ok(0);
+        }
         let retry: BTreeSet<u64> = failed_by(&events, self.name, self.since, self.retry_failed_to)
             .into_iter()
             .filter(|n| !self.retried.contains(n))
@@ -420,6 +429,12 @@ impl Pool<'_> {
         if self.home.plan_held(self.name, number).unwrap_or(false) {
             if let std::collections::btree_map::Entry::Vacant(seen) = self.elsewhere.entry(number) {
                 seen.insert(Instant::now());
+                // Recorded, so `paja pool status` says the item is being planned.
+                record(
+                    self.home,
+                    EV_POOL_PLANNING,
+                    json!({ "repo": self.name, "number": number }),
+                )?;
                 progress(&format!(
                     "#{number} is being planned by another `paja pool plan`; using its plan"
                 ));
@@ -451,6 +466,7 @@ impl Pool<'_> {
             self.home,
             self.name,
             &mut self.planners,
+            &mut self.elsewhere,
             PLAN_LIMIT,
             PLANNER_GRACE,
         )? {
@@ -644,6 +660,19 @@ fn reap_stopped(stopped: &mut Vec<(Child, Instant)>, grace: Duration) {
     });
 }
 
+/// Take out of `elsewhere` the items waited on for longer than `limit`, and return them.
+fn expired(elsewhere: &mut BTreeMap<u64, Instant>, limit: Duration) -> Vec<u64> {
+    let gone: Vec<u64> = elsewhere
+        .iter()
+        .filter(|(_, seen)| seen.elapsed() > limit)
+        .map(|(&n, _)| n)
+        .collect();
+    for number in &gone {
+        elsewhere.remove(number);
+    }
+    gone
+}
+
 /// Take out of `planners` the plans that ended, ending first any going longer than `limit`, and
 /// return each that recorded no plan with why. A plan killed for its time may still have
 /// recorded one in the instant before, which counts like any other.
@@ -651,6 +680,7 @@ fn reap(
     home: &Home,
     repo: &str,
     planners: &mut BTreeMap<u64, (Child, u64, Instant)>,
+    elsewhere: &mut BTreeMap<u64, Instant>,
     limit: Duration,
     grace: Duration,
 ) -> Result<Vec<(u64, String)>> {
@@ -675,9 +705,7 @@ fn reap(
     let events = home.events().read_all()?;
     let mut failed = Vec::new();
     for (number, at) in ended {
-        let kept = planners
-            .remove(&number)
-            .expect("an ended planner is in the map");
+        let kept = planners.remove(&number);
         let planned = events.iter().any(|e| {
             e.seq > at
                 && e.kind == EV_POOL_PLANNED
@@ -687,12 +715,12 @@ fn reap(
         if planned {
             continue;
         }
+        drop(kept);
         // Refused because another plan of the item is running (one started by hand): that one
-        // records the plan, so wait for it, with the planner kept as if it had just started, so
-        // the time limit counts from now.
+        // records the plan, so the pool waits for it as it does when it finds the lock held
+        // before starting a planner, under the same rules and time limit.
         if !overdue.contains(&number) && held.contains(&number) {
-            let (child, at, _) = kept;
-            planners.insert(number, (child, at, Instant::now()));
+            elsewhere.entry(number).or_insert_with(Instant::now);
             continue;
         }
         let why = if overdue.contains(&number) {
@@ -1797,6 +1825,7 @@ mod tests {
             &home,
             "acme/app",
             &mut planners,
+            &mut BTreeMap::new(),
             Duration::from_secs(60),
             quick,
         )
@@ -1832,20 +1861,32 @@ mod tests {
         planners.insert(6, (ended(), at, long_ago));
         let other5 = home.try_plan_lock("acme/app", 5).unwrap().unwrap();
         let other6 = home.try_plan_lock("acme/app", 6).unwrap().unwrap();
-        let failed = reap(&home, "acme/app", &mut planners, limit, grace).unwrap();
+        let mut elsewhere = BTreeMap::new();
+        let failed = reap(
+            &home,
+            "acme/app",
+            &mut planners,
+            &mut elsewhere,
+            limit,
+            grace,
+        )
+        .unwrap();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(planners.keys().copied().collect::<Vec<_>>(), [5, 6]);
-        // The wait counts from the refusal, not from when the planner started.
-        assert!(planners[&5].2.elapsed() < Duration::from_secs(5));
+        // Both now wait on the other plan, as an item the pool found held before starting one
+        // does, with the wait counted from the refusal.
+        assert!(planners.is_empty());
+        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [5, 6]);
+        assert!(elsewhere[&5].elapsed() < Duration::from_secs(5));
         // #5's other plan records its plan and lets go; #6's lets go with none.
         let plan = json!({"repo": "acme/app", "number": 5, "paths": ["src/"], "source": "plan"});
         record(&home, EV_POOL_PLANNED, plan).unwrap();
         drop(other5);
         drop(other6);
-        let failed = reap(&home, "acme/app", &mut planners, limit, grace).unwrap();
-        let numbers: Vec<u64> = failed.iter().map(|(n, _)| *n).collect();
-        assert_eq!(numbers, [6], "{failed:?}");
-        assert!(planners.is_empty());
+        // Past the limit, the wait ends; one not yet past it stays.
+        elsewhere.insert(7, Instant::now());
+        elsewhere.insert(5, Instant::now() - Duration::from_secs(120));
+        assert_eq!(expired(&mut elsewhere, limit), [5]);
+        assert_eq!(elsewhere.keys().copied().collect::<Vec<_>>(), [6, 7]);
     }
 
     #[cfg(unix)]
@@ -1895,13 +1936,28 @@ mod tests {
         let started = Instant::now();
         let limit = Duration::from_secs(1);
         let grace = Duration::from_secs(60);
-        assert!(reap(&home, "acme/app", &mut planners, limit, grace)
-            .unwrap()
-            .is_empty());
+        assert!(reap(
+            &home,
+            "acme/app",
+            &mut planners,
+            &mut BTreeMap::new(),
+            limit,
+            grace
+        )
+        .unwrap()
+        .is_empty());
         assert!(started.elapsed() < Duration::from_secs(5));
         let deadline = Instant::now() + Duration::from_secs(10);
         let failed = loop {
-            let failed = reap(&home, "acme/app", &mut planners, limit, grace).unwrap();
+            let failed = reap(
+                &home,
+                "acme/app",
+                &mut planners,
+                &mut BTreeMap::new(),
+                limit,
+                grace,
+            )
+            .unwrap();
             if !failed.is_empty() || Instant::now() > deadline {
                 break failed;
             }

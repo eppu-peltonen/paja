@@ -11910,9 +11910,23 @@ fn a_pool_waits_for_a_plan_started_by_hand_and_uses_it() {
             .contains("#5 is being planned by another `paja pool plan`")
     });
     std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Recorded once as being planned, so status says so, with no planner of the pool's.
     let planning = events_of(&f, "pool.planning");
-    assert!(planning.is_empty(), "{planning:?}");
+    assert_eq!(planning.len(), 1, "{planning:?}");
+    assert_eq!(planning[0]["data"]["number"], 5, "{planning:?}");
     assert!(events_of(&f, "pool.planned").is_empty());
+    let (_, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    let waiting = status["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["number"] == 5)
+        .unwrap_or_else(|| panic!("#5 not waiting: {status}"))
+        .clone();
+    assert_eq!(
+        waiting["why"], "planning which files it touches",
+        "{status}"
+    );
     // The hand-run plan finishes; the pool admits #5 on it.
     std::fs::remove_file(dir.join("plan-hold")).unwrap();
     std::mem::forget(guard);

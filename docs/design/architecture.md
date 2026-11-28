@@ -272,8 +272,10 @@ name made from another repository stops the plan with the `paja env remove <name
 `plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an OS lock for its
 item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs is refused
 within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no planner of its
-own, says so, counts the item as being planned (it takes one of the free lanes' planning slots), and admits it on the
-plan that one records; after 10 minutes it stops waiting and the plan fails. The plan,
+own, records `pool.planning`, says so, counts the item as being planned (it takes one of the free lanes' planning
+slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A planner of
+the pool's refused because a plan started by hand took the lock just after the pool looked waits the same way. An item
+that leaves the queue meanwhile is no longer waited for. The plan,
 `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
 they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
 `.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
