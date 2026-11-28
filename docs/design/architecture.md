@@ -330,8 +330,9 @@ Then, for at most five rounds:
    question runs to the end of the message), followed by the question, the options and its recommendation. Mestari
    then escalates at once with that question: no checks run and no more rounds are spent, and the round is recorded
    with verdict `question`. Commits the builder made stay on the branch for the next run; uncommitted edits are
-   dropped. Every escalation question, the builder's and a reviewer's alike, is redacted, cut to 4000 characters and
-   has its `@` broken before it goes on the issue, as a follow-up does.
+   dropped. Every escalation question, the builder's and a reviewer's alike, is redacted, has its mentions, code
+   fences and comment markers made inert, and has its middle cut (marked "(cut short)") if it runs past 20,000
+   characters (`QUOTED_CHARS`), before it goes on the issue.
 2. Vasara runs each command in `.paja/checks`, read from the default
    branch. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
