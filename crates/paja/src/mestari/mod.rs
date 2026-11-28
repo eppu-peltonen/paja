@@ -1340,7 +1340,7 @@ fn run_item(
         }
         // A merge Paja handed over must be finished, not committed with its conflicts. It stays
         // in progress, so the next round sees the files that still conflict.
-        if let Some(merge) = unfinished_merge(&env, &target.branch)? {
+        if unfinished_merge(&env, &target.branch)?.is_some() {
             // The next round starts from the conflicts again: restart the merge, so the files
             // hold markers for the builder to resolve.
             git(&env.path, &["merge", "--abort"])?;
@@ -1361,7 +1361,6 @@ fn run_item(
                     target.branch
                 ),
             };
-            let _ = merge;
             if let Some(p) = &prior {
                 feedback.push_str(&format!(
                     "\n\nThe review's blockers still need fixing too:\n\n{}",
