@@ -261,14 +261,15 @@ checkout once it is over an hour old.
 
 Changes land one at a time per repository, each on the latest default branch, whether from a pool's lanes or from
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
-`runs/<owner>@<name>@land.lock`, under the home lock (`land::land_turn`), recording `pool.merging` (`repo`, `number`,
-`round`) while another run holds it and `pool.landing` once it has it; it holds the turn through the push, the pull
+`runs/<owner>@<name>@land.lock`, under the home lock (`land::land_turn`), recording `run.merging` (`repo`, `number`,
+`round`) while another run holds it and `run.landing` once it has it (logs written before these were renamed call them
+`pool.merging` and `pool.landing`, and are read the same); it holds the turn through the push, the pull
 request, CI and the merge, and lets go when the change lands or goes back to its builder. Turns go in the order runs
 began to wait, a pool's lanes and single runs alike (`paja pool status` lists a pool's lanes in that order): a run
-takes a free turn only when no other run of the repository still waiting has a `pool.merging` older than its own, as
-its item's latest `run.started`, `pool.merging`, `pool.landing`, `run.round` or `run.landed` shows. A run still
+takes a free turn only when no other run of the repository still waiting has a `run.merging` older than its own, as
+its item's latest `run.started`, `run.merging`, `run.landing`, `run.round` or `run.landed` shows. A run still
 waits while it holds its item's merging lock, `runs/<owner>@<name>@<number>@merging.lock`, taken with its
-`pool.merging` and let go when it takes the turn or stops waiting, so a `pool.merging` left by a run that stopped or
+`run.merging` and let go when it takes the turn or stops waiting, so a `run.merging` left by a run that stopped or
 died holds no one up. A run back from its builder after a conflict or failed checks at the turn waits again from the
 back. With the turn it merges the
 latest default branch in again: when that branch moved on while it waited, Vasara's checks run again on the merge
@@ -311,7 +312,7 @@ process it started), and it never waits on one while it runs lanes. A planner wh
 is gone, stops the same way.
 
 `paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
-from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
+from each lane's latest `run.merging`, `run.landing`, `run.round` or `run.landed`.
 
 `pool::status` carries everything a live dashboard shows, all replayed from the log and the same through the CLI, the
 MCP tool and Paja Desk, which only draws it. Each lane has `round` (1 up to the five rounds a change gets: the review round, from `run.step` and the

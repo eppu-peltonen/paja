@@ -1,11 +1,26 @@
 use super::*;
 
 /// A run that waits for another to finish landing in the same repository:
-/// `{repo, number, round}`.
-pub(super) const EV_MERGING: &str = "pool.merging";
+/// `{repo, number, round}`. Single runs write it as pool lanes do, so it is a `run.*` event.
+pub(super) const EV_MERGING: &str = "run.merging";
 /// A run that takes its turn to land: `{repo, number, round}`. It holds the turn until the
 /// change lands, or goes back to its builder.
-pub(super) const EV_LANDING: &str = "pool.landing";
+pub(super) const EV_LANDING: &str = "run.landing";
+/// The name [`EV_MERGING`] had in logs written before the rename, read as it.
+pub(super) const OLD_MERGING: &str = "pool.merging";
+/// The name [`EV_LANDING`] had in logs written before the rename, read as it.
+pub(super) const OLD_LANDING: &str = "pool.landing";
+
+/// An event's kind with the turn-to-land events under their current names, so a log written
+/// before the rename reads the same.
+pub(super) fn turn_kind(event: &crate::events::Event) -> &str {
+    match event.kind.as_str() {
+        OLD_MERGING => EV_MERGING,
+        OLD_LANDING => EV_LANDING,
+        other => other,
+    }
+}
+
 /// GitHub's limit for a pull request's description, in characters.
 const PR_BODY_CHARS: usize = 65_536;
 
@@ -13,20 +28,20 @@ const PR_BODY_CHARS: usize = 65_536;
 const LAND_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Wait for this repository's turn to land, taken under the home lock and held for as long as
-/// the returned lock lives. Recorded as `pool.merging` while it waits, `pool.landing` once taken.
+/// the returned lock lives. Recorded as `run.merging` while it waits, `run.landing` once taken.
 /// Turns go in the order runs began to wait, a pool's lanes and single runs alike (`paja pool
 /// status` lists a pool's lanes in that order): a free turn is taken only when no run of the
 /// repository still waiting has waited longer. A run back from its builder after a conflict or
 /// failed checks at the turn waits again from the back. A `stop now` ends the wait.
 ///
 /// While it waits, the run holds its item's merging lock ([`Home::try_merging_lock`]), which
-/// is what tells the others it still waits: a `pool.merging` left by a run that stopped or
+/// is what tells the others it still waits: a `run.merging` left by a run that stopped or
 /// died, or by one whose item a new run has claimed but not brought to the turn yet, holds no
 /// one up. The log is read only when the turn is free, which is seldom; while the longest
 /// waiting run hasn't looked yet, each other waiter reads it once a tick.
 pub(super) fn land_turn(home: &Home, item: &WorkItem, round: u32) -> Result<crate::home::RunLock> {
     let data = json!({ "repo": item.repo, "number": item.number, "round": round });
-    // The seq of this run's `pool.merging`, once it waits, and the lock that says it does.
+    // The seq of this run's `run.merging`, once it waits, and the lock that says it does.
     let mut waiting: Option<(u64, Option<crate::home::RunLock>)> = None;
     let mut announced = false;
     let mut probe_failed = false;
@@ -85,8 +100,8 @@ pub(super) fn land_turn(home: &Home, item: &WorkItem, round: u32) -> Result<crat
 }
 
 /// The items of `repo` other than `number` whose runs have waited for the turn to land longer
-/// than this one: since `mine`, the seq of this run's `pool.merging`, or at all when it hasn't
-/// waited yet. An item's latest `run.started`, `pool.merging`, `pool.landing`, `run.round` or
+/// than this one: since `mine`, the seq of this run's `run.merging`, or at all when it hasn't
+/// waited yet. An item's latest `run.started`, `run.merging`, `run.landing`, `run.round` or
 /// `run.landed` says whether it waits, and only a run still waiting (`held`: its item's merging
 /// lock is held) counts, so a run stopped or ended while it waited holds no one up.
 fn waiting_ahead(
@@ -99,7 +114,7 @@ fn waiting_ahead(
     let mut latest: std::collections::BTreeMap<u64, &crate::events::Event> = Default::default();
     for e in events {
         if e.data["repo"] != repo
-            || ![EV_STARTED, EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&e.kind.as_str())
+            || ![EV_STARTED, EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&turn_kind(e))
         {
             continue;
         }
@@ -109,7 +124,7 @@ fn waiting_ahead(
     }
     latest
         .into_iter()
-        .filter(|(_, e)| e.kind == EV_MERGING && mine.is_none_or(|mine| e.seq < mine))
+        .filter(|(_, e)| turn_kind(e) == EV_MERGING && mine.is_none_or(|mine| e.seq < mine))
         .map(|(n, _)| n)
         .filter(|n| held(*n))
         .collect()
@@ -764,6 +779,37 @@ mod tests {
                 "{kind}"
             );
         }
+        // A log written before the rename says `pool.merging` and `pool.landing`: read the same.
+        let renamed = |events: &[crate::events::Event]| -> Vec<crate::events::Event> {
+            events
+                .iter()
+                .cloned()
+                .map(|mut e| {
+                    e.kind = match e.kind.as_str() {
+                        EV_MERGING => OLD_MERGING.to_string(),
+                        EV_LANDING => OLD_LANDING.to_string(),
+                        _ => e.kind,
+                    };
+                    e
+                })
+                .collect()
+        };
+        let old = renamed(&events);
+        assert_eq!(waiting_ahead(&old, "o/r", 5, Some(6), all), [6, 7]);
+        let mut took_turn = events.clone();
+        took_turn.push(ev(8, EV_LANDING, 6));
+        assert_eq!(
+            waiting_ahead(&renamed(&took_turn), "o/r", 5, Some(6), all),
+            [7]
+        );
+        // A log upgraded midway: #6 began to wait before the rename, #7 and #5 after.
+        let mut mixed = events.clone();
+        mixed[3].kind = OLD_MERGING.to_string();
+        assert_eq!(waiting_ahead(&mixed, "o/r", 5, Some(6), all), [6, 7]);
+        assert_eq!(waiting_ahead(&mixed, "o/r", 7, Some(5), all), [6]);
+        // #6 then takes the turn under the new name, and waits no more.
+        mixed.push(ev(8, EV_LANDING, 6));
+        assert_eq!(waiting_ahead(&mixed, "o/r", 5, Some(6), all), [7]);
     }
 
     #[test]

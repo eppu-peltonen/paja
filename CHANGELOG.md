@@ -10,6 +10,7 @@ when tagging `vX.Y.Z`, rename Unreleased to `X.Y.Z` (the release workflow reads 
 - `paja doctor` warns of an environment left over from a closed item (a parked item keeps its worktree and ports), and names the `paja env remove` that frees it.
 - `paja usage` gives the 90th percentile of wall time per landed item in its summary line, next to the median.
 - `paja doctor` quotes and escapes the role words it names as skipped in `.paja/models`, so a control character in the file never reaches the terminal.
+- The events a run writes while it waits for and takes the turn to land are now `run.merging` and `run.landing`, since single runs write them as pool lanes do; logs with the old `pool.merging` and `pool.landing` still read the same.
 
 ## 0.1.0
 

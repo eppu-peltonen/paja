@@ -149,8 +149,8 @@ impl Home {
     }
 
     /// Take the lock a run holds while it waits for `repo`'s turn to land with item `number`,
-    /// without waiting. None when another holds it. Held from the run's `pool.merging` until it
-    /// takes the turn or stops waiting, so a `pool.merging` whose lock is free is one nobody
+    /// without waiting. None when another holds it. Held from the run's `run.merging` until it
+    /// takes the turn or stops waiting, so a `run.merging` whose lock is free is one nobody
     /// waits on any more.
     pub fn try_merging_lock(&self, repo: &str, number: u64) -> Result<Option<RunLock>> {
         self.try_runs_lock(repo, &format!("{number}@merging"))
