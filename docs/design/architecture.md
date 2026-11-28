@@ -658,9 +658,12 @@ while it starts.
   of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current
   directory or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not
   spelling). Git passes the git directory down to every process it starts (hooks, `!` aliases, submodule commands),
-  so the shim clears an inherited `GIT_DIR` and `GIT_WORK_TREE` that name the worktree's git directory for git
-  commands aimed outside the worktree. A caller's own `GIT_DIR`, `--git-dir` or `--work-tree` is left alone, and other
-  git commands run unchanged. The `.git` file on the host is never rewritten. Only the git
+  so for git commands aimed outside the worktree the shim clears an inherited `GIT_DIR` that is the worktree's git
+  directory and an inherited `GIT_WORK_TREE` that is the worktree, each also on its own, compared by identity (another
+  spelling, a symlink or a mount path of the same directory counts). A caller's own `GIT_DIR` or `GIT_WORK_TREE` (any
+  other directory), `--git-dir` or `--work-tree` is left alone, and other git commands run unchanged; a caller that
+  sets `GIT_DIR` to the worktree's own git directory from outside it can't be told from git handing it down, so that is
+  cleared too. The `.git` file on the host is never rewritten. Only the git
   found on `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses
   it. The unit tests run the shim against a fake git on the host; the check against real `sbx` is manual. On
   Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status` and
