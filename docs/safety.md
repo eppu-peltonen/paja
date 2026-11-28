@@ -25,27 +25,30 @@ safety improvements arrive with Claude Code updates, so keep Claude Code current
 **Without a sandbox, code an agent writes runs as you when the checks run.** The hook is a guardrail, not a sandbox.
 Tests and build scripts on the branch run as your user, with your files and your sign-ins (for example credential files
 in your home folder). Paja detects changes to git's configuration and hooks and stops (see below), but it cannot see
-everything such code does. `paja doctor` warns while no sandbox is set, and `paja run` says so before it starts.
+everything such code does. `paja doctor` warns while there is no sandbox, and `paja run` says so before it starts.
 
-## The optional sandbox
+## The sandbox
 
-It stays optional, and nothing requires Docker. Use it when people outside your team can write the repository's issues
-or code, and for long unattended runs (`paja run --every`, pools with `--workers`).
+When [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`) is installed, `paja run` (and `paja run
+--workers`, `paja triage` and `paja init`'s agents) runs every agent and every check inside one sandbox named `paja`.
+You don't set anything: Paja finds `sbx` on your `PATH`. Nothing requires Docker either; without `sbx`, agents and
+checks run on your machine as described above.
 
-Set `PAJA_SBX` to the [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) program and `paja run` runs every agent
-and every check inside one sandbox named `paja`:
-
-```sh
-PAJA_SBX=sbx paja run --once
-```
-
-On Windows, PowerShell: `$env:PAJA_SBX = "sbx"`. Then:
-
-1. Install Docker Sandboxes (`sbx`) first. If it can't start, `paja run` stops with an error; it never falls back to
-   running on your machine.
-2. Sign in to Claude Code once inside the sandbox: `sbx exec -it paja claude`, then `/login`.
+1. Install Docker Sandboxes (`sbx`). Before a run uses it, Paja checks that `sbx version` and `sbx ls` work (`sbx ls`
+   needs the Docker engine), for at most about 10 seconds. If they don't, `paja run` stops with an error that says to
+   start Docker Desktop. It never falls back to running on your machine, then or later in the run.
+2. Sign in to Claude Code once inside the sandbox: `sbx exec -it paja claude`, then `/login`. (The first run creates
+   the sandbox; a run whose agent finds it isn't signed in parks the item with this command in the question.)
 3. If the project's checks need tools, put a POSIX shell script in `.paja/setup` on the default branch. Paja runs it in
    the sandbox once, and again when it changes.
+
+`PAJA_SBX` overrides the choice. `PAJA_SBX=off` (or an empty value) always runs on your machine, without asking `sbx`
+anything. `PAJA_SBX=<program>` names the `sbx` program to use, as a path or a name on `PATH`; then a sandbox that can't
+start stops the run in the same way. On Windows, PowerShell: `$env:PAJA_SBX = "off"`.
+
+`paja doctor` and the first progress line of `paja run` say which way agents run and why: `sbx` found on `PATH`,
+`PAJA_SBX` set, `PAJA_SBX` off, or no `sbx` found. Each `run.started` event in the log records it too, as `backend`
+(`sandbox` or `host`) and `backend_why` (`detected`, `set`, `off` or `not_found`).
 
 What it adds: code only reaches the worktrees and the repository's `.git` directory. Your home folder, credential files,
 global git configuration, Paja's event log and the hook's binary are not in it, and neither are your environment

@@ -1111,7 +1111,14 @@ fn run_item(
     record(
         home,
         EV_STARTED,
-        json!({ "repo": item.repo, "number": item.number, "env": env.name, "base": base }),
+        json!({
+            "repo": item.repo,
+            "number": item.number,
+            "env": env.name,
+            "base": base,
+            "backend": if crate::sandbox::active().is_some() { "sandbox" } else { "host" },
+            "backend_why": crate::sandbox::backend_why().as_str(),
+        }),
     )?;
 
     let mut feedback = String::new();
@@ -4145,7 +4152,7 @@ mod tests {
         )
         .unwrap();
         let prefixes = super::lines(&text);
-        for file in ["agent.rs", "land.rs", "mod.rs"] {
+        for file in ["agent.rs", "land.rs", "mod.rs", "plan.rs"] {
             let path = format!("crates/paja/src/mestari/{file}");
             assert!(super::is_high_risk(&path, &prefixes), "{path}");
         }
@@ -4665,7 +4672,6 @@ mod tests {
             "mestari/builder.rs",
             "mestari/follow_ups.rs",
             "mestari/live.rs",
-            "mestari/plan.rs",
             "mestari/pool.rs",
             "mestari/progress.rs",
             "mestari/usage.rs",

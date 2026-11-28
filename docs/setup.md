@@ -1,7 +1,7 @@
 # Setting up Paja
 
 How to install Paja and start it on its own queue. Paja runs natively on Windows, Linux and macOS. Before the first
-run, read [`safety.md`](./safety.md): what the agents can do on your machine, the optional sandbox and a GitHub token
+run, read [`safety.md`](./safety.md): what the agents can do on your machine, the sandbox and a GitHub token
 limited to one repository.
 
 ## What Paja needs
@@ -223,10 +223,10 @@ When a check fails, or the detection finds no check, nothing is committed or pus
 the clone stays with the files, the error names the check that failed (with its output) and says so, and you fix it in
 the clone and commit and push by hand, or delete the repository (`gh repo delete <owner>/<name>`, after
 `gh auth refresh -s delete_repo`) and the clone. The three agent sessions each spend usage on the `init` model of
-`.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox (`PAJA_SBX`)
-the agent and the checks run in it, with the clone mounted. Set one for a generated skeleton when you can: the stack's
-own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any code they are given, so
-without a sandbox the hook can't keep the agent from running arbitrary code as you.
+`.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox (`sbx`
+installed, or `PAJA_SBX`) the agent and the checks run in it, with the clone mounted. Use one for a generated skeleton
+when you can: the stack's own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any
+code they are given, so without a sandbox the hook can't keep the agent from running arbitrary code as you.
 
 ## Check the setup
 
@@ -263,8 +263,10 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.
 - `.paja/models` on the default branch parses. It is a warning when a line names a role this Paja doesn't know: that
   line is skipped, so the role runs on the default model or turn cap. Install the newer Paja, or fix the typo.
-- The sandbox: a warning, not a failure, when `PAJA_SBX` is not set. Agents and checks then run as your user, with
-  your files and sign-ins, behind the deny-list hook only.
+- The sandbox: which way agents run and why. With `sbx` on `PATH` (and `PAJA_SBX` unset), it checks that `sbx version`
+  and `sbx ls` work, and fails with the fix when they don't. A warning, not a failure, when there is no `sbx` or
+  `PAJA_SBX=off`: agents and checks then run as your user, with your files and sign-ins, behind the deny-list hook
+  only.
 
 With `--json` it prints `{"checks": [{"name", "status", "detail", "fix"}], "ok": bool}`; `fix` is null for a passing
 check, and `ok` is false when any check failed (a warning doesn't count). The exit code is non-zero when any check
@@ -277,9 +279,9 @@ failed. The MCP tool `doctor` returns the same JSON.
   Code current.
 - **On top: the deny-list hook** (`paja hook`). A thin extra layer for what only Paja knows: no `git push`, only the
   programs in `.paja/commands`, and fail closed. It is not a sandbox and does not stand in for auto mode.
-- **Optional: the sandbox** (`PAJA_SBX`, Docker Sandboxes). Recommended when people outside your team can write the
-  repository's issues or code, and for long unattended runs (`paja run --every`, `--workers` pools). Nothing requires
-  Docker; see [`safety.md`](./safety.md).
+- **The sandbox** (Docker Sandboxes, `sbx`). Used whenever `sbx` is installed, unless `PAJA_SBX=off`. Install it
+  when people outside your team can write the repository's issues or code, and for long unattended runs (`paja run
+  --every`, `--workers` pools). Nothing requires Docker; see [`safety.md`](./safety.md).
 
 ## Using Paja from Claude Code
 

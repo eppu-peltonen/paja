@@ -744,28 +744,49 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
 }
 
 fn sandbox(checks: &mut Vec<Check>) {
+    use crate::sandbox::Why;
     let var = crate::sandbox::PROGRAM_VAR;
-    match crate::sandbox::configured() {
-        Some(program) => match run(Command::new(&program).arg("version")) {
-            Ok(out) if out.status.success() => {
-                checks.push(ok("sandbox", format!("{var} is {program}")))
+    let choice = crate::sandbox::chosen();
+    let said = choice.describe();
+    match (&choice.program, choice.why) {
+        (Some(program), Why::Detected) => {
+            match crate::sandbox::probe_within(program, crate::sandbox::PROBE_LIMIT) {
+                Ok(()) => checks.push(ok("sandbox", said)),
+                Err(cause) => checks.push(failed(
+                    "sandbox",
+                    format!("{said}, but {cause}"),
+                    crate::sandbox::probe_fix(program),
+                )),
             }
+        }
+        (Some(program), _) => match run(Command::new(program).arg("version")) {
+            Ok(out) if out.status.success() => checks.push(ok("sandbox", said)),
             // It started but failed: a broken or wrong `sbx` must not look set up.
             Ok(out) => checks.push(failed(
                 "sandbox",
                 format!("{var} is {program}, and `{program} version` failed: {}", text(&out)),
-                format!("fix or reinstall `sbx` and point {var} at it, or unset {var} to run without a sandbox"),
+                format!("fix or reinstall `sbx` and point {var} at it, or set {var}=off to run without a sandbox"),
             )),
             Err(err) => checks.push(failed(
                 "sandbox",
                 format!("{var} is {program}, which did not run: {err}"),
-                format!("install `sbx` and point {var} at it, or unset {var} to run without a sandbox"),
+                format!("install `sbx` and point {var} at it, or set {var}=off to run without a sandbox"),
             )),
         },
-        None => checks.push(warning(
+        (None, Why::NotFound) if crate::sandbox::detected_earlier() => checks.push(failed(
             "sandbox",
-            format!("{var} is not set, so agents and checks run as this user, with your files and sign-ins"),
-            format!("install `sbx` and set {var} to it for a sandbox (see docs/setup.md)"),
+            format!("{said}, though this Paja ran agents in it earlier"),
+            crate::sandbox::lost_sbx(),
+        )),
+        (None, Why::Off) => checks.push(warning(
+            "sandbox",
+            format!("{said}, so agents and checks run as this user, with your files and sign-ins"),
+            format!("unset {var} to use `sbx` when it is installed (see docs/setup.md)"),
+        )),
+        (None, _) => checks.push(warning(
+            "sandbox",
+            format!("{said}, so agents and checks run as this user, with your files and sign-ins"),
+            "install `sbx`, which Paja then uses (see docs/setup.md)".to_string(),
         )),
     }
 }
