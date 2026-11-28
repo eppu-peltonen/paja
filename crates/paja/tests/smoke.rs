@@ -10116,6 +10116,19 @@ fn init_new_pushes_a_generated_skeleton_whose_checks_pass() {
     );
 }
 
+/// A failed generated skeleton's error says once how to clean up after `gh repo create`: the
+/// repository to delete, the scope that takes, and the folder to remove.
+fn assert_names_the_cleanup(error: &str, tmp: &tempfile::TempDir) {
+    let dir = tmp.path().join("work").join("zippy");
+    assert!(
+        error.contains("`gh repo delete acme/")
+            && error.contains("gh auth refresh -s delete_repo")
+            && error.contains(&format!("and remove {}", dir.display()))
+            && error.matches("gh repo delete").count() == 1,
+        "{error}"
+    );
+}
+
 /// Whether anything reached origin's `main`.
 fn pushed(origin: &Path) -> bool {
     Command::new("git")
@@ -10129,21 +10142,29 @@ fn pushed(origin: &Path) -> bool {
 
 #[test]
 fn init_new_says_so_when_the_skeleton_agent_writes_nothing() {
-    let (_tmp, origin, ok, out) = init_new_generated_with("test -f build.zig", "true");
+    let (tmp, origin, ok, out) = init_new_generated_with("test -f build.zig", "true");
     assert!(!ok, "{out}");
     let error = out["error"].as_str().unwrap();
     assert!(
         error.contains("the init agent wrote no files for the zig skeleton")
             && error.contains("delete the new repository on GitHub")
+            && error.contains("`gh repo delete acme/")
+            && error.contains("gh auth refresh -s delete_repo")
+            && !error.contains("`gh repo delete`")
+            && error.contains(&format!(
+                "and remove {}",
+                tmp.path().join("work").join("zippy").display()
+            ))
             && error.contains("paja init --new"),
         "{error}"
     );
+    assert_names_the_cleanup(error, &tmp);
     assert!(!pushed(&origin));
 }
 
 #[test]
 fn init_new_pushes_nothing_when_no_check_is_found_for_a_generated_skeleton() {
-    let (_tmp, origin, ok, out) = init_new_generated("");
+    let (tmp, origin, ok, out) = init_new_generated("");
     assert!(!ok, "{out}");
     let error = out["error"].as_str().unwrap();
     assert!(
@@ -10151,6 +10172,7 @@ fn init_new_pushes_nothing_when_no_check_is_found_for_a_generated_skeleton() {
             && error.contains("nothing was pushed"),
         "{error}"
     );
+    assert_names_the_cleanup(error, &tmp);
     assert!(!pushed(&origin));
 }
 
@@ -10166,6 +10188,13 @@ fn init_new_refuses_a_skeleton_the_agent_committed() {
     assert!(
         error.contains("the init agent committed or switched branches")
             && error.contains("delete the new repository on GitHub")
+            && error.contains("`gh repo delete acme/")
+            && error.contains("gh auth refresh -s delete_repo")
+            && !error.contains("`gh repo delete`")
+            && error.contains(&format!(
+                "and remove {}",
+                tmp.path().join("work").join("zippy").display()
+            ))
             && error.contains("paja init --new"),
         "{error}"
     );
@@ -10173,6 +10202,7 @@ fn init_new_refuses_a_skeleton_the_agent_committed() {
         error.contains(&tmp.path().join("work").join("zippy").display().to_string()),
         "{error}"
     );
+    assert_names_the_cleanup(error, &tmp);
     assert!(!pushed(&origin));
 }
 
@@ -10201,6 +10231,7 @@ fn init_new_pushes_nothing_when_a_generated_skeletons_check_fails() {
         "{error}"
     );
     assert!(error.contains("Nothing was committed or pushed"), "{error}");
+    assert_names_the_cleanup(error, &tmp);
     // The clone stays, with the files and no commit; origin has no branch.
     let dir = tmp.path().join("work").join("zippy");
     assert!(dir.join("build.zig").is_file() && dir.join(".paja/checks").is_file());
