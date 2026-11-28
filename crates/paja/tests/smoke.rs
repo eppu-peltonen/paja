@@ -9537,12 +9537,47 @@ fn paja_sbx_name_names_the_sandbox_paja_creates_and_runs_in() {
     );
 }
 
+/// A fake `sbx` like [`fake_sbx`] that also models how `sbx exec -i` hangs: it passes stdin only
+/// with `-i`, and when the program inside exits with some of it unread, it leaves
+/// `stdin-left-unread` (where the real one would never return).
+fn fake_sbx_that_hangs_on_unread_stdin(dir: &Path) -> std::path::PathBuf {
+    let body = "#!/bin/sh\necho \"$*\" >> D/sbx.log\n\
+         case \"$1\" in\ncreate) : > D/created; exit 0 ;;\nexec) shift; keep=\n\
+         [ -f D/created ] || { echo 'no such sandbox' >&2; exit 1; }\n\
+         while [ \"$1\" != \"--\" ]; do case \"$1\" in -i) keep=1; shift ;; -w) cd \"$2\"; shift 2 ;; -e) export \"$2\"; shift 2 ;; *) shift ;; esac; done\n\
+         shift\n\
+         case \"$*\" in *\"cc --version\"*) exit 0 ;; esac\n\
+         [ -n \"$keep\" ] || exec \"$@\" < /dev/null\n\
+         cat > D/sbx-stdin-$$\n\
+         exec 3< D/sbx-stdin-$$\n\
+         \"$@\" <&3; status=$?\n\
+         left=$(wc -c <&3); [ $left -gt 0 ] && : > D/stdin-left-unread\n\
+         rm -f D/sbx-stdin-$$; exit $status ;;\nesac\n"
+        .replace('D', &slash(dir));
+    program(dir, "sbx", &body)
+}
+
 #[test]
-fn agents_in_the_sandbox_read_their_prompt_from_a_file_not_from_sbx_exec_stdin() {
-    // `sbx exec -i` can hang for good when the program exits before reading all its stdin, so
-    // the prompt reaches the agent from a file in the repository's git data instead.
+fn the_fake_sbx_notices_a_program_that_leaves_stdin_unread() {
+    // The tests below rely on it: a program that exits without reading its stdin is caught.
+    let tmp = tempfile::tempdir().unwrap();
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(tmp.path());
+    std::fs::write(tmp.path().join("created"), "").unwrap();
+    let mut child = Command::new(&sbx)
+        .args(["exec", "-i", "paja", "--", "sh", "-c", "exit 0"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"a prompt").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(tmp.path().join("stdin-left-unread").exists());
+}
+
+#[test]
+fn agents_in_the_sandbox_get_their_prompt_on_stdin_and_sbx_sees_it_read_to_the_end() {
     let f = Factory::new("true\n", "land");
-    let sbx = fake_sbx(f.tmp.path());
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
     let (ok, report) = paja_with(
         &f.home,
         &f.repo,
@@ -9556,19 +9591,48 @@ fn agents_in_the_sandbox_read_their_prompt_from_a_file_not_from_sbx_exec_stdin()
     assert!(ok, "{report}");
     assert_eq!(report["outcome"], "landed", "{report}");
     let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
-    assert!(!log.contains("exec -i"), "{log}");
-    assert!(log.contains("paja-prompts"), "{log}");
-    // Both the builder and the reviewer got their prompt on stdin.
+    assert!(log.contains("exec -i"), "{log}");
+    assert!(!f.tmp.path().join("stdin-left-unread").exists(), "{log}");
     assert!(f.tmp.path().join("prompt-on-stdin").exists());
     let calls = f.claude_calls();
     assert!(calls.len() >= 2, "{calls:?}");
     assert!(calls.iter().all(|c| c.contains("#5")), "{calls:?}");
-    // Every prompt file is gone once its agent is done.
-    let prompts = f.repo.join(".git").join("paja-prompts");
-    let left: Vec<_> = std::fs::read_dir(&prompts)
-        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
-        .unwrap_or_default();
-    assert!(left.is_empty(), "{left:?}");
+    // The prompt is never written to a file the sandbox can reach.
+    assert!(!f.repo.join(".git").join("paja-prompts").exists());
+}
+
+#[test]
+fn an_agent_in_the_sandbox_that_exits_without_reading_its_prompt_does_not_hang_sbx() {
+    // The real `sbx exec -i` never returns when this happens, which hung sandboxed runs.
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let claude = program(
+        f.tmp.path(),
+        "claude-that-fails-early",
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *--version*) exec {} \"$@\" ;; esac\n\
+             : > {}/failed-early; echo 'failed early' >&2; exit 1\n",
+            slash(&f.claude),
+            slash(f.tmp.path())
+        ),
+    );
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert!(f.tmp.path().join("failed-early").exists(), "{report} {log}");
+    assert!(log.contains("exec -i"), "{log}");
+    assert!(
+        !f.tmp.path().join("stdin-left-unread").exists(),
+        "{report} {log}"
+    );
 }
 
 #[test]

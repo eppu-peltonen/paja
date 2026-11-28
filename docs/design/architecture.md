@@ -702,10 +702,9 @@ while it starts.
   `sandbox-exec` don't exist on every platform Paja runs on. So Paja has one backend, and the owner opts in.
 - **Assumptions about `sbx`.** Everything Paja assumes about it is in `crates/paja/src/sandbox.rs`: `sbx exec`
   with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, and that a mounted path has the same absolute
-  path inside the sandbox. Paja never pipes an agent's prompt through `sbx exec -i`: when the program inside exits
-  without reading all of its stdin, the exec never returns. Mestari writes the prompt to a file under the
-  repository's git directory (`paja-prompts/`, which the sandbox mounts), runs `claude` with its stdin redirected from
-  that file inside the sandbox, gives `sbx` no stdin, and removes the file when the agent ends.
+  path inside the sandbox, and that `sbx exec -i` passes stdin through. It never returns when the program inside exits
+  before reading all of its stdin, so an agent's command reads its prompt to the end in a shell first and gets it
+  from a pipe; the prompt is never written to a file the sandbox can reach.
 - **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
   which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
