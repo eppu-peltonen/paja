@@ -2448,7 +2448,8 @@ impl Factory {
                  input=$(cat); [ -n \"$input\" ] && : > {d}/prompt-on-stdin; first=$1; shift; set -- \"$first\" \"$input\" \"$@\"\n\
                  echo \"$*\" >> {d}/claude-args.log\n\
                  case \"$*\" in\n\
-                 *PAJA-PLAN*) p='\"feature.txt\"'; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) p=\"\\\"$t.txt\\\"\" ;; esac; done\n\
+                 *PAJA-PLAN*) while [ -f {d}/plan-hold ]; do : > {d}/plan-alive; sleep 0.1; done\n\
+                 p='\"feature.txt\"'; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) p=\"\\\"$t.txt\\\"\" ;; esac; done\n\
                  echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"paths\\\": [$p]}}}}\" ;;\n\
                  *\"You are Paja's arbiter\"*) cat {d}/arbiter.json 2>/dev/null || echo '{{\"is_error\": false, \"structured_output\": {{\"verdict\": \"escalate\"}}}}' ;;\n\
                  *--json-schema*) if [ -f {d}/review-hang ]; then : > {d}/review-hanging; while [ -f {d}/review-hang ]; do sleep 0.1; done; exit 1; fi\n\
@@ -10887,6 +10888,151 @@ fn a_stopping_pools_lanes_leave_the_stop_now_hint_to_the_pool() {
             !line.contains("stop now") && !line.contains("Ctrl-C"),
             "{line}\n{err}"
         );
+    }
+}
+
+/// A pool that stops while it plans ends the planning agent too, not only `paja pool plan`.
+#[cfg(unix)]
+#[test]
+fn a_stopping_pool_ends_its_planners_agents() {
+    let f = pool_factory(false);
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("plan-hold"), "").unwrap();
+    let pool = start_pool(&f, "1");
+    wait_until(&f, "a planner's agent running", || {
+        dir.join("plan-alive").exists()
+    });
+    let reports = stop_pool(&f, pool);
+    assert!(reports.is_empty(), "{reports:?}");
+    // The agent's loop marks itself alive every tenth of a second while it runs.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::remove_file(dir.join("plan-alive")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let alive = dir.join("plan-alive").exists();
+    std::fs::remove_file(dir.join("plan-hold")).unwrap();
+    assert!(!alive, "the planning agent outlived the pool");
+    // A stopped plan is not a failed one, and the planner says nothing about stopping.
+    let failed = events_of(&f, "pool.planned");
+    assert!(
+        failed.iter().all(|e| e["data"]["source"] != "failed"),
+        "{failed:?}"
+    );
+    let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
+    assert!(
+        !err.lines()
+            .any(|l| l.starts_with("plan #") && l.contains("stopping")),
+        "{err}"
+    );
+}
+
+/// A terminal's Ctrl-C reaches the pool, not its planners: the pool tells each `stop now`, so
+/// the planning agent ends with them.
+#[cfg(unix)]
+#[test]
+fn a_ctrl_c_at_the_terminal_ends_a_pools_planners_agents() {
+    use std::os::unix::process::CommandExt as _;
+    let f = pool_factory(false);
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("plan-hold"), "").unwrap();
+    let log = std::fs::File::create(dir.join("pool.err")).unwrap();
+    // A process group of its own stands in for the terminal's, which Ctrl-C signals whole.
+    let pool = Command::new(env!("CARGO_BIN_EXE_paja"))
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env_remove("PAJA_SBX")
+        .args(["--json", "run", "--every", "1", "--workers", "1"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let guard = EndOnPanic(pool.id());
+    wait_until(&f, "a planner's agent running", || {
+        dir.join("plan-alive").exists()
+    });
+    let group = format!("-{}", pool.id());
+    let sent = Command::new("kill")
+        .args(["-INT", "--", &group])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    std::mem::forget(guard);
+    let output = output_within(pool, std::time::Duration::from_secs(60));
+    let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
+    assert!(output.status.success(), "{err}");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = std::fs::remove_file(dir.join("plan-alive"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let alive = dir.join("plan-alive").exists();
+    std::fs::remove_file(dir.join("plan-hold")).unwrap();
+    assert!(!alive, "the planning agent outlived the Ctrl-C\n{err}");
+}
+
+/// A planner told `stop now`, or whose stdin closes because its pool is gone, ends its agent and
+/// records no plan, so the pool's own reason stands.
+#[cfg(unix)]
+#[test]
+fn a_planner_stopped_now_or_left_by_its_pool_ends_its_agent_and_records_no_plan() {
+    use std::io::Write as _;
+    let f = pool_factory(false);
+    let dir = f.tmp.path();
+    let (ok, synced) = paja_with(
+        &f.home,
+        &f.repo,
+        &["work", "sync"],
+        &[("PAJA_GH", f.gh.as_path())],
+    );
+    assert!(ok, "{synced}");
+    for say_stop_now in [true, false] {
+        std::fs::write(dir.join("plan-hold"), "").unwrap();
+        let _ = std::fs::remove_file(dir.join("plan-alive"));
+        let mut planner = Command::new(env!("CARGO_BIN_EXE_paja"))
+            .current_dir(&f.repo)
+            .env("PAJA_HOME", &f.home)
+            .env("PAJA_GH", &f.gh)
+            .env("PAJA_CLAUDE", &f.claude)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .env_remove("PAJA_SBX")
+            .args(["--json", "pool", "plan", "7", "--stop-on-stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let guard = EndOnPanic(planner.id());
+        wait_until(&f, "the planning agent running", || {
+            dir.join("plan-alive").exists()
+        });
+        let mut stdin = planner.stdin.take().unwrap();
+        // Told `stop now`, the planner must stop with its stdin still open.
+        let open = if say_stop_now {
+            writeln!(stdin, "stop now").unwrap();
+            stdin.flush().unwrap();
+            Some(stdin)
+        } else {
+            drop(stdin);
+            None
+        };
+        std::mem::forget(guard);
+        let output = output_within(planner, std::time::Duration::from_secs(30));
+        drop(open);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{err}");
+        assert!(!err.contains("stopping"), "{err}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::fs::remove_file(dir.join("plan-alive")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let alive = dir.join("plan-alive").exists();
+        std::fs::remove_file(dir.join("plan-hold")).unwrap();
+        assert!(
+            !alive,
+            "the planning agent outlived its planner (stop now: {say_stop_now})"
+        );
+        let planned = events_of(&f, "pool.planned");
+        assert!(planned.is_empty(), "{planned:?}");
     }
 }
 
