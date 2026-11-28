@@ -12964,6 +12964,178 @@ fn a_busy_pool_plans_its_next_item_ahead_and_no_more() {
     }
 }
 
+/// A pool admits an item on a plan made before it started, and plans again one whose text
+/// changed since its plan.
+#[cfg(unix)]
+#[test]
+fn a_pool_reuses_an_earlier_plan_and_plans_an_edited_item_again() {
+    let f = pool_factory(false);
+    let issues_at = |touches: &str| {
+        serde_json::json!([
+            {"number": 5, "title": "Alpha feature", "body": "Please.", "url": "https://example.com/5"},
+            {"number": 6, "title": "Beta feature", "body": format!("Please.\n\nTouches: {touches}"),
+             "url": "https://example.com/6"},
+            {"number": 7, "title": "Gamma feature", "body": "Please.", "url": "https://example.com/7"},
+        ])
+        .to_string()
+    };
+    let issues = f.tmp.path().join("issues.json");
+    std::fs::write(&issues, issues_at("docs/old.md")).unwrap();
+    let vars = [
+        ("PAJA_GH", f.gh.as_path()),
+        ("PAJA_CLAUDE", f.claude.as_path()),
+    ];
+    let (ok, synced) = paja_with(&f.home, &f.repo, &["work", "sync"], &vars);
+    assert!(ok, "{synced}");
+    for n in ["5", "6", "7"] {
+        let (ok, plan) = paja_with(&f.home, &f.repo, &["pool", "plan", n], &vars);
+        assert!(ok, "{plan}");
+        assert!(plan["basis"].is_string(), "{plan}");
+    }
+    // #6's `Touches:` line is edited; the sync a pool makes as it starts records the edit before
+    // it admits anything.
+    std::fs::write(&issues, issues_at("docs/new.md")).unwrap();
+    let pool = start_pool(&f, "1");
+    wait_until(&f, "Alpha building", || holding(&f, "Alpha"));
+    let planned_6 = || {
+        events_of(&f, "pool.planned")
+            .iter()
+            .filter(|e| e["data"]["number"] == 6)
+            .count()
+    };
+    wait_until(&f, "Beta planned again", || planned_6() == 2);
+    let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert!(ok, "{status}");
+    assert_eq!(
+        status["lanes"][0]["paths"],
+        serde_json::json!(["Alpha.txt"]),
+        "{status}"
+    );
+    let waiting = |n: u64| {
+        status["waiting"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["number"] == n)
+            .unwrap_or_else(|| panic!("{status}"))["paths"]
+            .clone()
+    };
+    assert_eq!(waiting(6), serde_json::json!(["docs/new.md"]));
+    assert_eq!(waiting(7), serde_json::json!(["Gamma.txt"]));
+    for t in ["Alpha", "Beta", "Gamma"] {
+        release(&f, t);
+    }
+    wait_until(&f, "all three landing", || landed(&f) == 3);
+    assert_eq!(stop_pool(&f, pool).len(), 3);
+    // The pool planned only #6, the edited item; #5 and #7 ran on the plans made by hand.
+    let planning: Vec<u64> = events_of(&f, "pool.planning")
+        .iter()
+        .map(|e| e["data"]["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(planning, [6]);
+}
+
+/// Plans made before main listed their files in `.paja/high-risk` are judged by the list main
+/// has when the pool runs: the two items, high risk now, share one lane.
+#[cfg(unix)]
+#[test]
+fn a_pool_judges_reused_plans_by_the_high_risk_list_main_has_now() {
+    let f = pool_factory(false);
+    let vars = [
+        ("PAJA_GH", f.gh.as_path()),
+        ("PAJA_CLAUDE", f.claude.as_path()),
+    ];
+    let (ok, synced) = paja_with(&f.home, &f.repo, &["work", "sync"], &vars);
+    assert!(ok, "{synced}");
+    for n in ["5", "6"] {
+        let (ok, plan) = paja_with(&f.home, &f.repo, &["pool", "plan", n], &vars);
+        assert!(ok, "{plan}");
+        assert_eq!(plan["high_risk"], false, "{plan}");
+    }
+    f.on_main(".paja/high-risk", "Alpha.txt\nBeta.txt\n");
+    let pool = start_pool(&f, "2");
+    wait_until(&f, "Alpha and Gamma building", || {
+        holding(&f, "Alpha") && holding(&f, "Gamma")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(!holding(&f, "Beta"), "two high-risk items ran at once");
+    let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert!(ok, "{status}");
+    let beta = status["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["number"] == 6)
+        .unwrap_or_else(|| panic!("{status}"))
+        .clone();
+    // Status judges the plans by the list the pool recorded reading, as the pool does.
+    assert_eq!(
+        beta["why"], "overlaps #5: both touch high-risk paths",
+        "{status}"
+    );
+    let read = events_of(&f, "pool.high_risk");
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(
+        read[0]["data"]["paths"],
+        serde_json::json!(["Alpha.txt", "Beta.txt"])
+    );
+    release(&f, "Alpha");
+    wait_until(&f, "Beta starting once Alpha is done", || {
+        holding(&f, "Beta")
+    });
+    release(&f, "Beta");
+    release(&f, "Gamma");
+    wait_until(&f, "all three landing", || landed(&f) == 3);
+    assert_eq!(stop_pool(&f, pool).len(), 3);
+    let admitted = events_of(&f, "pool.admitted");
+    let risky = |n: u64| {
+        admitted
+            .iter()
+            .find(|e| e["data"]["number"] == n)
+            .map(|e| e["data"]["high_risk"].clone())
+    };
+    assert_eq!(risky(5), Some(true.into()), "{admitted:?}");
+    assert_eq!(risky(6), Some(true.into()), "{admitted:?}");
+    assert_eq!(risky(7), Some(false.into()), "{admitted:?}");
+    // Neither was planned again for it.
+    let planning: Vec<u64> = events_of(&f, "pool.planning")
+        .iter()
+        .map(|e| e["data"]["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(planning, [7]);
+}
+
+/// main's `.paja/high-risk` changing while lanes run is read at the pool's next sync: a running
+/// lane whose file became high risk keeps a newly high-risk item out, and the next one runs.
+#[cfg(unix)]
+#[test]
+fn a_pool_judges_its_running_lanes_by_the_high_risk_list_after_a_sync() {
+    let f = pool_factory(true);
+    let pool = start_pool(&f, "2");
+    wait_until(&f, "Alpha and Beta building", || {
+        holding(&f, "Alpha") && holding(&f, "Beta")
+    });
+    // Alpha's lane was admitted as low risk; now its file and Gamma's are high risk.
+    f.on_main(".paja/high-risk", "Alpha.txt\nGamma.txt\n");
+    release(&f, "Beta");
+    wait_until(&f, "Delta taking Beta's lane", || holding(&f, "Delta"));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(!holding(&f, "Gamma"), "Gamma ran beside high-risk Alpha");
+    release(&f, "Alpha");
+    wait_until(&f, "Gamma starting once Alpha is done", || {
+        holding(&f, "Gamma")
+    });
+    release(&f, "Gamma");
+    release(&f, "Delta");
+    wait_until(&f, "all four landing", || landed(&f) == 4);
+    assert_eq!(stop_pool(&f, pool).len(), 4);
+    let gamma = events_of(&f, "pool.admitted")
+        .into_iter()
+        .find(|e| e["data"]["number"] == 7)
+        .unwrap();
+    assert_eq!(gamma["data"]["high_risk"], true, "{gamma}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {

@@ -4,9 +4,9 @@
 
 use super::*;
 
-/// A plan of an item: `{repo, number, paths, source, high_risk, error?}`. `source` is `spec`
-/// (its `Touches:` line), `plan` (the planning agent) or `failed`, which the pool treats as
-/// touching everything.
+/// A plan of an item: `{repo, number, paths, source, high_risk, basis?, error?}`. `source` is
+/// `spec` (its `Touches:` line), `plan` (the planning agent) or `failed`, which the pool treats
+/// as touching everything.
 pub const EV_POOL_PLANNED: &str = "pool.planned";
 
 /// The most paths a plan keeps: one that names more is as good as "everything".
@@ -19,10 +19,37 @@ pub struct Plan {
     /// Repository-relative paths, `/`-separated; a path ending in `/` is a directory.
     pub paths: Vec<String>,
     pub source: String,
-    /// Whether any path is under `.paja/high-risk`, as main has it.
+    /// Whether any path is under `.paja/high-risk`, as main had it when the plan was made; a pool
+    /// judges it again by the list main has now.
     pub high_risk: bool,
+    /// What the plan was made from: [`text_basis`] of the item's title and text as the plan read
+    /// them, so a pool can tell a plan of the item as it is now from one of older text. Absent
+    /// from a plan that failed before it read the item, and from plans older releases recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// A short, stable fingerprint of an item's title and text (64-bit FNV-1a, in hex): the same
+/// in every release and on every platform, so a plan's `basis` can be compared with the item
+/// as a later sync left it.
+pub fn text_basis(title: &str, body: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // A NUL between them, which no GitHub title holds, keeps "a" + "bc" apart from "ab" + "c".
+    for byte in title.bytes().chain([0]).chain(body.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Whether a plan of `paths` is high risk by the `high_risk` prefixes: a path under one, or a
+/// directory holding one.
+pub fn judge_high_risk(paths: &[String], high_risk: &[String]) -> bool {
+    paths
+        .iter()
+        .any(|p| is_high_risk(p, high_risk) || high_risk.iter().any(|h| overlap(p, h)))
 }
 
 /// The paths a spec's `Touches:` line names, comma- or space-separated, quotes, backticks and
@@ -201,7 +228,10 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
              started by hand); wait for it, then `paja pool status` shows its plan"
         );
     };
-    let made = make(home, &repo, &name, number);
+    // The item's title and text as the plan read them, which a failed plan records too: an edit
+    // a sync records while the plan runs then makes even a failed plan one of old text.
+    let mut basis = None;
+    let made = make(home, &repo, &name, number, &mut basis);
     let plan = match made {
         Ok(plan) => plan,
         Err(err) => {
@@ -211,6 +241,7 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
                 paths: Vec::new(),
                 source: "failed".to_string(),
                 high_risk: false,
+                basis,
                 error: Some(format!("{err:#}")),
             };
             // A tampered repository gets no more git or gh, and no event that could hide it.
@@ -224,7 +255,14 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     Ok(plan)
 }
 
-fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
+/// Make the plan, setting `basis` from the item as soon as it is read.
+fn make(
+    home: &Home,
+    repo: &Path,
+    name: &str,
+    number: u64,
+    basis: &mut Option<String>,
+) -> Result<Plan> {
     ahjo::ensure_untampered(home, repo)?;
     let item = jono::list(home, name)?
         .into_iter()
@@ -232,6 +270,7 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
         .with_context(|| {
             format!("{name} has no work item #{number}; `paja work list` shows the queue")
         })?;
+    *basis = Some(text_basis(&item.title, &item.body));
     let target = RepoSettings::read(repo)?;
     let branch = target.branch.as_str();
     let base = fetch_tip(repo, branch).with_context(|| {
@@ -270,11 +309,10 @@ fn make(home: &Home, repo: &Path, name: &str, number: u64) -> Result<Plan> {
         repo: name.to_string(),
         number,
         // A directory holding a high-risk path is high risk too.
-        high_risk: paths
-            .iter()
-            .any(|p| is_high_risk(p, &high_risk) || high_risk.iter().any(|h| overlap(p, h))),
+        high_risk: judge_high_risk(&paths, &high_risk),
         paths,
         source: source.to_string(),
+        basis: basis.clone(),
         error: None,
     })
 }
@@ -522,6 +560,7 @@ mod tests {
             paths: paths.iter().map(|p| p.to_string()).collect(),
             source: source.into(),
             high_risk,
+            basis: None,
             error: None,
         };
         let a = plan(5, &["src/a.rs"], "spec", false);
