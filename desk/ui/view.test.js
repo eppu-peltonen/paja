@@ -69,19 +69,22 @@ test("a running pool shows busy lanes, idle slots, merging and closing", () => {
   assert.deepEqual(cards.map((c) => c.kind), ["busy", "busy", "idle"]);
   assert.deepEqual(cards.slice(0, 2).map((c) => c.lane.number), [10, 11]);
   assert.deepEqual(cards.slice(0, 2).map((c) => c.merging), [true, true]);
-  assert.equal(cards.some((c) => c.closing), false);
+  assert.equal(v.shrinkBy(status), 0);
 });
 
-test("a busy lane beyond the target finishes, then closes", () => {
-  const cards = v.laneCards({
+test("busy lanes beyond the target are counted, not pinned to a card", () => {
+  const status = {
     state: "running",
     target: 1,
     lanes: [lane(1, 10), lane(2, 11)],
     landing: null,
     merging: [],
-  });
-  assert.deepEqual(cards.map((c) => c.closing), [false, true]);
-  assert.equal(cards.every((c) => !c.merging), true);
+  };
+  const cards = v.laneCards(status);
+  assert.equal(cards.length, 2);
+  assert.equal(cards.every((c) => !c.merging && c.closing === undefined), true);
+  assert.equal(v.shrinkBy(status), 1);
+  assert.equal(v.shrinkBy({ ...status, state: "stopped" }), 0);
 });
 
 test("waiting items split into ready and the rest", () => {

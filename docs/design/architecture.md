@@ -765,7 +765,8 @@ inside itself. It shows one repository at a time (a picker in the bar when Desk 
   files the lane was admitted for. The lane holding the turn to land and those waiting for it say `merging`. An idle lane,
   and every lane while the pool is stopped, says `idle`. After the last card a dashed `+` card adds a lane and each card's
   `−` removes one, both by calling `pool_lanes` with one more or less (a running pool reads it on its next tick, a stopped
-  one starts with it); a busy lane beyond the count finishes its item first and says `finishing, then closes`. The core's
+  one starts with it); busy lanes beyond the count finish their item first, and the region says the pool is shrinking by that many (the core
+closes whichever lane frees first, so no card is named). The core's
   refusal (0 to 32 lanes) shows under the bar. Clicking a card opens the item's run view in place of the side panel.
 - **Side panel**, a third of the width, with three tabs. `Next`: the ready items (waiting only for a free lane) with
   their files, then, dimmed, the items waiting for another reason and that reason. `Held`: the escalated items, one line

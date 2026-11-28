@@ -198,10 +198,10 @@ function renderBar() {
 
   const entry = repoEntry();
   const runs = (entry && entry.runs) || {};
-  const ours = !!runs.desk && runs.workers != null;
   byId("start").hidden = !status || running || !!runs.desk || !!runs.terminal || !(entry && entry.checkout);
-  byId("stop").hidden = !ours;
-  byId("stop-now").hidden = !ours;
+  // Stop is there for any run Desk started, a single item's included.
+  byId("stop").hidden = !runs.desk;
+  byId("stop-now").hidden = !runs.desk;
 }
 
 byId("repo-pick").addEventListener("change", () => {
@@ -293,7 +293,6 @@ function laneCard(card) {
     ]),
     el("div", { className: "files mono" }, V.files(lane.paths).text || "no files named"),
   );
-  if (card.closing) node.append(el("div", { className: "flag" }, "finishing, then closes"));
   node.addEventListener("click", (event) => {
     if (event.target.closest("a, button")) return;
     openRun(lane.number);
@@ -309,7 +308,13 @@ function renderLanes() {
   }
   const skeleton = el("button", { type: "button", className: "skeleton", title: "Add a lane (+)" }, "+");
   skeleton.addEventListener("click", () => changeLanes(1));
-  box.replaceChildren(...V.laneCards(data.status).map(laneCard), skeleton);
+  // The core lets every busy lane finish and closes whichever frees first, so the note is the
+  // pool's, not a card's.
+  const shrink = V.shrinkBy(data.status);
+  const note = shrink > 0
+    ? [el("p", { className: "flag shrink-note" }, `Pool shrinking by ${shrink}: busy lanes finish their item, then ${shrink === 1 ? "one closes" : `${shrink} close`}.`)]
+    : [];
+  box.replaceChildren(...note, ...V.laneCards(data.status).map(laneCard), skeleton);
 }
 
 // Add or remove a lane: the lane count the pool keeps, one more or less. A running pool picks it

@@ -66,20 +66,24 @@ function lanesAfter(target, delta) {
   return next < 0 || next > MAX_LANES ? null : next;
 }
 
+// How many busy lanes are beyond the lane count the pool keeps. The core lets every busy lane
+// finish and closes whichever frees first, so no card is the one that closes.
+function shrinkBy(status) {
+  if (status.state !== "running") return 0;
+  return Math.max(0, (status.lanes || []).length - (status.target ?? 1));
+}
+
 // The cards of the lanes region, from `pool_status`: one per lane the pool keeps (at least the
-// busy ones), busy ones first in lane order. A busy lane beyond the target finishes its item,
-// then closes. While the pool is stopped every card is idle.
+// busy ones), busy ones first in lane order. While the pool is stopped every card is idle.
 function laneCards(status) {
   const running = status.state === "running";
   const busy = running ? [...status.lanes].sort((a, b) => a.lane - b.lane) : [];
   const keep = Math.max(status.target ?? 1, busy.length);
-  const excess = Math.max(0, busy.length - (status.target ?? 1));
   const merging = new Set(status.merging || []);
-  const cards = busy.map((lane, i) => ({
+  const cards = busy.map((lane) => ({
     kind: "busy",
     lane,
     merging: status.landing === lane.number || merging.has(lane.number),
-    closing: i >= busy.length - excess,
   }));
   for (let i = busy.length; i < keep; i++) cards.push({ kind: "idle" });
   return cards;
@@ -131,7 +135,7 @@ function activityLines(events) {
 
 const exported = {
   MAX_LANES, duration, tokens, usd, files, colourTag, roundLabel, verdictMark, firstLine,
-  lanesAfter, laneCards, splitWaiting, heldItems, activityLine, activityLines,
+  lanesAfter, laneCards, shrinkBy, splitWaiting, heldItems, activityLine, activityLines,
 };
 if (typeof module !== "undefined" && module.exports) module.exports = exported;
 else window.View = exported;
