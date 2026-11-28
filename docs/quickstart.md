@@ -153,9 +153,10 @@ landed, or escalated with a question.
 
 When a run can't decide something (reviewers disagree, five rounds weren't enough, or the issue needs a decision),
 Paja escalates: it asks on the issue, labels it so it stands out, and Posti tells you: a desktop notification when
-`paja` runs in a terminal (`PAJA_NOTIFIER=desktop` gets one without), or a program of your own (`PAJA_NOTIFIER`) or a push URL such as an ntfy topic for your phone (`PAJA_NOTIFY`
-or `.paja/notify`); see [Notifications](./setup.md#notifications). Answer in any of three ways, and the item goes back
-in the queue with your answer:
+`paja` runs in a terminal (`PAJA_NOTIFIER=desktop` gets one without), or a program of your own (`PAJA_NOTIFIER`) or a
+push URL such as an ntfy topic for your phone (`PAJA_NOTIFY` or `.paja/notify`); see
+[Notifications](./setup.md#notifications). Answer in any of three ways, and the item goes back in the queue with your
+answer:
 
 - In Paja Desk, in the item's answer box under **Waiting on you**.
 - In Claude Code, with `/paja:answer`.
@@ -175,5 +176,5 @@ what waits on you. Ctrl-C once stops after the current step; twice stops at once
 queue, with today's usage. `paja usage` (`--item <number>`, `--since <YYYY-MM-DD>`, `--json`; MCP tool `usage`) reads
 the recorded steps back: per item the rounds, steps by role and model, tokens, turns, wall time and outcome, totals
 per day and overall, and the median and 90th percentile per landed item. Steps whose usage couldn't be read are
-counted as unknown, never as zero. Before leaving Paja running on its own, read [`safety.md`](./safety.md) again, and see
-[`troubleshooting.md`](./troubleshooting.md) when something goes wrong.
+counted as unknown, never as zero. Before leaving Paja running on its own, read [`safety.md`](./safety.md) again, and
+see [`troubleshooting.md`](./troubleshooting.md) when something goes wrong.

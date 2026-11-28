@@ -39,17 +39,17 @@ the real repository, to the smoke tests.
 - `crates/paja/src/ahjo.rs`: environments, i.e. git worktrees with their own port blocks.
 - `crates/paja/src/jono.rs`: the work queue, imported from GitHub issues with the work label (`paja` here; `gh`,
   or `$PAJA_GH`).
-- `crates/paja/src/mestari/`: `paja run`, the build, check, review and land loop for one work item. Only the
-  high-risk parts are listed in `.paja/high-risk`: `mod.rs` (the round loop, main's configuration, the risk tier,
-  the review prompt and verdicts), `agent.rs` (`claude()`, the hook settings and self-test, the sandbox glue,
-  `GitGuard`), `arbiter.rs` (the arbiter agent that settles an escalation before it reaches the person, and the
-  rules that overrule it), `land.rs` (landing, waiting for CI, escalation), `triage.rs` (`paja triage`: an agent
-  closes duplicate and already-fixed follow-ups) and `detect.rs` (the `init` agents' sandboxes and tool lists).
-  `usage.rs` (what a step spent), `progress.rs` (stderr text), `follow_ups.rs`, `builder.rs` (the builder's question
-  and answers), `pool.rs` (`paja run --workers`: lanes, each a `paja run --item` of its own), `plan.rs` (`paja pool
-  plan`: the files an item will touch, which the pool admits it by) and `live.rs` (where a run is, read from the log)
-  are normal risk. Outside `mestari/`, `init/generate.rs` (the programs a generated skeleton's agent may run) is high
-  risk too.
+- `crates/paja/src/mestari/`: `paja run`, the build, check, review and land loop for one work item. Only the high-risk
+  parts are listed in `.paja/high-risk`: `mod.rs` (the round loop, main's configuration, the risk tier, the review
+  prompt and verdicts), `agent.rs` (`claude()`, the hook settings and self-test, the sandbox glue, `GitGuard`),
+  `arbiter.rs` (the arbiter agent that settles an escalation before it reaches the person, and the rules that overrule
+  it), `land.rs` (landing, waiting for CI, escalation), `triage.rs` (`paja triage`: an agent closes duplicate and
+  already-fixed follow-ups), `detect.rs` (the `init` agents' sandboxes and tool lists) and `plan.rs` (`paja pool plan`:
+  the planning agent's read-only tools, its sandbox and its checkout of the default branch, and the files an item will
+  touch and whether it is high risk, which the pool admits it by). `usage.rs` (what a step spent), `progress.rs` (stderr
+  text), `follow_ups.rs`, `builder.rs` (the builder's question and answers), `pool.rs` (`paja run --workers`: lanes,
+  each a `paja run --item` of its own) and `live.rs` (where a run is, read from the log) are normal risk. Outside
+  `mestari/`, `init/generate.rs` (the programs a generated skeleton's agent may run) is high risk too.
 - `.paja/checks`, `.paja/high-risk`, `.paja/models`, `.paja/commands`, `.paja/labels`: Vasara's check commands, the
   high-risk path prefixes, the model per agent role, the programs agents may run besides local git (`review <program>`
   for reviewers too; `cargo` when missing) and the repository's `work`, `follow-up` and `needs-answer` issue labels
@@ -65,8 +65,8 @@ the real repository, to the smoke tests.
 - `crates/paja/src/main.rs`: the `paja` CLI. Library code lives in the modules, not here.
 - `desk/`: Paja Desk, a Tauri 2 app (`paja-desk`) that calls the core in-process; `desk/ui/` is plain HTML, CSS and
   JavaScript. Not a default workspace member: build and test it with `-p paja-desk` (on Linux it needs WebKitGTK's
-  development packages). Its Tauri permissions (`desk/capabilities/`, `desk/tauri.conf.json`) and its installer (`desk/tauri.bundle.json`,
-  `desk/installer.nsh`, which edits PATH) are high risk.
+  development packages). Its Tauri permissions (`desk/capabilities/`, `desk/tauri.conf.json`) and its installer
+  (`desk/tauri.bundle.json`, `desk/installer.nsh`, which edits PATH) are high risk.
 - `crates/paja/tests/smoke.rs`: end-to-end test that drives the real binary. Its fake `gh` and `claude` are shell
   scripts; on Windows `crates/paja/examples/fake_tool.rs` runs them, so run the whole `cargo test`, which builds it.
 - `evals/`: harness evals that run headless Claude Code (need a signed-in `claude`; not run in CI).

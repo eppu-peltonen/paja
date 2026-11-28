@@ -90,7 +90,8 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
     if is_paja_name(opts.name) {
         bail!(
             "environment name {:?} has the shape Paja gives its own environments \
-             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-triage`, `work-<n>`, `plan-<n>`, where \
+             (`<repo>-<hash>-work-<n>`, `<repo>-<hash>-plan-<n>`, `<repo>-<hash>-triage`, \
+             `work-<n>`, `plan-<n>`, where \
              `<hash>` is any six hex digits), and Paja would reuse, reset and remove it; pick \
              another name",
             opts.name
@@ -100,9 +101,9 @@ pub fn create_by_person(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
 }
 
 /// Whether `name` has the shape of a name Paja gives its own environments: what
-/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage` or
-/// `-work-<n>`), a plan's `plan-<n>`, or the `work-<n>` of releases before names carried the
-/// repository.
+/// [`crate::jono::env_name_for`] makes (an optional `<repo>-`, six hex digits, then `-triage`,
+/// `-work-<n>` or a plan's `-plan-<n>`), or the `work-<n>` and `plan-<n>` of releases before
+/// names carried the repository.
 pub fn is_paja_name(name: &str) -> bool {
     let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
     if ["work-", "plan-"]
@@ -111,18 +112,26 @@ pub fn is_paja_name(name: &str) -> bool {
     {
         return true;
     }
-    let head = if let Some(head) = name.strip_suffix("-triage") {
-        head
-    } else if let Some((head, n)) = name.rsplit_once("-work-") {
-        if !number(n) {
-            return false;
-        }
-        head
-    } else {
-        return false;
+    // Each ending on its own: a repository named `home-work-app` puts `-work-` before the
+    // `-plan-<n>` its planner's name ends in.
+    let hashed = |head: &str| {
+        let hash = head.rsplit('-').next().unwrap_or(head);
+        hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
     };
-    let hash = head.rsplit('-').next().unwrap_or(head);
-    hash.len() == 6 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    name.strip_suffix("-triage").is_some_and(hashed)
+        || ["-work-", "-plan-"].iter().any(|what| {
+            name.rsplit_once(what)
+                .is_some_and(|(head, n)| number(n) && hashed(head))
+        })
+}
+
+/// Whether two repository paths are the same folder, as the file system resolves them; paths
+/// that can't be resolved (a repository that moved) are compared as written.
+pub(crate) fn same_repo(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 pub fn create(home: &Home, opts: CreateOptions<'_>) -> Result<Env> {
@@ -260,6 +269,19 @@ impl From<&Env> for RemoveReport {
 /// Remove an environment's worktree. The branch is kept, since it may hold work that has not
 /// landed yet. Without `force`, a worktree with uncommitted changes is refused.
 pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
+    remove_unless(home, name, force, |_, _, _| Ok(None))
+}
+
+/// [`remove`], unless `keep` names a reason to keep the environment, which is then the error.
+/// `keep` runs under the home lock, after the tamper check and before git touches anything, with
+/// the log as it stands, the environment and the tamper check's proof (None when the repository
+/// is gone, so no git may run), so what it decides can't change before the removal.
+pub(crate) fn remove_unless(
+    home: &Home,
+    name: &str,
+    force: bool,
+    keep: impl FnOnce(&[Event], &Env, Option<&Untampered>) -> Result<Option<String>>,
+) -> Result<Env> {
     let lock = home.lock()?;
     let log = home.events();
     let events = log.read_all()?;
@@ -276,6 +298,9 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
     } else {
         None
     };
+    if let Some(why) = keep(&events, &env, checked.as_ref())? {
+        bail!("{why}");
+    }
 
     match checked {
         None => {
@@ -320,7 +345,7 @@ pub fn remove(home: &Home, name: &str, force: bool) -> Result<Env> {
                         repo = env.repo.display()
                     )
                 } else {
-                    format!("removing worktree {path} (if it has uncommitted changes, --force discards them)")
+                    format!("removing worktree {path}; git refuses one with uncommitted changes or untracked files (--force discards them), and a locked one or one with submodules")
                 }
             })?;
             }
@@ -1499,6 +1524,43 @@ mod tests {
     }
 
     #[test]
+    fn remove_unless_keeps_what_its_check_keeps_before_git_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_unchecked(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+        let mut args = commit.to_vec();
+        args.extend(["commit", "-q", "--allow-empty", "-m", "c"]);
+        git_unchecked(&repo, &args).unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        let env = create(
+            &home,
+            CreateOptions {
+                name: "keep-me",
+                repo: &repo,
+                base: None,
+            },
+        )
+        .unwrap();
+        let before = home.events().read_all().unwrap().len();
+        let err = remove_unless(&home, "keep-me", false, |events, seen, ok| {
+            assert!(ok.is_some());
+            assert_eq!(events.len(), before);
+            assert_eq!(seen.name, "keep-me");
+            Ok(Some("the item was reopened".into()))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the item was reopened");
+        assert!(env.path.exists());
+        assert_eq!(home.events().read_all().unwrap().len(), before);
+        assert!(get(&home, "keep-me").is_ok());
+        // With nothing to keep it, it goes.
+        remove_unless(&home, "keep-me", false, |_, _, _| Ok(None)).unwrap();
+        assert!(!env.path.exists() && get(&home, "keep-me").is_err());
+    }
+
+    #[test]
     fn port_blocks_reuse_the_lowest_free_slot() {
         let mut envs = BTreeMap::new();
         assert_eq!(free_port_block(&envs).unwrap(), 20_000);
@@ -1527,8 +1589,14 @@ mod tests {
 
     #[test]
     fn paja_shaped_names_are_told_apart_from_a_persons() {
-        for repo in ["acme/app", "acme/a-very-long-repository-name", "acme/---"] {
-            for what in ["triage", "work-7", "work-12345"] {
+        for repo in [
+            "acme/app",
+            "acme/a-very-long-repository-name",
+            "acme/---",
+            "acme/home-work-app",
+            "acme/x-plan-y",
+        ] {
+            for what in ["triage", "work-7", "work-12345", "plan-7"] {
                 let name = crate::jono::env_name_for(repo, what);
                 assert!(is_paja_name(&name), "{name}");
             }
@@ -1547,6 +1615,8 @@ mod tests {
             "app-abcdef-work-",
             "app-abcdef-work-7a",
             "app-abcdef-worker",
+            "app-abcdef-plan-",
+            "app-abcdef-plan-x",
         ] {
             assert!(!is_paja_name(theirs), "{theirs}");
         }

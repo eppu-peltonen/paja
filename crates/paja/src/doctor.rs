@@ -84,7 +84,7 @@ fn warning(name: &str, detail: impl Into<String>, fix: impl Into<String>) -> Che
 
 /// Run `cmd` with no stdin and no prompts; `Err` is why it couldn't start.
 fn run(cmd: &mut Command) -> std::result::Result<Output, String> {
-    crate::platform::own_process_group(cmd)
+    crate::platform::own_group_for_caller(cmd)
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .output()
@@ -242,7 +242,7 @@ fn machine(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             checks.push(failed("home folder", why, fix));
         }
     }
-    checks.push(left_over_environments(home));
+    checks.push(left_over_environments(home, repo));
     checks.push(match home.events().read_all() {
         Ok(events) => usage_window(&events, &claude, windowed),
         Err(err) => warning(
@@ -323,19 +323,47 @@ fn usage_window(events: &[crate::events::Event], claude: &str, windowed: bool) -
 }
 
 /// Environments whose work item's issue was closed: a parked item keeps its environment (so the
-/// builder's edits survive the question), and nothing removes it if the issue is closed instead
-/// of answered.
-fn left_over_environments(home: &Home) -> Check {
+/// builder's edits survive the question), and one with uncommitted changes is kept when its
+/// issue is closed instead of answered. An item still marked active counts once no run holds
+/// it (the run crashed or was killed). An item from a log written before items carried their
+/// repository, or of the repository whose checkout `repo` is in, matches the `work-<n>`
+/// environment of its number made there, as releases before names carried the repository did.
+fn left_over_environments(home: &Home, repo: &Path) -> Check {
     let name = "environments";
     let found = (|| -> Result<Vec<String>> {
         let events = home.events().read_all()?;
         let envs = ahjo::replay(&events)?;
-        let mut left: Vec<String> = jono::replay(&events, "")?
-            .values()
-            .filter(|item| !item.open && item.status != jono::Status::Active)
-            .map(|item| item.env_name())
-            .filter(|env| envs.contains_key(env))
-            .collect();
+        // Made in this checkout: doctor may run from a folder inside it.
+        let checkout = jono::checkout_top(repo)?;
+        let here = |env: &ahjo::Env| jono::same_dir(&env.repo, &checkout);
+        // A `work-<n>` is the item's only when the log shows the item last ran there.
+        let ours = |item: &jono::WorkItem| {
+            item.repo.is_empty() || jono::ran_in_work_n(&events, &item.repo, item.number)
+        };
+        let mut left = Vec::new();
+        for item in jono::replay(&events, "")?.values() {
+            if item.open {
+                continue;
+            }
+            // An item from before items carried their repository can't be held by a run, which
+            // records the repository first.
+            if item.status == jono::Status::Active
+                && !item.repo.is_empty()
+                && home.run_held(&item.repo, item.number)?
+            {
+                continue;
+            }
+            if !item.repo.is_empty() && envs.contains_key(&item.env_name()) {
+                left.push(item.env_name());
+            }
+            // Releases before names carried the repository named an item's environment
+            // `work-<n>`: the item's when it was made in this checkout and the log shows the item
+            // last ran there (or the log names no repository).
+            let plain = format!("work-{}", item.number);
+            if envs.get(&plain).is_some_and(&here) && ours(item) {
+                left.push(plain);
+            }
+        }
         left.sort();
         left.dedup();
         Ok(left)
@@ -364,7 +392,7 @@ fn left_over_environments(home: &Home) -> Check {
         ),
         Err(err) => warning(
             name,
-            format!("couldn't read the event log: {err:#}"),
+            format!("couldn't check: {err:#}"),
             format!("check {}", home.root().display()),
         ),
     }
@@ -680,7 +708,8 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
     }
     // CI.
     let ci_file = crate::mestari::CI_FILE;
-    let mode = show(proof.path(), &commit, ci_file).map(|t| lines(&t.unwrap_or_default()));
+    let mode = show(proof.path(), &commit, ci_file)
+        .map(|t| crate::mestari::parse_ci(&t.unwrap_or_default()));
     let required = || match gh_in_repo(&["workflow", "list"]) {
         Ok(list) if !list.is_empty() => ok("ci", "a GitHub Actions workflow is set up"),
         Ok(_) => failed(
@@ -704,42 +733,60 @@ fn repository(home: &Home, repo: &Path, checks: &mut Vec<Check>) {
             format!("reading {ci_file} on {rev}: {err}"),
             "check that the repository is intact (`git status`)",
         ),
-        Ok(words) => match words.as_slice() {
-            [w] if w == "none" => ok("ci", format!("{ci_file} says none")),
-            [] => required(),
-            [w] if w == "required" => required(),
-            _ => failed(
-                "ci",
-                format!("{ci_file} on {rev} must hold `required` or `none`"),
-                format!("fix {ci_file} on the default branch"),
-            ),
-        },
+        Ok(Ok((crate::mestari::CiMode::None, _))) => ok("ci", format!("{ci_file} says none")),
+        Ok(Ok((crate::mestari::CiMode::Required, _))) => required(),
+        Ok(Err(why)) => failed(
+            "ci",
+            format!("{ci_file} on {rev} {why}"),
+            format!("fix {ci_file} on the default branch"),
+        ),
     });
 }
 
 fn sandbox(checks: &mut Vec<Check>) {
+    use crate::sandbox::Why;
     let var = crate::sandbox::PROGRAM_VAR;
-    match crate::sandbox::configured() {
-        Some(program) => match run(Command::new(&program).arg("version")) {
-            Ok(out) if out.status.success() => {
-                checks.push(ok("sandbox", format!("{var} is {program}")))
+    let choice = crate::sandbox::chosen();
+    let said = choice.describe();
+    match (&choice.program, choice.why) {
+        (Some(program), Why::Detected) => {
+            match crate::sandbox::probe_within(program, crate::sandbox::PROBE_LIMIT) {
+                Ok(()) => checks.push(ok("sandbox", said)),
+                Err(cause) => checks.push(failed(
+                    "sandbox",
+                    format!("{said}, but {cause}"),
+                    crate::sandbox::probe_fix(program),
+                )),
             }
+        }
+        (Some(program), _) => match run(Command::new(program).arg("version")) {
+            Ok(out) if out.status.success() => checks.push(ok("sandbox", said)),
             // It started but failed: a broken or wrong `sbx` must not look set up.
             Ok(out) => checks.push(failed(
                 "sandbox",
                 format!("{var} is {program}, and `{program} version` failed: {}", text(&out)),
-                format!("fix or reinstall `sbx` and point {var} at it, or unset {var} to run without a sandbox"),
+                format!("fix or reinstall `sbx` and point {var} at it, or set {var}=off to run without a sandbox"),
             )),
             Err(err) => checks.push(failed(
                 "sandbox",
                 format!("{var} is {program}, which did not run: {err}"),
-                format!("install `sbx` and point {var} at it, or unset {var} to run without a sandbox"),
+                format!("install `sbx` and point {var} at it, or set {var}=off to run without a sandbox"),
             )),
         },
-        None => checks.push(warning(
+        (None, Why::NotFound) if crate::sandbox::detected_earlier() => checks.push(failed(
             "sandbox",
-            format!("{var} is not set, so agents and checks run as this user, with your files and sign-ins"),
-            format!("install `sbx` and set {var} to it for a sandbox (see docs/setup.md)"),
+            format!("{said}, though this Paja ran agents in it earlier"),
+            crate::sandbox::lost_sbx(),
+        )),
+        (None, Why::Off) => checks.push(warning(
+            "sandbox",
+            format!("{said}, so agents and checks run as this user, with your files and sign-ins"),
+            format!("unset {var} to use `sbx` when it is installed (see docs/setup.md)"),
+        )),
+        (None, _) => checks.push(warning(
+            "sandbox",
+            format!("{said}, so agents and checks run as this user, with your files and sign-ins"),
+            "install `sbx`, which Paja then uses (see docs/setup.md)".to_string(),
         )),
     }
 }

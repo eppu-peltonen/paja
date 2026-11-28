@@ -232,6 +232,11 @@ enum PoolCommand {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Read `stop now` lines on stdin, as a pool's planner does: the planning agent is
+        /// ended with every process it started, and no plan is recorded. Stdin closing stops it
+        /// the same way.
+        #[arg(long)]
+        stop_on_stdin: bool,
     },
     /// The pool: running or stopped, its lanes (item, stage, step, time in step, spend, files),
     /// the items waiting and why, and the latest landings.
@@ -244,7 +249,8 @@ enum PoolCommand {
 
 #[derive(Subcommand)]
 enum WorkCommand {
-    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`).
+    /// Import open issues with the work label from the checkout's GitHub repository (uses `gh`),
+    /// and remove the clean environment of a parked item whose issue was closed (the branch stays).
     Sync {
         /// Any path inside the repository (default: current directory).
         #[arg(long, default_value = ".")]
@@ -336,6 +342,8 @@ enum EnvCommand {
 }
 
 fn main() -> ExitCode {
+    // Before any thread: a pool's choice for its lane's backend, never passed on further.
+    paja::sandbox::take_passed();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
@@ -578,7 +586,11 @@ fn run(cli: &Cli) -> Result<()> {
             // Ctrl-C finishes the step in flight and stops; a second one stops at once.
             paja::platform::catch_interrupts()?;
             if *stop_on_stdin {
-                paja::platform::stop_on_stdin(*lane);
+                paja::platform::stop_on_stdin(if *lane {
+                    paja::platform::StopFrom::Pool
+                } else {
+                    paja::platform::StopFrom::Program
+                });
             }
             if let (Some(lanes), Some(minutes)) = (workers, every) {
                 let pool = mestari::pool::run(
@@ -609,8 +621,8 @@ fn run(cli: &Cli) -> Result<()> {
                     },
                 );
                 let Some(minutes) = every else {
-                    let report = match outcome {
-                        Ok(report) => report,
+                    let pass = match outcome {
+                        Ok(pass) => pass,
                         Err(err) => {
                             if mestari::is_fatal(&err) {
                                 paja::posti::stopped(&home, repo);
@@ -621,7 +633,7 @@ fn run(cli: &Cli) -> Result<()> {
                             return Err(err);
                         }
                     };
-                    emit(cli, run_json(&report)?, || describe_run(&report));
+                    emit(cli, run_json(&pass)?, || describe_run(&pass.report));
                     break;
                 };
                 // A long-running loop reports an error and carries on; it must not stop the factory.
@@ -629,9 +641,10 @@ fn run(cli: &Cli) -> Result<()> {
                 // A usage limit waits for its reset instead of polling the queue.
                 let mut reset: Option<u64> = None;
                 let wait = match outcome {
-                    Ok(report) => {
+                    Ok(pass) => {
                         failures.passed();
-                        emit(cli, run_json(&report)?, || describe_run(&report));
+                        emit(cli, run_json(&pass)?, || describe_run(&pass.report));
+                        let report = pass.report;
                         idle = matches!(report, mestari::RunReport::Idle);
                         reset = match &report {
                             mestari::RunReport::Paused { resets_at } => Some(*resets_at),
@@ -721,10 +734,17 @@ fn run(cli: &Cli) -> Result<()> {
             WorkCommand::Sync { repo } => {
                 let report = jono::sync(&home, repo)?;
                 emit(cli, serde_json::to_value(&report)?, || {
-                    format!(
+                    let mut text = format!(
                         "imported {:?}, changed {:?}, closed {:?}, reopened {:?}",
                         report.imported, report.changed, report.closed, report.reopened
-                    )
+                    );
+                    if !report.freed.is_empty() {
+                        text.push_str(&format!("\nfreed {}", report.freed.join(", ")));
+                    }
+                    for kept in &report.kept {
+                        text.push_str(&format!("\nkept {}: {}", kept.env, kept.why));
+                    }
+                    text
                 });
             }
             WorkCommand::List { all, repo } => {
@@ -825,7 +845,19 @@ fn run(cli: &Cli) -> Result<()> {
                     format!("pool of {}: {count} ({state})", report.repo)
                 });
             }
-            PoolCommand::Plan { number, repo } => {
+            PoolCommand::Plan {
+                number,
+                repo,
+                stop_on_stdin,
+            } => {
+                if *stop_on_stdin {
+                    // Caught, a signal or console event (a Ctrl-Break on Windows, a hangup) stops
+                    // the planner as `stop now` does, ending its agent, instead of killing the
+                    // planner and leaving the agent going. The hint is set first, so even the
+                    // first one stops it now.
+                    paja::platform::stop_on_stdin(paja::platform::StopFrom::PoolPlanner);
+                    paja::platform::catch_interrupts()?;
+                }
                 let plan = mestari::plan::plan(&home, repo, *number)?;
                 emit(cli, serde_json::to_value(&plan)?, || {
                     format!(
@@ -878,13 +910,10 @@ fn emit(cli: &Cli, value: Value, text: impl FnOnce() -> String) {
 }
 
 /// The run's report, with whether a sandbox was in use.
-fn run_json(report: &mestari::RunReport) -> Result<serde_json::Value> {
-    let mut value = serde_json::to_value(report)?;
+fn run_json(pass: &mestari::Pass) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(&pass.report)?;
     if let Some(fields) = value.as_object_mut() {
-        fields.insert(
-            "sandbox".to_string(),
-            json!(paja::sandbox::active().is_some()),
-        );
+        fields.insert("sandbox".to_string(), json!(pass.sandbox));
     }
     Ok(value)
 }

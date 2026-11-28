@@ -62,29 +62,39 @@ events appends a `work.synced` event naming it, so a later command from another 
 ## Work queue
 
 Jono's items are GitHub issues with the work label (`.paja/labels`, `paja` in this repository), each belonging to a
-repository. `.paja/labels`, read from the default branch like `.paja/checks` and never from the branch under review,
-has up to three lines: `work <label>`, which Jono imports, `follow-up <label>`, which Jono imports after the
-work label (people file these; Mestari files none), and `needs-answer <label>`, which marks an escalated item's issue until `paja work answer` requeues it.
-Without the file they are `factory`, `factory-follow-up` and `factory-needs-answer`; this repository keeps `paja` and
-`paja-follow-up`. The three must differ. A file that doesn't read stops a sync with an error that names the line;
-`paja work answer` still records and posts the answer, removes the default `factory-needs-answer` and says on stderr
-that it did.
-Changing the work label closes the queue as it was: the next sync no longer sees issues with the old label and closes
-every item it imported with it. `.paja/labels` takes effect only once its change lands on the default branch, so add the
-new label to the open issues before it lands, keeping the old one, and remove the old label after: every sync in
-between sees them under one label or the other.
-`paja work sync` reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed` and `work.reopened`
-events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than the last one recorded, as the file
-system resolves them (a symlink or a Windows short name to the same folder is the same checkout) (every
-`paja run` syncs first, so runs record it too); it never touches another repository's items, even when their issue
-numbers are the same. `paja work
-list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout they run
-in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with its
-`repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no
-`work.*` event names one yet. Whether an issue is open is kept apart from
-the item's status (`queued`, `active`, `landed`, `escalated`, set with `work.status`), so an escalation's question
-survives the issue closing and reopening; a landed issue that reopens is queued again. `paja work claim` takes the
-oldest open, queued item that waits on nothing and marks it active under the home lock, so two runs never share one.
+repository. `.paja/labels`, read from the default branch like `.paja/checks` and never from the branch under review, has
+up to three lines: `work <label>`, which Jono imports, `follow-up <label>`, which Jono imports after the work label
+(people file these; Mestari files none), and `needs-answer <label>`, which marks an escalated item's issue until
+`paja work answer` requeues it. Without the file they are `factory`, `factory-follow-up` and `factory-needs-answer`;
+this repository keeps `paja` and `paja-follow-up`. The three must differ. A file that doesn't read stops a sync with an
+error that names the line; `paja work answer` still records and posts the answer, removes the default
+`factory-needs-answer` and says on stderr that it did. Changing the work label closes the queue as it was: the next sync
+no longer sees issues with the old label and closes every item it imported with it. `.paja/labels` takes effect only
+once its change lands on the default branch, so add the new label to the open issues before it lands, keeping the old
+one, and remove the old label after: every sync in between sees them under one label or the other. `paja work sync`
+reads the open ones of the checkout's repository with `gh` and appends `work.imported`, `work.changed`, `work.closed`
+and `work.reopened` events, plus `work.checkout` (`repo`, `path`) when it runs in another checkout than the last one
+recorded, as the file system resolves them (a symlink or a Windows short name to the same folder is the same checkout)
+(every `paja run` syncs first, so runs record it too); it never touches another repository's items, even when their
+issue numbers are the same. Each sync also frees the environments of closed, parked (escalated) items whose issue GitHub
+says is closed: it removes the item's Ahjo environment (its hashed name, or the `work-<n>` an older release made, when
+the log shows the item last ran there) if it was made in this checkout, keeping the branch, and lists it under `freed`,
+since nothing else frees the worktree and port block of an item closed instead of answered. A reopened item resumes from
+the kept branch: its own, else `paja/work-<n>`, renamed to its own (see `paja run` below). An environment is kept,
+listed under `kept` with the reason and tried again by the next sync, when the issue is still open (its label changed,
+or `follow-ups = off` hides it), when a run holds the item or the item is no longer closed and parked once the home lock
+is taken for the removal (`ahjo::remove_unless` decides under the same lock as the removal), when the worktree folder is
+already gone (removing it would prune every missing worktree of the repository), when the worktree isn't on the
+environment's branch or git can't read its HEAD, or when git refuses: uncommitted changes, untracked files, a locked
+worktree or submodules. One removed meanwhile by another sync or `paja env remove` is in neither list. Ignored files,
+such as build output or a local `.env`, go with the worktree. `paja run` prints what its sync freed and kept on stderr.
+`paja work list|show|next|claim|answer|set`, `paja run` and the matching MCP tools act on the repository of the checkout
+they run in (`--repo`, default the current directory); `paja work list --all` lists every repository's items, each with
+its `repo`, and works outside a checkout unless the log still holds events from before items carried a repository and no
+`work.*` event names one yet. Whether an issue is open is kept apart from the item's status (`queued`, `active`,
+`landed`, `escalated`, set with `work.status`), so an escalation's question survives the issue closing and reopening; a
+landed issue that reopens is queued again. `paja work claim` takes the oldest open, queued item that waits on nothing
+and marks it active under the home lock, so two runs never share one.
 
 Several runners can share one queue, because a claim is written on GitHub where every runner reads it. The first time a
 home claims anything it records a random runner id (`runner.created`); the id names no host or user, since the
@@ -156,59 +166,73 @@ escape hatch for an item that needs no answer.
 
 ## The run loop
 
-Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/high-risk` lists only what decides
-what lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review
-prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue,
-`GitGuard`), `arbiter.rs` (the arbiter that settles an escalation, and the rules that overrule it), `land.rs`
-(landing, waiting for CI, escalation), `triage.rs` (`paja triage`) and `detect.rs` (the `init` agents' sandboxes and
-tool lists). Outside the module, `init/generate.rs` (the programs a generated skeleton's agent may run) is high risk
-too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`), follow-ups (`follow_ups.rs`), the builder's
-question and answers (`builder.rs`), where a run is (`live.rs`), the pool (`pool.rs`, `plan.rs`) and the rest of
-`init/` are normal risk. A unit test walks every source file and fails on one that is neither on the list nor named
-as normal risk on purpose.
+Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/high-risk` lists only what decides what
+lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review prompt and
+verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue, `GitGuard`), `arbiter.rs`
+(the arbiter that settles an escalation, and the rules that overrule it), `land.rs` (landing, waiting for CI,
+escalation), `triage.rs` (`paja triage`), `detect.rs` (the `init` agents' sandboxes and tool lists) and `plan.rs` (the
+planning agent's read-only tools, its sandbox and its checkout of the default branch, and the files an item will touch
+and whether it is high risk, which the pool admits it by). Outside the module, `init/generate.rs` (the programs a
+generated skeleton's agent may run) is high risk too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`),
+follow-ups (`follow_ups.rs`), the builder's question and answers (`builder.rs`), where a run is (`live.rs`), the pool
+(`pool.rs`) and the rest of `init/` are normal risk. A unit test walks every source file and fails on one that is
+neither on the list nor named as normal risk on purpose.
 
 `paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
-and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, or `none` for a
-repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims anything, once an item
-is ready to take, so nothing is claimed on GitHub; with `none`
-landing skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and
-creates an Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of
-`owner/name`, so two repositories' item #5 never share a worktree, branch or port block) from the default branch
-(resuming the branch an earlier run kept). An item started before environments carried the repository's name
-resumes its old `work-<issue>` environment when that was made in this checkout; one that belongs to another
-repository is never taken, and a hashed name found to belong to another repository stops the run with the
-`paja env remove <name>` fix. `paja env create` and the MCP tool refuse names of that shape (and the triage pass's
-`<repo>-<hash>-triage`, a plan's `plan-<issue>` and the old `work-<issue>`), so Paja never reuses, resets or removes
-an environment a person made. A mistake in that configuration stops the pass before it claims anything, with an error
-naming the file and line, so one fix on the default branch is all it takes. That holds even when the queue is empty:
-the pass reports the error, not `idle`. A `--every` loop reports it and tries again after its wait.
-For its whole life a `paja run` also holds a shared OS file lock, `runs/<owner>@<name>@any.lock`, the repository's run
-marker: a pool and its lanes, or runs on different items, hold it together, and it covers the gaps no item's lock does (a
-loop sleeping between items, a run still starting). `Home::repo_run_held` probes it with a brief exclusive try, so Desk
-can tell that some run is going; `Home::hold_repo_run` waits out such a probe for a few seconds before giving up.
-While it works on an item the run holds an OS file lock,
-`runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process ends. An item a `paja run`
-claimed (its status change carries `"run": true`) that is still `active` while its lock is free was left by a run that
-stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment, and
-says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
+and `.paja/ci` from the default branch and checks them (`.paja/ci` is `required`, the default, with an optional
+`wait <minutes>` for CI, or `none` for a repository without CI; with `required` a repository with no GitHub Actions workflow stops the run before it claims
+anything, once an item is ready to take, so nothing is claimed on GitHub (with the usage window nearly used, only an
+item left active to resume counts, so a pass that pauses with only new items ready skips the check); with `none` landing
+skips the CI wait and the pull request body says so), claims the next item of the checkout's repository and creates an
+Ahjo environment named `<repo>-<hash>-work-<issue>` (the repository's name and a short hash of `owner/name`, so two
+repositories' item #5 never share a worktree, branch or port block) from the default branch (resuming the branch an
+earlier run kept). An item started before environments carried the repository's name resumes its old `work-<issue>`
+environment when that was made in this checkout, or, once that environment is gone, its `paja/work-<issue>` branch,
+which is renamed to the item's own so it is carried over once. The branch is the item's only when the log shows it: the
+latest run in an environment named `work-<issue>` is the item's, and no run of the item landed after it. Otherwise, or
+when a `work-<issue>` environment still holds it or a worktree has it checked out, the run says so and starts fresh,
+keeping the branch. A carried-over branch starts a new builder session, since the old one worked in the old worktree. A
+run that stops on an error removes the environment it used, but a `work-<issue>` only when it has no uncommitted
+changes, since an older release's park may have kept the builder's edits there; one that belongs to another repository
+is never taken, and a hashed name found to belong to another repository stops the run with the `paja env remove <name>`
+fix. `paja env create` and the MCP tool refuse names of that shape (and the triage pass's `<repo>-<hash>-triage`, a
+plan's `<repo>-<hash>-plan-<issue>`, and the old `work-<issue>` and `plan-<issue>`), so Paja never reuses, resets or
+removes an environment a person made.
+A mistake in that configuration stops the pass before it claims anything, with an error naming the file and line, so one
+fix on the default branch is all it takes. That holds even when the queue is empty: the pass reports the error, not
+`idle`. A `--every` loop reports it and tries again after its wait. For its whole life a `paja run` also holds a shared
+OS file lock, `runs/<owner>@<name>@any.lock`, the repository's run marker: a pool and its lanes, or runs on different
+items, hold it together, and it covers the gaps no item's lock does (a loop sleeping between items, a run still
+starting). `Home::repo_run_held` probes it with a brief exclusive try, so Desk can tell that some run is going;
+`Home::hold_repo_run` waits out such a probe for a few seconds before giving up. While it works on an item the run holds
+an OS file lock, `runs/<owner>@<name>@<issue>.lock` in the home, which the operating system releases however the process
+ends. An
+item a `paja run` claimed (its status change carries `"run": true`) that is still `active` while its lock is free was
+left by a run that stopped (Ctrl-C, a closed terminal, a reboot): the next pass resumes it first, in its environment,
+and says so on stderr. The resumed run goes on in the round that was cut off ("resuming #5 in round 2: the review of
 abc1234 was interrupted"), never past `MAX_ROUNDS` counted across all runs of the item. When the environment or its
 branch is gone, the item starts again on a new branch with a build, but in the round it had reached ("resuming #5 in
-round 2 on a new branch"), so the rounds already spent still count toward the cap. It rebuilds where it stood
-from every run event of the item since it was last queued, claimed or answered, not only the last run's, so an item
-interrupted again before it records a round keeps its round count and blockers: the round, the feedback for the
-builder, and the reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on
-the branch's HEAD (`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no
-index flags, it skips the build; if the default branch is also unchanged it skips the checks too and goes straight to
-the review. Any other state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git and gh run
-in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the terminal's
-Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build, the
-checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
+round 2 on a new branch"), so the rounds already spent still count toward the cap. It rebuilds where it stood from every
+run event of the item since it was last queued, claimed or answered, not only the last run's, so an item interrupted
+again before it records a round keeps its round count and blockers: the round, the feedback for the builder, and the
+reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on the branch's HEAD
+(`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no index flags, it skips
+the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. When every
+reviewer had already approved that very commit (a run stopped waiting for the turn to land, or in the CI wait), and as
+many reviewers as the change needs now, it skips the review as well ("resuming #5 in round 1: the review approved
+abc1234, which was waiting to land") and goes on to land with the findings that review approved with. If the default
+branch moved, Paja merges it in and runs the checks again first, as at the turn to land: checks that fail, or a
+conflict, go back to the builder as having come after the review, and the fix is reviewed in full. Any other state
+builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
+and gh run in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the
+terminal's Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build,
+the checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
 `stopped`, the item stays active for the next run, and the run reports `{"outcome": "stopped"}`; `--every` stops its
 loop too. Any error after a Ctrl-C ends the same way rather than parking the item, unless the repository was tampered
 with. A second Ctrl-C ends the running agent or check with every process it started and stops at once. A program that
-starts `paja run` without a terminal (Paja Desk) passes `--stop-on-stdin` and writes a `stop` or `stop now` line to
-its stdin instead, which counts as the first or second Ctrl-C on every platform (the first stop's message then names
+starts `paja run` without a terminal (Paja Desk) passes `--stop-on-stdin` and writes a `stop` or `stop now` line to its
+stdin instead, which counts as the first or second Ctrl-C on every platform (the first stop's message then names
 `stop now`, not a second Ctrl-C); stdin closing leaves the run going. A stdout nobody reads any more (that program
 exited) loses the report but not the run: Paja doesn't panic on it, and the exit code still says how the run ended.
 
@@ -220,51 +244,101 @@ count, the latest `pool.lanes` event (`repo`, `lanes`), and hands each free lane
 (`jono::runnable`: items a stopped run left active first, then ready ones, never one a live run holds). `paja pool
 lanes <N>` records a new count, which the running pool reads on its next tick: a higher one starts lanes then, and a
 lower one lets running items finish and starts none until the busy lanes are under it. An item whose lane ended on an
-error waits for the next timed sync, as `--every` waits after a failed pass. The pool records `pool.started` (`repo`,
-`lanes`, `pid`), `pool.lane` (`repo`, `lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage`
-is `starting`, `build`, `checks`, `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja
-pool status` and its MCP tool `pool_status` rebuild the pool from them and the lock alone: its `state` is `running`
-only while a live pool holds `runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool
-that was killed, which records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line
-stops admitting and is passed on to every lane's run, which finishes its step as one run does; the pool stops when
-the lanes have. A tamper stop any lane's run records (`run.tampered` for the checkout) is seen on the next tick: every
-lane is told `stop now`, none starts, and the pool ends with the tamper error, as `--every` would. A pool that ends on
-any other error stops its lanes the same way first, and ends a lane's run still going 30 seconds after `stop now`, so
-a stuck run can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
-(`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes;
-`origin/<branch>` is then moved to that tip, as a plain fetch would, also back after a force-push. The fetches in a
-checkout take turns (`paja-fetch.lock` in its git directory), so the last to move it is the newest; a fetch that waited a
-minute for the lock goes ahead without it, and then never moves it back onto a commit it holds. A fetch ref a killed
-run left behind is deleted by the first fetch in that checkout once it is over an hour old.
+error waits for the next timed sync, as `--every` waits after a failed pass; `paja pool status` gives that as the
+item's reason for waiting, and keeps giving it after the sync, since the log doesn't record the sync, so the item may
+then be waiting only for a free lane. The pool records `pool.started` (`repo`, `lanes`, `pid`), `pool.lane` (`repo`,
+`lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage` is `starting`, `build`, `checks`,
+`review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja pool status` and its MCP tool
+`pool_status` rebuild the pool from them and the lock alone: its `state` is `running` only while a live pool holds
+`runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool that was killed, which
+records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line stops admitting and is
+passed on to every lane's run, which finishes its step as one run does; the pool stops when the lanes have. A tamper
+stop any lane's run records (`run.tampered` for the checkout) is seen on the next tick: every lane is told `stop
+now`, none starts, and the pool ends with the tamper error, as `--every` would. A pool that ends on any other error
+stops its lanes the same way first, and ends a lane's run still going 30 seconds after `stop now`, so a stuck run
+can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip
+from a ref of its own fetch (`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or
+`origin/<branch>`, which every fetch there writes; `origin/<branch>` is then moved to that tip, as a plain fetch
+would, also back after a force-push. The fetches in a checkout take turns (`paja-fetch.lock` in its git directory),
+so the last to move it is the newest; a fetch that waited a minute for the lock goes ahead without it, and then never
+moves it back onto a commit it holds. A fetch ref a killed run left behind is deleted by the first fetch in that
+checkout once it is over an hour old.
 
 Changes land one at a time per repository, each on the latest default branch, whether from a pool's lanes or from
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
-`runs/<owner>@<name>@land.lock`, under the home lock (`land::land_turn`), recording `pool.merging` (`repo`, `number`,
-`round`) while another run holds it and `pool.landing` once it has it; it holds the turn through the push, the pull
-request, CI and the merge, and lets go when the change lands or goes back to its builder. With the turn it merges the
+`runs/<owner>@<name>@land.lock`, under the home lock (`land::land_turn`), recording `run.merging` (`repo`, `number`,
+`round`) while another run holds it and `run.landing` once it has it (logs written before these were renamed call them
+`pool.merging` and `pool.landing`, and are read the same); it holds the turn through the push, the pull
+request, CI and the merge, and lets go when the change lands or goes back to its builder. Turns go in the order runs
+began to wait, a pool's lanes and single runs alike (`paja pool status` lists a pool's lanes in that order): a run
+takes a free turn only when no other run of the repository still waiting has a `run.merging` older than its own, as
+its item's latest `run.started`, `run.merging`, `run.landing`, `run.round` or `run.landed` shows. A run still
+waits while it holds its item's merging lock, `runs/<owner>@<name>@<number>@merging.lock`, taken with its
+`run.merging` and let go when it takes the turn or stops waiting, so a `run.merging` left by a run that stopped or
+died holds no one up. A run back from its builder after a conflict or failed checks at the turn waits again from the
+back. With the turn it merges the
 latest default branch in again: when that branch moved on while it waited, Vasara's checks run again on the merge
 commit, and only that commit lands. A conflict, or checks that fail on it, sends the item back to its builder for
 another round (`conflict` or `checks_failed`) within the five rounds, and the next review reads the whole change.
 A pool admits an item to a lane only when the files it will touch don't overlap a running item's
 (`crates/paja/src/mestari/plan.rs`). Before a lane starts it, the pool plans the item in a `paja pool plan <number>` of
-its own, so its ticks go on meanwhile (at most as many at once as there are free lanes; recorded as `pool.planning`):
-the item's `Touches:` line names the paths when it has one (`source: spec`; the words `and`, `or`, `none` and
-`nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
-`plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). The plan,
-`pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap when
-they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
-`.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed (`source: failed`, with its
-`error`; a planner still going after 10 minutes is ended and fails) overlaps everything, so its item runs only in an otherwise idle pool,
-unless it is planned again: after the next timed sync, once per pool run. The pool takes items in queue order and
-admits one only once every item before it has a plan, so a plan that finishes first never puts a later item ahead;
-it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording `pool.admitted` (`repo`,
-`number`, `lane`, `paths`, `source`, `high_risk`). Each round records the paths its change touches as `run.changed`;
-when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`, `admitted`), so the planner's
-accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows each lane's `paths` and each
-waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning which files it touches`).
+its own, so its ticks go on meanwhile, recorded as `pool.planning`. With a lane free, it runs at most as many plans at
+once as there are free lanes. With every lane busy, it looks every 5 seconds and plans ahead, in queue order, until the
+first items a freed lane could take, as many as the pool has lanes, have a plan ready or on its way, so the next lane to
+free has its plan waiting. An item that would still wait whichever one lane ends (two running lanes block it: an
+overlap, both high risk, or a failed plan) isn't one of them. An item that one lane blocks counts, though another lane
+may end first, and that lane then plans its next item itself. A look scans at most twice as many items as the pool has
+lanes, no more plans run at once than the pool has lanes, and none are planned ahead while `pool lanes` shrinks the
+pool. Planning ahead reads the queue as last synced, since a busy pool doesn't sync, and a failed plan is retried only
+after a timed sync, which waits for a free lane. In a plan, the item's `Touches:` line names the paths when it has one
+(`source: spec`; the words `and`, `or`, `none` and `nothing` and a sentence's punctuation are skipped, though a bracket
+pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`),
+else a short read-only agent on the `plan` role, in an environment of the default branch under the deny-list hook, lists
+them (`source: plan`). That environment is `<repo>-<hash>-plan-<issue>`, so two repositories sharing a home never plan
+in one checkout; one of that name made from another repository stops the plan with the `paja env remove <name>` fix, and
+an older release's `plan-<issue>` of this repository, left by a killed plan, is removed with its branch. A plan holds an
+OS lock for its item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs
+is refused within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no
+planner of its own, records `pool.planning`, says so, counts the item as being planned (it takes one of the pool's
+planning slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A
+planner of the pool's refused because a plan started by hand took the lock just after the pool looked waits the same
+way. An item that leaves the queue meanwhile is no longer waited for. The pool looks only when it is about to plan an
+item: one that already has a plan from this pool run can be admitted on it while a plan started by hand re-plans it. The
+plan, `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`), holds for the pool's run. Two plans overlap
+when they name the same path or one holds the other (`src/` and `src/a.rs`); two high-risk ones (a path under
+`.paja/high-risk`, or a directory holding one) always do, so high-risk changes share one lane; a plan that failed
+(`source: failed`, with its `error`) overlaps everything, so its item runs only in an otherwise idle pool, unless it is
+planned again: after the next timed sync, once per pool run. The pool takes items in queue order and admits one only
+once every item before it has a plan, so a plan that finishes first never puts a later item ahead; it skips one that
+overlaps a busy lane's plan, or one admitted in the same tick, and admits the next that doesn't, recording
+`pool.admitted` (`repo`, `number`, `lane`, `paths`, `source`, `high_risk`). Each round records the paths its change
+touches as `run.changed`; when a lane ends, the paths outside its plan are recorded as `pool.drift` (`outside`,
+`admitted`), so the planner's accuracy can be measured, and the lane is never stopped for it. `paja pool status` shows
+each lane's `paths` and each waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning which files it
+touches`).
+
+A planner runs in a process group of its own, so a terminal's Ctrl-C reaches only the pool, and any interrupt a
+planner does get (a Ctrl-Break on Windows, a hangup) stops it at once. One still going after 10 minutes is ended and
+its plan fails. Then, and on every planner when the pool stops, the pool writes `stop now` to the planner's `paja
+pool plan --stop-on-stdin`. That ends the planning agent with every process it started and records no plan, so the
+pool's own reason stands. If a planner is still running 5 seconds later, the pool kills it (on Windows with every
+process it started), and it never waits on one while it runs lanes. A planner whose stdin closes, because its pool
+is gone, stops the same way.
 
 `paja pool status` shows the lane holding the turn (`landing`) and the merging queue (`merging`, longest waiting first),
-from each lane's latest `pool.merging`, `pool.landing`, `run.round` or `run.landed`.
+from each lane's latest `run.merging`, `run.landing`, `run.round` or `run.landed`.
+
+`pool::status` carries everything a live dashboard shows, all replayed from the log and the same through the CLI, the
+MCP tool and Paja Desk, which only draws it. Each lane has `round` (1 up to the five rounds a change gets: the review round, from `run.step` and the
+`next` of a `run.round` that goes on), `admitted_ms` (its `pool.admitted`), `tokens` (input, output and cache of the
+item's finished rounds, counted as `paja usage` does) next to `spent_usd`, `area` (the longest directory its `paths`
+share, else the first path's top folder, empty without paths) and, in `review`, `reviews`: one `pending`, `pass` or
+`block` per reviewer of the round, from the `reviewers` of the review's `run.step` and each `run.reviewed` (`round`,
+`reviewer`, `verdict`). A waiting item has an `area` too. The pool has `tokens` next to `spent_usd`, `out` (the latest
+five items that left a lane, newest first: `number`, `title`, `outcome` and `ts_ms`; the outcome is `landed`, `held`
+for an escalation, `failed` for a run that errored, or `retired` for an item closed without landing, from the lane's
+`done`), `retired_since_start` (the `failed` and `retired` exits since the pool started) and `target`, 1 for a repository that never recorded a lane count. `run.checked` records
+`checks_passed` and `run.landed` the `checks_passed` and `merge_commit` of the change, on new events only.
 
 Then, for at most five rounds:
 
@@ -291,9 +365,13 @@ Then, for at most five rounds:
    "Usage limit" below. Reviewers never resume: each review is a fresh session reading cold.
    A resumed step records `resumed: true` and only its own share of the session's running `total_cost_usd` and
    `modelUsage`. When the issue leaves a decision only the person can make, the builder commits
-   nothing and ends its final message with a line starting `PAJA-QUESTION:`, followed by the question, the options
-   and its recommendation. Mestari then escalates at once with that question: no checks run and no more rounds are
-   spent, and the round is recorded with verdict `question`.
+   nothing and puts a line starting `PAJA-QUESTION:` in its final message (the first such line counts, and the
+   question runs to the end of the message), followed by the question, the options and its recommendation. Mestari
+   then escalates at once with that question: no checks run and no more rounds are spent, and the round is recorded
+   with verdict `question`. Commits the builder made stay on the branch for the next run; uncommitted edits are
+   dropped. Every escalation question, the builder's and a reviewer's alike, is redacted, has its mentions, code
+   fences and comment markers made inert, and has its middle cut (marked "(cut short)") if it runs past 20,000
+   characters (`QUOTED_CHARS`), before it goes on the issue.
 2. Vasara runs each command in `.paja/checks`, read from the default
    branch. A failure goes back to the builder, and so does a
    check run that changed the worktree, its index or its commits, which are put back first. The checks start from a
@@ -379,13 +457,19 @@ the builder resolves them and commits, which finishes the merge. A merge it leav
 and goes back to it, naming the files that still conflict and any review blockers.
 
 On `land`, Mestari pushes the exact commit the checks and reviewers judged as the branch, opens a pull request, waits
-for CI with `gh pr checks --watch`, merges it and marks the item landed. A red CI goes back to the builder as another
+for CI with `gh pr checks --watch`, merges it and marks the item landed. The wait has a limit, 120 minutes unless
+`.paja/ci` names a `wait <minutes>` and counting the wait for checks to appear, since the run holds the repository's
+turn to land through it: CI still going at the limit always escalates, with the checks as `gh` last showed them, and
+`stop now` ends the wait like any other step. A red CI goes back to the builder as another
 round, like a failed check, with the failing checks and the end of the first failed job's log (`gh run view --job <id>
 --log-failed`); the pull request stays open and the next round pushes to it. So do checks that never start because the
 default branch moved on meanwhile (GitHub runs none on a conflicting pull request): the next round merges it in. Any other
 CI error (a `gh` or network failure, workflows that never report) escalates, since another round can't fix it. The merge is a squash when the repository allows it, otherwise a rebase,
-otherwise a merge commit; a repository that allows none (or refuses the merge for permission) escalates with the
-setting to change. On `escalate`, five failed rounds or
+otherwise a merge commit; a repository that allows none escalates with the setting to change. When `gh pr merge`
+fails, Mestari asks `gh repo view` why rather than reading the error's wording: an account below write access, or the
+chosen method now off (an answer is enough when another is still on), escalates naming the fix. A refusal those
+settings don't explain, such as a token without write scope or a branch rule, is an error the item is parked on with
+gh's message. Once answered, the next run lands through the pull request already open. On `escalate`, five failed rounds or
 an error it can't fix, it comments on the issue with the question (redacted like a follow-up: the factory home, repository and home folder named, tokens hidden, mentions made inert, code fences made plain text so the frame after a quote never renders as code) and marks the item escalated; the branch
 keeps the work. Agents run with a throwaway `PAJA_HOME`, so they never touch the factory's own state. Each step is
 recorded as `run.started`, `run.step_started` (a builder session's id, before it runs), `run.round`, `run.landed` or
@@ -396,21 +480,32 @@ queues the item again, with no `run.escalated`. `run.step` (`round`, `role`, `mo
 `reviewer`, `pr`) records that a step starts, so the run can be followed from outside its terminal: an agent step under
 its `.paja/models` role, `checks` for Vasara's checks, and `ci` (or `land` with no CI) once the pull request `pr` is
 open; logs from before it replay with no steps. `run.checked` (`round`, `commit`, `base`)
-records that Vasara's checks passed on a commit. A `run.round` of a round after which the loop goes on carries
+records that Vasara's checks passed on a commit. A round can be recorded twice in one run: a later `run.round` for the
+same `round` is how that round ended, such as a round approved for landing that then fails at the turn to land (a
+conflict or failed checks on the latest default branch, or failed CI) or errors. Readers take the later record: the
+`run` of `paja work show` (and Paja Desk's run view) shows the round once, with the later verdict and detail in place
+of the earlier ones and the steps of both. A `run.round` of a round after which the loop goes on carries
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
-like `detail`) or null; older events without it stay readable. Each `run.round` event also lists the
-round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
-Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
-`duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
-already ran, as a `run.round` with verdict `error` and the error as its detail, before the item is parked. A field the
-result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying those events gives
-each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching MCP tools; a step
-with missing fields counts in its `unknown_steps` and adds only the fields it has, so each sum is a lower bound; a
-recorded step Jono can't read counts as unknown and adds nothing, so a bad usage record never stops the queue, and
-the sequence number of its event is listed in `unreadable_events`. While it
-works, `paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each
-review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON.
-`paja run --every 5` keeps going, checking an empty queue every five minutes.
+like `detail`) or null, and with no `prior` the `noted` findings outside the change the latest review named, for the
+next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list when
+there are none, which a resumed run of that round takes over the earlier ones. A round every reviewer approved also
+carries `approved`: the `reviewed` commit, the `commit` it lands as, how many `reviewers` approved it and all the
+`findings` it lands with, in the change and outside it, so a resumed run lands it without reviewing again. A
+`run.checked` with `landing` true is of Paja's own merge of the default branch into the approved change, which moves the
+approval's `commit` to it; checks on any other commit in that round, or a later review in it that didn't approve, take
+the approval back. A round stopped or ended on an error has no `noted`, and older events without these fields stay
+readable. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or `review` with
+its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and cache-creation
+tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p` result. A round that
+stops on an error still records the steps that already ran, as a `run.round` with verdict `error` and the error as its
+detail, before the item is parked. A field the result lacks is `null`, never zero, and rounds recorded before steps were
+kept have none. Replaying those events gives each work item a `usage` total (null until a step is recorded) in `paja
+work` JSON and the matching MCP tools; a step with missing fields counts in its `unknown_steps` and adds only the fields
+it has, so each sum is a lower bound; a recorded step Jono can't read counts as unknown and adds nothing, so a bad usage
+record never stops the queue, and the sequence number of its event is listed in `unreadable_events`. While it works,
+`paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each review
+and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON. `paja run
+--every 5` keeps going, checking an empty queue every five minutes.
 
 ### Posti
 
@@ -470,16 +565,18 @@ or web tool is defined at all), `--exclude-dynamic-system-prompt-sections` (the 
 first message, so sessions in different environments share a cached prompt prefix) and settings that send each tool call
 to `paja hook --root <environment> --home <factory home> --programs <list>` as a Claude Code `PreToolUse` hook. No settings file and no
 MCP server is loaded, so neither the owner's settings nor a file on the branch can loosen the hook or switch it off.
-Because that also skips `CLAUDE.md`, Mestari passes the default branch's `CLAUDE.md` with `--append-system-prompt`, so the branch
-under review can't rewrite the rules its builder and reviewers follow. The bounds are passed in rather than read from
-the tool call, because the reported `cwd` moves when the agent runs `cd`.
+Because that also skips `CLAUDE.md`, Mestari passes the default branch's `CLAUDE.md` with `--append-system-prompt`, so
+the branch under review can't rewrite the rules its builder and reviewers follow. The `paja init` agent is the
+exception: the repository it sets up isn't one Paja works in yet, so its `CLAUDE.md` is data the agent reads and
+judges, never system-prompt instructions. The bounds are passed in rather than read from the tool call, because the
+reported `cwd` moves when the agent runs `cd`.
 
 The hook adds to Claude Code's auto mode (always on, see Permissions below); it never replaces it. Auto mode is the
 base layer, and its safety improvements reach agents through Claude Code updates. The hook is a thin layer for what only
 Paja knows: no `git push`, the programs in `.paja/commands`, and fail closed. A rule goes into the deny-list only when it
 is Paja-specific and auto mode can't know it; broad safety rules belong to Claude Code. For untrusted writers of the
-repository's issues or code, and for long unattended runs (`paja run --every`, pools), the optional sandbox below is
-recommended.
+repository's issues or code, and for long unattended runs (`paja run --every`, pools), the sandbox below is
+recommended; Paja uses it whenever `sbx` is installed.
 
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
   tools included, is blocked. Subagents run in the same worktree in the foreground, under the same hook; one with
@@ -607,12 +704,12 @@ sandbox below closes when it is on.
 
 ### The sandbox
 
-The sandbox is optional and off by default. It is a [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`)
-backend: set `PAJA_SBX` to the `sbx` program (`PAJA_SBX=sbx`) and `paja run` runs every agent session and every
-check command of Vasara inside one long-lived sandbox named `paja`, which every run reuses. A run reuses it only when
-the directories it needs are mounted in it; otherwise it stops and says to remove the sandbox (`sbx rm paja`) so the
-next run creates it again. Toolchain setup waits (about five minutes) for apt's locks, which a new sandbox holds
-while it starts.
+The sandbox is a [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`) backend, on by default whenever
+one is available: `paja run` (and the pool's lanes, `paja triage`, `paja pool plan` and `paja init`'s agents) runs
+every agent session and every check command of Vasara inside one long-lived sandbox named `paja`, which every run
+reuses. A run reuses it only when the directories it needs are mounted in it; otherwise it stops and says to remove
+the sandbox (`sbx rm paja`) so the next run creates it again. Toolchain setup waits (about five minutes) for apt's
+locks, which a new sandbox holds while it starts.
 
 - **What the code can reach.** Only what is mounted: the factory's `envs/` directory (the worktrees) and the
   repository's own `.git` directory, which commits in a worktree need (unless it is already under `envs/`, as an `init`
@@ -620,13 +717,33 @@ while it starts.
   git's global and system configuration, the factory's event log, the hook's copy of the binary and the stamp are not in
   the sandbox. Code in it gets a throwaway `PAJA_HOME` in the sandbox's own `/tmp` and the same stripped git environment
   as on the host, and none of the host's environment variables.
-- **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If `PAJA_SBX` is
-  set and the sandbox can't start, it stops with an error that says what to install or set up. It never falls back to
-  running on the host. Without `PAJA_SBX`, `paja run` says on stderr that there is no sandbox, and runs as described
-  above, behind the deny-list hook only. The sandbox is named `paja`; `PAJA_SBX_NAME` names another one (the real-`sbx`
-  test uses it, so it never removes the person's own). `.paja/setup` runs with stderr merged into stdout, so a failure's
-  last lines keep their order, and writes a progress line to stderr while it runs. Detection is optional by design: Paja has no Docker dependency, and its tests
-  use a fake `sbx`.
+- **Choosing the backend.** `sandbox::chosen` reads `PAJA_SBX` once per step. `off` or an empty value means the host,
+  with no probe (`off`). Any other value names the `sbx` program (`set`), used as before. Unset, Paja looks for `sbx` on
+  `PATH` (`sbx.exe` on Windows): found, it is used exactly as if `PAJA_SBX` named it (`detected`), after a probe (`sbx
+  version`, then `sbx ls`, which needs the Docker engine, about 10 seconds in all, each in its own process group so a
+  stuck daemon is killed with its children); not found, the host (`not_found`). The first progress line of the step says
+  which and why, `paja doctor` reports the same, and `run.started` records it as `backend` (`sandbox` or `host`) and
+  `backend_why` (`detected`, `set`, `off`, `not_found`), as the step chose, so the log shows which runs ran on the host.
+  A pool chooses once, before its first lane, and passes the choice to every lane and planner it starts, in
+  `PAJA_SBX_PASSED` (the reason and the program; the child's `main` takes it out of its environment, so its agents and
+  checks never see it, and `PAJA_SBX` stays as the person set it), so no lane runs on the host after another ran in the
+  sandbox. The pool's own daily triage uses the same choice. A process that has used a detected `sbx` stops, rather than
+  run on the host, when a later step finds none on `PATH`, and its doctor fails the sandbox check. The probe can't tell
+  whether Claude Code is signed in inside the sandbox; the first agent finds that out (see Signing in). Paja Desk passes
+  its environment, `PAJA_SBX` included, to the runs it starts; it shows the backend in a run's output (the progress
+  line) and in its Check (the doctor's sandbox check), and a failing check stops it starting a run.
+- **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If a sandbox was
+  chosen (`set` or `detected`) and it can't start, or the probe fails, it stops with an error that says what to install,
+  start or sign in to, and that `PAJA_SBX=off` runs on the host. It never falls back to running on the host, then or
+  partway through. On the host, `paja run` says so on stderr and runs as described above, behind the deny-list hook
+  only. The sandbox is named `paja`; `PAJA_SBX_NAME` names another one (the real-`sbx` test uses it, so it never removes
+  the person's own). `.paja/setup` runs with stderr merged into stdout, so a failure's last lines keep their order, and
+  writes a progress line to stderr while it runs. Paja has no Docker dependency: with no `sbx` it runs on the host, and
+  its tests use a fake `sbx` (the smoke tests set `PAJA_SBX=off` unless a test chooses otherwise, and clear
+  `PAJA_SBX_NAME` and `PAJA_SBX_PASSED`, so a developer's own `sbx` is never used).
+- **One step's sandbox.** The sandbox a step starts is in use for that step's agents and checks only, on the thread
+  that runs it, and is put back when the step ends, an error included. So two calls at once in one long-lived `paja mcp`
+  never start an agent in each other's sandbox, or with none once the other has finished.
 - **Permissions.** Claude Code is always started with `--permission-mode auto`, with or without a sandbox; the sandbox
   image's default, `bypassPermissions`, and every weaker mode are never used. Auto mode is an extra layer, not a
   replacement for the deny-list hook, `--tools` or the turn caps. If a Claude Code rejects auto mode headless, the step
@@ -649,24 +766,35 @@ while it starts.
   macOS and Linux with one installer and no administrator account setup. A dedicated low-privilege user with ACLs, an
   AppContainer or a restricted token each need per-machine administrator setup on Windows that differs between Home
   and Pro, and none of them hides the owner's files from a process the way a separate VM does; bubblewrap and
-  `sandbox-exec` don't exist on every platform Paja runs on. So Paja has one backend, and the owner opts in.
+  `sandbox-exec` don't exist on every platform Paja runs on. So Paja has one backend, used when it is installed.
 - **Assumptions about `sbx`.** Everything Paja assumes about it is in `crates/paja/src/sandbox.rs`: `sbx exec`
-  with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, and that a mounted path has the same absolute
-  path inside the sandbox.
+  with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, that `sbx version` and `sbx ls` succeed when it
+  and the Docker engine work, that a mounted path has the same absolute path inside the sandbox, and that `sbx exec -i`
+  passes stdin through. It never returns when the program inside exits before reading all of its stdin, so a shell in
+  the sandbox reads an agent's prompt to the end first and then becomes the agent, with the prompt on a here-document;
+  the prompt is never written to a file the sandbox can reach. The command-line budget counts the whole `sbx` command,
+  wrapping included.
 - **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
   which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead
-  of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current
-  directory or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not
-  spelling). Git passes the git directory down to every process it starts (hooks, `!` aliases, submodule commands),
-  so the shim clears an inherited `GIT_DIR` and `GIT_WORK_TREE` that name the worktree's git directory for git
-  commands aimed outside the worktree. A caller's own `GIT_DIR`, `--git-dir` or `--work-tree` is left alone, and other
-  git commands run unchanged. The `.git` file on the host is never rewritten. Only the git
-  found on `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses
-  it. The unit tests run the shim against a fake git on the host; the check against real `sbx` is manual. On
-  Windows, in a sandboxed worktree, run through `sbx exec` the way Mestari does: `git status` and
-  `git -c k=v -C <worktree> log -1` must succeed, `command -v git` must name `$HOME/.paja-shim/git`, and
-  `git -C /tmp status` must not be redirected to the worktree.
+  of the real one on `PATH` adds `--git-dir` and `--work-tree` to git commands aimed at the worktree (current directory
+  or `-C`, read past any other global options such as `-c k=v` or `--no-pager`, compared by identity, not spelling); a
+  caller that chose its own work tree gets only `--git-dir`, and one that chose its own repository gets nothing added. A
+  git directory passed this way reaches the processes git starts as `GIT_DIR` and `GIT_WORK_TREE`, so each is decided on
+  its own, by identity (another spelling, a symlink or a mount path of the same directory counts): an inherited
+  `GIT_DIR` that is the worktree's git directory is cleared for git commands aimed outside the worktree, and an
+  inherited `GIT_WORK_TREE` that is the worktree is cleared for those and for another repository the caller chose, and
+  so is an inherited `GIT_INDEX_FILE` in the worktree's git directory. A value naming any other directory is the
+  caller's own and left alone; one set to the worktree's own, for any of the three, can't be told from git handing it
+  down, so it is treated the same way. Git puts its own exec directory first on `PATH` for hooks and `!` aliases, so a
+  git called there usually runs the real git, not the shim. A relative value is read, as git reads it, against the
+  directory after any `-C`; git hands down absolute ones, except the `GIT_WORK_TREE=.` a hook gets, which a hook that
+  runs git in another directory makes its own. The `.git` file on the host is never rewritten. Only the git found on
+  `PATH` goes through the shim: a tool that calls git by absolute path, or sets its own `GIT_DIR`, bypasses it. The unit
+  tests run the shim against a fake git on the host; the check against real `sbx` is manual. On Windows, in a sandboxed
+  worktree, run through `sbx exec` the way Mestari does: `git status` and `git -c k=v -C <worktree> log -1` must
+  succeed, `command -v git` must name `$HOME/.paja-shim/git`, and `git -C /tmp status` must not be redirected to the
+  worktree.
 - **Still open.** The sandbox covers only what Paja starts inside it: Paja's own git and `gh` run on the host with
   Mestari's credentials, so GitGuard still watches the shared git files, which the sandbox mounts read-write. The
   other worktrees under `envs/` are mounted too, so code in one worktree can reach another.
@@ -693,18 +821,46 @@ door to the one core. Desk keeps no state of its own. Everything it shows comes 
 log, and any write it makes later goes through the core and holds the home lock. The HTTP API, so Desk's view reaches a
 phone, comes after v0.1.
 
-For every repository in the log the window lists the work items, grouped as waiting on you (escalated, with the
-question), active, queued and the latest landed, each linking to its issue (opened in the browser). It reads the queue
-again whenever `events.jsonl` changes, polling its size and time; the commands run off the window's thread, and a
-refresh that finishes late never draws over a newer one. An error from the core shows in the window with the text the
-CLI prints.
+The window opens at 1440×900 (the screen's size when that is smaller; `desk/tauri.conf.json` and `fit_window`), is
+resizable and remembers nothing, and is one screen with no page scroll: each region sizes to the window and scrolls
+inside itself. It shows one repository at a time (a picker in the bar when Desk knows more than one) in four regions:
 
-An active item has a run view ("Follow run"), filled by `mestari::live` from the item's latest `run.started` on: the run's
+- **Top bar.** The pool's state as a coloured dot and word, the figures since the pool started (running time, landed,
+  ready, spend as tokens and dollars) and the actions: `Start` (or `Stop after this step` and `Stop now` while Desk's
+  own pool runs), `Held` (highlighted when above 0; it opens the held tab), `New work` and `Repositories`. The last two
+  open as dialogs; Escape or a click outside closes them. An error from the core shows as one line under the bar with the
+  text the CLI prints, laid over the top of the regions so it doesn't push them down.
+- **Lanes**, the main region: a card per lane the pool keeps, side by side and wrapping. A card shows the item
+  (number in the item's colour, linking to its issue; title), stage and step, the round (`first`, `rework 1`, ...),
+  the reviewers' verdicts while in review (one mark each), clocks for the step and the lane, tokens and dollars, and the
+  files the lane was admitted for. The lane holding the turn to land and those waiting for it say `merging`. An idle lane,
+  and every lane while the pool is stopped, says `idle`. After the last card a dashed `+` card adds a lane and each card's
+  `−` removes one, both by calling `pool_lanes` with one more or less (a running pool reads it on its next tick, a stopped
+  one starts with it); busy lanes beyond the count finish their item first, and the region says the pool is shrinking
+  by that many (the core closes whichever lane frees first, so no card is named). The core's refusal (0 to 32 lanes)
+  shows under the bar. Clicking a card opens the item's run view in place of the side panel.
+- **Side panel**, a third of the width, with three tabs. `Next`: the ready items (waiting only for a free lane) with
+  their files, then, dimmed, the items waiting for another reason and that reason. `Held`: the escalated items, one line
+  each (number, title, first line of the question); one opens its full question and the answer box (the text survives
+  refreshes), and items whose issue is closed sit in a collapsed `closed issues` group. `Out`: the latest items that left
+  a lane with their outcome (`landed`, `held`, `failed`, `retired`) and time. The Held tab carries a count badge.
+- **Activity**, a strip along the bottom: the newest `pool.*` and `run.*` events, newest at the bottom, with time, what
+  happened (`admitted`, `step`, `round`, `landed`, `held`, `lanes`), the item and the detail.
+
+Everything comes from `pool_status`, `pool_events`, `work_list`, `repos` and `work_run`, read again every two seconds and
+whenever `events.jsonl` changes (polling its size and time); the commands run off the window's thread, and a refresh
+that finishes late never draws over a newer one. Desk holds only the picked repository, the open tab, run view and
+dialog, and the answers being typed. Numbers are monospace, right aligned and fixed width; durations read `7m 13s` and
+tokens `2.6M`; each item number has a colour picked from it. Light and dark follow the system. Keys `n` (new work), `+`
+(add a lane), `h` (held) and Escape (close the run view) do nothing while a text box has focus. What is computed from
+the core's JSON (durations, token counts, file lists, colour tags, the lane cards and counts, the activity lines) is plain
+functions in `desk/ui/view.js`, tested by `desk/ui/view.test.js` under Node, which a test of `cargo test -p paja-desk`
+runs (it is skipped, saying so, where Node isn't installed; CI's runners have it).
+
+A lane's run view, opened from its card, is filled by `mestari::live` from the item's latest `run.started` on: the run's
 environment, the round of three, the step it is in (role and model) with a clock since its `run.step`, each finished
 round's verdict and what every step spent (tokens, cost, turns, time, from `run.round`), and the pull request once
-`run.step` names it. The view is read again on every refresh, and every five seconds while one is open, since a run that is killed writes no event;
-the timer reads only the open run views, so an answer being typed elsewhere keeps its focus, and a view closes once its
-item is no longer active. An active item that no `paja run` holds (its
+`run.step` names it. The view is read again on every refresh, since a run that is killed writes no event. An active item that no `paja run` holds (its
 `runs/<repo>@<number>.lock` is free or missing) shows as interrupted, not running; checking tries that lock and lets go
 of it at once, without creating it, holding the home lock that `paja run` claims items under, so a claim never meets it.
 A claim since the latest `run.started` means that run's steps aren't the current ones: a new `paja run` that hasn't
@@ -721,33 +877,38 @@ newest checkout Paja synced in or made an environment from for it that `gh` stil
 (`jono::known_checkouts`, newest first, from the log's `work.checkout` and `env.created`
 events, each folder once in its newest spelling; each sync records `work.checkout` with its checkout's top level, the nearest folder holding `.git` (its path's `..` parts folded first), when it
 is another folder than the last one, and skips a path that isn't UTF-8; Desk asks `gh` about the newest three at most), else the directory Desk
-started in when it is a checkout of that repository, else an error that says where to start. The
+started in when it is a checkout of that repository, else an error that says where to start. The repository list
+shows the checkout by the same lookup, with each `gh` call limited to 10 s. When `gh` fails (offline, signed out,
+rate-limited, timed out) rather than naming another repository, the row keeps the newest remembered checkout and
+carries the error in `checkout_error`, which the window shows beside the path. Desk reuses a repository's answer for
+30 s as long as its remembered checkouts are the same, so the refreshing window doesn't ask `gh` on every tick. The
 person's text stays in the window across refreshes and errors. Desk's Tauri permissions
 (`desk/capabilities/`, `desk/tauri.conf.json`) are high risk: the window may listen for Desk's events and open
 `https://github.com/` links, nothing else.
 
 Desk also starts and stops runs (`desk/src/runs.rs`). It lists every repository with a work item or a `work.checkout`,
-adds one by syncing in a checkout folder the person names, and shows `doctor::run_checks` for it. A run is the
-installed `paja` as a child process (`paja run --once --yes` or `paja run --every 5`, with `--stop-on-stdin`) in the
-repository's checkout, so it is the CLI's run with its own lock and hook. "Stop after this step" and "Stop now" write
-`stop` and `stop now` to its stdin; after "Stop now" Desk ends a `paja` still going 15 seconds later. The run's output
-goes to `desk/<owner>@<name>.log` in the home, not to a pipe, so a run left going when Desk closes still has somewhere
-to write; Desk shows its end. Desk refuses to start a run while `paja doctor` has a failing check, while its own run of
-the repository is going, while the repository's run marker is held (a `paja run` started from a terminal, even one
-sleeping between items of `--every` or still starting, which holds no item's run lock), or while any active item's run
-lock is held, probing the item locks under the home lock as the run view does. Closing the window while Desk's runs are going asks whether to stop them or leave them
-running; stopping sends each `stop now` and waits for them to end before Desk exits, ending a `paja` still going after
-the same 15 seconds, so none is left stuck. The log file holds output only, never state.
+adds one by syncing in a checkout folder the person names, and shows `doctor::run_checks` for it. A run is the installed
+`paja` as a child process (`paja run --once --yes` or `paja run --every 5`, with `--stop-on-stdin`) in the repository's
+checkout, so it is the CLI's run with its own lock and hook. "Stop after this step" and "Stop now" write `stop` and
+`stop now` to its stdin; after "Stop now" Desk ends a `paja` still going 15 seconds later, with every process it started
+(`platform::kill_with_descendants`: `taskkill /T` on Windows; on Unix it freezes the tree top down with `SIGSTOP`, found
+with `ps`, and then kills it bottom up; a process already reparented away is out of reach), since a run's agents and
+checks are in process groups of their own. The run's output goes to `desk/<owner>@<name>.log` in the home, not to a
+pipe, so a run left going when Desk closes still has somewhere to write; Desk shows its end. Desk refuses to start a run
+while `paja doctor` has a failing check, while its own run of the repository is going, while the repository's run marker
+is held (a `paja run` started from a terminal, even one sleeping between items of `--every` or still starting, which
+holds no item's run lock), or while any active item's run lock is held, probing the item locks under the home lock as
+the run view does. Closing the window while Desk's runs are going asks whether to stop them or leave them running; stopping sends each `stop now` and waits
+for them to end before Desk exits, ending a `paja` still going after the same 15 seconds the same way, so none is left
+stuck. The log file holds output only, never state.
 
-Each repository also has a pool view ("Pool"), read every two seconds and on every log change: `pool::status` (lanes
-with their item, stage, step, time in step, spend and admitted files; the lane landing and the merging queue; what
-waits and why; what landed; since the pool started, its
-spend, landings, ready items and items held for an answer) and the repository's newest `pool.*` and `run.*` events.
-Its lane count calls `pool::lanes` (as `paja pool lanes`), which a running pool reads on its next tick; lowering
-it below the busy lanes says which lanes finish their item first, and a box that holds no count is refused rather
-than read as 0. "Start the pool" runs `paja run --every 5 --workers
-N` the same way as a run, and Desk refuses it while a pool already runs for the repository. The view keeps nothing of
-its own: everything it shows is the event log's.
+The lanes, panel and activity are the repository's pool, read from `pool::status` (lanes with their item, stage, step,
+round, reviewers' verdicts, time in step and on the lane, spend and admitted files; the lane landing and the merging
+queue; what waits and why; what left a lane; since the pool started, its spend, landings, ready items and items held
+for an answer) and the repository's newest `pool.*` and `run.*` events. Its lane count calls `pool::lanes` (as `paja
+pool lanes`). `Start` runs `paja run --every 5 --workers N` with the lane count the pool keeps, the same way as a run,
+and Desk refuses it while a pool already runs for the repository. The view keeps nothing of its own: everything it
+shows is the event log's.
 
 Desk is a workspace member but not a default one, since it needs the webview's development files to build (WebKitGTK
 on Linux): plain `cargo build` and `cargo test` cover the core, and CI's `desk` job runs clippy and the tests for
@@ -757,6 +918,6 @@ Each `v*` release also builds Desk's installers with Tauri's bundler (the `desk`
 Windows, a dmg per Mac architecture, an AppImage and a deb on Linux, unsigned for now. The installer carries the
 `paja` built from the same commit as a Tauri sidecar (`desk/tauri.bundle.json`, which only the release build merges
 in, names `desk/binaries/paja-<target>`), next to `paja-desk`: in the install folder on Windows, which the NSIS hooks in
-`desk/installer.nsh` put on the user's `PATH`, inside the app on macOS and in `/usr/bin` from the deb. Desk's footer
-runs that `paja` (next to its own executable, else on `PATH`) with `--json --version`, shows its full path (a bare name
+`desk/installer.nsh` put on the user's `PATH`, inside the app on macOS and in `/usr/bin` from the deb. Desk's activity
+strip header runs that `paja` (next to its own executable, else on `PATH`) with `--json --version`, shows its full path (a bare name
 is looked up on `PATH`), and warns when its version differs from Desk's; a test keeps `desk/tauri.conf.json`, Desk's crate and the core's crate at one version.

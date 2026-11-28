@@ -1,7 +1,7 @@
 # Setting up Paja
 
 How to install Paja and start it on its own queue. Paja runs natively on Windows, Linux and macOS. Before the first
-run, read [`safety.md`](./safety.md): what the agents can do on your machine, the optional sandbox and a GitHub token
+run, read [`safety.md`](./safety.md): what the agents can do on your machine, the sandbox and a GitHub token
 limited to one repository.
 
 ## What Paja needs
@@ -208,7 +208,8 @@ For one with no template, an agent on the `init` role writes the skeleton instea
 
 1. A first session, with no repository and no tools, names the programs the stack's build, formatter, linter and test
    runner run. Paja keeps plain program names and drops shells, programs that run another command (`nohup`, `wsl`,
-   `busybox`), network tools and the like, with or without an extension (`bash.exe` and `cmd.bat` are dropped too).
+   `busybox`), network tools and the like, in any case and with or without an extension or version (`bash.exe`,
+   `cmd.bat` and `perl5.36.0` are dropped too).
 2. A second session writes a minimal app, one passing test, the formatter's and linter's configuration and a
    `.gitignore`, and runs the formatter, linter and test until they pass. It runs under the deny-list hook, and the
    only programs it may run besides local git are the ones from step 1. It can't write `.github/` (the hook refuses CI
@@ -220,11 +221,12 @@ For one with no template, an agent on the `init` role writes the skeleton instea
 
 When a check fails, or the detection finds no check, nothing is committed or pushed: the repository exists on GitHub and
 the clone stays with the files, the error names the check that failed (with its output) and says so, and you fix it in
-the clone and commit and push by hand, or delete the repository. The three agent sessions each spend usage on the `init`
-model of `.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox
-(`PAJA_SBX`) the agent and the checks run in it, with the clone mounted. Set one for a generated skeleton when you can:
-the stack's own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any code they are
-given, so without a sandbox the hook can't keep the agent from running arbitrary code as you.
+the clone and commit and push by hand, or delete the repository (`gh repo delete <owner>/<name>`, after
+`gh auth refresh -s delete_repo`) and the clone. The three agent sessions each spend usage on the `init` model of
+`.paja/models` (the account's default here, as the new repository has no such file yet). With a sandbox (`sbx`
+installed, or `PAJA_SBX`) the agent and the checks run in it, with the clone mounted. Use one for a generated skeleton
+when you can: the stack's own programs are often interpreters or runners (`python`, `node`, `npx`, `ruby`) that run any
+code they are given, so without a sandbox the hook can't keep the agent from running arbitrary code as you.
 
 ## Check the setup
 
@@ -240,9 +242,16 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   lookup takes a few seconds at most; when it fails (offline), the check says so and stays ok. `PAJA_CLAUDE_LATEST`
   names another source: an `http(s)` URL or a file holding the version.
 - The deny-list hook passes its self-test, and Paja's home folder (`PAJA_HOME`) is private to your user.
-- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it
-  is answered; if its issue is closed instead, this is a warning that names the environment and the
-  `paja env remove <name>` that frees it (the branch is kept).
+- No environment is left over from a closed item. A parked item keeps its environment (worktree and ports) until it is
+  answered; if its issue is closed on GitHub instead, `paja work sync` (and `paja run`) in the checkout that made it
+  removes it, keeping the branch. It is kept while the issue is still open (its label was removed, say) or `gh` can't
+  say, while a run holds the item, while the worktree has uncommitted changes or untracked files, isn't on its branch or
+  can't be read by git, and when its folder is already gone. The sync lists what it kept and why, and tries again each
+  time, so `paja run` repeats a kept line until the reason is gone. Ignored files in the worktree, such as a local
+  `.env`, go with it. Any environment of a closed item that is still there (kept that way, a queued or landed item's, or
+  one whose run crashed or was killed after its issue was closed) is a warning that names the environment and the
+  `paja env remove <name>` that frees it (the branch is kept). That includes an older release's `work-<n>` one made in
+  this checkout when the log shows the item last ran there (or the log names no repository).
 - Claude Code's results report the usage window. Paja reads the window from the `rate_limit_event` messages of
   `claude -p --output-format stream-json`; when none of the latest five agent steps in the log reported one, this is a
   warning, because a nearly used window then can't hold a build back. `claude update` fixes an old Claude Code; if it
@@ -254,8 +263,10 @@ check is `ok`, `warning` or `failed`, and each warning or failure says how to fi
   as your checkout has it (`origin/main`, else `main`); push first, or `paja run` will not see what you changed.
 - `.paja/models` on the default branch parses. It is a warning when a line names a role this Paja doesn't know: that
   line is skipped, so the role runs on the default model or turn cap. Install the newer Paja, or fix the typo.
-- The sandbox: a warning, not a failure, when `PAJA_SBX` is not set. Agents and checks then run as your user, with
-  your files and sign-ins, behind the deny-list hook only.
+- The sandbox: which way agents run and why. With `sbx` on `PATH` (and `PAJA_SBX` unset), it checks that `sbx version`
+  and `sbx ls` work, and fails with the fix when they don't. A warning, not a failure, when there is no `sbx` or
+  `PAJA_SBX=off`: agents and checks then run as your user, with your files and sign-ins, behind the deny-list hook
+  only.
 
 With `--json` it prints `{"checks": [{"name", "status", "detail", "fix"}], "ok": bool}`; `fix` is null for a passing
 check, and `ok` is false when any check failed (a warning doesn't count). The exit code is non-zero when any check
@@ -268,9 +279,9 @@ failed. The MCP tool `doctor` returns the same JSON.
   Code current.
 - **On top: the deny-list hook** (`paja hook`). A thin extra layer for what only Paja knows: no `git push`, only the
   programs in `.paja/commands`, and fail closed. It is not a sandbox and does not stand in for auto mode.
-- **Optional: the sandbox** (`PAJA_SBX`, Docker Sandboxes). Recommended when people outside your team can write the
-  repository's issues or code, and for long unattended runs (`paja run --every`, `--workers` pools). Nothing requires
-  Docker; see [`safety.md`](./safety.md).
+- **The sandbox** (Docker Sandboxes, `sbx`). Used whenever `sbx` is installed, unless `PAJA_SBX=off`. Install it
+  when people outside your team can write the repository's issues or code, and for long unattended runs (`paja run
+  --every`, `--workers` pools). Nothing requires Docker; see [`safety.md`](./safety.md).
 
 ## Using Paja from Claude Code
 
@@ -294,18 +305,34 @@ the repository's checkout, because the MCP tools work on the checkout they run i
 Paja waits for the pull request's CI before it lands. `.paja/ci`, read from the default branch next to `.paja/checks`,
 says whether the repository has any: `required` (the default when the file is missing) or `none`. With `required`, a
 repository with no active GitHub Actions workflow (`gh workflow list` is empty) stops the run before it claims anything,
-once an item is ready to take (a pass with nothing to take doesn't call GitHub for this), and gives an error that names the
+once an item is ready to take (a pass with nothing to take doesn't call GitHub for this, and neither does one that pauses
+because the usage window is nearly used and only new items are ready), and gives an error that names the
 two fixes: add a workflow that runs the checks on pull requests, or put `none` in `.paja/ci` on the default branch. The
 check only sees that a workflow exists, not that it runs on pull requests: a repository whose workflows run only on push
 or on a schedule passes it and then waits five minutes for checks that never appear. With `none`, Paja lands on Vasara's
 checks and the reviewers alone, and says so in the pull request body. If the default branch's protection still requires
 status checks, GitHub refuses the merge and the error says so.
 
+A run waits for CI for at most 120 minutes, counting the wait for checks to appear, and holds the repository's turn to
+land meanwhile, so other runs there wait too. CI still going then escalates the item with the checks as they stood, so a
+stuck job or one queued with no runner doesn't hold up every landing; answer once it is unstuck, and Paja checks the
+pull request's CI again before it lands. A repository whose CI takes longer puts a `wait <minutes>` line (1 to 1440) in
+`.paja/ci` next to `required`, for example `wait 240`; `none` takes no `wait`. `stop now` (or a second Ctrl-C) ends the
+wait at once, and the next run resumes the item.
+
 ## Paja Desk
 
-Paja Desk shows the queue of every repository Paja knows in one window, with what waits on you first, and follows the
-event log as it changes. You can answer Paja's questions there and file new work (it shows the issue for approval
-before filing it). Its footer shows Desk's version and the `paja` it found, and it warns when the two differ.
+Paja Desk opens big (1440×900, or the screen's size) on one repository's lanes, and follows the event log as it
+changes. The top bar shows whether the pool runs, how long, what it landed and spent, and has **Start**, **Stop after
+this step**, **Stop now**, **Held** (highlighted when something waits on you), **New work** and **Repositories**; a
+repository picker appears when Desk knows more than one. Each lane is a card with its item, stage, round, reviewers'
+verdicts, clocks, spend and the files it was admitted for; click a card for the item's run. The dashed **+** card adds
+a lane and each card's **−** removes one (as `paja pool lanes <N>` does: a running pool reads it on its next tick, and
+a stopped one starts with it). The side panel has **Next** (ready items, then those waiting and why), **Held** (click
+one for its question and an answer box) and **Out** (what left a lane, and how); the strip along the bottom shows the
+latest events. You can file new work with **New work** (it shows the issue for approval before filing it). Keys: `n`
+new work, `+` add a lane, `h` held, Escape closes the run view. The strip's header shows Desk's version and the `paja`
+it found, and warns when the two differ.
 
 Under **Repositories** Desk lists every repository Paja knows. Add one by pasting its checkout folder's path (Desk
 syncs its issues there, as `paja work sync` does, and remembers the folder). For each repository:
@@ -317,15 +344,11 @@ syncs its issues there, as `paja work sync` does, and remembers the folder). For
 - **Stop after this step** and **Stop now** do what the first and second Ctrl-C do in a terminal.
 - A run started in a terminal shows as running too, and Desk won't start a second one in the same repository; stop it
   where it was started.
-- **Pool** opens the repository's worker pool: whether it runs, how long, what it spent and landed, how many items
-  are ready or held for your answer, which lane is landing and which wait to land, a row per lane (item, stage,
-  step, time in step, spend, the files it was admitted for), the waiting items and why, the last landings and the
-  pool's latest events. **Start the pool** starts `paja run --every 5 --workers <N>`
-  with the lane count in the box. **Set lanes** changes the count of a running pool, which it reads on its next tick,
-  as `paja pool lanes <N>` does; lowering it says which busy lanes finish their items first. A pool started in a
-  terminal shows here too, and its lanes can be changed the same way.
+- **Start** in the top bar starts `paja run --every 5 --workers <N>` with the pool's lane count. A pool started in a
+  terminal shows in the lanes too, and its lanes can be changed the same way.
 
-Closing Desk while its runs are going asks whether to stop them or leave them running on their own.
+Closing Desk while its runs are going asks whether to stop them or leave them running on their own. Stopping
+ends the agent or check each run is on, and ends a run still going after 15 seconds with everything it started.
 
 ### Install Paja Desk
 

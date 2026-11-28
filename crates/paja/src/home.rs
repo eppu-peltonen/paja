@@ -135,24 +135,59 @@ impl Home {
         self.try_runs_lock(repo, "land")
     }
 
+    /// Take the lock a `paja pool plan` of item `number` of `repo` holds while it plans, without
+    /// waiting. None when another live plan of the item holds it, so a manual plan and a pool's
+    /// never share the planner's checkout or branch.
+    pub fn try_plan_lock(&self, repo: &str, number: u64) -> Result<Option<RunLock>> {
+        self.try_runs_lock(repo, &format!("plan-{number}"))
+    }
+
     /// Take the lock a `paja triage` pass holds for `repo` while it runs, without waiting. None
     /// when another live pass holds it, so two passes never share the triage checkout.
     pub fn try_triage_lock(&self, repo: &str) -> Result<Option<RunLock>> {
         self.try_runs_lock(repo, "triage")
     }
 
+    /// Take the lock a run holds while it waits for `repo`'s turn to land with item `number`,
+    /// without waiting. None when another holds it. Held from the run's `run.merging` until it
+    /// takes the turn or stops waiting, so a `run.merging` whose lock is free is one nobody
+    /// waits on any more.
+    pub fn try_merging_lock(&self, repo: &str, number: u64) -> Result<Option<RunLock>> {
+        self.try_runs_lock(repo, &format!("{number}@merging"))
+    }
+
     /// Whether a live run holds item `number` of `repo`'s run lock, found without writing: a
     /// lock file that isn't there yet is held by no one, so a probe never creates one.
     pub fn run_held(&self, repo: &str, number: u64) -> Result<bool> {
-        let path = self.runs_lock_path(repo, &number.to_string());
+        self.runs_lock_held(repo, &number.to_string())
+    }
+
+    /// Whether a live `paja pool plan` holds item `number` of `repo`'s plan lock (see
+    /// [`Home::try_plan_lock`]), found without writing, as [`Home::run_held`] does.
+    pub fn plan_held(&self, repo: &str, number: u64) -> Result<bool> {
+        self.runs_lock_held(repo, &format!("plan-{number}"))
+    }
+
+    /// Whether a run is waiting for `repo`'s turn to land with item `number` (it holds the lock
+    /// [`Home::try_merging_lock`] takes), found as [`Home::run_held`] finds a run.
+    pub fn merging_held(&self, repo: &str, number: u64) -> Result<bool> {
+        self.runs_lock_held(repo, &format!("{number}@merging"))
+    }
+
+    fn runs_lock_held(&self, repo: &str, tail: &str) -> Result<bool> {
+        let path = self.runs_lock_path(repo, tail);
         let file = match OpenOptions::new().read(true).open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
         };
         match file.try_lock() {
-            // Free: the probe lets go at once (the file closes here).
-            Ok(()) => Ok(false),
+            // Free: the probe lets go at once, explicitly, since Windows may release a lock on
+            // a closed handle only a moment later, and a claim right after must find it free.
+            Ok(()) => {
+                let _ = file.unlock();
+                Ok(false)
+            }
             Err(TryLockError::WouldBlock) => Ok(true),
             Err(TryLockError::Error(err)) => {
                 Err(err).with_context(|| format!("locking {}", path.display()))
@@ -265,6 +300,25 @@ pub struct HomeLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_waits_to_land_only_while_it_holds_its_merging_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home")).unwrap();
+        assert!(!home.merging_held("o/r", 5).unwrap());
+        // A run working on the item is not a run waiting to land with it.
+        let working = home.try_run_lock("o/r", 5).unwrap().unwrap();
+        assert!(home.run_held("o/r", 5).unwrap());
+        assert!(!home.merging_held("o/r", 5).unwrap());
+        let waiting = home.try_merging_lock("o/r", 5).unwrap().unwrap();
+        assert!(home.merging_held("o/r", 5).unwrap());
+        assert!(!home.merging_held("o/r", 6).unwrap());
+        drop(waiting);
+        assert!(!home.merging_held("o/r", 5).unwrap());
+        // A probe leaves the lock free for the next taker at once.
+        assert!(home.try_merging_lock("o/r", 5).unwrap().is_some());
+        drop(working);
+    }
 
     #[test]
     fn a_lock_taken_within_a_limit_gives_up_at_it() {

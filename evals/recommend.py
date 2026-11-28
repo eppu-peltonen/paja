@@ -244,10 +244,11 @@ def one_case(case, paja, base_env):
             shutil.copy(creds, os.path.join(home, ".claude", ".credentials.json"))
         env = dict(base_env)
         env.update({"HOME": home, "USERPROFILE": home, "PAJA_HOME": paja_home})
-        for var in ("PAJA_SBX", "PAJA_SBX_NAME"):
+        for var in ("PAJA_SBX_NAME", "PAJA_SBX_PASSED"):
             env.pop(var, None)
+        # Without a sandbox, `off`: unset, Paja would use an `sbx` it finds on PATH.
+        env["PAJA_SBX"] = case["sandbox"] or "off"
         if case["sandbox"]:
-            env["PAJA_SBX"] = case["sandbox"]
             env["PAJA_SBX_NAME"] = SANDBOX
         done = run(
             [paja, "--json", "init", "--recommend", BUILDING, "--prefer", "python"], cwd, env
@@ -282,12 +283,14 @@ def main():
     target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(root, "target")
     paja = os.path.join(target, "debug", "paja" + (".exe" if WINDOWS else ""))
 
-    sbx = os.environ.get("PAJA_SBX") or shutil.which("sbx")
+    # `off` (or empty) in the caller's shell is not a sandbox program: look on PATH then.
+    named = os.environ.get("PAJA_SBX", "").strip()
+    sbx = (named if named.lower() != "off" else "") or shutil.which("sbx")
     results = {}
     for case in ({"name": "with the sandbox", "sandbox": sbx},
                  {"name": "without the sandbox", "sandbox": None}):
         if case["name"] == "with the sandbox" and not sbx:
-            result = {"passed": False, "error": "`sbx` is not on PATH and PAJA_SBX is not set, so "
+            result = {"passed": False, "error": "`sbx` is not on PATH and PAJA_SBX names no program, so "
                       "the sandbox case can't run; install Docker Sandboxes (sbx), then rerun"}
         else:
             try:

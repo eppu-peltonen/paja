@@ -5,22 +5,32 @@ pub(super) fn claude_program() -> String {
     std::env::var("PAJA_CLAUDE").unwrap_or_else(|_| "claude".to_string())
 }
 
-/// The sandbox agents and checks run in, when `PAJA_SBX` turns it on. Refuses when it is on but
-/// can't start; says so when it is off.
+/// Which backend agents and checks run in ([`crate::sandbox::choose`]), said on stderr; `None`
+/// for the host. Refuses when a chosen sandbox can't start or a detected `sbx` doesn't work.
+pub(super) fn choose_backend() -> Result<Option<crate::sandbox::Choice>> {
+    let choice = crate::sandbox::choose()?;
+    if choice.program.is_none() {
+        progress(&format!(
+            "{}: agents and checks run as you, behind the deny-list hook only",
+            choice.describe()
+        ));
+        return Ok(None);
+    }
+    progress(&format!("starting {}", choice.describe()));
+    Ok(Some(choice))
+}
+
+/// The sandbox agents and checks run in, when one is available or `PAJA_SBX` names one (see
+/// [`choose_backend`]). Refuses when it can't start; says so when there is none.
 /// `base` is the default branch's commit, which `.paja/setup` is read from.
 pub(super) fn start_sandbox(
     home: &Home,
     repo: &Path,
     base: &str,
 ) -> Result<Option<crate::sandbox::Sbx>> {
-    if crate::sandbox::configured().is_none() {
-        progress(&format!(
-            "no sandbox ({} is not set): agents and checks run as you, behind the deny-list hook only",
-            crate::sandbox::PROGRAM_VAR
-        ));
+    let Some(choice) = choose_backend()? else {
         return Ok(None);
-    }
-    progress("starting the sandbox");
+    };
     let envs = home.envs_dir();
     std::fs::create_dir_all(&envs).with_context(|| format!("creating {}", envs.display()))?;
     // The worktrees keep their git data in the repository's own `.git`, which commits need.
@@ -30,9 +40,11 @@ pub(super) fn start_sandbox(
     )?;
     let setup = read_from_base(repo, base, crate::sandbox::SETUP_FILE)?;
     crate::sandbox::start(
+        &choice,
         &sandbox_mounts(envs, PathBuf::from(common)),
         setup.as_deref(),
     )
+    .map(Some)
 }
 
 /// The folders the sandbox mounts: the home's environments and the repository's git data. Git
@@ -219,7 +231,8 @@ fn claude_args(
         args.extend(["--settings".to_string(), settings]);
     }
     // With no setting sources Claude Code loads no CLAUDE.md, so pass the harness from
-    // main: the branch under review can't rewrite the rules its agents follow.
+    // main: the branch under review can't rewrite the rules its agents follow. It is empty for
+    // the `paja init` agent ([`Harness::Omitted`]).
     args.extend(["--append-system-prompt".to_string(), harness]);
     // No MCP servers from anyone's configuration: agents get only Claude Code's own tools.
     args.push("--strict-mcp-config".to_string());
@@ -302,12 +315,32 @@ pub(super) fn claude(
     model_args: &[String],
 ) -> Result<Value> {
     claude_with(
-        home, env, base, prompt, tools, schema, read_only, model_args, None,
+        home,
+        env,
+        base,
+        prompt,
+        tools,
+        schema,
+        read_only,
+        model_args,
+        None,
+        Harness::DefaultBranch,
     )
 }
 
+/// Whether an agent's system prompt carries the default branch's `CLAUDE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Harness {
+    /// The rules of a repository Paja works in: every agent that builds or judges its work.
+    DefaultBranch,
+    /// Left out: for an agent that judges a repository Paja doesn't work in yet (`paja init`),
+    /// whose `CLAUDE.md` is data to read, not rules.
+    Omitted,
+}
+
 /// [`claude`], with `programs` (when given) as the programs the hook lets it run instead of
-/// `.paja/commands`: for a repository that has no such file yet.
+/// `.paja/commands`: for a repository that has no such file yet; and `harness`, whether the
+/// default branch's `CLAUDE.md` goes in the system prompt.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn claude_with(
     home: &Home,
@@ -319,9 +352,14 @@ pub(super) fn claude_with(
     read_only: bool,
     model_args: &[String],
     programs: Option<&[String]>,
+    harness: Harness,
 ) -> Result<Value> {
     let program = claude_program();
-    let harness = match read_from_base(&env.path, base, "CLAUDE.md")? {
+    let harness = match (harness == Harness::DefaultBranch)
+        .then(|| read_from_base(&env.path, base, "CLAUDE.md"))
+        .transpose()?
+        .flatten()
+    {
         Some(text) => format!("The project's CLAUDE.md, as it is on the default branch:\n\n{text}"),
         None => String::new(),
     };
@@ -360,29 +398,14 @@ pub(super) fn claude_with(
         tools,
         schema,
     );
-    let line: usize = args.iter().map(|arg| arg.len() + 3).sum();
-    if line > COMMAND_LINE_BUDGET {
-        let longest = args
-            .iter()
-            .max_by_key(|arg| arg.len())
-            .cloned()
-            .unwrap_or_default();
-        let _ = std::fs::remove_file(&stamp);
-        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
-            let _ = std::fs::remove_dir(dir);
-        }
-        bail!(
-            "the `claude` command line would be {line} characters, over Paja's budget of \
-             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
-            longest.chars().take(60).collect::<String>()
-        );
-    }
     let mut cmd = match &sbx {
         Some(sbx) => {
             let mut argv = vec![program.clone()];
             argv.extend(args);
+            let argv = crate::sandbox::draining_stdin(&argv);
             let mut cmd = in_sandbox(sbx, &env.path, git_identity, Err(&argv))?;
-            // `sbx exec` passes stdin through only when asked to.
+            // `sbx exec` passes stdin through only when asked to, and the program it runs
+            // reads all of it before the agent starts (see `draining_stdin`).
             crate::sandbox::keep_stdin(&mut cmd);
             cmd
         }
@@ -398,6 +421,32 @@ pub(super) fn claude_with(
             cmd
         }
     };
+    // Measured on the whole command, with the sandbox's wrapping when there is one, as Windows
+    // quotes it for an `.exe`: at most each argument in quotes and a space, and a `\` before
+    // every `"` or `\`. A `.cmd` or `.bat` goes through `cmd.exe`, which escapes differently.
+    let line: usize = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.len() + 3 + arg.matches(['"', '\\']).count()
+        })
+        .sum();
+    if line > COMMAND_LINE_BUDGET {
+        let longest = cmd
+            .get_args()
+            .max_by_key(|arg| arg.len())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&stamp);
+        if let Some(dir) = stamp.parent().filter(|_| sbx.is_none()) {
+            let _ = std::fs::remove_dir(dir);
+        }
+        bail!(
+            "the `claude` command line would be {line} characters, over Paja's budget of \
+             {COMMAND_LINE_BUDGET} (Windows allows 32,767); its longest argument starts `{}`",
+            longest.chars().take(60).collect::<String>()
+        );
+    }
     let before = git_head(&env.path);
     let status_before = git_status(&env.path);
     let output = crate::platform::output_until_stopped_with_input(
@@ -1119,7 +1168,7 @@ pub(super) fn tempfile_dir(near: &Path) -> Result<PathBuf> {
 /// login, git's credential helpers and askpass programs, and registry tokens). Agents keep
 /// the owner's `HOME`, which Claude Code needs to sign in, so code they run can still read
 /// credential files there (`.netrc`, say), and a token written into the remote's URL is not
-/// covered. Determined code run by `cargo test` is the sandbox's job (`PAJA_SBX`).
+/// covered. Determined code run by `cargo test` is the sandbox's job.
 pub(super) fn without_credentials(
     cmd: &mut Command,
     scratch: &Path,
@@ -1137,6 +1186,8 @@ pub(super) fn without_credentials(
         // Replacement refs would let code show the reviewer a different history.
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_GRAFT_FILE", "/dev/null")
+        // A pool's choice for its lane's backend is the lane's alone (`main` already took it).
+        .env_remove(crate::sandbox::PASSED_VAR)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")

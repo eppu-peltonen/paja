@@ -239,9 +239,8 @@ fn generated(
     )?;
     if git(dir, &["status", "--porcelain"])?.is_empty() {
         bail!(
-            "the init agent wrote no files for the {stack} skeleton; delete the new repository on \
-             GitHub (`gh repo delete`) and the folder, then run `paja init --new` again, or use a \
-             stack with a built-in skeleton (rust, node, python)"
+            "the init agent wrote no files for the {stack} skeleton; to avoid it, use a stack with \
+             a built-in skeleton (rust, node, python), which needs no init agent"
         );
     }
     // Paja writes these from what it finds; the agent's own copies would only disagree.
@@ -341,9 +340,11 @@ pub fn run_new(home: &Home, cwd: &Path, options: NewOptions) -> Result<NewReport
     };
     let after_create = |err: anyhow::Error| {
         err.context(format!(
-            "the repository {url} was created; finish by hand in {} or delete it on GitHub \
-             (`gh repo delete {repo}`) before running `paja init --new` again with the same name",
-            dir.display()
+            "the repository {url} was created; finish by hand in {dir}, or delete the new \
+             repository on GitHub (`gh repo delete {repo}`, which needs the `delete_repo` scope: \
+             `gh auth refresh -s delete_repo`) and remove {dir} before running `paja init --new` \
+             again with the same name",
+            dir = dir.display()
         ))
     };
     gh(cwd, &["repo", "clone", &url, &dir.display().to_string()]).map_err(after_create)?;
