@@ -96,8 +96,9 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
   - weakening phrases (relax the test, skip the check, drop the assert and the like) in the question, the reviewers'
     summaries or the answer;
   - a guard file or rule named in the question itself (Paja's framing, or the builder's or a reviewer's escalation
-    question) or in the answer, but not in the reviewers' summaries or the check output a question quotes, which name
-    them only to say what a change is about or where a test failed;
+    question) or in the answer, but not in the reviewers' summaries or in what a question quotes (the summaries in a
+    split, the last round's feedback after five rounds), which name them only to say what a change is about or where
+    a test failed;
   - in the answer alone, markers of a changed test or a skipped check (`#[ignore`, `--skip`, `.skip(`, an expected
     value, a snapshot, the CI config), any test file or test code, and a `.paja/checks` command with arguments in an
     answer that also has a word for not running something (skip, drop, stop and the like, anywhere in it).
