@@ -8461,6 +8461,7 @@ fn run_every_waits_for_the_reset_instead_of_polling() {
     let resets = epoch_secs_in(3600);
     std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
     std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
+    let started = std::time::Instant::now();
     let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
@@ -8478,8 +8479,11 @@ fn run_every_waits_for_the_reset_instead_of_polling() {
         .find(|line| {
             line.contains("waiting until it resets at") || line.contains("checking again in")
         });
-    // Long enough for a busy loop to show itself as repeated passes.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // A busy loop would start its next pass at once, and no later pass takes longer than the
+    // first (one that finds the window still closed returns at once), so watching for three
+    // times the first pass shows one however loaded the machine is.
+    let pass = started.elapsed();
+    std::thread::sleep((pass * 3).max(std::time::Duration::from_millis(1500)));
     let still_running = every.try_wait().unwrap().is_none();
     every.kill().unwrap();
     every.wait().unwrap();
@@ -11323,15 +11327,23 @@ fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
     let calls = f.claude_calls().len();
     let admitted = events_of(&f, "pool.admitted").len();
     let pool = start_pool(&f, "2");
-    // Several ticks of the pool, which would have admitted lanes without the pause.
-    std::thread::sleep(std::time::Duration::from_millis(3000));
+    // The pool says it is paused in the tick that would otherwise have planned and admitted.
+    // It reads the `stop` only at the top of a later tick, so once it has stopped that whole
+    // tick is over, however slowly it ran: whatever it started is in the log by then.
+    let paused = || {
+        std::fs::read_to_string(dir.join("pool.err"))
+            .unwrap_or_default()
+            .contains("starting nothing until")
+    };
+    wait_until(&f, "the pool saying it is paused", paused);
+    // That first tick is certain; a few more ticks are extra cover for a pause that holds only
+    // in the tick that announces it.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let reports = stop_pool(&f, pool);
+    assert!(reports.is_empty(), "{reports:?}");
     assert_eq!(events_of(&f, "pool.admitted").len(), admitted);
     assert!(events_of(&f, "pool.planning").is_empty());
     assert_eq!(f.claude_calls().len(), calls, "no agent started");
-    let reports = stop_pool(&f, pool);
-    assert!(reports.is_empty(), "{reports:?}");
-    let err = std::fs::read_to_string(dir.join("pool.err")).unwrap();
-    assert!(err.contains("starting nothing until"), "{err}");
 }
 
 /// The pool says how to stop it now; its lanes, which read `stop` from the pool, only say they
