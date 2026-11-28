@@ -6158,6 +6158,55 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
 }
 
 #[test]
+fn the_arbiter_answers_when_a_reviewer_only_says_no_check_is_weakened() {
+    let f = Factory::new("true\n", "escalate");
+    // Reviewers often close with this; on its own it is no reason to keep the arbiter out. The
+    // fake puts review-summary into its JSON as it is, so it holds no `"` or `\`.
+    std::fs::write(
+        f.tmp.path().join("review-summary"),
+        "Adds the test. It doesn't weaken any check.",
+    )
+    .unwrap();
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "Use v2.",
+            "reason": "The issue says so.",
+            "weakens_a_check": false
+        }),
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "arbitrated", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["answers"][0]["answer"], "Use v2.", "{item}");
+}
+
+#[test]
+fn the_arbiter_is_overruled_when_its_answer_names_weakening_even_to_deny_it() {
+    let f = Factory::new("true\n", "escalate");
+    arbiter_says(
+        &f,
+        serde_json::json!({
+            "verdict": "answer",
+            "answer": "One more round. This doesn't weaken any check.",
+            "reason": "A test is missing.",
+            "weakens_a_check": false
+        }),
+    );
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("weakening a check"), "{question}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "escalated", "{item}");
+    assert!(item["answers"].as_array().unwrap().is_empty(), "{item}");
+}
+
+#[test]
 fn the_arbiter_answers_an_item_only_once() {
     let f = Factory::new("true\n", "escalate");
     arbiter_says(
@@ -9487,6 +9536,165 @@ fn paja_sbx_name_names_the_sandbox_paja_creates_and_runs_in() {
         !log.contains(" paja -- ") && !log.contains("--name paja "),
         "{log}"
     );
+}
+
+/// A fake `sbx` like [`fake_sbx`] that also models how `sbx exec -i` hangs: it passes stdin only
+/// with `-i`, and when the program inside exits with some of it unread, it leaves
+/// `stdin-left-unread` (where the real one would never return).
+fn fake_sbx_that_hangs_on_unread_stdin(dir: &Path) -> std::path::PathBuf {
+    let d = slash(dir);
+    program(
+        dir,
+        "sbx",
+        &format!(
+            "#!/bin/sh\necho \"<<sbx>> $*\" >> {d}/sbx.log\n\
+             case \"$1\" in\ncreate) : > {d}/created; exit 0 ;;\nexec) shift; keep=\n\
+             [ -f {d}/created ] || {{ echo 'no such sandbox' >&2; exit 1; }}\n\
+             while [ \"$1\" != \"--\" ]; do case \"$1\" in -i) keep=1; shift ;; -w) cd \"$2\"; shift 2 ;; -e) export \"$2\"; shift 2 ;; *) shift ;; esac; done\n\
+             shift\n\
+             case \"$*\" in *\"cc --version\"*) exit 0 ;; esac\n\
+             [ -n \"$keep\" ] || exec \"$@\" < /dev/null\n\
+             cat > {d}/sbx-stdin-$$\n\
+             exec 3< {d}/sbx-stdin-$$\n\
+             \"$@\" <&3; status=$?\n\
+             left=$(wc -c <&3); [ $left -gt 0 ] && : > {d}/stdin-left-unread\n\
+             rm -f {d}/sbx-stdin-$$; exit $status ;;\nesac\n"
+        ),
+    )
+}
+
+#[test]
+fn the_fake_sbx_notices_a_program_that_leaves_stdin_unread() {
+    // The tests below rely on it: a program that exits without reading its stdin is caught.
+    let tmp = tempfile::tempdir().unwrap();
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(tmp.path());
+    std::fs::write(tmp.path().join("created"), "").unwrap();
+    let mut child = Command::new(&sbx)
+        .args(["exec", "-i", "paja", "--", "sh", "-c", "exit 0"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"a prompt").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(tmp.path().join("stdin-left-unread").exists());
+}
+
+#[test]
+fn agents_in_the_sandbox_get_their_prompt_on_stdin_through_the_drain() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let (ok, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "landed", "{report}");
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert!(log.contains("exec -i"), "{log}");
+    assert!(!f.tmp.path().join("stdin-left-unread").exists(), "{log}");
+    assert!(f.tmp.path().join("prompt-on-stdin").exists());
+    let calls = f.claude_calls();
+    assert!(calls.len() >= 2, "{calls:?}");
+    assert!(calls.iter().all(|c| c.contains("#5")), "{calls:?}");
+    // Each agent's command reads its stdin to the end before the agent starts.
+    let agents: Vec<&str> = log
+        .split("<<sbx>> ")
+        .filter(|c| c.contains("--output-format"))
+        .collect();
+    assert!(agents.len() >= 2, "{log}");
+    assert!(
+        agents
+            .iter()
+            .all(|c| c.starts_with("exec -i") && c.contains("PAJA_PROMPT_END")),
+        "{log}"
+    );
+}
+
+#[test]
+fn an_agent_in_the_sandbox_that_exits_without_reading_its_prompt_does_not_hang_sbx() {
+    // The real `sbx exec -i` never returns when this happens, which hung sandboxed runs.
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let claude = program(
+        f.tmp.path(),
+        "claude-that-fails-early",
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *--version*) exec {} \"$@\" ;; esac\n\
+             : > {}/failed-early; echo 'failed early' >&2; exit 1\n",
+            slash(&f.claude),
+            slash(f.tmp.path())
+        ),
+    );
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert!(f.tmp.path().join("failed-early").exists(), "{report} {log}");
+    assert!(log.contains("exec -i"), "{log}");
+    assert!(
+        !f.tmp.path().join("stdin-left-unread").exists(),
+        "{report} {log}"
+    );
+}
+
+#[test]
+fn a_sandboxed_agent_whose_whole_command_line_is_too_long_is_refused_before_it_starts() {
+    // The budget counts the sandbox's wrapping too, so Windows never refuses the command.
+    let with_harness = || {
+        let f = Factory::new("true\n", "land");
+        std::fs::write(f.repo.join("CLAUDE.md"), "x".repeat(27_600)).unwrap();
+        git(&f.repo, &["add", "CLAUDE.md"]);
+        git(&f.repo, &["commit", "-qm", "a long harness"]);
+        git(&f.repo, &["push", "-q", "origin", "main"]);
+        f
+    };
+    // On its own, `claude`'s command line fits.
+    let f = with_harness();
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+        ],
+    );
+    assert_eq!(report["outcome"], "landed", "{report}");
+    // Wrapped for the sandbox, it doesn't: the excess, about 1,800 characters, is mostly the
+    // sandbox's own shell wrapping (`Sbx::command`'s git shim), so this needs a new size if that
+    // shrinks.
+    let f = with_harness();
+    let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
+    let (_, report) = paja_with(
+        &f.home,
+        &f.repo,
+        &["run"],
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+            ("PAJA_SBX", sbx.as_path()),
+        ],
+    );
+    assert!(
+        report.to_string().contains("over Paja's budget"),
+        "{report}"
+    );
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap_or_default();
+    assert!(!log.contains("--output-format"), "{log}");
 }
 
 #[test]

@@ -100,7 +100,12 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
   or the answer may weaken a check. The arbiter's own `weakens_a_check` flag is the main defence against that, and an
   answer stands only when it gives it as `false`. Word and path rules back it up:
   - weakening phrases (relax the test, skip the check, drop the assert and the like) in the question, the reviewers'
-    summaries or the answer;
+    summaries or the answer. In the answer any mention counts, even a denial, and the prompt says so. The question
+    and the summaries are written by reviewers, who are asked whether a change weakens a check, so one kind of
+    sentence is left out of them first: a closing sentence (the last of the text, or of one reviewer's part) that
+    says word for word, with only letters, apostrophes and a final `.` or `!`, that the change weakens no check ("It
+    doesn't weaken any check."). Anything more ("apart from the flaky case" on the next line or in the next sentence,
+    "don't skip the test", a question) still counts;
   - a guard file or rule named in the question itself (Paja's framing, or the builder's or a reviewer's escalation
     question) or in the answer, but not in the reviewers' summaries or in what a question quotes (the summaries in a
     split, the last round's feedback after five rounds), which name them only to say what a change is about or where

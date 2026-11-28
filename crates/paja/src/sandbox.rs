@@ -430,6 +430,25 @@ fn transcript_script(id: &str) -> String {
     format!("ls \"$HOME\"/.claude/projects/*/{id}.jsonl >/dev/null 2>&1")
 }
 
+/// The shell script [`draining_stdin`] runs in the sandbox: read all of stdin (the `.` keeps
+/// trailing newlines through `$(...)`), then become the program with it on a here-document.
+/// The end marker is matched before `$p` is expanded, so no line of the prompt can end it.
+const DRAIN: &str =
+    "p=$(cat; echo .) && p=${p%.} && exec \"$@\" <<PAJA_PROMPT_END\n$p\nPAJA_PROMPT_END";
+
+/// `argv` wrapped so that, in the sandbox, all of its stdin is read before the program starts,
+/// and the program, which replaces the shell, gets it back on its own stdin. `sbx exec -i` never
+/// returns when the program in the sandbox exits before it has read all of its stdin (the
+/// sandbox's copy of stdin fails with a broken pipe), as an agent that fails early does; read
+/// to the end first, the copy always completes. Nothing is written outside the sandbox, so
+/// nothing there can redirect it. The program sees the text with one newline added; it is for
+/// text, since the shell drops NUL bytes.
+pub fn draining_stdin(argv: &[String]) -> Vec<String> {
+    let mut wrapped = vec!["sh".into(), "-c".into(), DRAIN.into(), "sh".into()];
+    wrapped.extend(argv.iter().cloned());
+    wrapped
+}
+
 /// Make an `sbx exec` command from [`Sbx::command`] pass Paja's stdin to the program in the
 /// sandbox (`exec -i`), for a prompt written there. Any other command is left as it is.
 pub fn keep_stdin(cmd: &mut Command) {
@@ -717,6 +736,57 @@ mod tests {
         let (first, after) = b.join().unwrap();
         assert_eq!(first.as_deref(), Some("b"));
         assert_eq!(after, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draining_stdin_hands_the_program_all_of_stdin_and_becomes_it() {
+        use std::io::Write;
+        let input = "a \"b\" $x `y` \\n\n\n";
+        let argv = draining_stdin(&["cat".to_string()]);
+        assert_eq!(argv[..4], ["sh", "-c", DRAIN, "sh"]);
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("{input}\n"));
+        // A program that exits without reading still leaves stdin read to the end, and its
+        // own exit status is the wrapper's.
+        let argv = draining_stdin(&["sh".into(), "-c".into(), "exit 7".into()]);
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&[b'x'; 300_000])
+            .unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        // The shell hands its process over to the program, so stopping one stops the other.
+        let argv = draining_stdin(&["sh".into(), "-c".into(), "echo $$".into()]);
+        let shell = Command::new("sh")
+            .args(["-c", "echo $$; exec \"$@\""])
+            .arg("sh")
+            .args(&argv)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let shell = String::from_utf8(shell.stdout).unwrap();
+        let mut pids = shell.lines();
+        assert_eq!(pids.next(), pids.next(), "{shell}");
     }
 
     #[test]
