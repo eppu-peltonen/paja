@@ -12501,6 +12501,122 @@ fn two_lanes_at_the_land_turn(f: &Factory) -> (u64, u64) {
     turn
 }
 
+/// Two lanes waiting for the turn to land take it in the order they began to wait, the order
+/// `paja pool status` lists them in, not whichever looks first once it is free. The one that
+/// waited first is paused while the turn comes free, so the other looks first.
+#[cfg(unix)]
+#[test]
+fn lanes_waiting_to_land_take_the_turn_in_the_order_they_began_to_wait() {
+    let f = pool_factory(false);
+    std::fs::write(f.tmp.path().join("own-files"), "").unwrap();
+    for flag in ["real-merge", "ci-hold"] {
+        std::fs::write(f.tmp.path().join(flag), "").unwrap();
+    }
+    let pool = start_pool(&f, "3");
+    wait_until(&f, "three lanes building", || {
+        ["Alpha", "Beta", "Gamma"].iter().all(|t| holding(&f, t))
+    });
+    let status = || paja(&f.home, &f.repo, &["pool", "status"]).1;
+    let merging = |status: &Value| -> Vec<u64> {
+        status["merging"]
+            .as_array()
+            .map(|m| m.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    };
+    let took = |n: u64| {
+        paja(&f.home, &f.repo, &["log"])
+            .1
+            .as_array()
+            .unwrap()
+            .iter()
+            .rfind(|e| e["kind"] == "pool.landing" && e["data"]["number"] == n)
+            .map(|e| e["seq"].as_u64().unwrap())
+    };
+    // One at a time, so the order they begin to wait is known.
+    release(&f, "Alpha");
+    wait_until(&f, "one lane landing", || {
+        status()["landing"].as_u64().is_some()
+    });
+    release(&f, "Beta");
+    wait_until(&f, "a second lane waiting", || {
+        merging(&status()).len() == 1
+    });
+    release(&f, "Gamma");
+    wait_until(&f, "a third lane waiting", || merging(&status()).len() == 2);
+    let order = merging(&status());
+    // Pause the lane that waited first, a child of the pool; it still holds its item, so it
+    // still counts.
+    let first = Command::new("pgrep")
+        .args([
+            "-P",
+            &pool.id().to_string(),
+            "-f",
+            "--",
+            &format!("--item {} ", order[0]),
+        ])
+        .output()
+        .unwrap();
+    let first = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    assert!(
+        !first.is_empty() && !first.contains('\n'),
+        "lane of #{}: {first:?}",
+        order[0]
+    );
+    // Whether the lane got the signal; only the last resume may ignore it.
+    let signal = |sig: &str| {
+        Command::new("kill")
+            .args([sig, first.as_str()])
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    // However the test ends from here, the paused lane is let go again.
+    struct Resume<'a>(&'a dyn Fn(&str) -> bool);
+    impl Drop for Resume<'_> {
+        fn drop(&mut self) {
+            let _ = (self.0)("-CONT");
+        }
+    }
+    let resume = Resume(&signal);
+    // Paused while it doesn't hold the home lock, which it takes briefly at each look, so the
+    // first change can still record its landing.
+    let home_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(f.home.join("lock"))
+        .unwrap();
+    loop {
+        assert!(signal("-STOP"), "pausing the lane of #{}", order[0]);
+        match home_lock.try_lock() {
+            Ok(()) => {
+                home_lock.unlock().unwrap();
+                break;
+            }
+            Err(_) => {
+                assert!(signal("-CONT"), "resuming the lane of #{}", order[0]);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    std::fs::remove_file(f.tmp.path().join("ci-hold")).unwrap();
+    wait_until(&f, "the first change landing", || landed(&f) == 1);
+    // Several looks of the second waiter, each finding the turn free.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let jumped = took(order[1]);
+    drop(resume);
+    assert!(
+        jumped.is_none(),
+        "#{} took the turn while #{} waited longer",
+        order[1],
+        order[0]
+    );
+    wait_until(&f, "all three landing", || landed(&f) == 3);
+    let reports = stop_pool(&f, pool);
+    assert!(
+        reports.iter().all(|r| r["outcome"] == "landed"),
+        "{reports:?}"
+    );
+    assert!(took(order[0]).unwrap() < took(order[1]).unwrap());
+}
+
 /// What origin's main holds at `path`, or None.
 #[cfg(unix)]
 fn on_origin(f: &Factory, rev: &str, path: &str) -> Option<String> {

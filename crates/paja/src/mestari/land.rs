@@ -14,28 +14,105 @@ const LAND_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Wait for this repository's turn to land, taken under the home lock and held for as long as
 /// the returned lock lives. Recorded as `pool.merging` while it waits, `pool.landing` once taken.
-/// A `stop now` ends the wait.
+/// Turns go in the order runs began to wait, a pool's lanes and single runs alike (`paja pool
+/// status` lists a pool's lanes in that order): a free turn is taken only when no run of the
+/// repository still waiting has waited longer. A run back from its builder after a conflict or
+/// failed checks at the turn waits again from the back. A `stop now` ends the wait.
+///
+/// While it waits, the run holds its item's merging lock ([`Home::try_merging_lock`]), which
+/// is what tells the others it still waits: a `pool.merging` left by a run that stopped or
+/// died, or by one whose item a new run has claimed but not brought to the turn yet, holds no
+/// one up. The log is read only when the turn is free, which is seldom; while the longest
+/// waiting run hasn't looked yet, each other waiter reads it once a tick.
 pub(super) fn land_turn(home: &Home, item: &WorkItem, round: u32) -> Result<crate::home::RunLock> {
     let data = json!({ "repo": item.repo, "number": item.number, "round": round });
-    let mut waiting = false;
+    // The seq of this run's `pool.merging`, once it waits, and the lock that says it does.
+    let mut waiting: Option<(u64, Option<crate::home::RunLock>)> = None;
+    let mut announced = false;
+    let mut probe_failed = false;
     loop {
         {
             let lock = home.lock()?;
             if let Some(turn) = home.try_land_lock(&item.repo)? {
-                home.events().append(&lock, EV_LANDING, data)?;
-                return Ok(turn);
+                let events = home.events().read_all()?;
+                let failed = std::cell::Cell::new(None);
+                // A probe that fails counts as nobody waiting, so a lock file Paja can't read
+                // costs the order, never the landing.
+                let held = |n: u64| {
+                    home.merging_held(&item.repo, n).unwrap_or_else(|err| {
+                        failed.set(Some(format!("{err:#}")));
+                        false
+                    })
+                };
+                let mine = waiting.as_ref().map(|(seq, _)| *seq);
+                let ahead = waiting_ahead(&events, &item.repo, item.number, mine, held);
+                if let Some(err) = failed.take().filter(|_| !probe_failed) {
+                    probe_failed = true;
+                    progress(&format!(
+                        "couldn't tell whether another run waits to land, so turns may not go \
+                         in order: {err}"
+                    ));
+                }
+                if ahead.is_empty() {
+                    home.events().append(&lock, EV_LANDING, data)?;
+                    return Ok(turn);
+                }
+                // Not this run's turn: the longest waiting takes it at its next look.
+                drop(turn);
             }
-            if !waiting {
-                home.events().append(&lock, EV_MERGING, data.clone())?;
+            if waiting.is_none() {
+                let merging = home.try_merging_lock(&item.repo, item.number)?;
+                // The run lock makes the item this run's alone, so another holder means a run
+                // that outlived its run lock; this run still waits, but others can't see it.
+                if merging.is_none() {
+                    progress(&format!(
+                        "another process holds #{}'s merging lock, so runs waiting after this \
+                         one may land first",
+                        item.number
+                    ));
+                }
+                let event = home.events().append(&lock, EV_MERGING, data.clone())?;
+                waiting = Some((event.seq, merging));
             }
         }
-        if !waiting {
-            waiting = true;
+        if !announced {
+            announced = true;
             progress("another change is landing in this repository; waiting for its turn");
         }
         stop_point()?;
         std::thread::sleep(LAND_TICK);
     }
+}
+
+/// The items of `repo` other than `number` whose runs have waited for the turn to land longer
+/// than this one: since `mine`, the seq of this run's `pool.merging`, or at all when it hasn't
+/// waited yet. An item's latest `run.started`, `pool.merging`, `pool.landing`, `run.round` or
+/// `run.landed` says whether it waits, and only a run still waiting (`held`: its item's merging
+/// lock is held) counts, so a run stopped or ended while it waited holds no one up.
+fn waiting_ahead(
+    events: &[crate::events::Event],
+    repo: &str,
+    number: u64,
+    mine: Option<u64>,
+    held: impl Fn(u64) -> bool,
+) -> Vec<u64> {
+    let mut latest: std::collections::BTreeMap<u64, &crate::events::Event> = Default::default();
+    for e in events {
+        if e.data["repo"] != repo
+            || ![EV_STARTED, EV_MERGING, EV_LANDING, EV_ROUND, EV_LANDED].contains(&e.kind.as_str())
+        {
+            continue;
+        }
+        if let Some(n) = e.data["number"].as_u64().filter(|n| *n != number) {
+            latest.insert(n, e);
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|(_, e)| e.kind == EV_MERGING && mine.is_none_or(|mine| e.seq < mine))
+        .map(|(n, _)| n)
+        .filter(|n| held(*n))
+        .collect()
 }
 
 /// How a landing attempt ended.
@@ -641,6 +718,52 @@ mod tests {
         // Another method being off says nothing about this one.
         let v = json!({"viewerPermission": "ADMIN", "rebaseMergeAllowed": false});
         assert_eq!(why(v, super::SQUASH), None);
+    }
+
+    #[test]
+    fn the_turn_to_land_goes_to_the_run_that_waited_longest() {
+        use super::*;
+        let ev = |seq: u64, kind: &str, number: u64| crate::events::Event {
+            seq,
+            kind: kind.to_string(),
+            data: json!({ "repo": "o/r", "number": number }),
+            v: 1,
+            ts_ms: 0,
+        };
+        let events = vec![
+            ev(1, EV_STARTED, 5),
+            ev(2, EV_STARTED, 6),
+            ev(3, EV_STARTED, 7),
+            ev(4, EV_MERGING, 6),
+            ev(5, EV_MERGING, 7),
+            ev(6, EV_MERGING, 5),
+            // Another repository's waiter never counts.
+            crate::events::Event {
+                seq: 7,
+                kind: EV_MERGING.to_string(),
+                data: json!({ "repo": "o/other", "number": 8 }),
+                v: 1,
+                ts_ms: 0,
+            },
+        ];
+        let all = |_: u64| true;
+        // #6 waited first, so it goes first; #7 and #5 wait behind it, in that order.
+        assert!(waiting_ahead(&events, "o/r", 6, Some(4), all).is_empty());
+        assert_eq!(waiting_ahead(&events, "o/r", 7, Some(5), all), [6]);
+        assert_eq!(waiting_ahead(&events, "o/r", 5, Some(6), all), [6, 7]);
+        // A run that hasn't waited yet queues behind every waiter.
+        assert_eq!(waiting_ahead(&events, "o/r", 9, None, all), [5, 6, 7]);
+        // A waiter whose run is gone holds no one up.
+        assert!(waiting_ahead(&events, "o/r", 7, Some(5), |n| n != 6).is_empty());
+        // Nor does one whose item moved on: a round, a landing or a new run since it waited.
+        for kind in [EV_LANDING, EV_ROUND, EV_LANDED, EV_STARTED] {
+            let mut moved = events.clone();
+            moved.push(ev(8, kind, 6));
+            assert!(
+                waiting_ahead(&moved, "o/r", 7, Some(5), all).is_empty(),
+                "{kind}"
+            );
+        }
     }
 
     #[test]
