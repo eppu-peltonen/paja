@@ -104,7 +104,7 @@ impl Runner {
         } else {
             cmd.args(["--once", "--yes"]);
         }
-        let mut child = cmd.spawn().with_context(|| {
+        let mut child = spawn_retrying_busy(&mut cmd).with_context(|| {
             format!(
                 "starting {} (install Paja, or Desk's installer, which includes it)",
                 self.program.display()
@@ -282,6 +282,23 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Start `cmd`, trying again for a moment while its program is busy being written. On Linux, a
+/// program file another process still holds open for writing can't be started (`ETXTBSY`): a
+/// program being replaced as it is started (an update of Paja), or a child that another thread
+/// forked in the instant a file was being written and that hasn't started its own program yet.
+fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<Child> {
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -436,6 +453,39 @@ mod tests {
         runner.stop("acme/lib", true).unwrap();
         wait_until("the stuck run ending", || !runner.is_running("acme/lib"));
         wait_for_end_of_agent(dir.path());
+    }
+
+    #[test]
+    fn a_program_held_open_for_writing_starts_once_it_is_let_go() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("busy");
+        std::fs::write(&program, "#!/bin/sh\necho started\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Held open for writing, as a child another thread forked mid-write holds it: Linux
+        // refuses to start it until the last writer lets go.
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&program)
+            .unwrap();
+        let busy = Command::new(&program).output().unwrap_err();
+        assert_eq!(
+            busy.kind(),
+            std::io::ErrorKind::ExecutableFileBusy,
+            "{busy}"
+        );
+        let let_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(writer);
+        });
+        let mut cmd = Command::new(&program);
+        cmd.stdout(Stdio::piped());
+        let out = spawn_retrying_busy(&mut cmd)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "started\n");
+        let_go.join().unwrap();
     }
 
     #[test]
