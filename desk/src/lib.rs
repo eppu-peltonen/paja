@@ -1165,6 +1165,12 @@ mod tests {
     #[test]
     fn a_failing_doctor_check_blocks_starting_a_run() {
         let dir = tempfile::tempdir().unwrap();
+        // The doctor runs in this process: on the host, so a developer's own `sbx` on PATH is
+        // never probed (pinned for every test here, which none minds).
+        paja::sandbox::pin(&paja::sandbox::Choice {
+            program: None,
+            why: paja::sandbox::Why::Off,
+        });
         // The checkout has no `.paja/checks` on its default branch, which `paja doctor` fails.
         let (home, _) = escalated_with_checkout(dir.path());
         let runner = Runner::new(dir.path().join("no-paja"));

@@ -1,12 +1,15 @@
-//! The optional sandbox: one long-lived Docker Sandboxes (`sbx`) sandbox that Mestari runs agent
-//! sessions and Vasara's checks in, so the code they start can't reach the owner's files or
-//! credentials. See "The sandbox" in `docs/design/architecture.md`.
+//! The sandbox: one long-lived Docker Sandboxes (`sbx`) sandbox that Mestari runs agent sessions
+//! and Vasara's checks in, so the code they start can't reach the owner's files or credentials.
+//! See "The sandbox" in `docs/design/architecture.md`.
 //!
-//! The backend is optional: it is on when `PAJA_SBX` names the `sbx` program, and then it fails
-//! closed. Nothing here needs Docker unless it is on, so tests use a fake `sbx`.
+//! It is on by default whenever `sbx` is available ([`choose`]): `PAJA_SBX` names the program,
+//! or, when it is unset, `sbx` on `PATH` that answers is used; `PAJA_SBX=off` runs on the host.
+//! Once on, it fails closed. Nothing here needs Docker unless `sbx` is there, so tests use a fake
+//! `sbx`.
 //!
 //! Everything Paja assumes about `sbx` is in this file: `sbx exec [-w DIR] [-e K=V] NAME -- CMD`,
-//! `sbx create --name NAME AGENT PATH...`, and that a mounted path has the same absolute path
+//! `sbx create --name NAME AGENT PATH...`, that `sbx version` and `sbx ls` succeed when it and
+//! the Docker engine it needs are working, and that a mounted path has the same absolute path
 //! inside the sandbox.
 
 use anyhow::{bail, Context, Result};
@@ -15,8 +18,63 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// The environment variable that names the `sbx` program and turns the sandbox on.
+/// The environment variable that names the `sbx` program, or is `off` for the host.
 pub const PROGRAM_VAR: &str = "PAJA_SBX";
+
+/// Set on a child Paja (a pool's lane or planner) by [`pass_to`]: its parent's choice, as
+/// `why:program` for a sandbox and `why` for the host, so the child runs where its parent
+/// chose and says why. `PAJA_SBX` stays as the person set it. The child's `main` takes this out
+/// of its environment as it starts ([`take_passed`]), so agents, checks and the Paja they run
+/// never see it.
+pub const PASSED_VAR: &str = "PAJA_SBX_PASSED";
+
+/// The choice every [`chosen`] in this process returns, once set: by [`pin`], or by
+/// [`take_passed`] from a parent's [`pass_to`].
+static PINNED: std::sync::OnceLock<Choice> = std::sync::OnceLock::new();
+
+/// Make every later [`chosen`] in this process return `choice` (the first pin wins). A pool
+/// pins the choice it made, so its own daily triage runs where its lanes do.
+pub fn pin(choice: &Choice) {
+    let _ = PINNED.set(choice.clone());
+}
+
+/// Read `PAJA_SBX_PASSED`, remove it from this process's environment, and [`pin`] the choice it
+/// holds. Removing a variable is sound only while one thread runs: `paja`'s `main` calls this
+/// first, before anything starts a thread, and nothing else may (Paja Desk and tests never
+/// do, so they never honour it). A value that doesn't parse pins nothing, and the process
+/// chooses for itself.
+pub fn take_passed() {
+    let Some(value) = std::env::var_os(PASSED_VAR) else {
+        return;
+    };
+    std::env::remove_var(PASSED_VAR);
+    if let Some(choice) = parse_passed(&value.to_string_lossy()) {
+        pin(&choice);
+    }
+}
+
+/// [`pass_to`]'s value read back.
+fn parse_passed(value: &str) -> Option<Choice> {
+    // The reason has no `:`, a Windows path does: split at the first.
+    let (why, program) = match value.split_once(':') {
+        Some((why, program)) => (why, Some(program.to_string())),
+        None => (value, None),
+    };
+    let why = [Why::Set, Why::Detected, Why::Off, Why::NotFound]
+        .into_iter()
+        .find(|w| w.as_str() == why)?;
+    // A program goes with a sandbox's reasons only.
+    let sandbox = matches!(why, Why::Set | Why::Detected);
+    (program.as_deref().is_some_and(|p| !p.is_empty()) == sandbox)
+        .then_some(Choice { program, why })
+}
+
+/// The program looked for on `PATH` when [`PROGRAM_VAR`] is unset.
+const DEFAULT_PROGRAM: &str = "sbx";
+
+/// How long finding out whether a detected `sbx` works may take, so a stuck daemon can't hang a
+/// run.
+pub const PROBE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The sandbox's name. One per machine; it is reused by every run.
 const NAME: &str = "paja";
@@ -225,6 +283,7 @@ const TOOLCHAIN_CHECK: &str = "cc --version && cargo --version && rustfmt --vers
 pub struct Sbx {
     program: String,
     name: String,
+    why: Why,
 }
 
 thread_local! {
@@ -265,12 +324,207 @@ impl Drop for Entered {
     }
 }
 
-/// The `sbx` program, when the person turned the sandbox on.
-pub fn configured() -> Option<String> {
-    std::env::var(PROGRAM_VAR)
+/// Why agents and checks run where they do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// [`PROGRAM_VAR`] names the program.
+    Set,
+    /// [`PROGRAM_VAR`] is unset, and `sbx` on `PATH` answered.
+    Detected,
+    /// [`PROGRAM_VAR`] is `off` (or empty): the host, without looking for `sbx`.
+    Off,
+    /// [`PROGRAM_VAR`] is unset, and there is no `sbx` on `PATH`: the host.
+    NotFound,
+}
+
+impl Why {
+    /// The word the event log and the JSON reports use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Why::Set => "set",
+            Why::Detected => "detected",
+            Why::Off => "off",
+            Why::NotFound => "not_found",
+        }
+    }
+}
+
+/// Where agents and checks run: in the sandbox `program` names, or on the host (`None`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Choice {
+    pub program: Option<String>,
+    pub why: Why,
+}
+
+impl Choice {
+    /// What the run's progress line and `paja doctor` say about it.
+    pub fn describe(&self) -> String {
+        let var = PROGRAM_VAR;
+        match (&self.program, self.why) {
+            (Some(program), Why::Detected) => format!(
+                "the sandbox, with `{program}` found on PATH ({var}=off runs on the host instead)"
+            ),
+            (Some(program), _) => format!("the sandbox, with {var}={program}"),
+            (None, Why::Off) => format!("no sandbox, as {var} is off"),
+            (None, _) => format!("no sandbox, as there is no `{DEFAULT_PROGRAM}` on PATH"),
+        }
+    }
+}
+
+/// Which backend to use, read from [`PROGRAM_VAR`] and `PATH` without starting anything: the
+/// program it names; the host when it is `off` or empty; when it is unset, `sbx` on `PATH`, or
+/// the host when there is none. A detected `sbx` is [`probe`]d before it is used; a named one
+/// fails, if it does, when it starts.
+pub fn chosen() -> Choice {
+    PINNED.get().cloned().unwrap_or_else(chosen_by_var)
+}
+
+/// Make `cmd`, a child Paja, use `choice`, made once by its parent, instead of choosing again:
+/// a pool whose lanes chose each for themselves could start one on the host after another
+/// in the sandbox, were `sbx` to leave `PATH` while it runs. A detected `sbx` is probed again
+/// in the child, which fails closed when it stopped working.
+pub fn pass_to(choice: &Choice, cmd: &mut Command) {
+    let value = match &choice.program {
+        Some(program) => format!("{}:{program}", choice.why.as_str()),
+        None => choice.why.as_str().to_string(),
+    };
+    cmd.env(PASSED_VAR, value);
+}
+
+fn chosen_by_var() -> Choice {
+    match std::env::var_os(PROGRAM_VAR) {
+        Some(value) => {
+            let value = value.to_string_lossy().trim().to_string();
+            if value.is_empty() || value.eq_ignore_ascii_case("off") {
+                Choice {
+                    program: None,
+                    why: Why::Off,
+                }
+            } else {
+                Choice {
+                    program: Some(value),
+                    why: Why::Set,
+                }
+            }
+        }
+        None => match crate::platform::program_on_path(DEFAULT_PROGRAM) {
+            Some(path) => Choice {
+                program: Some(path.to_string_lossy().into_owned()),
+                why: Why::Detected,
+            },
+            None => Choice {
+                program: None,
+                why: Why::NotFound,
+            },
+        },
+    }
+}
+
+/// Whether this process has used an `sbx` it found on `PATH`: once it has, a later step that
+/// finds none stops rather than run on the host (`sbx` mid-upgrade, say).
+static DETECTED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why the last step [`choose`] chose for ran on the host, for [`backend_why`]: what was
+/// chosen, never what `PATH` holds later.
+static LAST_HOST_WHY: std::sync::Mutex<Option<Why>> = std::sync::Mutex::new(None);
+
+/// [`chosen`], with a detected `sbx` [`probe`]d first: one that is installed but doesn't work
+/// is an error that names the fix, never a silent fall back to the host. Neither is an `sbx`
+/// that this process detected before and that has left `PATH` since.
+pub fn choose() -> Result<Choice> {
+    use std::sync::atomic::Ordering;
+    let choice = chosen();
+    match (&choice.program, choice.why) {
+        (Some(program), Why::Detected) => {
+            probe(program)?;
+            DETECTED_ONCE.store(true, Ordering::Relaxed);
+        }
+        (None, Why::NotFound) if detected_earlier() => bail!("{}", lost_sbx()),
+        _ => {}
+    }
+    if choice.program.is_none() {
+        *LAST_HOST_WHY.lock().unwrap_or_else(|e| e.into_inner()) = Some(choice.why);
+    }
+    Ok(choice)
+}
+
+/// Whether this process has used an `sbx` it found on `PATH`, so finding none now is an error.
+pub fn detected_earlier() -> bool {
+    DETECTED_ONCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The error for an `sbx` this process used and no longer finds on `PATH`.
+pub fn lost_sbx() -> String {
+    format!(
+        "`{DEFAULT_PROGRAM}` was on PATH earlier in this run, so its agents ran in the sandbox, \
+         and now it isn't; put Docker Sandboxes (`{DEFAULT_PROGRAM}`) back on PATH, or set \
+         {PROGRAM_VAR}=off and start Paja again (`paja mcp` too) to use the host"
+    )
+}
+
+/// The sandbox's name: `PAJA_SBX_NAME`, or `paja`.
+pub fn sandbox_name() -> String {
+    std::env::var(NAME_VAR)
         .ok()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| NAME.to_string())
+}
+
+/// Whether `program` (an `sbx`) works: `version` succeeds, and so does `ls`, which needs the
+/// Docker engine. Both together are stopped after [`PROBE_LIMIT`]. The error names the fix.
+pub fn probe(program: &str) -> Result<()> {
+    let Err(cause) = probe_within(program, PROBE_LIMIT) else {
+        return Ok(());
+    };
+    bail!(
+        "`{program}` was found on PATH, so Paja runs agents and checks in its sandbox, but {cause}. \
+         {}",
+        probe_fix(program)
+    )
+}
+
+/// What to do about an `sbx` that fails [`probe`].
+pub fn probe_fix(program: &str) -> String {
+    let name = sandbox_name();
+    format!(
+        "Start Docker Desktop (the engine `sbx` needs) and run again; if the sandbox `{name}` \
+         exists and isn't signed in, run `{program} exec -it {name} claude` and type `/login`; or \
+         set {PROGRAM_VAR}=off to run on the host, behind the deny-list hook only"
+    )
+}
+
+/// [`probe`]'s two steps within `limit` in all: which failed and what it said, when one did.
+pub fn probe_within(program: &str, limit: std::time::Duration) -> std::result::Result<(), String> {
+    let started = std::time::Instant::now();
+    for step in ["version", "ls"] {
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(format!(
+                "`{program} {step}` didn't start: the steps before it used all of {}s",
+                limit.as_secs()
+            ));
+        }
+        let mut cmd = Command::new(program);
+        cmd.arg(step);
+        let out =
+            crate::platform::output_within(crate::platform::own_process_group(&mut cmd), left);
+        let said = match out {
+            Ok(out) if out.status.success() => continue,
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                format!(
+                    "{} ({})",
+                    if stderr.is_empty() { stdout } else { stderr },
+                    out.status
+                )
+            }
+            Err(err) => format!("{err:#} (the probe has {}s in all)", limit.as_secs()),
+        };
+        return Err(format!("`{program} {step}` failed: {said}"));
+    }
+    Ok(())
 }
 
 /// The project's setup script, read from the default branch.
@@ -294,21 +548,18 @@ fn script_hash(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Start (or reuse) the sandbox with `mounts` reachable inside it. `Ok(None)` when it isn't
-/// configured; an error, never a silent fallback, when it is configured but can't start.
-/// `setup` is the project's `.paja/setup` from the default branch; without it the sandbox gets
-/// the Rust toolchain.
-pub fn start(mounts: &[PathBuf], setup: Option<&str>) -> Result<Option<Sbx>> {
-    let Some(program) = configured() else {
-        return Ok(None);
-    };
+/// Start (or reuse) the sandbox of `program` with `mounts` reachable inside it: an error, never
+/// a silent fallback, when it can't start. `setup` is the project's `.paja/setup` from the
+/// default branch; without it the sandbox gets the Rust toolchain.
+pub fn start(choice: &Choice, mounts: &[PathBuf], setup: Option<&str>) -> Result<Sbx> {
+    let program = choice
+        .program
+        .as_deref()
+        .context("no sandbox program was chosen")?;
     let sbx = Sbx {
-        program,
-        name: std::env::var(NAME_VAR)
-            .ok()
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| NAME.to_string()),
+        program: program.to_string(),
+        why: choice.why,
+        name: sandbox_name(),
     };
     if sbx.exec_ok("true").is_err() {
         let mut create = Command::new(&sbx.program);
@@ -381,7 +632,7 @@ pub fn start(mounts: &[PathBuf], setup: Option<&str>) -> Result<Option<Sbx>> {
             )
         })?;
     }
-    Ok(Some(sbx))
+    Ok(sbx)
 }
 
 /// `path` as the sandbox spells it. The sandbox is Linux: on Windows `C:\a\b` is `/c/a/b` there
@@ -470,21 +721,36 @@ pub fn keep_stdin(cmd: &mut Command) {
     *cmd = kept;
 }
 
+/// Why the agents and checks a step starts now run where they do: the sandbox in use and why it
+/// was chosen, or why there is none.
+pub fn backend_why() -> Why {
+    active().map_or_else(
+        || {
+            LAST_HOST_WHY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|| chosen().why)
+        },
+        |sbx| sbx.why,
+    )
+}
+
 impl Sbx {
     fn unavailable(&self) -> String {
-        format!(
-            "running `{}` ({} names it): {}",
-            self.program,
-            PROGRAM_VAR,
-            self.fix()
-        )
+        let named = match self.why {
+            Why::Detected => "found on PATH".to_string(),
+            _ => format!("{PROGRAM_VAR} names it"),
+        };
+        format!("running `{}` ({named}): {}", self.program, self.fix())
     }
 
     fn fix(&self) -> String {
+        if self.why == Why::Detected {
+            return probe_fix(&self.program);
+        }
         format!(
-            "install Docker Sandboxes (`sbx`) and sign in to Docker, or unset {} to run agents \
-             behind the deny-list hook only",
-            PROGRAM_VAR
+            "install Docker Sandboxes (`sbx`), start Docker Desktop and sign in to Docker, or set \
+             {PROGRAM_VAR}=off to run agents behind the deny-list hook only"
         )
     }
 
@@ -672,6 +938,7 @@ mod tests {
         Sbx {
             program: "sbx".into(),
             name: "paja".into(),
+            why: Why::Set,
         }
     }
 
@@ -679,6 +946,7 @@ mod tests {
         Some(Sbx {
             program: "sbx".into(),
             name: name.into(),
+            why: Why::Set,
         })
     }
 
@@ -1284,11 +1552,84 @@ mod tests {
         assert!(script.contains("apt_retry apt-get install"), "{script}");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn an_unconfigured_sandbox_is_none() {
-        // The variable is unset in the test environment; `start` must not try to run anything.
-        if configured().is_none() {
-            assert!(start(&[], None).unwrap().is_none());
+    fn a_working_sbx_passes_the_probe_and_a_broken_one_names_the_fix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        assert!(probe(&script("ok", "exit 0")).is_ok());
+        let engine = script(
+            "engine",
+            "[ \"$1\" = version ] && exit 0; echo 'engine down' >&2; exit 1",
+        );
+        let err = probe(&engine).unwrap_err().to_string();
+        assert!(
+            err.contains("ls` failed: engine down") && err.contains("Start Docker Desktop"),
+            "{err}"
+        );
+        assert!(
+            err.contains("/login") && err.contains("PAJA_SBX=off"),
+            "{err}"
+        );
+        // A daemon that never answers is stopped at the limit, with its children.
+        let stuck = script("stuck", "[ \"$1\" = version ] && exit 0; sleep 30");
+        let started = std::time::Instant::now();
+        let err = probe_within(&stuck, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{err}"
+        );
+        assert!(
+            err.contains("ls` failed") && err.contains("still running after"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_choice_passed_to_a_child_comes_back_whole() {
+        let choices = [
+            Choice {
+                program: Some("/opt/bin/sbx".to_string()),
+                why: Why::Detected,
+            },
+            Choice {
+                program: Some(r"C:\Tools\sbx.exe".to_string()),
+                why: Why::Set,
+            },
+            Choice {
+                program: None,
+                why: Why::NotFound,
+            },
+            Choice {
+                program: None,
+                why: Why::Off,
+            },
+        ];
+        for choice in choices {
+            let mut cmd = Command::new("paja");
+            pass_to(&choice, &mut cmd);
+            let vars: Vec<_> = cmd.get_envs().collect();
+            // Only Paja's own variable: `PAJA_SBX` stays as the person set it.
+            assert_eq!(vars.len(), 1, "{vars:?}");
+            assert_eq!(vars[0].0, PASSED_VAR);
+            let value = vars[0].1.unwrap().to_string_lossy().into_owned();
+            assert_eq!(parse_passed(&value), Some(choice.clone()), "{value}");
+        }
+        for bad in [
+            "",
+            "maybe",
+            "off:/opt/bin/sbx",
+            "detected",
+            "detected:",
+            "not_found:sbx",
+        ] {
+            assert_eq!(parse_passed(bad), None, "{bad}");
         }
     }
 }
