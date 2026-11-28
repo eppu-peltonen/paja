@@ -90,8 +90,12 @@ verdicts), the diff stat, earlier answers and main's `CLAUDE.md`, and it returns
   two to four options and a recommendation, so one line answers it.
 - **Always escalated, enforced in code:** an answer is overruled to `escalate` when the item already has an arbiter
   answer (at most one per item, so it can't loop), when the change touches `.paja/checks`, `.paja/high-risk` or the
-  deny-list hook, or when the escalation or the answer is about weakening a check (editing the failing test, those
-  files, the hook's rules). The person then gets the raw question and the reason. The prompt also tells the arbiter
+  deny-list hook, or when the escalation or the answer may weaken a check. A word list alone misses paraphrases, so
+  that takes any of: the arbiter's own `weakens_a_check` flag, which an answer must give as `false`; weakening
+  wording (relax, skip, drop the assert, the CI config and the like) in the question, the reviewers' summaries or the
+  answer; a guard file or rule (those files, the hook, `.github/workflows`) named in the question or the answer, but
+  not in the summaries, which name them only to say what a change is about; and a test file, or a `.paja/checks`
+  command with arguments, named in the answer. The person then gets the raw question and the reason. The prompt also tells the arbiter
   to escalate anything that changes the issue's intent or scope, secrets, actions outside the repository and any
   question that asks for the person's preference.
 - An arbiter that can't run or gives no usable verdict leaves the escalation as it was. Escalations that are not
