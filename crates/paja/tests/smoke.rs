@@ -4163,7 +4163,7 @@ fn a_run_holds_the_repository_marker_for_its_whole_life() {
     std::fs::write(dir.join("hang"), "").unwrap();
     let home = paja::home::Home::at(&f.home).unwrap();
     assert!(!home.repo_run_held("acme/app").unwrap());
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
