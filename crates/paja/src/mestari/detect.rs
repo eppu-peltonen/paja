@@ -68,20 +68,15 @@ pub fn init_agent(
         .context("the init agent returned no answer")
 }
 
-/// A sandbox, when `PAJA_SBX` asks for one, that can reach the fresh clone `dir`, which is not
-/// under the home's `envs` folder.
+/// A sandbox, when one is available or `PAJA_SBX` names one, that can reach the fresh clone
+/// `dir`, which is not under the home's `envs` folder.
 fn clone_sandbox(home: &Home, dir: &Path) -> Result<Option<crate::sandbox::Sbx>> {
-    if crate::sandbox::configured().is_none() {
-        progress(&format!(
-            "no sandbox ({} is not set): agents and checks run as you, behind the deny-list hook only",
-            crate::sandbox::PROGRAM_VAR
-        ));
+    let Some(choice) = choose_backend()? else {
         return Ok(None);
-    }
-    progress("starting the sandbox");
+    };
     let envs = home.envs_dir();
     std::fs::create_dir_all(&envs).with_context(|| format!("creating {}", envs.display()))?;
-    crate::sandbox::start(&[envs, dir.to_path_buf()], None)
+    crate::sandbox::start(&choice, &[envs, dir.to_path_buf()], None).map(Some)
 }
 
 /// Run the skeleton agent in `dir`, a fresh clone with no commit, and wait for it to finish: it

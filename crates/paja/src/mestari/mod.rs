@@ -1111,7 +1111,14 @@ fn run_item(
     record(
         home,
         EV_STARTED,
-        json!({ "repo": item.repo, "number": item.number, "env": env.name, "base": base }),
+        json!({
+            "repo": item.repo,
+            "number": item.number,
+            "env": env.name,
+            "base": base,
+            "backend": if crate::sandbox::active().is_some() { "sandbox" } else { "host" },
+            "backend_why": crate::sandbox::backend_why().as_str(),
+        }),
     )?;
 
     let mut feedback = String::new();
@@ -1120,6 +1127,9 @@ fn run_item(
     // A resumed item goes on in the round that was cut off, with what that round was given.
     let mut start = 1;
     let mut reuse: Option<(String, String)> = None;
+    // The findings of a review that approved the cut-off round's change, which goes on to land
+    // without being reviewed again while it is still that change.
+    let mut approved: Option<Approval> = None;
     if resumed && kept {
         let point = resume_point(&home.events().read_all()?, &item.repo, item.number);
         start = point.round;
@@ -1133,14 +1143,30 @@ fn run_item(
         };
         prior = point.prior;
         reuse = point.checked;
-        let was = match (&reuse, &prior) {
-            (Some((commit, _)), _) => format!("the review of {} was interrupted", short(commit)),
-            (None, Some(p)) => format!(
+        // The approval holds only for the very commit it approved, untouched since.
+        if let (Some(approval), Some((commit, _))) = (point.approved, &reuse) {
+            if approval.commit == *commit && untouched_at(&env, commit)? {
+                follow_ups = approval.findings.clone();
+                // The approval settled the blockers of the rounds before it: a fix after the
+                // default branch is merged in reads the whole change, as at the turn to land.
+                prior = None;
+                approved = Some(approval);
+            }
+        }
+        let was = match (&reuse, &prior, &approved) {
+            (_, _, Some(approval)) => format!(
+                "the review approved {}, which was waiting to land",
+                short(&approval.reviewed)
+            ),
+            (Some((commit, _)), _, _) => {
+                format!("the review of {} was interrupted", short(commit))
+            }
+            (None, Some(p), _) => format!(
                 "the fix for the review of {} was interrupted",
                 short(&p.reviewed)
             ),
-            (None, None) if start > 1 => format!("{} before it", point.stopped_in),
-            (None, None) => "the build was interrupted".to_string(),
+            (None, None, _) if start > 1 => format!("{} before it", point.stopped_in),
+            (None, None, _) => "the build was interrupted".to_string(),
         };
         progress(&format!(
             "resuming #{} in round {start}: {was}",
@@ -1191,10 +1217,18 @@ fn run_item(
         // Only the round that was cut off may reuse what it had: the build, and the checks if
         // nothing has changed since they passed.
         let reused = if round == start { reuse.take() } else { None };
+        let approval = if round == start {
+            approved.take()
+        } else {
+            None
+        };
         let skip_build = match &reused {
             Some((commit, _)) => untouched_at(&env, commit)?,
             None => false,
         };
+        // An approval holds only while the build is skipped. Merging the default branch in
+        // below, which is Paja's own merge, is checked again as at the turn to land.
+        let mut approval = approval.filter(|_| skip_build);
         if skip_build {
             progress(&format!(
                 "round {round} of {MAX_ROUNDS}: the build is already committed; skipping it"
@@ -1422,7 +1456,8 @@ fn run_item(
             }
             CatchUp::Conflict(files) => {
                 let branch = &target.branch;
-                feedback = conflict_feedback(branch, false, &files, prior.as_ref());
+                // An approved change from the run that stopped meets main as at the turn to land.
+                feedback = conflict_feedback(branch, approval.is_some(), &files, prior.as_ref());
                 progress(&format!(
                     "the branch conflicts with {branch}; sending the merge to the builder"
                 ));
@@ -1451,8 +1486,15 @@ fn run_item(
         if !skip_checks {
             let failed = vasara(home, &env, item, round, &checks, &checked)?;
             if let Some(failure) = failed {
-                feedback =
-                    format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}");
+                feedback = if approval.is_some() {
+                    format!(
+                        "{} moved on after the review, and with it merged in Vasara's checks \
+                         fail. Fix the cause, not the check:\n\n{failure}",
+                        target.branch
+                    )
+                } else {
+                    format!("Vasara's checks failed. Fix the cause, not the check:\n\n{failure}")
+                };
                 if let Some(prior) = &prior {
                     feedback.push_str(&format!(
                         "\n\nThe review's blockers still need fixing too:\n\n{}",
@@ -1476,7 +1518,15 @@ fn run_item(
                 )?;
                 continue;
             }
-            record_checked(home, item, round, &checked, &base, checks.len())?;
+            record_checked(
+                home,
+                item,
+                round,
+                &checked,
+                &base,
+                checks.len(),
+                approval.is_some(),
+            )?;
         }
         // --no-renames lists both sides of a rename, so moving a high-risk file keeps it high risk.
         let changed = git(
@@ -1502,6 +1552,15 @@ fn run_item(
         )?;
         let risky = paths.iter().any(|path| is_high_risk(path, &high_risk));
         let reviewers = if risky { 2 } else { 1 };
+        // `.paja/high-risk` on the default branch may have changed since the approval.
+        if let Some(fewer) = approval.as_ref().filter(|a| a.reviewers < reviewers) {
+            progress(&format!(
+                "the change is high risk now and needs {reviewers} reviewers, but {} approved it; \
+                 reviewing it again",
+                fewer.reviewers
+            ));
+            approval = None;
+        }
         // A review that reads the whole change (high risk, a fix that isn't a plain diff, or the
         // round after a conflict or failed checks at the turn to land) still hears what earlier
         // reviews noted outside the change, so those findings aren't lost.
@@ -1533,7 +1592,11 @@ fn run_item(
         let mut i = 0;
         progress("Vasara's checks passed");
         stop_point()?;
-        while i < reviewers {
+        let approved_before = approval.is_some();
+        if approved_before {
+            progress("the review already approved this change; skipping it");
+        }
+        while i < reviewers && !approved_before {
             // High-risk reviewers read the whole change every round: the two must agree on all
             // of it, not only on the fix.
             progress(&format!(
@@ -1655,22 +1718,30 @@ fn run_item(
             continue;
         }
         // Only the latest review's findings count: an earlier round's may be about code the fix
-        // has since changed.
-        follow_ups.clear();
-        for review in &reviews {
-            for finding in &review.follow_ups {
-                if !finding.text.trim().is_empty() && !follow_ups.contains(finding) {
-                    follow_ups.push(finding.clone());
+        // has since changed. An approval from the run that stopped brings its own.
+        match approval {
+            Some(approval) => follow_ups = approval.findings,
+            None => {
+                follow_ups.clear();
+                for review in &reviews {
+                    for finding in &review.follow_ups {
+                        if !finding.text.trim().is_empty() && !follow_ups.contains(finding) {
+                            follow_ups.push(finding.clone());
+                        }
+                    }
                 }
             }
         }
+        // No reviews ran after an approval: it stands for every reviewer's `land`.
         let verdicts: Vec<&str> = reviews.iter().map(|r| r.verdict.as_str()).collect();
-        progress(&format!("review verdict: {}", verdicts.join(", ")));
+        if !approved_before {
+            progress(&format!("review verdict: {}", verdicts.join(", ")));
+        }
         // Every finding in the change is fixed in it: a clean `land` with some still open goes
         // back to the builder, until the last round, which lands with them listed.
         let all_land = verdicts.iter().all(|v| *v == "land");
         let fixes = to_fix(&follow_ups);
-        if all_land && !fixes.is_empty() && round < MAX_ROUNDS {
+        if !approved_before && all_land && !fixes.is_empty() && round < MAX_ROUNDS {
             let list = fixes
                 .iter()
                 .map(|f| f.shown())
@@ -1705,9 +1776,9 @@ fn run_item(
         // A round that goes on is recorded below, with what the next one starts from.
         let ends =
             all_land || verdicts.contains(&"escalate") || (risky && verdicts.contains(&"land"));
-        if ends {
-            // The approved review's outside findings go in the log too: a run stopped at the
-            // turn to land, or in the CI wait, resumes with them.
+        if ends && !approved_before {
+            // The approved review's findings go in the log too: a run stopped at the turn to
+            // land, or in the CI wait, resumes with them and without reviewing again.
             record_round_noted(
                 home,
                 item,
@@ -1716,6 +1787,12 @@ fn run_item(
                 &summaries(&reviews),
                 steps,
                 &outside(&follow_ups),
+                all_land.then(|| Approval {
+                    reviewed: checked.clone(),
+                    commit: checked.clone(),
+                    reviewers,
+                    findings: follow_ups.clone(),
+                }),
             )?;
         }
 
@@ -1770,7 +1847,7 @@ fn run_item(
                         )?;
                         continue;
                     }
-                    record_checked(home, item, round, &judged, &base, checks.len())?;
+                    record_checked(home, item, round, &judged, &base, checks.len(), true)?;
                 }
                 CatchUp::Conflict(files) => {
                     drop(landing);
@@ -3138,7 +3215,10 @@ fn record_round(
 }
 
 /// A round that ended without a next round, with the findings outside the change its review
-/// noted (`noted`, an empty list when there are none), for a resumed run of that round.
+/// noted (`noted`, an empty list when there are none), for a resumed run of that round. A round
+/// every reviewer approved also records `approved` (an [`Approval`]), so a resumed run lands it
+/// without another review.
+#[allow(clippy::too_many_arguments)]
 fn record_round_noted(
     home: &Home,
     item: &WorkItem,
@@ -3147,6 +3227,7 @@ fn record_round_noted(
     detail: &str,
     steps: &mut Vec<StepUsage>,
     noted: &[Finding],
+    approved: Option<Approval>,
 ) -> Result<()> {
     let steps = std::mem::take(steps);
     let mut data = json!({
@@ -3158,6 +3239,11 @@ fn record_round_noted(
         "steps": steps,
     });
     data["noted"] = json!(noted);
+    // Every reviewer approved: the commit, how many approved it, and the findings the change
+    // lands with, in it and outside it.
+    if let Some(approval) = approved {
+        data["approved"] = json!(approval);
+    }
     record(home, EV_ROUND, data)
 }
 
@@ -3199,7 +3285,9 @@ fn record_round_next(
 }
 
 /// Vasara's checks passed on `commit`, with the default branch at `base`: recorded before the
-/// review, so a run that stops in it can go straight to the review again.
+/// review, so a run that stops in it can go straight to the review again. `landing`: the commit
+/// is Paja's own merge of the default branch into an approved change, checked again before it
+/// lands, so the approval holds for it.
 fn record_checked(
     home: &Home,
     item: &WorkItem,
@@ -3207,6 +3295,7 @@ fn record_checked(
     commit: &str,
     base: &str,
     checks_passed: usize,
+    landing: bool,
 ) -> Result<()> {
     record(
         home,
@@ -3214,8 +3303,23 @@ fn record_checked(
         json!({
             "repo": item.repo, "number": item.number, "round": round,
             "commit": commit, "base": base, "checks_passed": checks_passed,
+            "landing": landing,
         }),
     )
+}
+
+/// A round's review that every reviewer approved, as `run.round` records it in `approved`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Approval {
+    /// The commit the review read.
+    reviewed: String,
+    /// The commit the change lands as: the one reviewed, or Paja's own merge of the default
+    /// branch into it at the turn to land, checked again.
+    commit: String,
+    /// How many reviewers approved it: a change that needs more now is reviewed again.
+    reviewers: usize,
+    /// The findings it lands with, in the change and outside it.
+    findings: Vec<Finding>,
 }
 
 /// Where a run that stopped left an item, rebuilt from the item's events.
@@ -3230,6 +3334,8 @@ struct ResumePoint {
     /// The commit the checks passed on in that round, and the default branch's tip they ran
     /// against.
     checked: Option<(String, String)>,
+    /// The round's review approved the change, as [`Approval::commit`] stands.
+    approved: Option<Approval>,
     /// Where the run left off, in words.
     stopped_in: String,
 }
@@ -3244,6 +3350,7 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
         prior: None,
         noted: Vec::new(),
         checked: None,
+        approved: None,
         stopped_in: String::new(),
     };
     for event in jono::item_events(events, repo, number) {
@@ -3256,6 +3363,7 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                     prior: None,
                     noted: Vec::new(),
                     checked: None,
+                    approved: None,
                     stopped_in: String::new(),
                 };
             }
@@ -3269,6 +3377,7 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                         point.noted =
                             serde_json::from_value(next["noted"].clone()).unwrap_or_default();
                         point.checked = None;
+                        point.approved = None;
                         point.stopped_in = format!(
                             "round {round} ended with {}",
                             data["verdict"].as_str().unwrap_or("no verdict")
@@ -3276,6 +3385,14 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                     }
                     None => {
                         point.round = point.round.max(round);
+                        // A review that ended the round (it records `noted`) says whether
+                        // every reviewer approved: a later one that didn't (a split, an
+                        // escalation) takes back an earlier approval. A stop or an error records
+                        // no `noted` and leaves it; a new round, a fresh start or checks on
+                        // another commit take it back too.
+                        if data["noted"].is_array() {
+                            point.approved = serde_json::from_value(data["approved"].clone()).ok();
+                        }
                         // A round that ended approved names the latest outside findings, newer
                         // than what the round before it handed on, even when there are none. A
                         // round recorded without the field (a stop, an error, an older log)
@@ -3295,6 +3412,16 @@ fn resume_point(events: &[crate::events::Event], repo: &str, number: u64) -> Res
                 if let (Some(commit), Some(base)) = (data["commit"].as_str(), data["base"].as_str())
                 {
                     point.checked = Some((commit.to_string(), base.to_string()));
+                    // Checks on Paja's own merge of the approved change (`landing`) move the
+                    // approval to it; checks on any other commit mean the approved one was
+                    // built on, so it no longer holds.
+                    if let Some(approval) = &mut point.approved {
+                        if data["landing"] == true {
+                            approval.commit = commit.to_string();
+                        } else if approval.commit != commit {
+                            point.approved = None;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -4057,7 +4184,7 @@ mod tests {
         )
         .unwrap();
         let prefixes = super::lines(&text);
-        for file in ["agent.rs", "land.rs", "mod.rs"] {
+        for file in ["agent.rs", "land.rs", "mod.rs", "plan.rs"] {
             let path = format!("crates/paja/src/mestari/{file}");
             assert!(super::is_high_risk(&path, &prefixes), "{path}");
         }
@@ -4577,7 +4704,6 @@ mod tests {
             "mestari/builder.rs",
             "mestari/follow_ups.rs",
             "mestari/live.rs",
-            "mestari/plan.rs",
             "mestari/pool.rs",
             "mestari/progress.rs",
             "mestari/usage.rs",
@@ -4752,8 +4878,81 @@ mod tests {
         let point = super::resume_point(&item_log(&[with_prior, none]), "o/r", 7);
         assert!(point.prior.unwrap().follow_ups.is_empty());
         let stopped = (EV_ROUND, json!({"round": 2, "verdict": "stopped"}));
-        let point = super::resume_point(&item_log(&[noted, stopped]), "o/r", 7);
+        let point = super::resume_point(&item_log(&[noted, stopped.clone()]), "o/r", 7);
         assert_eq!(point.noted.len(), 1);
+        // A round every reviewer approved keeps its commit and the findings it lands with, in
+        // the change and outside it, through a stop. Checks on Paja's merge at the turn to land
+        // move it to that commit; checks on any other commit, a round that went on, or a fresh
+        // start take it back; a round that only noted findings (a split, an escalation) never
+        // gave one.
+        let checked_as = |commit: &str, landing: bool| {
+            (
+                EV_CHECKED,
+                json!({"round": 5, "commit": commit, "base": "b1", "landing": landing}),
+            )
+        };
+        let landing = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "land,land", "noted": [],
+                "approved": {"reviewed": "c1", "commit": "c1", "reviewers": 2, "findings": [
+                    {"kind": "nit", "finding": "Rename x"},
+                    {"kind": "outside", "finding": "The lexer drops a byte"}]}}),
+        );
+        let resumed =
+            |events: &[(&str, serde_json::Value)]| super::resume_point(&item_log(events), "o/r", 7);
+        let point = resumed(&[
+            checked_as("c1", false),
+            landing.clone(),
+            checked_as("m1", true),
+            stopped.clone(),
+        ]);
+        let approval = point.approved.expect("approved");
+        assert_eq!(approval.findings.len(), 2);
+        assert_eq!(approval.findings[0].text, "Rename x");
+        assert_eq!(approval.reviewers, 2);
+        assert_eq!(
+            (approval.reviewed.as_str(), approval.commit.as_str()),
+            ("c1", "m1")
+        );
+        assert_eq!(point.round, 5);
+        assert_eq!(point.checked, Some(("m1".into(), "b1".into())));
+        // A rebuild after the approval, checked and then stopped in its review.
+        let point = resumed(&[
+            checked_as("c1", false),
+            landing.clone(),
+            checked_as("x1", false),
+            stopped.clone(),
+        ]);
+        assert!(point.approved.is_none());
+        // The same commit checked again (the default branch tip moved, nothing merged) keeps it.
+        let point = resumed(&[landing.clone(), checked_as("c1", false)]);
+        assert!(point.approved.is_some());
+        let red = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "ci_failed", "next": {"feedback": "red"}}),
+        );
+        let after = |event: (&str, serde_json::Value)| resumed(&[landing.clone(), event]).approved;
+        assert!(after(red).is_none());
+        assert!(after((jono::EV_STATUS, json!({}))).is_none());
+        assert!(after(stopped).is_some());
+        let split = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "land,changes", "noted": []}),
+        );
+        assert!(resumed(std::slice::from_ref(&split)).approved.is_none());
+        // A later review of the same round that didn't approve takes the approval back.
+        let escalated = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "escalate", "noted": []}),
+        );
+        assert!(after(escalated).is_none());
+        assert!(after(split).is_none());
+        // An older approval shape, or none, is no approval.
+        let older = (
+            EV_ROUND,
+            json!({"round": 5, "verdict": "land", "noted": [], "approved": []}),
+        );
+        assert!(resumed(&[older]).approved.is_none());
     }
 
     #[test]

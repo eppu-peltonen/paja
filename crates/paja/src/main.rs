@@ -342,6 +342,8 @@ enum EnvCommand {
 }
 
 fn main() -> ExitCode {
+    // Before any thread: a pool's choice for its lane's backend, never passed on further.
+    paja::sandbox::take_passed();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {

@@ -210,6 +210,26 @@ pub fn posix_shell() -> Result<PathBuf> {
         )
 }
 
+/// The program `name` on `PATH` (with `.exe` on Windows), as an absolute path, if there is one.
+pub fn program_on_path(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        find_on_path(&format!("{name}.exe"))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // As a shell does: a file nobody may run is not the program.
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(name))
+            .find(|path| {
+                std::fs::metadata(path)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+    }
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .filter(|dir| dir.is_absolute())

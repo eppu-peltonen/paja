@@ -5,22 +5,32 @@ pub(super) fn claude_program() -> String {
     std::env::var("PAJA_CLAUDE").unwrap_or_else(|_| "claude".to_string())
 }
 
-/// The sandbox agents and checks run in, when `PAJA_SBX` turns it on. Refuses when it is on but
-/// can't start; says so when it is off.
+/// Which backend agents and checks run in ([`crate::sandbox::choose`]), said on stderr; `None`
+/// for the host. Refuses when a chosen sandbox can't start or a detected `sbx` doesn't work.
+pub(super) fn choose_backend() -> Result<Option<crate::sandbox::Choice>> {
+    let choice = crate::sandbox::choose()?;
+    if choice.program.is_none() {
+        progress(&format!(
+            "{}: agents and checks run as you, behind the deny-list hook only",
+            choice.describe()
+        ));
+        return Ok(None);
+    }
+    progress(&format!("starting {}", choice.describe()));
+    Ok(Some(choice))
+}
+
+/// The sandbox agents and checks run in, when one is available or `PAJA_SBX` names one (see
+/// [`choose_backend`]). Refuses when it can't start; says so when there is none.
 /// `base` is the default branch's commit, which `.paja/setup` is read from.
 pub(super) fn start_sandbox(
     home: &Home,
     repo: &Path,
     base: &str,
 ) -> Result<Option<crate::sandbox::Sbx>> {
-    if crate::sandbox::configured().is_none() {
-        progress(&format!(
-            "no sandbox ({} is not set): agents and checks run as you, behind the deny-list hook only",
-            crate::sandbox::PROGRAM_VAR
-        ));
+    let Some(choice) = choose_backend()? else {
         return Ok(None);
-    }
-    progress("starting the sandbox");
+    };
     let envs = home.envs_dir();
     std::fs::create_dir_all(&envs).with_context(|| format!("creating {}", envs.display()))?;
     // The worktrees keep their git data in the repository's own `.git`, which commits need.
@@ -30,9 +40,11 @@ pub(super) fn start_sandbox(
     )?;
     let setup = read_from_base(repo, base, crate::sandbox::SETUP_FILE)?;
     crate::sandbox::start(
+        &choice,
         &sandbox_mounts(envs, PathBuf::from(common)),
         setup.as_deref(),
     )
+    .map(Some)
 }
 
 /// The folders the sandbox mounts: the home's environments and the repository's git data. Git
@@ -1156,7 +1168,7 @@ pub(super) fn tempfile_dir(near: &Path) -> Result<PathBuf> {
 /// login, git's credential helpers and askpass programs, and registry tokens). Agents keep
 /// the owner's `HOME`, which Claude Code needs to sign in, so code they run can still read
 /// credential files there (`.netrc`, say), and a token written into the remote's URL is not
-/// covered. Determined code run by `cargo test` is the sandbox's job (`PAJA_SBX`).
+/// covered. Determined code run by `cargo test` is the sandbox's job.
 pub(super) fn without_credentials(
     cmd: &mut Command,
     scratch: &Path,
@@ -1174,6 +1186,8 @@ pub(super) fn without_credentials(
         // Replacement refs would let code show the reviewer a different history.
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_GRAFT_FILE", "/dev/null")
+        // A pool's choice for its lane's backend is the lane's alone (`main` already took it).
+        .env_remove(crate::sandbox::PASSED_VAR)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")

@@ -166,16 +166,17 @@ escape hatch for an item that needs no answer.
 
 ## The run loop
 
-Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/high-risk` lists only what decides
-what lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review
-prompt and verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue,
-`GitGuard`), `arbiter.rs` (the arbiter that settles an escalation, and the rules that overrule it), `land.rs`
-(landing, waiting for CI, escalation), `triage.rs` (`paja triage`) and `detect.rs` (the `init` agents' sandboxes and
-tool lists). Outside the module, `init/generate.rs` (the programs a generated skeleton's agent may run) is high risk
-too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`), follow-ups (`follow_ups.rs`), the builder's
-question and answers (`builder.rs`), where a run is (`live.rs`), the pool (`pool.rs`, `plan.rs`) and the rest of
-`init/` are normal risk. A unit test walks every source file and fails on one that is neither on the list nor named
-as normal risk on purpose.
+Mestari's code is the `crates/paja/src/mestari/` module, split so that `.paja/high-risk` lists only what decides what
+lands and how hard it is judged: `mod.rs` (the round loop, main's configuration, the risk tier, the review prompt and
+verdicts), `agent.rs` (how agents are started: flags, hook settings, self-test, sandbox glue, `GitGuard`), `arbiter.rs`
+(the arbiter that settles an escalation, and the rules that overrule it), `land.rs` (landing, waiting for CI,
+escalation), `triage.rs` (`paja triage`), `detect.rs` (the `init` agents' sandboxes and tool lists) and `plan.rs` (the
+planning agent's read-only tools, its sandbox and its checkout of the default branch, and the files an item will touch
+and whether it is high risk, which the pool admits it by). Outside the module, `init/generate.rs` (the programs a
+generated skeleton's agent may run) is high risk too. Usage counting (`usage.rs`), stderr progress text (`progress.rs`),
+follow-ups (`follow_ups.rs`), the builder's question and answers (`builder.rs`), where a run is (`live.rs`), the pool
+(`pool.rs`) and the rest of `init/` are normal risk. A unit test walks every source file and fails on one that is
+neither on the list nor named as normal risk on purpose.
 
 `paja run` is Mestari's first graph. It reads the repository's default branch and allowed merge methods once from
 `gh repo view`, fetches `origin/<default branch>`, syncs Jono, reads `.paja/checks`, `.paja/high-risk`, `.paja/models`
@@ -212,8 +213,13 @@ run event of the item since it was last queued, claimed or answered, not only th
 again before it records a round keeps its round count and blockers: the round, the feedback for the builder, and the
 reviewed commit, blockers and follow-ups the next review narrows itself to. When the checks passed on the branch's HEAD
 (`run.checked`, with the default branch tip they ran against) and the worktree is clean, with no index flags, it skips
-the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. Any other
-state builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
+the build; if the default branch is also unchanged it skips the checks too and goes straight to the review. When every
+reviewer had already approved that very commit (a run stopped waiting for the turn to land, or in the CI wait), and as
+many reviewers as the change needs now, it skips the review as well ("resuming #5 in round 1: the review approved
+abc1234, which was waiting to land") and goes on to land with the findings that review approved with. If the default
+branch moved, Paja merges it in and runs the checks again first, as at the turn to land: checks that fail, or a
+conflict, go back to the builder as having come after the review, and the fix is reviewed in full. Any other state
+builds and checks again. Items claimed with `paja work claim` are never taken over. Agents, Vasara's checks, git
 and gh run in process groups of their own (Unix: a new process group; Windows: `CREATE_NEW_PROCESS_GROUP`), so the
 terminal's Ctrl-C reaches only `paja`. The first Ctrl-C stops the run at the next step boundary (before a round's build,
 the checks or the review; a change both reviewers passed still lands): the round's steps are recorded with verdict
@@ -466,21 +472,25 @@ conflict or failed checks on the latest default branch, or failed CI) or errors.
 of the earlier ones and the steps of both. A `run.round` of a round after which the loop goes on carries
 `next`: the `feedback` for the next build and the `prior` review (`reviewed` commit, `blockers`, `follow_ups`, clipped
 like `detail`) or null, and with no `prior` the `noted` findings outside the change the latest review named, for the
-next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list
-when there are none, which a resumed run of that round takes over the earlier ones; a round stopped or ended on an
-error has no `noted`, and older events without these fields stay readable. Each `run.round` event also lists the
-round's agent steps under `steps`: which step (`build`, or `review` with its `reviewer` number), the models used (Claude
-Code's `modelUsage`), the input, output, cache-read and cache-creation tokens, the estimated `cost_usd`, `num_turns`,
-`duration_ms` and `session_id` from the `claude -p` result. A round that stops on an error still records the steps that
-already ran, as a `run.round` with verdict `error` and the error as its detail, before the item is parked. A field the
-result lacks is `null`, never zero, and rounds recorded before steps were kept have none. Replaying those events gives
-each work item a `usage` total (null until a step is recorded) in `paja work` JSON and the matching MCP tools; a step
-with missing fields counts in its `unknown_steps` and adds only the fields it has, so each sum is a lower bound; a
-recorded step Jono can't read counts as unknown and adds nothing, so a bad usage record never stops the queue, and
-the sequence number of its event is listed in `unreadable_events`. While it
-works, `paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each
-review and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON.
-`paja run --every 5` keeps going, checking an empty queue every five minutes.
+next review. A round whose review approved or escalated has no `next` and carries them as `noted`, an empty list when
+there are none, which a resumed run of that round takes over the earlier ones. A round every reviewer approved also
+carries `approved`: the `reviewed` commit, the `commit` it lands as, how many `reviewers` approved it and all the
+`findings` it lands with, in the change and outside it, so a resumed run lands it without reviewing again. A
+`run.checked` with `landing` true is of Paja's own merge of the default branch into the approved change, which moves the
+approval's `commit` to it; checks on any other commit in that round, or a later review in it that didn't approve, take
+the approval back. A round stopped or ended on an error has no `noted`, and older events without these fields stay
+readable. Each `run.round` event also lists the round's agent steps under `steps`: which step (`build`, or `review` with
+its `reviewer` number), the models used (Claude Code's `modelUsage`), the input, output, cache-read and cache-creation
+tokens, the estimated `cost_usd`, `num_turns`, `duration_ms` and `session_id` from the `claude -p` result. A round that
+stops on an error still records the steps that already ran, as a `run.round` with verdict `error` and the error as its
+detail, before the item is parked. A field the result lacks is `null`, never zero, and rounds recorded before steps were
+kept have none. Replaying those events gives each work item a `usage` total (null until a step is recorded) in `paja
+work` JSON and the matching MCP tools; a step with missing fields counts in its `unknown_steps` and adds only the fields
+it has, so each sum is a lower bound; a recorded step Jono can't read counts as unknown and adds nothing, so a bad usage
+record never stops the queue, and the sequence number of its event is listed in `unreadable_events`. While it works,
+`paja run` prints one progress line per step on stderr (the issue it picked, each build round, the checks, each review
+and its verdict, waiting for CI, landed or asked, and with `--every` each wait), so stdout keeps its JSON. `paja run
+--every 5` keeps going, checking an empty queue every five minutes.
 
 ### Posti
 
@@ -550,8 +560,8 @@ The hook adds to Claude Code's auto mode (always on, see Permissions below); it 
 base layer, and its safety improvements reach agents through Claude Code updates. The hook is a thin layer for what only
 Paja knows: no `git push`, the programs in `.paja/commands`, and fail closed. A rule goes into the deny-list only when it
 is Paja-specific and auto mode can't know it; broad safety rules belong to Claude Code. For untrusted writers of the
-repository's issues or code, and for long unattended runs (`paja run --every`, pools), the optional sandbox below is
-recommended.
+repository's issues or code, and for long unattended runs (`paja run --every`, pools), the sandbox below is
+recommended; Paja uses it whenever `sbx` is installed.
 
 - **Tools** are allowed by name: the file tools, Bash, and harmless ones such as `TodoWrite`. Any other tool, MCP
   tools included, is blocked. Subagents run in the same worktree in the foreground, under the same hook; one with
@@ -679,12 +689,12 @@ sandbox below closes when it is on.
 
 ### The sandbox
 
-The sandbox is optional and off by default. It is a [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`)
-backend: set `PAJA_SBX` to the `sbx` program (`PAJA_SBX=sbx`) and `paja run` runs every agent session and every
-check command of Vasara inside one long-lived sandbox named `paja`, which every run reuses. A run reuses it only when
-the directories it needs are mounted in it; otherwise it stops and says to remove the sandbox (`sbx rm paja`) so the
-next run creates it again. Toolchain setup waits (about five minutes) for apt's locks, which a new sandbox holds
-while it starts.
+The sandbox is a [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`) backend, on by default whenever
+one is available: `paja run` (and the pool's lanes, `paja triage`, `paja pool plan` and `paja init`'s agents) runs
+every agent session and every check command of Vasara inside one long-lived sandbox named `paja`, which every run
+reuses. A run reuses it only when the directories it needs are mounted in it; otherwise it stops and says to remove
+the sandbox (`sbx rm paja`) so the next run creates it again. Toolchain setup waits (about five minutes) for apt's
+locks, which a new sandbox holds while it starts.
 
 - **What the code can reach.** Only what is mounted: the factory's `envs/` directory (the worktrees) and the
   repository's own `.git` directory, which commits in a worktree need (unless it is already under `envs/`, as an `init`
@@ -692,13 +702,30 @@ while it starts.
   git's global and system configuration, the factory's event log, the hook's copy of the binary and the stamp are not in
   the sandbox. Code in it gets a throwaway `PAJA_HOME` in the sandbox's own `/tmp` and the same stripped git environment
   as on the host, and none of the host's environment variables.
-- **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If `PAJA_SBX` is
-  set and the sandbox can't start, it stops with an error that says what to install or set up. It never falls back to
-  running on the host. Without `PAJA_SBX`, `paja run` says on stderr that there is no sandbox, and runs as described
-  above, behind the deny-list hook only. The sandbox is named `paja`; `PAJA_SBX_NAME` names another one (the real-`sbx`
-  test uses it, so it never removes the person's own). `.paja/setup` runs with stderr merged into stdout, so a failure's
-  last lines keep their order, and writes a progress line to stderr while it runs. Detection is optional by design: Paja has no Docker dependency, and its tests
-  use a fake `sbx`.
+- **Choosing the backend.** `sandbox::chosen` reads `PAJA_SBX` once per step. `off` or an empty value means the host,
+  with no probe (`off`). Any other value names the `sbx` program (`set`), used as before. Unset, Paja looks for `sbx` on
+  `PATH` (`sbx.exe` on Windows): found, it is used exactly as if `PAJA_SBX` named it (`detected`), after a probe (`sbx
+  version`, then `sbx ls`, which needs the Docker engine, about 10 seconds in all, each in its own process group so a
+  stuck daemon is killed with its children); not found, the host (`not_found`). The first progress line of the step says
+  which and why, `paja doctor` reports the same, and `run.started` records it as `backend` (`sandbox` or `host`) and
+  `backend_why` (`detected`, `set`, `off`, `not_found`), as the step chose, so the log shows which runs ran on the host.
+  A pool chooses once, before its first lane, and passes the choice to every lane and planner it starts, in
+  `PAJA_SBX_PASSED` (the reason and the program; the child's `main` takes it out of its environment, so its agents and
+  checks never see it, and `PAJA_SBX` stays as the person set it), so no lane runs on the host after another ran in the
+  sandbox. The pool's own daily triage uses the same choice. A process that has used a detected `sbx` stops, rather than
+  run on the host, when a later step finds none on `PATH`, and its doctor fails the sandbox check. The probe can't tell
+  whether Claude Code is signed in inside the sandbox; the first agent finds that out (see Signing in). Paja Desk passes
+  its environment, `PAJA_SBX` included, to the runs it starts; it shows the backend in a run's output (the progress
+  line) and in its Check (the doctor's sandbox check), and a failing check stops it starting a run.
+- **Fail closed.** `paja run` starts (creating, if needed) the sandbox before it touches the queue. If a sandbox was
+  chosen (`set` or `detected`) and it can't start, or the probe fails, it stops with an error that says what to install,
+  start or sign in to, and that `PAJA_SBX=off` runs on the host. It never falls back to running on the host, then or
+  partway through. On the host, `paja run` says so on stderr and runs as described above, behind the deny-list hook
+  only. The sandbox is named `paja`; `PAJA_SBX_NAME` names another one (the real-`sbx` test uses it, so it never removes
+  the person's own). `.paja/setup` runs with stderr merged into stdout, so a failure's last lines keep their order, and
+  writes a progress line to stderr while it runs. Paja has no Docker dependency: with no `sbx` it runs on the host, and
+  its tests use a fake `sbx` (the smoke tests set `PAJA_SBX=off` unless a test chooses otherwise, and clear
+  `PAJA_SBX_NAME` and `PAJA_SBX_PASSED`, so a developer's own `sbx` is never used).
 - **One step's sandbox.** The sandbox a step starts is in use for that step's agents and checks only, on the thread
   that runs it, and is put back when the step ends, an error included. So two calls at once in one long-lived `paja mcp`
   never start an agent in each other's sandbox, or with none once the other has finished.
@@ -724,13 +751,14 @@ while it starts.
   macOS and Linux with one installer and no administrator account setup. A dedicated low-privilege user with ACLs, an
   AppContainer or a restricted token each need per-machine administrator setup on Windows that differs between Home
   and Pro, and none of them hides the owner's files from a process the way a separate VM does; bubblewrap and
-  `sandbox-exec` don't exist on every platform Paja runs on. So Paja has one backend, and the owner opts in.
+  `sandbox-exec` don't exist on every platform Paja runs on. So Paja has one backend, used when it is installed.
 - **Assumptions about `sbx`.** Everything Paja assumes about it is in `crates/paja/src/sandbox.rs`: `sbx exec`
-  with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, and that a mounted path has the same absolute
-  path inside the sandbox, and that `sbx exec -i` passes stdin through. It never returns when the program inside exits
-  before reading all of its stdin, so a shell in the sandbox reads an agent's prompt to the end first and then
-  becomes the agent, with the prompt on a here-document; the prompt is never written to a file the sandbox can
-  reach. The command-line budget counts the whole `sbx` command, wrapping included.
+  with `-w`, `-e` and `--`, `sbx create --name NAME claude PATH...`, that `sbx version` and `sbx ls` succeed when it
+  and the Docker engine work, that a mounted path has the same absolute path inside the sandbox, and that `sbx exec -i`
+  passes stdin through. It never returns when the program inside exits before reading all of its stdin, so a shell in
+  the sandbox reads an agent's prompt to the end first and then becomes the agent, with the prompt on a here-document;
+  the prompt is never written to a file the sandbox can reach. The command-line budget counts the whole `sbx` command,
+  wrapping included.
 - **Git in a worktree on Windows.** A worktree's `.git` file holds the host's path (`gitdir: C:/.../.git/worktrees/x`),
   which doesn't exist in the sandbox, and the sandbox's git (2.47) can't use relative worktree paths. So when the path
   needs translating, Paja passes the sandbox spelling of the worktree and its git directory in, and a `git` shim ahead

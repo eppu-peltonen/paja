@@ -50,14 +50,24 @@ fn fake_token() -> String {
     ["ghp", "ABCDEFGHIJKLMNOPQRSTuvwx"].join("_")
 }
 
+/// The `paja` binary to run, on the host: `PAJA_SBX=off`, so neither a sandbox the developer's
+/// shell names nor an `sbx` on their `PATH` is used unless a test sets `PAJA_SBX` itself; and
+/// no sandbox name or passed reason from that shell either.
+fn paja_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+    cmd.env("PAJA_SBX", "off")
+        .env_remove("PAJA_SBX_PASSED")
+        .env_remove("PAJA_SBX_NAME");
+    cmd
+}
+
 /// `paja` with extra environment variables, such as `PAJA_GH` pointing at a fake `gh`. A
 /// sandbox the developer's shell names is left out unless `vars` names one.
 fn paja_with(home: &Path, cwd: &Path, args: &[&str], vars: &[(&str, &Path)]) -> (bool, Value) {
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(cwd)
         .env("PAJA_HOME", home)
         .env("PAJA_CLAUDE_LATEST", NO_LATEST)
-        .env_remove("PAJA_SBX")
         .envs(vars.iter().copied())
         .arg("--json")
         .args(args)
@@ -289,10 +299,7 @@ fn help_and_version_are_json_under_json() {
     let commit = version["commit"].as_str().unwrap();
     assert!(!commit.is_empty(), "{version}");
     // The text names both too.
-    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
-        .arg("--version")
-        .output()
-        .unwrap();
+    let text = paja_command().arg("--version").output().unwrap();
     let text = String::from_utf8_lossy(&text.stdout);
     assert_eq!(
         text.trim(),
@@ -476,7 +483,19 @@ struct Mcp {
 
 impl Mcp {
     fn start(home: &Path, repo: &Path, env: &[(&str, &Path)]) -> Mcp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
+        Mcp::start_with(home, repo, env, |_| {})
+    }
+
+    /// [`Mcp::start`], with `configure` changing the server's command first.
+    fn start_with(
+        home: &Path,
+        repo: &Path,
+        env: &[(&str, &Path)],
+        configure: impl FnOnce(&mut Command),
+    ) -> Mcp {
+        let mut cmd = paja_command();
+        configure(&mut cmd);
+        let mut child = cmd
             .arg("mcp")
             .current_dir(repo)
             .env("PAJA_HOME", home)
@@ -953,7 +972,7 @@ fn a_fetch_without_the_lock_follows_main_only_away_from_what_it_holds() {
         .unwrap();
     lock.lock().unwrap();
     let run = || {
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(&f.repo)
             .env("PAJA_HOME", &f.home)
             .env("PAJA_GH", &f.gh)
@@ -1004,7 +1023,7 @@ fn a_closed_stdout_ends_paja_with_its_exit_code_not_a_panic() {
                 "#!/bin/sh\nsleep 1\ncase \"$*\" in *nameWithOwner*) echo '{{\"nameWithOwner\": \"acme/app\"}}' ;; *) {answer} ;; esac\n"
             ),
         );
-        let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let mut run = paja_command()
             .current_dir(&repo)
             .env("PAJA_HOME", &home)
             .env("PAJA_GH", &gh)
@@ -1237,7 +1256,7 @@ fn work_waits_on_open_dependencies_until_they_close() {
     )
     .unwrap();
     paja_with(&home, &repo, &["work", "sync"], &with_gh);
-    let listed = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let listed = paja_command()
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
         .env("PAJA_GH", &gh)
@@ -1293,7 +1312,7 @@ fn work_answer_says_when_it_cannot_read_the_labels_file() {
     std::fs::write(repo.join(".paja/labels"), "needs-answer\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "labels"]);
-    let answered = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let answered = paja_command()
         .args(["--json", "work", "answer", "3", "Use v2"])
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
@@ -1376,7 +1395,7 @@ fn work_answer_comments_and_requeues_and_work_file_opens_an_issue() {
         &["work", "set", "3", "escalated", "--note", "Which API?"],
     );
     // Read without --json, the item says how to answer it.
-    let shown = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let shown = paja_command()
         .args(["work", "show", "3"])
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
@@ -2101,7 +2120,7 @@ fn usage_sums_recorded_steps_per_item_and_day_and_counts_unknown_ones() {
         "gh",
         "#!/bin/sh\necho '{\"nameWithOwner\": \"acme/app\"}'\n",
     );
-    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let text = paja_command()
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
         .env("PAJA_GH", &gh)
@@ -2559,7 +2578,7 @@ impl Factory {
 
     /// `run`, with the progress lines it wrote on stderr.
     fn run_with_stderr(&self) -> (Value, String) {
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(&self.repo)
             .env("PAJA_HOME", &self.home)
             .env("PAJA_GH", &self.gh)
@@ -2997,7 +3016,7 @@ fn the_default_branch_github_names_wins_over_an_origin_head_moved_to_a_review_br
                  \"workflow list\") echo 'CI\tactive\t1' ;;\nesac\n"
             ),
         );
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(&repo)
             .env("PAJA_HOME", &home)
             .env("PAJA_GH", &gh)
@@ -3116,7 +3135,7 @@ fn the_default_branch_github_names_is_read_without_origin_head_or_main() {
             slash(tmp.path().join("gh.log").as_path())
         ),
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
         .env("PAJA_GH", &gh)
@@ -3182,7 +3201,7 @@ fn doctor_reads_a_default_branch_that_is_not_main() {
          \"label list\") echo '[{\"name\": \"game\"}]' ;;\n\
          \"workflow list\") echo 'CI\tactive\t1' ;;\nesac\n",
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
         .env("PAJA_GH", &gh)
@@ -3225,7 +3244,7 @@ fn doctor_points_to_the_troubleshooting_guide_in_both_outputs() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let run = |json: bool| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+        let mut cmd = paja_command();
         cmd.current_dir(tmp.path())
             .env("PAJA_HOME", &home)
             .env("PAJA_CLAUDE_LATEST", NO_LATEST);
@@ -3257,7 +3276,7 @@ fn doctor_checks_that_the_sandbox_program_works() {
         "#!/bin/sh\necho 'sbx: daemon not running' >&2\nexit 3\n",
     );
     let sandbox = |sbx: &Path| -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(tmp.path())
             .env("PAJA_HOME", &home)
             .env("PAJA_SBX", sbx)
@@ -3294,6 +3313,103 @@ fn doctor_checks_that_the_sandbox_program_works() {
 }
 
 #[test]
+fn doctor_says_which_backend_agents_run_in_and_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (good, bad) = (tmp.path().join("good"), tmp.path().join("bad"));
+    for dir in [&good, &bad] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    program(&good, "sbx", "#!/bin/sh\necho 'sbx 0.9'\n");
+    program(
+        &bad,
+        "sbx",
+        "#!/bin/sh\n[ \"$1\" = version ] && exit 0\necho 'cannot connect to the Docker daemon' >&2\nexit 1\n",
+    );
+    // `PAJA_SBX` as `var` says (`None`: unset), with `bin` first on a PATH holding no other `sbx`.
+    let sandbox = |bin: Option<&Path>, var: Option<&str>| -> Value {
+        let mut cmd = paja_command();
+        match var {
+            Some(value) => cmd.env("PAJA_SBX", value),
+            None => cmd.env_remove("PAJA_SBX"),
+        };
+        let output = cmd
+            .current_dir(tmp.path())
+            .env("PAJA_HOME", &home)
+            .env("PAJA_CLAUDE_LATEST", NO_LATEST)
+            .env("PATH", path_without_sbx(bin))
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "sandbox")
+            .unwrap_or_else(|| panic!("no sandbox check in {report}"))
+            .clone();
+        assert!(
+            !check.to_string().contains("   "),
+            "a run of spaces in {check}"
+        );
+        check
+    };
+    let detected = sandbox(Some(&good), None);
+    assert_eq!(detected["status"], "ok", "{detected}");
+    assert!(
+        detected["detail"]
+            .as_str()
+            .unwrap()
+            .contains("found on PATH"),
+        "{detected}"
+    );
+
+    let broken = sandbox(Some(&bad), None);
+    assert_eq!(broken["status"], "failed", "{broken}");
+    let detail = broken["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("found on PATH") && detail.contains("cannot connect to the Docker daemon"),
+        "{broken}"
+    );
+    let fix = broken["fix"].as_str().unwrap();
+    for part in [
+        "Docker Desktop",
+        "exec -it paja claude",
+        "/login",
+        "PAJA_SBX=off",
+    ] {
+        assert!(fix.contains(part), "missing {part:?} in {broken}");
+    }
+    assert!(
+        !detail.contains("Docker Desktop"),
+        "the fix is in `fix`, not twice: {broken}"
+    );
+
+    // `off` is a warning, and the `sbx` on PATH is not asked.
+    let off = sandbox(Some(&bad), Some("off"));
+    assert_eq!(off["status"], "warning", "{off}");
+    assert!(
+        off["detail"].as_str().unwrap().contains("PAJA_SBX is off"),
+        "{off}"
+    );
+
+    let none = sandbox(None, None);
+    assert_eq!(none["status"], "warning", "{none}");
+    assert!(
+        none["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no `sbx` on PATH"),
+        "{none}"
+    );
+    assert!(
+        none["fix"].as_str().unwrap().contains("install `sbx`"),
+        "{none}"
+    );
+}
+
+#[test]
 fn doctor_warns_of_an_environment_left_by_a_closed_item() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -3315,7 +3431,7 @@ fn doctor_warns_of_an_environment_left_by_a_closed_item() {
         r#"{"v":1,"seq":7,"ts_ms":1,"kind":"work.closed","data":{"repo":"acme/app","number":5}}"#.to_string(),
     ];
     std::fs::write(home.join("events.jsonl"), events.join("\n") + "\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(tmp.path())
         .env("PAJA_HOME", &home)
         .env("PAJA_CLAUDE_LATEST", NO_LATEST)
@@ -3553,7 +3669,7 @@ fn a_sync_frees_a_closed_parked_items_environment_unless_it_has_changes() {
     // Every sync tries again: with the run gone and the draft cleared, 9 and 6 go. The text
     // output says what was freed and kept.
     std::fs::remove_file(dirty.join("draft.txt")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&repo)
         .env("PAJA_HOME", &home)
         .env("PAJA_GH", &gh)
@@ -3733,7 +3849,7 @@ fn doctor_warns_when_claude_code_is_out_of_date() {
     let current = tmp.path().join("current.txt");
     std::fs::write(&current, "2.0.0\n").unwrap();
     let claude_check = |source: &Path| -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(tmp.path())
             .env("PAJA_HOME", &home)
             .env("PAJA_CLAUDE", &claude)
@@ -3822,14 +3938,13 @@ fn doctor_reports_each_check_and_the_fix_for_a_failure() {
     let latest = tmp.path().join("latest.txt");
     std::fs::write(&latest, "2.0.0\n").unwrap();
     let doctor = || {
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(&repo)
             .env("PAJA_HOME", &home)
             .env("PAJA_GH", &gh)
             .env("PAJA_CLAUDE", &claude)
             // Not the network: a file that says the installed version is the latest.
             .env("PAJA_CLAUDE_LATEST", &latest)
-            .env_remove("PAJA_SBX")
             .args(["--json", "doctor"])
             .output()
             .unwrap();
@@ -3999,7 +4114,7 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
         ("PAJA_GH", f.gh.as_path()),
         ("PAJA_CLAUDE", f.claude.as_path()),
     ];
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .envs(vars.iter().copied())
@@ -4025,7 +4140,7 @@ fn a_run_resumes_an_item_an_interrupted_run_left_active() {
     assert_eq!(item["status"], "active", "{item}");
 
     // The next run picks the same item up again, in the same environment, and says so.
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .envs(vars.iter().copied())
@@ -4056,7 +4171,7 @@ fn rounds_spent_count_toward_the_cap_when_the_environment_is_lost() {
     assert!(ok);
     git(&f.repo, &["branch", "-D", &format!("paja/{env}")]);
     std::fs::write(dir.join("verdict.txt"), "land").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -4090,7 +4205,7 @@ fn rounds_spent_count_toward_the_cap_when_the_environment_is_lost() {
 fn interrupt_run(f: &Factory, marker: &str) {
     let dir = f.tmp.path();
     let _ = std::fs::remove_file(dir.join(marker));
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -4181,7 +4296,7 @@ fn slow_run(f: &Factory) -> std::process::Child {
     use std::os::unix::process::CommandExt;
     let dir = f.tmp.path();
     std::fs::write(dir.join("slow"), "").unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let child = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -4283,7 +4398,7 @@ fn a_stop_line_on_stdin_lets_the_step_finish_like_the_first_ctrl_c() {
     let f = Factory::new("true\n", "land");
     let dir = f.tmp.path();
     std::fs::write(dir.join("slow"), "").unwrap();
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -4334,7 +4449,7 @@ fn stop_now_on_stdin_stops_at_once_and_ends_the_agent() {
     let f = Factory::new("true\n", "land");
     let dir = f.tmp.path();
     std::fs::write(dir.join("slow"), "").unwrap();
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -4431,7 +4546,7 @@ fn the_first_ctrl_c_lets_the_step_finish_and_the_next_run_resumes() {
     assert_eq!(rounds.len(), 1, "{log}");
     assert_eq!(rounds[0]["data"]["verdict"], "stopped", "{log}");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -4523,7 +4638,7 @@ fn an_interrupted_builder_session_is_resumed_by_the_next_run() {
         ("PAJA_GH", f.gh.as_path()),
         ("PAJA_CLAUDE", f.claude.as_path()),
     ];
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .envs(vars.iter().copied())
@@ -4681,7 +4796,7 @@ fn a_landing_pass_says_once_that_the_checks_passed() {
     // A pass that lands an item says once that the checks passed, before its reviewers.
     let f = Factory::new("true\n", "land");
     f.on_main(".paja/high-risk", "feature.txt\n");
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -4710,7 +4825,7 @@ fn first_wait_of_every(f: &Factory) -> (String, bool, Value) {
 /// [`first_wait_of_every`] with more environment variables.
 fn first_wait_of_every_with(f: &Factory, vars: &[(&str, &Path)]) -> (String, bool, Value) {
     use std::io::{BufRead, BufReader};
-    let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut every = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -5133,10 +5248,11 @@ fn review_prompts(f: &Factory) -> Vec<String> {
         .collect()
 }
 
-/// A run stopped in the CI wait after its review approved resumes with that review's outside
-/// findings: the approved round's `run.round` keeps them, and the review run again hears them.
+/// A run stopped in the CI wait after its review approved resumes straight to landing: the
+/// approved round's `run.round` keeps the review's findings, so the review isn't run again, the
+/// build and the checks aren't either, and the findings are still listed once.
 #[test]
-fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
+fn a_run_stopped_after_its_review_approved_lands_on_resume_without_reviewing_again() {
     let f = Factory::new("true\n", "land");
     let dir = f.tmp.path();
     f.reviewer_finds(
@@ -5155,16 +5271,177 @@ fn outside_findings_survive_a_run_stopped_after_its_review_approved() {
         approved["data"]["noted"][0]["finding"], "The parser drops a line",
         "{approved}"
     );
+    assert_eq!(
+        approved["data"]["approved"]["findings"][0]["finding"], "The parser drops a line",
+        "{approved}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1);
     let (report, stderr) = f.run_with_stderr();
     assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
-    let reviews = review_prompts(&f);
-    let last = reviews.last().unwrap_or_else(|| panic!("{stderr}"));
-    assert!(reviews.len() >= 2, "{stderr}");
     assert!(
-        last.contains("noted these findings outside the change")
-            && last.contains("The parser drops a line"),
-        "{last}"
+        stderr.contains("resuming #5 in round 1: the review approved "),
+        "{stderr}"
     );
+    assert!(
+        stderr.contains("the review already approved this change; skipping it"),
+        "{stderr}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1, "reviewed again\n{stderr}");
+    assert_eq!(builds(&f), 1, "built again\n{stderr}");
+    let left: Vec<Value> = events_of(&f, "run.follow_up");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["data"]["error"], "not filed: outside the change");
+    let log = f.gh_log();
+    let last = log.rfind("pr create").expect(&log);
+    assert_eq!(
+        log[last..].matches("The parser drops a line").count(),
+        1,
+        "{log}"
+    );
+}
+
+/// A change approved before the run stopped is still checked and reviewed again on resume when
+/// its worktree changed since: the approval holds only for the commit it approved.
+#[test]
+fn an_approval_does_not_carry_to_a_worktree_changed_since() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let env = f
+        .home
+        .join("envs")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Committed, so Paja has nothing left over to commit (CI has no git identity).
+    std::fs::write(env.join("stray.txt"), "changed").unwrap();
+    git(&env, &["add", "stray.txt"]);
+    git(&env, &["commit", "-q", "-m", "stray"]);
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(!stderr.contains("the review approved"), "{stderr}");
+    assert!(!stderr.contains("the review already approved"), "{stderr}");
+    assert_eq!(review_prompts(&f).len(), 2, "{stderr}");
+}
+
+/// The approval names the commit it approved: a rebuild after it, checked and then stopped in
+/// its own review, is reviewed when the run resumes again, not landed on the old approval.
+#[test]
+fn an_approval_does_not_carry_to_a_rebuild_stopped_in_its_review() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let env = f
+        .home
+        .join("envs")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Committed, so Paja has nothing left over to commit (CI has no git identity).
+    std::fs::write(env.join("stray.txt"), "changed").unwrap();
+    git(&env, &["add", "stray.txt"]);
+    git(&env, &["commit", "-q", "-m", "stray"]);
+    std::fs::write(dir.join("review-hang"), "").unwrap();
+    interrupt_run(&f, "review-hanging");
+    std::fs::remove_file(dir.join("review-hang")).unwrap();
+    let before = review_prompts(&f).len();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(!stderr.contains("the review already approved"), "{stderr}");
+    assert_eq!(review_prompts(&f).len(), before + 1, "{stderr}");
+}
+
+/// The default branch moved while an approved change was stopped: the resumed run merges it in
+/// and runs the checks again, as at the turn to land, and lands without another review.
+#[test]
+fn an_approved_change_resumed_after_main_moved_is_checked_again_not_reviewed() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    f.on_main("other.txt", "elsewhere\n");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("moved on; merged it into the branch"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("checks already passed"), "{stderr}");
+    assert!(
+        stderr.contains("the review already approved this change; skipping it"),
+        "{stderr}"
+    );
+    assert_eq!(review_prompts(&f).len(), 1, "{stderr}");
+    let checked = events_of(&f, "run.checked");
+    let last = checked.last().unwrap_or_else(|| panic!("{stderr}"));
+    assert_eq!(last["data"]["landing"], true, "{last}");
+}
+
+/// When the checks fail with the moved default branch merged in, the approval is gone: the
+/// builder is told main moved on after the review, and the fix is reviewed in full.
+#[test]
+fn an_approved_change_whose_checks_fail_after_main_moved_goes_back_and_is_reviewed() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    let block = dir.join("block");
+    std::fs::write(&block, "").unwrap();
+    // Fails once, then passes.
+    let b = slash(&block);
+    f.on_main(
+        ".paja/checks",
+        &format!("test ! -f {b} || {{ rm {b}; false; }}\n"),
+    );
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    let rounds = events_of(&f, "run.round");
+    let failed = rounds
+        .iter()
+        .find(|r| r["data"]["verdict"] == "checks_failed")
+        .unwrap_or_else(|| panic!("{rounds:?}\n{stderr}"));
+    let feedback = failed["data"]["next"]["feedback"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(feedback.contains("moved on after the review"), "{feedback}");
+    assert!(failed["data"]["next"]["prior"].is_null(), "{failed}");
+    assert_eq!(review_prompts(&f).len(), 2, "{stderr}");
+    assert!(
+        !stderr.contains("the review already approved this change; skipping it"),
+        "{stderr}"
+    );
+}
+
+/// An approval holds for as many reviewers as gave it: a change that `.paja/high-risk` on the
+/// default branch makes high risk while it was stopped is reviewed again, by two.
+#[test]
+fn an_approval_by_one_reviewer_does_not_land_a_change_now_high_risk() {
+    let f = Factory::new("true\n", "land");
+    let dir = f.tmp.path();
+    std::fs::write(dir.join("ci-hold"), "").unwrap();
+    interrupt_run(&f, "ci-waiting");
+    std::fs::remove_file(dir.join("ci-hold")).unwrap();
+    assert_eq!(review_prompts(&f).len(), 1);
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
+    assert!(
+        stderr.contains("the change is high risk now and needs 2 reviewers, but 1 approved it"),
+        "{stderr}"
+    );
+    assert_eq!(review_prompts(&f).len(), 3, "{stderr}");
 }
 
 /// A run stopped in the round after a conflict at the turn to land resumes with the outside
@@ -5502,12 +5779,11 @@ fn run_once_lands_one_of_two_items_and_says_what_it_will_do_without_asking() {
     )
     .unwrap();
     // Stdin is not a terminal here, so the run must not wait for an answer.
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
-        .env_remove("PAJA_SBX")
         .args(["--json", "run", "--once"])
         .stdin(std::process::Stdio::null())
         .output()
@@ -5535,12 +5811,11 @@ fn run_once_lands_one_of_two_items_and_says_what_it_will_do_without_asking() {
 /// `paja --json run <args>` on the factory's checkout with no terminal, and `answer` standing in
 /// for the person (debug builds only): its stdout as JSON and its stderr.
 fn run_args(f: &Factory, args: &[&str], answer: Option<&str>) -> (bool, Value, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+    let mut cmd = paja_command();
     cmd.current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
-        .env_remove("PAJA_SBX")
         .args(["--json", "run"])
         .args(args)
         .stdin(std::process::Stdio::null());
@@ -5599,12 +5874,11 @@ fn run_item_says_when_it_skips_an_item_left_active() {
     two_items(&f);
     let dir = f.tmp.path();
     std::fs::write(dir.join("hang"), "").unwrap();
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
-        .env_remove("PAJA_SBX")
         .args(["--json", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -5658,7 +5932,7 @@ fn declining_the_confirmation_leaves_the_queue_as_it_was() {
 #[test]
 fn yes_with_every_is_refused() {
     let f = Factory::new("true\n", "land");
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .args(["--json", "run", "--every", "1", "--yes"])
@@ -5676,7 +5950,7 @@ fn yes_with_every_is_refused() {
 fn run_says_what_it_is_doing_on_stderr() {
     // Building takes minutes; a silent run reads as a broken one. Stdout stays one JSON value.
     let f = Factory::new("true\n", "land");
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -5704,7 +5978,7 @@ fn run_says_what_it_is_doing_on_stderr() {
 #[test]
 fn run_says_when_it_needs_a_decision() {
     let f = Factory::new("true\n", "escalate");
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -5867,7 +6141,7 @@ fn runs_starting_together_send_a_skipped_role_notice_once() {
         ),
     );
     let start = || {
-        Command::new(env!("CARGO_BIN_EXE_paja"))
+        paja_command()
             .current_dir(&f.repo)
             .env("PAJA_HOME", &f.home)
             .env("PAJA_GH", &f.gh)
@@ -5980,7 +6254,7 @@ fn an_escalation_and_its_answer_finish_when_every_label_call_fails() {
     assert_eq!(notices.lines().count(), 1, "{notices}");
     // Taking the label off fails too, and the answer is still recorded and the item queued.
     std::fs::write(f.tmp.path().join("label-down"), "").unwrap();
-    let answer = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let answer = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -6070,7 +6344,7 @@ fn the_arbiter_answers_a_reviewer_escalation_and_the_item_is_queued_again() {
     assert!(events_of(&f, "notify.sent").is_empty());
     assert!(events_of(&f, "run.escalated").is_empty());
     // The text view says who answered, and a person may override it.
-    let shown = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let shown = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -6511,7 +6785,7 @@ fn an_escalated_issue_is_labelled_until_it_is_answered() {
         &[("PAJA_GH", f.gh.as_path())],
     );
     assert!(ok, "{synced}");
-    let listed = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let listed = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -6576,7 +6850,7 @@ fn a_failed_pass_of_run_every_reaches_the_notifier() {
 fn a_push_url_that_is_not_a_url_is_recorded_and_the_run_carries_on() {
     let f = Factory::new("true\n", "escalate");
     f.on_main(".paja/notify", "# where notices go\nntfy.example/paja\n");
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -6603,7 +6877,7 @@ fn a_push_url_that_is_not_a_url_is_recorded_and_the_run_carries_on() {
 #[test]
 fn a_plain_http_push_url_to_another_machine_is_refused() {
     let f = Factory::new("true\n", "escalate");
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -6626,7 +6900,7 @@ fn a_plain_http_push_url_to_another_machine_is_refused() {
 #[test]
 fn run_text_says_how_to_answer_an_escalation() {
     let f = Factory::new("true\n", "escalate");
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -7371,7 +7645,7 @@ fn a_duplicate_note_that_fails_is_reported_and_tried_again_next_pass() {
     )
     .unwrap();
     let vars = triage_vars(&dir);
-    let text = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let text = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_CLAUDE_LATEST", NO_LATEST)
@@ -8245,7 +8519,7 @@ fn freeing_takes_the_label_off_even_when_a_claim_comment_cannot_be_deleted() {
     // Another account wrote the claim comment, so GitHub refuses to delete it.
     f.claimed_by_other(true, "2999-01-01T00:00:00Z");
     std::fs::write(f.tmp.path().join("delete-refused"), "").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -8382,7 +8656,7 @@ fn a_resume_that_fails_starts_a_fresh_session() {
     let f = Factory::new("true\n", "changes");
     std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
     std::fs::write(f.tmp.path().join("resume-fails"), "").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -8653,7 +8927,7 @@ fn doctor_warns_while_no_step_reports_a_usage_window() {
         ),
     );
     let window = |f: &Factory| {
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(&f.repo)
             .env("PAJA_HOME", &f.home)
             .env("PAJA_GH", &f.gh)
@@ -8884,7 +9158,7 @@ fn run_every_waits_for_the_reset_instead_of_polling() {
     std::fs::write(f.tmp.path().join("build-429"), "").unwrap();
     std::fs::write(f.tmp.path().join("reset-at"), resets.to_string()).unwrap();
     let started = std::time::Instant::now();
-    let mut every = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut every = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -8953,7 +9227,7 @@ fn a_builder_without_a_session_gets_a_fresh_one_next_round() {
     let f = Factory::new("true\n", "changes");
     std::fs::write(f.tmp.path().join("then-land"), "").unwrap();
     std::fs::write(f.tmp.path().join("no-session"), "").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let output = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -9339,7 +9613,7 @@ fn the_builder_may_run_what_paja_commands_lists_and_nothing_else() {
 #[test]
 fn a_hook_without_mestaris_list_blocks_everything() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut child = paja_command()
         .args(["hook", "--root"])
         .arg(tmp.path())
         .arg("--home")
@@ -9729,6 +10003,161 @@ fn agents_outside_the_sandbox_run_in_auto_mode_too() {
     }
 }
 
+/// This test process's `PATH` with every folder that holds an `sbx` left out, and `first`, when
+/// given, in front: no `sbx` but a test's own is found. A folder left out that also holds `git`
+/// would take git with it, so that stops the test with what to do.
+fn path_without_sbx(first: Option<&Path>) -> std::ffi::OsString {
+    let (sbx, git) = if cfg!(windows) {
+        ("sbx.exe", "git.exe")
+    } else {
+        ("sbx", "git")
+    };
+    let host = std::env::var_os("PATH").unwrap_or_default();
+    let kept = std::env::split_paths(&host).filter(|dir| {
+        let has_sbx = dir.join(sbx).exists();
+        assert!(
+            !(has_sbx && dir.join(git).exists()),
+            "{} holds both `sbx` and `git`, so this test can't hide that `sbx`; install `sbx` \
+             in a folder of its own on PATH",
+            dir.display()
+        );
+        !has_sbx
+    });
+    std::env::join_paths(first.map(Path::to_path_buf).into_iter().chain(kept)).unwrap()
+}
+
+/// `paja run` as a person runs it, with `PAJA_SBX` as `sbx_var` says (`None`: unset) and `bin`,
+/// when given, first on a `PATH` that otherwise holds no `sbx`. Returns the report and stderr.
+fn run_choosing_sandbox(f: &Factory, bin: Option<&Path>, sbx_var: Option<&str>) -> (Value, String) {
+    let mut cmd = paja_command();
+    match sbx_var {
+        Some(value) => cmd.env("PAJA_SBX", value),
+        None => cmd.env_remove("PAJA_SBX"),
+    };
+    let output = cmd
+        .current_dir(&f.repo)
+        .env("PAJA_HOME", &f.home)
+        .env("PAJA_GH", &f.gh)
+        .env("PAJA_CLAUDE", &f.claude)
+        .env("PATH", path_without_sbx(bin))
+        .args(["--json", "run"])
+        .output()
+        .unwrap();
+    let report = serde_json::from_slice(&output.stdout).unwrap();
+    (report, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// The backend the log's first `run.started` names, and why.
+fn started_backend(f: &Factory) -> (Value, Value) {
+    let started = events_of(f, "run.started");
+    let data = &started[0]["data"];
+    (data["backend"].clone(), data["backend_why"].clone())
+}
+
+#[test]
+fn an_sbx_on_path_is_used_without_paja_sbx() {
+    let f = Factory::new("true\n", "land");
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    fake_sbx(&bin);
+    let (report, stderr) = run_choosing_sandbox(&f, Some(&bin), None);
+    assert_eq!(report["outcome"], "landed", "{report} {stderr}");
+    assert_eq!(report["sandbox"], true, "{report}");
+    assert!(stderr.contains("found on PATH"), "{stderr}");
+    assert!(stderr.contains("PAJA_SBX=off"), "{stderr}");
+    let log = std::fs::read_to_string(bin.join("sbx.log")).unwrap();
+    // Probed first, then created and used.
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines[..2], ["version", "ls"], "{log}");
+    assert!(log.contains("create --name paja claude"), "{log}");
+    assert!(log.contains("--output-format stream-json"), "{log}");
+    assert_eq!(
+        started_backend(&f),
+        (Value::from("sandbox"), Value::from("detected"))
+    );
+}
+
+#[test]
+fn without_an_sbx_agents_run_on_the_host_and_say_why() {
+    let f = Factory::new("true\n", "land");
+    let (report, stderr) = run_choosing_sandbox(&f, None, None);
+    assert_eq!(report["outcome"], "landed", "{report} {stderr}");
+    assert_eq!(report["sandbox"], false, "{report}");
+    assert!(stderr.contains("no `sbx` on PATH"), "{stderr}");
+    assert_eq!(
+        started_backend(&f),
+        (Value::from("host"), Value::from("not_found"))
+    );
+}
+
+#[test]
+fn an_sbx_on_path_that_does_not_work_stops_the_run_and_names_the_fix() {
+    let f = Factory::new("true\n", "land");
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let d = slash(&bin);
+    program(
+        &bin,
+        "sbx",
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {d}/sbx.log\n\
+             case \"$1\" in\nversion) exit 0 ;;\n\
+             *) echo 'cannot connect to the Docker daemon' >&2; exit 1 ;;\nesac\n"
+        ),
+    );
+    let (report, stderr) = run_choosing_sandbox(&f, Some(&bin), None);
+    let error = report["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{report}"));
+    for part in [
+        " ls` failed: cannot connect",
+        "cannot connect to the Docker daemon",
+        "Docker Desktop",
+        "/login",
+        "PAJA_SBX=off",
+    ] {
+        assert!(error.contains(part), "missing {part:?} in {error}");
+    }
+    // Fail closed: nothing was created, no agent ran, and the item was not taken.
+    let log = std::fs::read_to_string(bin.join("sbx.log")).unwrap();
+    assert!(!log.contains("create"), "{log}");
+    assert!(!f.tmp.path().join("claude-args.log").exists(), "{stderr}");
+    assert!(events_of(&f, "run.started").is_empty());
+}
+
+#[test]
+fn paja_sbx_off_runs_on_the_host_without_asking_sbx() {
+    let f = Factory::new("true\n", "land");
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    fake_sbx(&bin);
+    let (report, stderr) = run_choosing_sandbox(&f, Some(&bin), Some("off"));
+    assert_eq!(report["outcome"], "landed", "{report} {stderr}");
+    assert_eq!(report["sandbox"], false, "{report}");
+    assert!(stderr.contains("PAJA_SBX is off"), "{stderr}");
+    assert!(!bin.join("sbx.log").exists(), "the `sbx` on PATH was run");
+    assert_eq!(
+        started_backend(&f),
+        (Value::from("host"), Value::from("off"))
+    );
+}
+
+#[test]
+fn paja_sbx_naming_a_program_uses_it_and_records_why() {
+    let f = Factory::new("true\n", "land");
+    let sbx = fake_sbx(f.tmp.path());
+    let (report, stderr) = run_choosing_sandbox(&f, None, Some(sbx.to_str().unwrap()));
+    assert_eq!(report["outcome"], "landed", "{report} {stderr}");
+    assert!(stderr.contains("with PAJA_SBX="), "{stderr}");
+    // A program the person names is not probed with `version` and `ls` first.
+    let log = std::fs::read_to_string(f.tmp.path().join("sbx.log")).unwrap();
+    assert_ne!(log.lines().next(), Some("version"), "{log}");
+    assert_eq!(
+        started_backend(&f),
+        (Value::from("sandbox"), Value::from("set"))
+    );
+}
+
 /// A fake `sbx` for the setup tests: like [`fake_sbx`], but it never touches the host's packages
 /// (the root step is a no-op), "installs Rust" by creating `rust-installed` (which `cc --version`
 /// needs), and keeps the sandbox's home, where Paja records the setup hash, in `home/`.
@@ -10038,7 +10467,7 @@ fn hook(input: &str) -> (Option<i32>, String) {
 fn hook_with(args: &[&str], input: &str) -> (Option<i32>, String) {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut child = paja_command()
         .arg("hook")
         .args(args)
         .stdin(Stdio::piped())
@@ -11663,7 +12092,7 @@ fn ci_that_never_reports_escalates_instead_of_spending_a_round() {
 /// `paja run` in the factory's checkout with `vars` set, its stdout and stderr read, ended
 /// and failed past five minutes.
 fn run_with_vars(f: &Factory, vars: &[(&str, &str)], args: &[&str]) -> (Value, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_paja"));
+    let mut cmd = paja_command();
     cmd.current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -11845,7 +12274,7 @@ fn stop_now_in_the_ci_wait(flag: &str) {
         true,
     );
     std::fs::write(dir.join(flag), "").unwrap();
-    let mut run = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let mut run = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
@@ -11896,7 +12325,7 @@ fn doctor_reads_a_ci_wait_as_run_does() {
     let f = Factory::new("test -f feature.txt\n", "land");
     let ci = |text: &str| {
         f.on_main(".paja/ci", text);
-        let output = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let output = paja_command()
             .current_dir(&f.repo)
             .env("PAJA_HOME", &f.home)
             .env("PAJA_GH", &f.gh)
@@ -12083,13 +12512,23 @@ fn pool_factory_with(four: bool, checks: &str) -> Factory {
 
 #[cfg(unix)]
 fn start_pool(f: &Factory, workers: &str) -> std::process::Child {
+    start_pool_with(f, workers, |_| {})
+}
+
+/// [`start_pool`], with `configure` changing the pool's command first.
+#[cfg(unix)]
+fn start_pool_with(
+    f: &Factory,
+    workers: &str,
+    configure: impl FnOnce(&mut Command),
+) -> std::process::Child {
     let log = std::fs::File::create(f.tmp.path().join("pool.err")).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_paja"))
-        .current_dir(&f.repo)
+    let mut cmd = paja_command();
+    configure(&mut cmd);
+    cmd.current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
-        .env_remove("PAJA_SBX")
         .args([
             "--json",
             "run",
@@ -12155,6 +12594,165 @@ fn landed(f: &Factory) -> usize {
         .iter()
         .filter(|item| item["status"] == "landed")
         .count()
+}
+
+/// A long-lived `paja mcp` that ran agents in an `sbx` it found never runs them on the host once
+/// that `sbx` is gone from PATH: the next step stops with what to do, and so does the doctor.
+#[cfg(unix)]
+#[test]
+fn an_sbx_that_leaves_path_stops_later_steps_instead_of_using_the_host() {
+    let f = Factory::new("true\n", "land");
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sbx = fake_sbx(&bin);
+    let path = path_without_sbx(Some(&bin));
+    let mut mcp = Mcp::start_with(
+        &f.home,
+        &f.repo,
+        &[
+            ("PAJA_GH", f.gh.as_path()),
+            ("PAJA_CLAUDE", f.claude.as_path()),
+        ],
+        |cmd| {
+            cmd.env_remove("PAJA_SBX").env("PATH", &path);
+        },
+    );
+    mcp.initialize();
+    let recommend = serde_json::json!({"building": "a todo app", "prefer": []});
+    // The fake agent's answer is no recommendation; what matters is where it ran.
+    let (_, first) = mcp.call("init_recommend", recommend.clone());
+    let log = std::fs::read_to_string(bin.join("sbx.log")).unwrap();
+    assert!(log.starts_with("version\nls\n"), "{log}");
+    assert!(
+        log.contains("--output-format"),
+        "the agent ran in the sandbox: {first}\n{log}"
+    );
+    std::fs::remove_file(&sbx).unwrap();
+    let calls = f.claude_calls().len();
+    let (ok, second) = mcp.call("init_recommend", recommend);
+    assert!(!ok, "{second}");
+    let error = second["error"].as_str().unwrap();
+    assert!(
+        error.contains("was on PATH earlier") && error.contains("PAJA_SBX=off"),
+        "{second}"
+    );
+    assert_eq!(f.claude_calls().len(), calls, "an agent ran on the host");
+    let (_, report) = mcp.call("doctor", serde_json::json!({}));
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "sandbox")
+        .unwrap_or_else(|| panic!("{report}"))
+        .clone();
+    assert_eq!(check["status"], "failed", "{check}");
+    assert!(
+        check["fix"]
+            .as_str()
+            .unwrap()
+            .contains("was on PATH earlier"),
+        "{check}"
+    );
+    mcp.finish();
+}
+
+/// A pool chooses where agents run once, and its lanes run there and record why: in the `sbx`
+/// it found on PATH, or on the host when there is none.
+#[cfg(unix)]
+#[test]
+fn a_pools_lanes_run_where_the_pool_chose_and_record_why() {
+    for found in [true, false] {
+        let f = pool_factory(false);
+        let bin = f.tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        if found {
+            fake_sbx(&bin);
+        }
+        let path = path_without_sbx(Some(&bin));
+        let pool = start_pool_with(&f, "1", |cmd| {
+            cmd.env_remove("PAJA_SBX").env("PATH", &path);
+        });
+        wait_until(&f, "a lane building", || holding(&f, "Alpha"));
+        for title in ["Alpha", "Beta", "Gamma"] {
+            release(&f, title);
+        }
+        stop_pool(&f, pool);
+        let err = std::fs::read_to_string(f.tmp.path().join("pool.err")).unwrap();
+        let first = err.lines().next().unwrap_or_default();
+        let started = events_of(&f, "run.started");
+        assert!(!started.is_empty(), "{err}");
+        let (backend, why) = if found {
+            ("sandbox", "detected")
+        } else {
+            ("host", "not_found")
+        };
+        for run in &started {
+            assert_eq!(run["data"]["backend"], backend, "{run}\n{err}");
+            assert_eq!(run["data"]["backend_why"], why, "{run}\n{err}");
+        }
+        if found {
+            assert!(first.contains("found on PATH"), "{err}");
+            let log = std::fs::read_to_string(bin.join("sbx.log")).unwrap();
+            assert!(log.starts_with("version\nls\n"), "{log}");
+            assert!(log.contains("create --name paja claude"), "{log}");
+        } else {
+            assert!(first.contains("no `sbx` on PATH"), "{err}");
+        }
+    }
+}
+
+/// A lane runs where its pool chose, never choosing again: here the `sbx` the pool found leaves
+/// PATH right after the pool's probe, and the lane, which would find none, stops instead of
+/// running its agents on the host.
+#[cfg(unix)]
+#[test]
+fn a_pools_lane_never_chooses_the_host_for_itself() {
+    let f = pool_factory(false);
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let d = slash(&bin);
+    // `ls`, the probe's last step, takes the program off PATH once it has answered.
+    program(
+        &bin,
+        "sbx",
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {d}/sbx.log\n[ \"$1\" = ls ] && rm -f \"$0\"\nexit 0\n"
+        ),
+    );
+    let path = path_without_sbx(Some(&bin));
+    let pool = start_pool_with(&f, "1", |cmd| {
+        cmd.env_remove("PAJA_SBX").env("PATH", &path);
+    });
+    // The lane stops on the probe it runs again, at the path the pool found.
+    wait_until(&f, "a lane ending", || {
+        let (_, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+        status["out"].as_array().is_some_and(|out| !out.is_empty())
+    });
+    for title in ["Alpha", "Beta", "Gamma"] {
+        release(&f, title);
+    }
+    let reports = stop_pool(&f, pool);
+    let err = std::fs::read_to_string(f.tmp.path().join("pool.err")).unwrap();
+    assert!(
+        err.lines()
+            .next()
+            .unwrap_or_default()
+            .contains("found on PATH"),
+        "{err}"
+    );
+    assert!(
+        reports.iter().any(|r| r["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("was found on PATH"))),
+        "{reports:?}\n{err}"
+    );
+    let started = events_of(&f, "run.started");
+    assert!(
+        started.iter().all(|e| e["data"]["backend"] != "host"),
+        "a lane ran on the host: {started:?}\n{reports:?}\n{err}"
+    );
+    // No agent ran at all: none could have run in the gone sandbox.
+    assert!(!f.tmp.path().join("claude-args.log").exists(), "{err}");
 }
 
 /// Stop the pool with a `stop` line and return its stdout lines, one report per item. A pool that
@@ -12459,12 +13057,11 @@ fn a_ctrl_c_at_the_terminal_ends_a_pools_planners_agents() {
     std::fs::write(dir.join("plan-hold"), "").unwrap();
     let log = std::fs::File::create(dir.join("pool.err")).unwrap();
     // A process group of its own stands in for the terminal's, which Ctrl-C signals whole.
-    let pool = Command::new(env!("CARGO_BIN_EXE_paja"))
+    let pool = paja_command()
         .current_dir(&f.repo)
         .env("PAJA_HOME", &f.home)
         .env("PAJA_GH", &f.gh)
         .env("PAJA_CLAUDE", &f.claude)
-        .env_remove("PAJA_SBX")
         .args(["--json", "run", "--every", "1", "--workers", "1"])
         .process_group(0)
         .stdin(Stdio::null())
@@ -12512,13 +13109,12 @@ fn a_planner_stopped_now_or_left_by_its_pool_ends_its_agent_and_records_no_plan(
     for say_stop_now in [true, false] {
         std::fs::write(dir.join("plan-hold"), "").unwrap();
         let _ = std::fs::remove_file(dir.join("plan-alive"));
-        let mut planner = Command::new(env!("CARGO_BIN_EXE_paja"))
+        let mut planner = paja_command()
             .current_dir(&f.repo)
             .env("PAJA_HOME", &f.home)
             .env("PAJA_GH", &f.gh)
             .env("PAJA_CLAUDE", &f.claude)
             .env("PAJA_CLAUDE_LATEST", NO_LATEST)
-            .env_remove("PAJA_SBX")
             .args(["--json", "pool", "plan", "7", "--stop-on-stdin"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
