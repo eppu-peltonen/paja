@@ -37,11 +37,11 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
   way. Each re-reviewer checks the earlier findings in the change as fixes, and sees the earlier `outside` findings
   (also after a red CI) and repeats the ones that still apply. Every review that reads the whole change after an
   earlier one sees them too, such as a high-risk one, one of a fix that merged or rewrote history, and the one after a
-  conflict or failed checks at the turn to land. The log keeps them for a resumed run: a round recorded with no
-  `prior` as `next.noted`, and a round whose review approved as `noted` (empty when none) and as `approved`, with the
-  findings in the change too, so a run stopped at the turn to land or in the CI wait lands on resume without another
-  review. A red CI at the round limit
-  escalates, and what the change would have landed without is recorded as `not filed: the change did not land`. The
+  conflict or failed checks at the turn to land. The log keeps them for a resumed run: a round recorded with no `prior`
+  as `next.noted`, and a round whose review approved as `noted` (empty when none) and as `approved`, with the findings
+  in the change too and the commit it approved, so a run stopped at the turn to land or in the CI wait lands on resume
+  without another review while the change is still that commit. A red CI at the round limit escalates, and what the
+  change would have landed without is recorded as `not filed: the change did not land`. The
   description goes to `gh` in a file, since ten findings are past Windows' command-line limit, and is cut at GitHub's
   65,536 characters; a reused pull request gets the new round's description (if that edit fails, the landing goes on
   with the old one).
