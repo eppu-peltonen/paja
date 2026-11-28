@@ -256,7 +256,14 @@ Changes land one at a time per repository, each on the latest default branch, wh
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
 `runs/<owner>@<name>@land.lock`, under the home lock (`land::land_turn`), recording `pool.merging` (`repo`, `number`,
 `round`) while another run holds it and `pool.landing` once it has it; it holds the turn through the push, the pull
-request, CI and the merge, and lets go when the change lands or goes back to its builder. With the turn it merges the
+request, CI and the merge, and lets go when the change lands or goes back to its builder. Turns go in the order runs
+began to wait, a pool's lanes and single runs alike (`paja pool status` lists a pool's lanes in that order): a run
+takes a free turn only when no other run of the repository still waiting has a `pool.merging` older than its own, as
+its item's latest `run.started`, `pool.merging`, `pool.landing`, `run.round` or `run.landed` shows. A run still
+waits while it holds its item's merging lock, `runs/<owner>@<name>@<number>@merging.lock`, taken with its
+`pool.merging` and let go when it takes the turn or stops waiting, so a `pool.merging` left by a run that stopped or
+died holds no one up. A run back from its builder after a conflict or failed checks at the turn waits again from the
+back. With the turn it merges the
 latest default branch in again: when that branch moved on while it waited, Vasara's checks run again on the merge
 commit, and only that commit lands. A conflict, or checks that fail on it, sends the item back to its builder for
 another round (`conflict` or `checks_failed`) within the five rounds, and the next review reads the whole change.

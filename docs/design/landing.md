@@ -72,10 +72,11 @@ Review has to converge, or a fresh reviewer finding one more edge case each time
 - **Each review is a fresh, short session.** Reviewers never share context with the builder or with each other, which
   keeps them independent and keeps each session small.
 - **One change lands at a time, on the latest default branch.** A change the reviewers approved waits for the
-  repository's turn to land, merges in whatever landed meanwhile, and lands only if Vasara's checks pass again on
-  that merge. A conflict, or checks that fail there, is a round for the builder like any other. It holds the turn
-  through the CI wait, which has a limit (120 minutes, or `.paja/ci`'s `wait <minutes>`): CI still going at the limit
-  escalates, since another round can't unstick it, so one hung CI doesn't hold up every landing in the repository.
+  repository's turn to land, in the order the changes began to wait, merges in whatever landed meanwhile, and lands
+  only if Vasara's checks pass again on that merge. A conflict, or checks that fail there, is a round for the builder
+  like any other, and the change then waits again from the back. It holds the turn through the CI wait, which has a
+  limit (120 minutes, or `.paja/ci`'s `wait <minutes>`): CI still going at the limit escalates, since another round
+  can't unstick it, so one hung CI doesn't hold up every landing in the repository.
 
 ## Escalate, don't wait
 
