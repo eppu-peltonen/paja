@@ -335,7 +335,8 @@ syncs its issues there, as `paja work sync` does, and remembers the folder). For
   as `paja pool lanes <N>` does; lowering it says which busy lanes finish their items first. A pool started in a
   terminal shows here too, and its lanes can be changed the same way.
 
-Closing Desk while its runs are going asks whether to stop them or leave them running on their own.
+Closing Desk while its runs are going asks whether to stop them or leave them running on their own. Stopping
+ends the agent or check each run is on, and ends a run still going after 15 seconds with everything it started.
 
 ### Install Paja Desk
 
