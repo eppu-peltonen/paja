@@ -9932,7 +9932,7 @@ fn an_sbx_on_path_that_does_not_work_stops_the_run_and_names_the_fix() {
         .as_str()
         .unwrap_or_else(|| panic!("{report}"));
     for part in [
-        "sbx ls` failed",
+        " ls` failed: cannot connect",
         "cannot connect to the Docker daemon",
         "Docker Desktop",
         "/login",
