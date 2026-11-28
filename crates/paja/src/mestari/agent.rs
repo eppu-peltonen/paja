@@ -409,10 +409,14 @@ pub(super) fn claude_with(
             cmd
         }
     };
-    // Measured on the whole command, with the sandbox's wrapping when there is one.
+    // Measured on the whole command, with the sandbox's wrapping when there is one, as Windows
+    // quotes it: each argument in quotes and a space, and a `\` before every `"` or `\`.
     let line: usize = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
-        .map(|arg| arg.len() + 3)
+        .map(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.len() + 3 + arg.matches(['"', '\\']).count()
+        })
         .sum();
     if line > COMMAND_LINE_BUDGET {
         let longest = cmd

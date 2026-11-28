@@ -9655,7 +9655,7 @@ fn a_sandboxed_agent_whose_whole_command_line_is_too_long_is_refused_before_it_s
     // The budget counts the sandbox's wrapping too, so Windows never refuses the command.
     let with_harness = || {
         let f = Factory::new("true\n", "land");
-        std::fs::write(f.repo.join("CLAUDE.md"), "x".repeat(28_500)).unwrap();
+        std::fs::write(f.repo.join("CLAUDE.md"), "x".repeat(27_600)).unwrap();
         git(&f.repo, &["add", "CLAUDE.md"]);
         git(&f.repo, &["commit", "-qm", "a long harness"]);
         git(&f.repo, &["push", "-q", "origin", "main"]);
