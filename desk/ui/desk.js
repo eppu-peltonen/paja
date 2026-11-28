@@ -763,9 +763,11 @@ byId("close-leave").addEventListener("click", () => invoke("close_desk", { stop:
 byId("close-stop").addEventListener("click", () => {
   for (const id of ["close-leave", "close-stop", "close-cancel"]) byId(id).disabled = true;
   byId("close-stop").textContent = "Stopping the runs...";
+  byId("closing-status").hidden = false;
   invoke("close_desk", { stop: true }).catch((err) => {
     for (const id of ["close-leave", "close-stop", "close-cancel"]) byId(id).disabled = false;
     byId("close-stop").textContent = "Stop them now and close";
+    byId("closing-status").hidden = true;
     showError(err);
   });
 });
