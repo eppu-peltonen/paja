@@ -1286,7 +1286,7 @@ fn run_item(
             }
             CatchUp::Conflict(files) => {
                 let branch = &target.branch;
-                feedback = conflict_feedback(branch, &files, prior.as_ref());
+                feedback = conflict_feedback(branch, false, &files, prior.as_ref());
                 progress(&format!(
                     "the branch conflicts with {branch}; sending the merge to the builder"
                 ));
@@ -1614,7 +1614,7 @@ fn run_item(
                 CatchUp::Conflict(files) => {
                     drop(landing);
                     let branch = &target.branch;
-                    feedback = conflict_feedback(branch, &files, None);
+                    feedback = conflict_feedback(branch, true, &files, None);
                     prior = None;
                     progress(&format!(
                         "{branch} moved on after the review and conflicts with the branch; sending the merge to the builder"
@@ -2696,8 +2696,6 @@ fn is_high_risk(path: &str, prefixes: &[String]) -> bool {
     })
 }
 
-/// Run each check in the environment. Returns the first failure's command and output. The
-/// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 /// Run Vasara's checks on `checked` in the environment, under a `GitGuard`. The failure to send
 /// the builder, or None when they pass. The checks run the branch's code, which could change the
 /// tree or even commit: that is put back and fails them, so nothing lands that they didn't judge.
@@ -2745,6 +2743,8 @@ fn vasara(
     failed
 }
 
+/// Run each check in the environment. Returns the first failure's command and output. The
+/// checks run the branch's code, so they get no more credentials than the agent that wrote it.
 fn run_checks(dir: &Path, checks: &[String]) -> Result<Option<String>> {
     // Read before any check runs: later, the branch's code may have changed the configuration.
     let identity = git_identity(dir);
@@ -3034,10 +3034,21 @@ fn catch_up(repo: &Path, env: &Env, branch: &str) -> Result<CatchUp> {
 }
 
 /// What the builder is told when merging the latest `branch` conflicts in `files`, with the
-/// review's blockers when they still need fixing.
-fn conflict_feedback(branch: &str, files: &[String], prior: Option<&Prior>) -> String {
+/// review's blockers when they still need fixing. `after_review` is for a conflict at the turn to
+/// land, when `branch` moved on after the review rather than since the branch was made.
+fn conflict_feedback(
+    branch: &str,
+    after_review: bool,
+    files: &[String],
+    prior: Option<&Prior>,
+) -> String {
+    let when = if after_review {
+        "after the review"
+    } else {
+        "since this branch was made"
+    };
     let mut feedback = format!(
-        "{branch} moved on since this branch was made, and merging it conflicts in: {}. Paja \
+        "{branch} moved on {when}, and merging it conflicts in: {}. Paja \
          started the merge: the conflicted files hold conflict markers. Resolve each one, keeping \
          what both sides meant, then `git add` the files and `git commit -m '<message>'` to \
          finish the merge.",

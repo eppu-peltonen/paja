@@ -2472,6 +2472,7 @@ impl Factory {
                  if git rev-parse -q --verify MERGE_HEAD >/dev/null; then case \"$*\" in *\"another round\"*) if [ -f {d}/leave-merge ]; then rm {d}/leave-merge; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi\n\
                  if [ -f {d}/limit-in-merge ]; then rm {d}/limit-in-merge; stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi ;; esac; fi\n\
                  tag=; file=feature.txt; for t in $(cat {d}/titles 2>/dev/null); do case \"$*\" in *\"$t feature\"*) tag=\" $t\"; if [ -f {d}/own-files ]; then file=$t.txt; fi ;; esac; done\n\
+                 if git rev-parse -q --verify MERGE_HEAD >/dev/null && [ -f $file ]; then grep -Ev '^(<<<<<<<|=======|>>>>>>>)' $file > $file.resolved; mv $file.resolved $file; fi\n\
                  echo \"built$tag\" >> $file\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/then-land ]; then echo land > {d}/verdict.txt; fi ;; esac\n\
                  stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\")\n\
@@ -9689,7 +9690,9 @@ fn a_conflict_with_the_default_branch_goes_back_to_the_builder() {
     let calls = f.claude_calls();
     let fix = calls
         .iter()
-        .find(|c| c.contains("merging it conflicts in: feature.txt"))
+        .find(|c| {
+            c.contains("main moved on since this branch was made, and merging it conflicts in: feature.txt")
+        })
         .unwrap_or_else(|| panic!("{calls:#?}"));
     assert!(fix.contains("another round"), "{fix}");
     // The round after the conflict builds on main as it is now.
@@ -10928,14 +10931,17 @@ fn a_lane_that_conflicts_with_the_landing_before_it_goes_back_for_a_round_then_l
     // The builder was told what conflicts, and its fix landed on top of the first change.
     let calls = f.claude_calls();
     assert!(
-        calls.iter().any(|c| c.contains(
-            "moved on since this branch was made, and merging it conflicts in: feature.txt"
-        )),
+        calls.iter().any(|c| c
+            .contains("main moved on after the review, and merging it conflicts in: feature.txt")),
         "{calls:#?}"
     );
     let landed = on_origin(&f, "main", "feature.txt").unwrap();
     assert!(
         landed.contains("built Alpha") && landed.contains("built Beta"),
+        "{landed}"
+    );
+    assert!(
+        !landed.contains("<<<<<<<") && !landed.contains("=======") && !landed.contains(">>>>>>>"),
         "{landed}"
     );
 }

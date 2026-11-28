@@ -46,10 +46,10 @@ pub(super) enum Landing {
     Retry(String),
 }
 
-/// Push `judged`, the commit Vasara's checks and the reviewers saw (or that commit with the
-/// latest default branch merged in, which the checks saw again), as the environment's branch,
-/// and land it. The caller holds the repository's turn to land. Not whatever the branch points at now: code run in the worktree could
-/// have moved it.
+/// Push `judged` as the environment's branch and land it. `judged` is the commit Vasara's checks
+/// and the reviewers saw, or that commit with the latest default branch merged in, which the
+/// checks saw again; not whatever the branch points at now, since code run in the worktree could
+/// have moved it. The caller holds the repository's turn to land.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn land(
     home: &Home,
