@@ -221,18 +221,19 @@ item's reason for waiting, and keeps giving it after the sync, since the log doe
 then be waiting only for a free lane. The pool records `pool.started` (`repo`, `lanes`, `pid`), `pool.lane` (`repo`,
 `lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage` is `starting`, `build`, `checks`,
 `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja pool status` and its MCP tool
-`pool_status` rebuild the pool from them and the lock alone: its `state` is `running` only while a live pool holds `runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool
-that was killed, which records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line
+`pool_status` rebuild the pool from them and the lock alone: its `state` is `running` only while a live pool holds
+`runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool that was killed, which
+records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line
 stops admitting and is passed on to every lane's run, which finishes its step as one run does; the pool stops when
 the lanes have. A tamper stop any lane's run records (`run.tampered` for the checkout) is seen on the next tick: every
 lane is told `stop now`, none starts, and the pool ends with the tamper error, as `--every` would. A pool that ends on
 any other error stops its lanes the same way first, and ends a lane's run still going 30 seconds after `stop now`, so
-a stuck run can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip from a ref of its own fetch
-(`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or `origin/<branch>`, which every fetch there writes;
-`origin/<branch>` is then moved to that tip, as a plain fetch would, also back after a force-push. The fetches in a
-checkout take turns (`paja-fetch.lock` in its git directory), so the last to move it is the newest; a fetch that waited a
-minute for the lock goes ahead without it, and then never moves it back onto a commit it holds. A fetch ref a killed
-run left behind is deleted by the first fetch in that checkout once it is over an hour old.
+a stuck run can't hang the pool. Lanes fetch in the same checkout at once, so a run reads the default branch's tip
+from a ref of its own fetch (`refs/paja/fetch/...`, deleted right after), never from `FETCH_HEAD` or
+`origin/<branch>`, which every fetch there writes; `origin/<branch>` is then moved to that tip, as a plain fetch
+would, also back after a force-push. The fetches in a checkout take turns (`paja-fetch.lock` in its git directory),
+so the last to move it is the newest; a fetch that waited a minute for the lock goes ahead without it, and then never
+moves it back onto a commit it holds. A fetch ref a killed run left behind is deleted by the first fetch in that checkout once it is over an hour old.
 
 Changes land one at a time per repository, each on the latest default branch, whether from a pool's lanes or from
 runs started apart. A run whose reviewers say `land` first takes the repository's turn to land,
