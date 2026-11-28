@@ -12821,7 +12821,7 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
 #[cfg(unix)]
 #[test]
 fn a_busy_pool_plans_its_next_item_ahead_and_no_more() {
-    let f = pool_factory(false);
+    let f = pool_factory(true);
     let pool = start_pool(&f, "1");
     let planned = |n: u64| {
         events_of(&f, "pool.planned")
@@ -12832,8 +12832,8 @@ fn a_busy_pool_plans_its_next_item_ahead_and_no_more() {
     wait_until(&f, "Alpha building", || holding(&f, "Alpha"));
     wait_until(&f, "Beta planned while Alpha builds", || planned(6) == 1);
     assert!(holding(&f, "Alpha"));
-    // One lane, one plan ahead: Gamma waits unplanned through the next look.
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    // One lane, one plan ahead: Gamma waits unplanned through the next looks.
+    std::thread::sleep(std::time::Duration::from_secs(8));
     assert_eq!(planned(7), 0, "{:?}", events_of(&f, "pool.planned"));
     let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
     assert!(ok, "{status}");
@@ -12845,16 +12845,20 @@ fn a_busy_pool_plans_its_next_item_ahead_and_no_more() {
         "{status}"
     );
 
-    // The freed lane takes Beta on the plan it has, and Gamma is planned ahead in turn.
+    // The freed lane takes Beta on the plan it has. Gamma, next, is planned at once, and with
+    // it one plan is ready again, so Delta waits unplanned while Beta builds.
     release(&f, "Alpha");
     wait_until(&f, "Beta starting", || holding(&f, "Beta"));
     wait_until(&f, "Gamma planned while Beta builds", || planned(7) == 1);
+    std::thread::sleep(std::time::Duration::from_secs(8));
     assert!(holding(&f, "Beta"));
-    release(&f, "Beta");
-    release(&f, "Gamma");
-    wait_until(&f, "all three landing", || landed(&f) == 3);
-    assert_eq!(stop_pool(&f, pool).len(), 3);
-    for n in [5, 6, 7] {
+    assert_eq!(planned(8), 0, "{:?}", events_of(&f, "pool.planned"));
+    for t in ["Beta", "Gamma", "Delta"] {
+        release(&f, t);
+    }
+    wait_until(&f, "all four landing", || landed(&f) == 4);
+    assert_eq!(stop_pool(&f, pool).len(), 4);
+    for n in [5, 6, 7, 8] {
         let starts = events_of(&f, "pool.planning")
             .iter()
             .filter(|e| e["data"]["number"] == n)

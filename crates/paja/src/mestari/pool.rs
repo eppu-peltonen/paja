@@ -302,13 +302,16 @@ impl Pool<'_> {
                         }
                     }
                 }
-                // With every lane busy, the next items are planned ahead now and then.
-                let ahead =
-                    free == 0 && !self.lanes.is_empty() && last_ahead.elapsed() >= AHEAD_EVERY;
+                // With every lane busy, the next items are planned ahead now and then: only when
+                // the next lane to end frees one (not while `pool lanes` shrinks the pool), and
+                // not while as many plans are on their way as the pool has lanes.
+                let ahead = !self.lanes.is_empty()
+                    && self.lanes.len() == target as usize
+                    && self.planners.len() + self.elsewhere.len() < target as usize
+                    && last_ahead.elapsed() >= AHEAD_EVERY;
                 if (free > 0 || ahead) && paused.is_none() && fatal.is_none() {
-                    if ahead {
-                        last_ahead = Instant::now();
-                    }
+                    // A look of either kind plans ahead too, so the next is AHEAD_EVERY later.
+                    last_ahead = Instant::now();
                     let admitted = self.admit(free, target as usize)?;
                     if admitted == 0
                         && self.lanes.is_empty()
@@ -374,19 +377,13 @@ impl Pool<'_> {
             .chain(self.elsewhere.keys())
             .copied()
             .collect();
-        // Waiting items with a plan to be admitted on; a failed plan is no plan to wait with.
-        let ready = queue
-            .iter()
-            .filter(|n| !planning.contains(n))
-            .filter(|n| plans.get(n).is_some_and(|plan| plan.source != "failed"))
-            .count();
-        let room = plan_room(
-            free,
-            target,
-            self.planners.len() + self.elsewhere.len(),
-            ready,
-        );
-        let (chosen, to_plan) = choose(&queue, &plans, &running, &planning, free, room);
+        let in_flight = self.planners.len() + self.elsewhere.len();
+        // At most as many plans at once as there are free lanes to use them.
+        let room = free.saturating_sub(in_flight);
+        let (chosen, mut to_plan) = choose(&queue, &plans, &running, &planning, free, room);
+        if free == 0 {
+            to_plan = plan_ahead(&queue, &plans, &running, &planning, in_flight, target);
+        }
         let chosen: Vec<Plan> = chosen.into_iter().cloned().collect();
         for number in to_plan {
             if retry.contains(&number) {
@@ -825,15 +822,39 @@ fn follow_lane(home: &Home, repo: &str, n: u32, lane: &mut Lane, events: &[Event
     Ok(())
 }
 
-/// How many plans to start: with a lane free, one for each free lane that no running plan is
-/// for already; with every lane busy, enough that `target` items have a plan ready or on its
-/// way, so the next lane to free has one waiting.
-fn plan_room(free: usize, target: usize, in_flight: usize, ready: usize) -> usize {
-    if free > 0 {
-        free.saturating_sub(in_flight)
-    } else {
-        target.saturating_sub(in_flight + ready)
+/// With every lane busy, the items of the runnable `queue` to start planning, so that the
+/// first `target` items a lane that frees could take, in queue order, have a plan ready or on
+/// its way. One whose plan failed, or overlaps a `running` lane's, isn't counted among them,
+/// since a freed lane can't count on taking it. At most `target` plans run at once, counting the
+/// `in_flight` ones.
+fn plan_ahead(
+    queue: &[u64],
+    plans: &BTreeMap<u64, Plan>,
+    running: &[&Plan],
+    planning: &BTreeSet<u64>,
+    in_flight: usize,
+    target: usize,
+) -> Vec<u64> {
+    let mut covered = 0;
+    let mut to_plan = Vec::new();
+    for number in queue {
+        if covered >= target || in_flight + to_plan.len() >= target {
+            break;
+        }
+        if planning.contains(number) {
+            covered += 1;
+            continue;
+        }
+        match plans.get(number) {
+            None => {
+                to_plan.push(*number);
+                covered += 1;
+            }
+            Some(plan) if plan.source == "failed" || blocked_by(plan, running).is_some() => {}
+            Some(_) => covered += 1,
+        }
     }
+    to_plan
 }
 
 /// The items to admit this tick and the ones to start planning, from the runnable `queue` in
@@ -1780,20 +1801,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_busy_pool_plans_ahead_only_as_many_items_as_it_has_lanes() {
-        // A free lane gets a plan of its own, less the ones on their way.
-        assert_eq!(plan_room(2, 3, 0, 5), 2);
-        assert_eq!(plan_room(2, 3, 1, 0), 1);
-        // Every lane busy: plans ready or on their way make up the pool's lanes, and no more.
-        assert_eq!(plan_room(0, 3, 0, 0), 3);
-        assert_eq!(plan_room(0, 3, 1, 1), 1);
-        assert_eq!(plan_room(0, 3, 1, 2), 0);
-        assert_eq!(plan_room(0, 2, 1, 4), 0);
-        // With every lane busy, an unplanned item is planned though none can be admitted.
-        let plans = BTreeMap::new();
-        let (chosen, to_plan) = choose(&[6, 7], &plans, &[], &BTreeSet::new(), 0, 1);
-        assert!(chosen.is_empty());
-        assert_eq!(to_plan, [6]);
+    fn a_busy_pool_plans_ahead_the_items_a_freed_lane_would_take_next() {
+        let plan = |number: u64, path: &str, source: &str| Plan {
+            repo: "acme/app".into(),
+            number,
+            paths: vec![path.to_string()],
+            source: source.into(),
+            high_risk: false,
+            error: None,
+        };
+        let none = BTreeSet::new();
+        // An unplanned item ahead of planned ones is planned: a freed lane takes it first.
+        let plans = BTreeMap::from([(8, plan(8, "b.rs", "plan")), (9, plan(9, "c.rs", "plan"))]);
+        assert_eq!(plan_ahead(&[7, 8, 9], &plans, &[], &none, 0, 2), [7]);
+        // The first `target` items have plans: nothing more is planned.
+        assert!(plan_ahead(&[8, 9, 10], &plans, &[], &none, 0, 2).is_empty());
+        // One being planned (again, after a failed plan) counts once.
+        let mut again = plans.clone();
+        again.insert(7, plan(7, "", "failed"));
+        let seven = BTreeSet::from([7]);
+        assert!(plan_ahead(&[7, 8, 10], &again, &[], &seven, 1, 2).is_empty());
+        // A failed plan, or one overlapping a running lane, isn't one a freed lane takes next.
+        let running = plan(5, "c.rs", "plan");
+        let mut failed = plans.clone();
+        failed.insert(7, plan(7, "", "failed"));
+        assert_eq!(
+            plan_ahead(&[7, 9, 8, 10], &failed, &[&running], &none, 0, 2),
+            [10]
+        );
+        // No more plans at once than the pool has lanes.
+        assert_eq!(plan_ahead(&[10, 11, 12], &plans, &[], &none, 1, 2), [10]);
+        assert!(plan_ahead(&[10, 11], &plans, &[], &none, 2, 2).is_empty());
     }
 
     #[test]
