@@ -169,7 +169,9 @@ pub fn blocked_by(plan: &Plan, running: &[&Plan]) -> Option<(u64, String)> {
 }
 
 /// Plan item `number` of the repository checked out at `repo`, and record it as
-/// `pool.planned`. A plan that fails is recorded as `failed` before the error is returned.
+/// `pool.planned`. A plan that fails is recorded as `failed` before the error is returned; one
+/// stopped now (a second Ctrl-C, or `stop now` from the pool) records nothing, so whoever stopped
+/// it says why.
 pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
     let repo = std::path::absolute(repo)?;
     let name = jono::repo_name(home, &repo)?;
@@ -186,7 +188,7 @@ pub fn plan(home: &Home, repo: &Path, number: u64) -> Result<Plan> {
                 error: Some(format!("{err:#}")),
             };
             // A tampered repository gets no more git or gh, and no event that could hide it.
-            if !is_tampered(&err) {
+            if !is_tampered(&err) && crate::platform::interrupts() < 2 {
                 let _ = record(home, EV_POOL_PLANNED, serde_json::to_value(&failed)?);
             }
             return Err(err);
