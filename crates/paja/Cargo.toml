@@ -1,6 +1,6 @@
 [package]
 name = "paja"
-version = "0.1.0"
+version = "0.2.0"
 description = "Paja software factory core and CLI"
 edition.workspace = true
 license.workspace = true

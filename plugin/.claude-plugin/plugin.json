@@ -1,5 +1,5 @@
 {
   "name": "paja",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Work with Paja from Claude Code: its core as MCP tools, and skills to see the queue, answer Paja's questions and turn a conversation into a spec."
 }
