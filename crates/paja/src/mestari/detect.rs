@@ -62,7 +62,7 @@ pub fn init_agent(
             true,
             &models.args("init"),
             None,
-            Harness::None,
+            Harness::Omitted,
         )?;
         out.get("structured_output")
             .cloned()
