@@ -32,6 +32,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  position: relative;
   font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--fg);
@@ -48,6 +49,7 @@ pre { white-space: pre-wrap; margin: 4px 0; }
 
 /* Top bar */
 #bar {
+  position: relative;
   flex: none;
   display: flex;
   align-items: center;
@@ -68,8 +70,16 @@ pre { white-space: pre-wrap; margin: 4px 0; }
 #fig-spend { min-width: 14ch; }
 #bar-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
 #held-button.hot { background: var(--accent); color: #fff; font-weight: 600; }
+/* The core's error is laid over the top of the screen, under the bar, so it never moves a region. */
+#error {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  cursor: pointer;
+}
 .error {
-  flex: none;
   margin: 0;
   background: var(--error-bg);
   color: var(--error-fg);

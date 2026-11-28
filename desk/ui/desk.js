@@ -171,8 +171,13 @@ function renderBar() {
   const pick = byId("repo-pick");
   const names = data.names ?? [];
   pick.hidden = names.length < 2;
-  pick.replaceChildren(...names.map((n) => el("option", { value: n }, n)));
-  if (ui.repo) pick.value = ui.repo;
+  // The options are rebuilt only when the list changes, so an open dropdown isn't reset.
+  const listed = names.join("\n");
+  if (pick.dataset.names !== listed) {
+    pick.dataset.names = listed;
+    pick.replaceChildren(...names.map((n) => el("option", { value: n }, n)));
+  }
+  if (ui.repo && pick.value !== ui.repo) pick.value = ui.repo;
 
   const running = status?.state === "running";
   byId("state-dot").className = running ? "dot running" : "dot";

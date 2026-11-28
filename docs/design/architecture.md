@@ -758,16 +758,16 @@ inside itself. It shows one repository at a time (a picker in the bar when Desk 
   ready, spend as tokens and dollars) and the actions: `Start` (or `Stop after this step` and `Stop now` while Desk's
   own pool runs), `Held` (highlighted when above 0; it opens the held tab), `New work` and `Repositories`. The last two
   open as dialogs; Escape or a click outside closes them. An error from the core shows as one line under the bar with the
-  text the CLI prints, and doesn't push the regions down.
+  text the CLI prints, laid over the top of the regions so it doesn't push them down.
 - **Lanes**, the main region: a card per lane the pool keeps, side by side and wrapping. A card shows the item
   (number in the item's colour, linking to its issue; title), stage and step, the round (`first`, `rework 1`, ...),
   the reviewers' verdicts while in review (one mark each), clocks for the step and the lane, tokens and dollars, and the
   files the lane was admitted for. The lane holding the turn to land and those waiting for it say `merging`. An idle lane,
   and every lane while the pool is stopped, says `idle`. After the last card a dashed `+` card adds a lane and each card's
   `−` removes one, both by calling `pool_lanes` with one more or less (a running pool reads it on its next tick, a stopped
-  one starts with it); busy lanes beyond the count finish their item first, and the region says the pool is shrinking by that many (the core
-closes whichever lane frees first, so no card is named). The core's
-  refusal (0 to 32 lanes) shows under the bar. Clicking a card opens the item's run view in place of the side panel.
+  one starts with it); busy lanes beyond the count finish their item first, and the region says the pool is shrinking
+  by that many (the core closes whichever lane frees first, so no card is named). The core's refusal (0 to 32 lanes)
+  shows under the bar. Clicking a card opens the item's run view in place of the side panel.
 - **Side panel**, a third of the width, with three tabs. `Next`: the ready items (waiting only for a free lane) with
   their files, then, dimmed, the items waiting for another reason and that reason. `Held`: the escalated items, one line
   each (number, title, first line of the question); one opens its full question and the answer box (the text survives
