@@ -162,6 +162,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         stopped: Vec::new(),
         since,
         high_risk: None,
+        branch: None,
         held_back: BTreeSet::new(),
         retry_failed_to: 0,
         retried: BTreeSet::new(),
@@ -206,6 +207,9 @@ struct Pool<'a> {
     /// Main's `.paja/high-risk`, read at the start and at each sync, by which a plan made against
     /// an older one is judged again; `None` while it can't be read (a plan's own judgement holds).
     high_risk: Option<Vec<String>>,
+    /// The default branch, from `gh repo view` once the first read of `.paja/high-risk` works:
+    /// later reads take the list from `origin/<branch>` as the pool's sync just fetched it.
+    branch: Option<String>,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
     /// `paja run --every` waits after a failed pass.
     held_back: BTreeSet<u64>,
@@ -355,7 +359,10 @@ impl Pool<'_> {
             home.plan_held(name, n).unwrap_or(false)
         });
         let events = self.home.events().read_all()?;
-        let mut plans = current_plans(&events, self.name, self.since);
+        let at = plans_at(&events, self.name, self.since);
+        let failed = failed_of(&at, self.retry_failed_to);
+        let mut plans: BTreeMap<u64, Plan> =
+            at.into_iter().map(|(n, (_, plan))| (n, plan)).collect();
         if let Some(high_risk) = &self.high_risk {
             judge_again(&mut plans, high_risk);
         }
@@ -368,7 +375,7 @@ impl Pool<'_> {
             let failed = self.plan_failed(number, &why)?;
             plans.insert(number, failed);
         }
-        let retry: BTreeSet<u64> = failed_by(&events, self.name, self.since, self.retry_failed_to)
+        let retry: BTreeSet<u64> = failed
             .into_iter()
             .filter(|n| !self.retried.contains(n))
             .collect();
@@ -380,7 +387,17 @@ impl Pool<'_> {
             .map(|item| item.number)
             .filter(|n| !busy.contains(n) && !self.held_back.contains(n))
             .collect();
-        let running: Vec<&Plan> = self.lanes.values().map(|lane| &lane.plan).collect();
+        // A running lane is judged by the list as it is now too, so a lane whose files became
+        // high risk still keeps another high-risk item out.
+        let mut lane_plans: BTreeMap<u64, Plan> = self
+            .lanes
+            .values()
+            .map(|lane| (lane.number, lane.plan.clone()))
+            .collect();
+        if let Some(high_risk) = &self.high_risk {
+            judge_again(&mut lane_plans, high_risk);
+        }
+        let running: Vec<&Plan> = lane_plans.values().collect();
         let planning: BTreeSet<u64> = self
             .planners
             .keys()
@@ -447,22 +464,36 @@ impl Pool<'_> {
         Ok(started)
     }
 
-    /// Read main's `.paja/high-risk` again, as the lanes' runs and planners do: from the default
-    /// branch's tip on `origin`, fetched now. One that can't be read is said, and the plans keep
-    /// their own judgement until a later sync reads it.
+    /// Read main's `.paja/high-risk` again, as the lanes' runs and planners do: at the start from
+    /// the default branch's tip, fetched then (with a `gh repo view` for the branch), and after
+    /// each sync from `origin/<branch>` as that sync fetched it, with no more network. One that
+    /// can't be read is said, and the list read last holds (the plans' own judgement, before any
+    /// read has worked) until a later sync reads it.
     fn read_high_risk(&mut self) {
-        let read = super::RepoSettings::read(self.repo).and_then(|target| {
-            let base = super::fetch_tip(self.repo, &target.branch)?;
-            super::read_from_base(self.repo, &base, super::HIGH_RISK_FILE)
-        });
+        let read = match &self.branch {
+            Some(branch) => super::read_from_base(
+                self.repo,
+                &format!("origin/{branch}"),
+                super::HIGH_RISK_FILE,
+            ),
+            None => super::RepoSettings::read(self.repo).and_then(|target| {
+                let base = super::fetch_tip(self.repo, &target.branch)?;
+                let text = super::read_from_base(self.repo, &base, super::HIGH_RISK_FILE)?;
+                self.branch = Some(target.branch);
+                Ok(text)
+            }),
+        };
         match read {
             Ok(text) => self.high_risk = Some(super::lines(&text.unwrap_or_default())),
-            Err(err) => {
-                progress(&format!(
-                    "couldn't read main's .paja/high-risk, so plans keep the high-risk judgement                      they were made with: {err:#}"
-                ));
-                self.high_risk = None;
-            }
+            Err(err) => progress(&format!(
+                "couldn't read main's .paja/high-risk ({err:#}); plans are judged by {} until \
+                 a later sync reads it; check the network and `gh auth status`",
+                if self.high_risk.is_some() {
+                    "the list read last"
+                } else {
+                    "the list they were made with"
+                }
+            )),
         }
     }
 
@@ -944,41 +975,46 @@ fn choose<'p>(
 /// not one that failed, which a new pool run tries again, nor one without a `basis` (an older
 /// release's), which holds only for the run that made it and until its item next changes.
 fn plans_at(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, (u64, Plan)> {
-    // Per item: the basis of its title and text now, and the seq they last changed at.
-    let mut text: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+    // Work events of an older release name no repository: they are the legacy one's.
+    let legacy = jono::legacy_repo(events, repo);
+    // Per item: its title and text now, and the seq they last changed at.
+    let mut text: BTreeMap<u64, (&str, &str, u64)> = BTreeMap::new();
     let mut latest: BTreeMap<u64, (u64, Plan)> = BTreeMap::new();
     for e in events {
         let kind = e.kind.as_str();
-        if kind != EV_POOL_PLANNED && kind != jono::EV_CHANGED && kind != jono::EV_IMPORTED {
+        let planned = kind == EV_POOL_PLANNED;
+        if !planned && kind != jono::EV_CHANGED && kind != jono::EV_IMPORTED {
             continue;
         }
-        if e.data["repo"] != repo {
-            continue;
-        }
-        let Some(number) = e.data["number"].as_u64() else {
+        let belongs = if planned {
+            e.data["repo"] == repo
+        } else {
+            jono::event_repo(e, legacy) == repo
+        };
+        let Some(number) = e.data["number"].as_u64().filter(|_| belongs) else {
             continue;
         };
-        if kind == EV_POOL_PLANNED {
+        if planned {
             if let Ok(plan) = serde_json::from_value::<Plan>(e.data.clone()) {
                 latest.insert(number, (e.seq, plan));
             }
             continue;
         }
-        let now = text_basis(
+        let now = (
             e.data["title"].as_str().unwrap_or_default(),
             e.data["body"].as_str().unwrap_or_default(),
         );
-        if text.get(&number).is_none_or(|(was, _)| *was != now) {
-            text.insert(number, (now, e.seq));
+        if text.get(&number).is_none_or(|(t, b, _)| (*t, *b) != now) {
+            text.insert(number, (now.0, now.1, e.seq));
         }
     }
     latest.retain(|number, (seq, plan)| {
         let (now, changed) = text
             .get(number)
-            .map_or((None, 0), |(basis, at)| (Some(basis), *at));
+            .map_or((None, 0), |(t, b, at)| (Some(text_basis(t, b)), *at));
         match &plan.basis {
             _ if plan.source == "failed" => *seq > since && changed < *seq,
-            Some(basis) => now == Some(basis),
+            Some(basis) => now.as_ref() == Some(basis),
             None => *seq > since && changed < *seq,
         }
     });
@@ -1005,11 +1041,18 @@ fn judge_again(plans: &mut BTreeMap<u64, Plan>, high_risk: &[String]) {
 /// The items of `repo` whose current plan ([`plans_at`]) failed in the pool run that started at
 /// `since` and was recorded at or before `to`: the ones to plan again. An item edited since its
 /// plan failed has no current plan, so it is planned for the edit and keeps its retry.
+#[cfg(test)]
 fn failed_by(events: &[Event], repo: &str, since: u64, to: u64) -> BTreeSet<u64> {
-    plans_at(events, repo, since)
-        .into_iter()
+    failed_of(&plans_at(events, repo, since), to)
+}
+
+/// The items of `plans` ([`plans_at`]) whose current plan failed and was recorded at or before
+/// `to`.
+fn failed_of(plans: &BTreeMap<u64, (u64, Plan)>, to: u64) -> BTreeSet<u64> {
+    plans
+        .iter()
         .filter(|(_, (seq, plan))| plan.source == "failed" && *seq <= to)
-        .map(|(number, _)| number)
+        .map(|(&number, _)| number)
         .collect()
 }
 
@@ -2040,12 +2083,19 @@ mod tests {
             planned(14, 6, "d.rs", "plan", Some("d")),
             // An older release's plan of #9, with no basis: not reused.
             planned(15, 9, "f.rs", "plan", None),
-            // Another repository's plan is not this one's.
+            // Another repository's plan is not this one's, though it fits this one's #7, and
+            // another repository's edit of its #3 leaves this one's #3 be.
+            imported(16, 7, "g"),
             event(
-                16,
+                17,
                 EV_POOL_PLANNED,
                 json!({"repo": "acme/other", "number": 7, "paths": ["x"], "source": "plan",
-                       "high_risk": false}),
+                       "high_risk": false, "basis": text_basis("t", "g")}),
+            ),
+            event(
+                18,
+                jono::EV_CHANGED,
+                json!({"repo": "acme/other", "number": 3, "title": "t", "body": "other"}),
             ),
             // In the run: #8's planner read "e", a sync recorded the edit to "e2" while it ran,
             // and then it recorded its plan: a plan of the old text.
@@ -2091,6 +2141,43 @@ mod tests {
         // Planned again from the edited text, the item has a plan again.
         later.push(planned(28, 3, "a2.rs", "spec", Some("a2")));
         assert_eq!(current_plans(&later, "acme/app", 20)[&3].paths, ["a2.rs"]);
+    }
+
+    #[test]
+    fn a_plan_is_matched_to_its_item_through_old_events_and_edits_back() {
+        let planned = |seq: u64, number: u64, text: &str| {
+            event(
+                seq,
+                EV_POOL_PLANNED,
+                json!({"repo": "acme/app", "number": number, "paths": ["a.rs"], "source": "plan",
+                       "high_risk": false, "basis": text_basis("t", text)}),
+            )
+        };
+        let work = |seq: u64, kind: &str, number: u64, text: &str, repo: Option<&str>| {
+            let mut data = json!({"number": number, "title": "t", "body": text});
+            if let Some(repo) = repo {
+                data["repo"] = json!(repo);
+            }
+            event(seq, kind, data)
+        };
+        let events = vec![
+            // An older release's import names no repository: it is the legacy one's.
+            work(1, jono::EV_IMPORTED, 10, "x", None),
+            work(2, jono::EV_IMPORTED, 12, "y", Some("acme/app")),
+            planned(3, 10, "x"),
+            // A plan of an item with no import of its own is of nothing the pool can take.
+            planned(4, 11, "z"),
+            // Edited and then edited back to the text the plan read: the plan fits again.
+            planned(5, 12, "y"),
+            work(6, jono::EV_CHANGED, 12, "y2", Some("acme/app")),
+            work(7, jono::EV_CHANGED, 12, "y", Some("acme/app")),
+        ];
+        let plans = current_plans(&events, "acme/app", 20);
+        let numbers: Vec<u64> = plans.keys().copied().collect();
+        assert_eq!(numbers, [10, 12], "{plans:?}");
+        // Without the edit back, #12's plan is of old text.
+        let plans = current_plans(&events[..6], "acme/app", 20);
+        assert!(!plans.contains_key(&12));
     }
 
     #[test]

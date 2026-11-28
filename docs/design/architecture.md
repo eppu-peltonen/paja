@@ -295,29 +295,31 @@ an older release's `plan-<issue>` of this repository, left by a killed plan, is 
 OS lock for its item (`runs/<owner>@<name>@plan-<issue>.lock`), so a second `paja pool plan` of the item while one runs
 is refused within a second and records nothing. A pool that finds the lock held (a plan started by hand) starts no
 planner of its own, records `pool.planning`, says so, counts the item as being planned (it takes one of the pool's
-planning slots), and admits it on the plan that one records; after 10 minutes it stops waiting and the plan fails. A
-planner of the pool's refused because a plan started by hand took the lock just after the pool looked waits the same
-way. An item that leaves the queue meanwhile is no longer waited for. The pool looks only when it is about to plan an
-item: one that already has a plan can be admitted on it while a plan started by hand re-plans it. The plan,
-`pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`, and `basis`, a fingerprint of the item's title and
-text as the plan read them), holds while the item's title and text are what it read: once a sync records them changed
-(say an edited `Touches:` line, even one recorded while the plan ran), the item is planned again when it is next about
-to be admitted, and a change of only its link or priority keeps the plan. A later pool run reuses it, as it does a plan
-made by hand before the pool started, and so does a reopened item whose text is unchanged; a failed plan, or an older
-release's plan with no `basis`, holds only for the pool run that made it. The pool judges each plan's `high_risk` again
-by main's `.paja/high-risk` as it reads it at its start and at each sync (keeping the plan's own judgement while it
-can't read it), so a plan made before the list changed admits by the list as it is; `paja pool status` shows a waiting
-item's plan with the judgement it was made with. Two plans overlap when they name the same path or one holds the other
-(`src/` and `src/a.rs`); two high-risk ones (a path under `.paja/high-risk`, or a directory holding one) always do, so
-high-risk changes share one lane; a plan that failed (`source: failed`, with its `error`) overlaps everything, so its
-item runs only in an otherwise idle pool, unless it is planned again: after the next timed sync, once per pool run. The
-pool takes items in queue order and admits one only once every item before it has a plan, so a plan that finishes first
-never puts a later item ahead; it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and
-admits the next that doesn't, recording `pool.admitted` (`repo`, `number`, `lane`, `paths`, `source`, `high_risk`). Each
-round records the paths its change touches as `run.changed`; when a lane ends, the paths outside its plan are recorded
-as `pool.drift` (`outside`, `admitted`), so the planner's accuracy can be measured, and the lane is never stopped for
-it. `paja pool status` shows each lane's `paths` and each waiting item's `paths` and why it waits (`overlaps #5:
-src/a.rs`, `planning which files it touches`).
+planning slots), and admits it on the plan that one records, if that is a plan of the item's text as it is now; after 10
+minutes it stops waiting and the plan fails. A planner of the pool's refused because a plan started by hand took the
+lock just after the pool looked waits the same way. An item that leaves the queue meanwhile is no longer waited for. The
+pool looks only when it is about to plan an item: one that already has a plan can be admitted on it while a plan started
+by hand re-plans it. The plan, `pool.planned` (`repo`, `number`, `paths`, `source`, `high_risk`, and `basis`, a
+fingerprint of the item's title and text as the plan read them), holds while the item's title and text are what it read:
+once a sync records them changed (say an edited `Touches:` line, even one recorded while the plan ran), the item is
+planned again when it is next about to be admitted, and a change of only its link or priority keeps the plan. A later
+pool run reuses it, as it does a plan made by hand before the pool started, and so does a reopened item whose text is
+unchanged; a failed plan, or an older release's plan with no `basis`, holds only for the pool run that made it, and
+until its item's text changes. The pool judges each plan's `high_risk`, a running lane's too, again by main's
+`.paja/high-risk` as it reads it at its start (fetched) and after each sync (from `origin/<branch>` as the sync fetched
+it), keeping the list read last, or before any read worked the plan's own judgement, while it can't read it, so a plan
+made before the list changed admits by the list as it is; `paja pool status` shows a waiting item's plan with the
+judgement it was made with. Two plans overlap when they name the same path or one holds the other (`src/` and
+`src/a.rs`); two high-risk ones (a path under `.paja/high-risk`, or a directory holding one) always do, so high-risk
+changes share one lane; a plan that failed (`source: failed`, with its `error`) overlaps everything, so its item runs
+only in an otherwise idle pool, unless it is planned again: after the next timed sync, once per pool run. The pool takes
+items in queue order and admits one only once every item before it has a plan, so a plan that finishes first never puts
+a later item ahead; it skips one that overlaps a busy lane's plan, or one admitted in the same tick, and admits the next
+that doesn't, recording `pool.admitted` (`repo`, `number`, `lane`, `paths`, `source`, `high_risk`). Each round records
+the paths its change touches as `run.changed`; when a lane ends, the paths outside its plan are recorded as `pool.drift`
+(`outside`, `admitted`), so the planner's accuracy can be measured, and the lane is never stopped for it. `paja pool
+status` shows each lane's `paths` and each waiting item's `paths` and why it waits (`overlaps #5: src/a.rs`, `planning
+which files it touches`).
 
 A planner runs in a process group of its own, so a terminal's Ctrl-C reaches only the pool, and any interrupt a
 planner does get (a Ctrl-Break on Windows, a hangup) stops it at once. One still going after 10 minutes is ended and

@@ -415,7 +415,8 @@ same time, so more lanes reach its limits sooner.
 Lanes never work on the same files at once. Before an item gets a lane, Paja plans which files it will touch: a
 `Touches: src/a.rs, docs/` line in the issue names them, and otherwise a short, cheap agent (the `plan` role in
 `.paja/models`) reads the code and lists them. An item that overlaps a running one waits, and `paja pool status` says
-which one; two high-risk items never run at once. `paja pool plan <number>` shows an item's plan.
+which one; two high-risk items never run at once. `paja pool plan <number>` shows an item's plan. A plan carries over
+to later pool runs until you edit the item's title or text (say its `Touches:` line), which has it planned again.
 
 Stop it with Ctrl+C. The first Ctrl+C lets the step in flight (an agent or a check) finish and keeps it, then stops; the
 item stays active, and the next `paja run` resumes it where its environment left off. Press Ctrl+C again to stop at

@@ -35,6 +35,7 @@ pub struct Plan {
 /// as a later sync left it.
 pub fn text_basis(title: &str, body: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // A NUL between them, which no GitHub title holds, keeps "a" + "bc" apart from "ab" + "c".
     for byte in title.bytes().chain([0]).chain(body.bytes()) {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);

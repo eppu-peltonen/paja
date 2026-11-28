@@ -12986,6 +12986,66 @@ fn a_pool_reuses_an_earlier_plan_and_plans_an_edited_item_again() {
     assert_eq!(planning, [6]);
 }
 
+/// Plans made before main listed their files in `.paja/high-risk` are judged by the list main
+/// has when the pool runs: the two items, high risk now, share one lane.
+#[cfg(unix)]
+#[test]
+fn a_pool_judges_reused_plans_by_the_high_risk_list_main_has_now() {
+    let f = pool_factory(false);
+    let vars = [
+        ("PAJA_GH", f.gh.as_path()),
+        ("PAJA_CLAUDE", f.claude.as_path()),
+    ];
+    let (ok, synced) = paja_with(&f.home, &f.repo, &["work", "sync"], &vars);
+    assert!(ok, "{synced}");
+    for n in ["5", "6"] {
+        let (ok, plan) = paja_with(&f.home, &f.repo, &["pool", "plan", n], &vars);
+        assert!(ok, "{plan}");
+        assert_eq!(plan["high_risk"], false, "{plan}");
+    }
+    f.on_main(".paja/high-risk", "Alpha.txt\nBeta.txt\n");
+    let pool = start_pool(&f, "2");
+    wait_until(&f, "Alpha and Gamma building", || {
+        holding(&f, "Alpha") && holding(&f, "Gamma")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(!holding(&f, "Beta"), "two high-risk items ran at once");
+    let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert!(ok, "{status}");
+    let beta = status["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["number"] == 6)
+        .unwrap_or_else(|| panic!("{status}"))
+        .clone();
+    assert_eq!(beta["why"], "no free lane", "{status}");
+    release(&f, "Alpha");
+    wait_until(&f, "Beta starting once Alpha is done", || {
+        holding(&f, "Beta")
+    });
+    release(&f, "Beta");
+    release(&f, "Gamma");
+    wait_until(&f, "all three landing", || landed(&f) == 3);
+    assert_eq!(stop_pool(&f, pool).len(), 3);
+    let admitted = events_of(&f, "pool.admitted");
+    let risky = |n: u64| {
+        admitted
+            .iter()
+            .find(|e| e["data"]["number"] == n)
+            .map(|e| e["data"]["high_risk"].clone())
+    };
+    assert_eq!(risky(5), Some(true.into()), "{admitted:?}");
+    assert_eq!(risky(6), Some(true.into()), "{admitted:?}");
+    assert_eq!(risky(7), Some(false.into()), "{admitted:?}");
+    // Neither was planned again for it.
+    let planning: Vec<u64> = events_of(&f, "pool.planning")
+        .iter()
+        .map(|e| e["data"]["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(planning, [7]);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
