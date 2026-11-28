@@ -12863,6 +12863,58 @@ fn a_pool_of_two_lanes_works_two_items_at_once_and_lands_all_three() {
     assert_eq!(events_of(&f, "pool.stopped").len(), 1);
 }
 
+/// With its one lane busy, a pool plans the next item ahead, and only that one, so the lane
+/// takes it on that plan once it frees.
+#[cfg(unix)]
+#[test]
+fn a_busy_pool_plans_its_next_item_ahead_and_no_more() {
+    let f = pool_factory(true);
+    let pool = start_pool(&f, "1");
+    let planned = |n: u64| {
+        events_of(&f, "pool.planned")
+            .iter()
+            .filter(|e| e["data"]["number"] == n)
+            .count()
+    };
+    wait_until(&f, "Alpha building", || holding(&f, "Alpha"));
+    wait_until(&f, "Beta planned while Alpha builds", || planned(6) == 1);
+    assert!(holding(&f, "Alpha"));
+    // One lane, one plan ahead: Gamma waits unplanned through the next looks.
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    assert_eq!(planned(7), 0, "{:?}", events_of(&f, "pool.planned"));
+    let (ok, status) = paja(&f.home, &f.repo, &["pool", "status"]);
+    assert!(ok, "{status}");
+    assert_eq!(status["waiting"][0]["number"], 6, "{status}");
+    assert_eq!(status["waiting"][0]["why"], "no free lane", "{status}");
+    assert_eq!(
+        status["waiting"][0]["paths"],
+        serde_json::json!(["Beta.txt"]),
+        "{status}"
+    );
+
+    // The freed lane takes Beta on the plan it has. Gamma, next, is planned at once, and with
+    // it one plan is ready again, so Delta waits unplanned while Beta builds.
+    release(&f, "Alpha");
+    wait_until(&f, "Beta starting", || holding(&f, "Beta"));
+    wait_until(&f, "Gamma planned while Beta builds", || planned(7) == 1);
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    assert!(holding(&f, "Beta"));
+    assert_eq!(planned(8), 0, "{:?}", events_of(&f, "pool.planned"));
+    for t in ["Beta", "Gamma", "Delta"] {
+        release(&f, t);
+    }
+    wait_until(&f, "all four landing", || landed(&f) == 4);
+    assert_eq!(stop_pool(&f, pool).len(), 4);
+    for n in [5, 6, 7, 8] {
+        let starts = events_of(&f, "pool.planning")
+            .iter()
+            .filter(|e| e["data"]["number"] == n)
+            .count();
+        assert_eq!(starts, 1, "#{n} was planned {starts} times");
+        assert_eq!(planned(n), 1);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_pool_starts_no_lane_or_planner_until_the_usage_window_resets() {
