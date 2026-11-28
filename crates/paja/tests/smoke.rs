@@ -2459,9 +2459,10 @@ impl Factory {
                  if [ $n = 2 ]; then stamp=$(echo \"$*\" | sed -n \"s/.*--stamp [\\\\\\\"']*\\([^\\\\\\\"']*\\).*/\\1/p\"); [ -n \"$stamp\" ] && : > \"$stamp\"; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 30}}'; exit 1; fi; fi\n\
                  if [ -f {d}/review-broken ]; then echo '{{\"is_error\": false, \"num_turns\": 2}}'; exit 0; fi\n\
                  if [ -f {d}/review-moves-main.sh ]; then sh {d}/review-moves-main.sh; rm {d}/review-moves-main.sh; fi\n\
-                 v=$(cat {d}/verdict.txt); f='[]'\n\
+                 v=$(cat {d}/verdict.txt); f='[]'; s=$(cat {d}/review-summary 2>/dev/null || echo 'fake review')\n\
+                 if [ -f {d}/verdict-second.txt ]; then r=$(cat {d}/review-count 2>/dev/null || echo 0); r=$((r+1)); echo $r > {d}/review-count; [ $((r % 2)) = 0 ] && v=$(cat {d}/verdict-second.txt); fi\n\
                  if [ -f {d}/findings.json ]; then f=$(cat {d}/findings.json); [ -f {d}/findings-once ] && rm {d}/findings.json; fi\n\
-                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"fake review\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
+                 echo \"{{\\\"is_error\\\": false, \\\"structured_output\\\": {{\\\"verdict\\\": \\\"$v\\\", \\\"summary\\\": \\\"$s\\\", \\\"comments\\\": \\\"add more\\\", \\\"question\\\": \\\"Which API?\\\", \\\"follow_ups\\\": $f}}}}\" ;;\n\
                  *) case \"$*\" in *--resume*) if [ -f {d}/resume-fails ]; then echo '{{\"is_error\": true, \"result\": \"No conversation found\", \"session_id\": \"s-2\", \"total_cost_usd\": 0.05}}'; exit 0; fi\n\
                  if [ -f {d}/resume-limited ]; then echo '{{\"is_error\": true, \"api_error_status\": 429, \"result\": \"usage limit reached\", \"session_id\": \"s-1\", \"total_cost_usd\": 0.4}}'; exit 1; fi ;; esac\n\
                  if [ -f {d}/mode-rejected ]; then echo \"error: option '--permission-mode <mode>' argument 'auto' is invalid.\" >&2; exit 1; fi\n\
@@ -2485,6 +2486,7 @@ impl Factory {
                  if [ -f {d}/build-limit-once ] || [ -f {d}/build-limit ]; then rm -f {d}/build-limit-once; echo '{{\"is_error\": true, \"subtype\": \"error_max_turns\", \"num_turns\": 81, \"session_id\": \"s-1\", \"total_cost_usd\": 0.1}}'; exit 1; fi\n\
                  case \"$*\" in *\"another round\"*) if [ -f {d}/lazy ]; then rm {d}/lazy; git checkout -q -- feature.txt; echo '{{\"is_error\": false, \"result\": \"done\"}}'; exit 0; fi ;; esac\n\
                  if [ -f {d}/cheat ]; then echo true > .paja/checks; git add .paja/checks; fi\n\
+                 if [ -f {d}/cheat-ci ]; then mkdir -p .github/workflows; echo 'on: push' > .github/workflows/ci.yml; git add .github; fi\n\
                  if [ -f {d}/cheat ]; then echo 'review haiku' > .paja/models; git add .paja/models; fi\n\
                  git add $file\n\
                  git -c user.name=t -c user.email=t@example.com commit -qm built >/dev/null\n\
@@ -5994,6 +5996,7 @@ fn the_arbiter_answers_a_reviewer_escalation_and_the_item_is_queued_again() {
         &f,
         serde_json::json!({
             "verdict": "answer",
+            "weakens_a_check": false,
             "answer": "Use v2; the issue names it.",
             // Agent text on a public issue: a path under the factory home and a mention.
             "reason": format!("The issue says which API; see {} and @octocat.", f.home.join("envs").display()),
@@ -6104,6 +6107,7 @@ fn the_arbiter_is_overruled_when_its_answer_would_weaken_a_check() {
         &f,
         serde_json::json!({
             "verdict": "answer",
+            "weakens_a_check": false,
             "answer": "Edit .paja/checks and drop the failing command.",
             "reason": "It is flaky."
         }),
@@ -6133,6 +6137,7 @@ fn the_arbiter_answers_an_item_only_once() {
         &f,
         serde_json::json!({
             "verdict": "answer",
+            "weakens_a_check": false,
             "answer": "Use v2.",
             "reason": "The issue says so."
         }),
@@ -6154,6 +6159,216 @@ fn the_arbiter_answers_an_item_only_once() {
         .as_str()
         .unwrap()
         .contains("at most once"));
+}
+
+/// The arbiter's plain answer, which leaves every check as it is.
+fn arbiter_answers(f: &Factory, answer: &str) {
+    arbiter_says(
+        f,
+        serde_json::json!({
+            "verdict": "answer",
+            "weakens_a_check": false,
+            "answer": answer,
+            "reason": "The issue decides it."
+        }),
+    );
+}
+
+/// The item was answered by the arbiter and queued again.
+fn assert_arbitrated(f: &Factory, report: &Value, answer: &str) {
+    assert_eq!(report["outcome"], "arbitrated", "{report}");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert_eq!(item["status"], "queued", "{item}");
+    assert_eq!(item["answers"][0]["by"], "arbiter", "{item}");
+    assert_eq!(item["answers"][0]["answer"], answer, "{item}");
+    let arbitrated = events_of(f, "run.arbitrated");
+    assert_eq!(arbitrated.len(), 1, "{arbitrated:?}");
+    assert_eq!(arbitrated[0]["data"]["verdict"], "answer");
+}
+
+#[test]
+fn the_arbiter_answers_a_builder_question() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("ask"), "").unwrap();
+    arbiter_answers(&f, "Use A; the issue names it.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Use A; the issue names it.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Which API, A or B?"),
+        "{item}"
+    );
+}
+
+#[test]
+fn the_arbiter_answers_after_five_failed_rounds() {
+    let f = Factory::new("test -f never.txt\n", "land");
+    arbiter_answers(&f, "Create feature.txt as the issue says.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Create feature.txt as the issue says.");
+    assert_eq!(report["rounds"], 5, "{report}");
+}
+
+#[test]
+fn the_arbiter_answers_after_five_rounds_whose_check_output_names_the_hook() {
+    // The last feedback quotes a check's output, which names a guard file and says `xfailed`:
+    // Paja's question quotes it, but only what Paja wrote is searched for guard names.
+    let f = Factory::new(
+        "echo panicked at crates/paja/src/hook.rs:3, 1 xfailed && false\n",
+        "land",
+    );
+    arbiter_answers(&f, "Create feature.txt as the issue says.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Create feature.txt as the issue says.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hook.rs:3"),
+        "{item}"
+    );
+}
+
+#[test]
+fn the_arbiter_answers_a_high_risk_split_whose_summaries_name_the_hook() {
+    // One reviewer lands, the other asks for changes; both name the hook only to say what the
+    // change is about, and the diff doesn't touch it.
+    let f = Factory::new("true\n", "land");
+    f.on_main(".paja/high-risk", "feature.txt\n");
+    std::fs::write(f.tmp.path().join("verdict-second.txt"), "changes").unwrap();
+    std::fs::write(
+        f.tmp.path().join("review-summary"),
+        "The change calls the rule in hook.rs and the deny-list it reads",
+    )
+    .unwrap();
+    arbiter_answers(&f, "Land it; the issue asks for exactly this.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Land it; the issue asks for exactly this.");
+    let (_, item) = paja(&f.home, &f.repo, &["work", "show", "5"]);
+    assert!(
+        item["answers"][0]["question"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("The two reviewers disagree"),
+        "{item}"
+    );
+}
+
+#[test]
+fn the_arbiter_answers_a_second_turn_limit() {
+    let f = Factory::new("true\n", "land");
+    std::fs::write(f.tmp.path().join("build-limit"), "").unwrap();
+    arbiter_answers(&f, "Do only the first half of the issue in this change.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(
+        &f,
+        &report,
+        "Do only the first half of the issue in this change.",
+    );
+    assert_eq!(report["rounds"], 2, "{report}");
+}
+
+#[test]
+fn the_arbiter_is_overruled_when_the_change_touches_a_guard_file() {
+    // The builder edits `.paja/checks` on its branch; the arbiter's answer is harmless, but a
+    // person decides anything about such a change.
+    let f = Factory::new("test -f feature.txt\n", "escalate");
+    std::fs::write(f.tmp.path().join("cheat"), "").unwrap();
+    arbiter_answers(&f, "Use v2.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("touches .paja/checks"), "{question}");
+    let arbitrated = events_of(&f, "run.arbitrated");
+    assert!(
+        arbitrated[0]["data"]["overruled"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(".paja/checks"),
+        "{arbitrated:?}"
+    );
+}
+
+#[test]
+fn the_arbiter_is_overruled_when_the_change_touches_a_ci_workflow() {
+    let f = Factory::new("true\n", "escalate");
+    std::fs::write(f.tmp.path().join("cheat-ci"), "").unwrap();
+    arbiter_answers(&f, "Use v2.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_eq!(report["outcome"], "escalated", "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(
+        question.contains("touches .github/workflows/ci.yml"),
+        "{question}"
+    );
+}
+
+#[test]
+fn the_arbiter_is_overruled_for_any_answer_that_may_weaken_a_check() {
+    let cases = [
+        // No flag at all: a missing `weakens_a_check` never reads as "no".
+        (
+            serde_json::json!({"verdict": "answer", "answer": "Use v2."}),
+            "leaves every test and check",
+        ),
+        // The arbiter flags its own answer.
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": true, "answer": "Use v2."}),
+            "leaves every test and check",
+        ),
+        // Paraphrases, each with the flag saying no.
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": false,
+                "answer": "Change line 3 in tests/smoke.rs to match."}),
+            "test file tests/smoke.rs",
+        ),
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": false,
+                "answer": "Drop that line from the CI config."}),
+            "the answer says `ci config`",
+        ),
+        (
+            serde_json::json!({"verdict": "answer", "weakens_a_check": false,
+                "answer": "Stop running `test -f feature.txt` for this item."}),
+            "the check `test -f feature.txt`",
+        ),
+    ];
+    for (said, why) in cases {
+        let f = Factory::new("test -f feature.txt\n", "escalate");
+        arbiter_says(&f, said.clone());
+        let (ok, report) = f.run();
+        assert!(ok, "{report}");
+        assert_eq!(report["outcome"], "escalated", "{said}: {report}");
+        let question = report["question"].as_str().unwrap();
+        assert!(question.contains("Which API?"), "{question}");
+        assert!(question.contains(why), "{said}: {question}");
+    }
+}
+
+#[test]
+fn a_review_that_names_the_hook_doesnt_stop_the_arbiter() {
+    // The reviewers' summaries only say what the change is about; the diff doesn't touch it.
+    let f = Factory::new("true\n", "escalate");
+    std::fs::write(
+        f.tmp.path().join("review-summary"),
+        "The change calls the rule in hook.rs and the deny-list it reads",
+    )
+    .unwrap();
+    arbiter_answers(&f, "Use v2.");
+    let (ok, report) = f.run();
+    assert!(ok, "{report}");
+    assert_arbitrated(&f, &report, "Use v2.");
 }
 
 #[test]

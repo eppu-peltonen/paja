@@ -1274,7 +1274,7 @@ fn run_item(
                     item,
                     models: &models,
                 };
-                return settle(&scene, &question, "", round);
+                return settle(&scene, &question, "", "", round);
             }
         }
         // A merge Paja handed over must be finished, not committed with its conflicts. It stays
@@ -1648,7 +1648,7 @@ fn run_item(
                 item,
                 models: &models,
             };
-            return settle(&scene, &esc.question, &summaries(&reviews), round);
+            return settle(&scene, &esc.question, "", &summaries(&reviews), round);
         }
         if verdicts.iter().all(|v| *v == "land") {
             // One change lands at a time per repository, each on the latest default branch: a
@@ -1788,10 +1788,9 @@ fn run_item(
         }
         if risky && verdicts.contains(&"land") {
             // High-risk reviewers must agree; a split is a question, not another round.
-            let question = format!(
-                "The two reviewers disagree on this high-risk change.\n\n{}",
-                summaries(&reviews)
-            );
+            let said = summaries(&reviews);
+            let question =
+                format!("The two reviewers disagree on this high-risk change.\n\n{said}");
             let scene = Scene {
                 home,
                 repo,
@@ -1800,7 +1799,7 @@ fn run_item(
                 item,
                 models: &models,
             };
-            return settle(&scene, &question, "", round);
+            return settle(&scene, &question, &said, "", round);
         }
         // A `changes` verdict without comments still names something: its summary.
         let blockers = reviews
@@ -1868,7 +1867,7 @@ fn run_item(
         item,
         models: &models,
     };
-    settle(&scene, &question, "", MAX_ROUNDS)
+    settle(&scene, &question, &feedback, "", MAX_ROUNDS)
 }
 
 /// The latest reset time any usage-limit stop recorded, in milliseconds since the epoch, when it
@@ -2006,7 +2005,7 @@ fn turn_limit_twice(scene: &Scene, note: &str, round: u32) -> Result<RunReport> 
          be too big for one change: split it into smaller issues, or raise the limit with a \
          `max-turns` line in `{MODELS_FILE}` on the default branch, then answer with what you changed."
     );
-    settle(scene, &question, "", round)
+    settle(scene, &question, "", "", round)
 }
 
 /// The environment an earlier run made for the item in `repo`, if there is one: the one named
