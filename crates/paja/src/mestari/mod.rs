@@ -3795,7 +3795,10 @@ mod tests {
         let theirs = create(&item.env_name(), &b);
         free_after_error(&home, &a, &item);
         assert!(theirs.path.exists());
-        assert_eq!(crate::ahjo::get(&home, &item.env_name()).unwrap().repo, b);
+        assert_eq!(
+            crate::ahjo::get(&home, &item.env_name()).unwrap().repo,
+            theirs.repo
+        );
         // The item's own is removed, uncommitted edits too, as before.
         crate::ahjo::remove(&home, &theirs.name, true).unwrap();
         let own = create(&item.env_name(), &a);
