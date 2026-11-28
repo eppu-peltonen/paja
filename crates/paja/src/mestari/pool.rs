@@ -997,7 +997,8 @@ impl std::fmt::Display for Why {
             Why::Overlaps(other, why) => write!(f, "overlaps #{other}: {why}"),
             Why::Planning => f.write_str("planning which files it touches"),
             Why::LaneErrored => f.write_str(
-                "its last run ended on an error; it is tried again at the next timed sync (see --every)",
+                "its last run ended on an error; it is held back until a timed sync (see --every), \
+                 and may have waited for a free lane since",
             ),
             Why::NoFreeLane => f.write_str("no free lane"),
         }

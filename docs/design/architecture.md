@@ -216,10 +216,10 @@ count, the latest `pool.lanes` event (`repo`, `lanes`), and hands each free lane
 (`jono::runnable`: items a stopped run left active first, then ready ones, never one a live run holds). `paja pool
 lanes <N>` records a new count, which the running pool reads on its next tick: a higher one starts lanes then, and a
 lower one lets running items finish and starts none until the busy lanes are under it. An item whose lane ended on an
-error waits for the next timed sync, as `--every` waits after a failed pass, and `paja pool status` says so as the item's
-reason for waiting. The pool records `pool.started` (`repo`,
-`lanes`, `pid`), `pool.lane` (`repo`, `lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage`
-is `starting`, `build`, `checks`, `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja
+error waits for the next timed sync, as `--every` waits after a failed pass; `paja pool status` gives that as the
+item's reason for waiting, and keeps giving it after the sync, since the log doesn't record the sync, so the item may
+then be waiting only for a free lane. The pool records `pool.started` (`repo`, `lanes`, `pid`), `pool.lane` (`repo`,
+`lane`, `number`, `stage`, `step`) for every step a lane's run starts (`stage` is `starting`, `build`, `checks`, `review`, `land`, then `done` with the run's `outcome`) and `pool.stopped`; `paja
 pool status` and its MCP tool `pool_status` rebuild the pool from them and the lock alone: its `state` is `running`
 only while a live pool holds `runs/<repo>@pool.lock` and no `pool.stopped` follows the latest `pool.started`, so a pool
 that was killed, which records no `pool.stopped`, reads as stopped and shows no busy lanes. Ctrl-C or a `stop` line
