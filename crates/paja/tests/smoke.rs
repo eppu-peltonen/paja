@@ -13019,9 +13019,17 @@ fn a_pool_judges_reused_plans_by_the_high_risk_list_main_has_now() {
         .find(|w| w["number"] == 6)
         .unwrap_or_else(|| panic!("{status}"))
         .clone();
-    // Not "overlaps #5": status shows a waiting plan with the high-risk judgement it was made
-    // with (docs/design/architecture.md), and both lanes are busy anyway.
-    assert_eq!(beta["why"], "no free lane", "{status}");
+    // Status judges the plans by the list the pool recorded reading, as the pool does.
+    assert_eq!(
+        beta["why"], "overlaps #5: both touch high-risk paths",
+        "{status}"
+    );
+    let read = events_of(&f, "pool.high_risk");
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(
+        read[0]["data"]["paths"],
+        serde_json::json!(["Alpha.txt", "Beta.txt"])
+    );
     release(&f, "Alpha");
     wait_until(&f, "Beta starting once Alpha is done", || {
         holding(&f, "Beta")

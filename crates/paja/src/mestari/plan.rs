@@ -4,9 +4,9 @@
 
 use super::*;
 
-/// A plan of an item: `{repo, number, paths, source, high_risk, basis?, error?}`. `source` is `spec`
-/// (its `Touches:` line), `plan` (the planning agent) or `failed`, which the pool treats as
-/// touching everything.
+/// A plan of an item: `{repo, number, paths, source, high_risk, basis?, error?}`. `source` is
+/// `spec` (its `Touches:` line), `plan` (the planning agent) or `failed`, which the pool treats
+/// as touching everything.
 pub const EV_POOL_PLANNED: &str = "pool.planned";
 
 /// The most paths a plan keeps: one that names more is as good as "everything".
@@ -19,7 +19,8 @@ pub struct Plan {
     /// Repository-relative paths, `/`-separated; a path ending in `/` is a directory.
     pub paths: Vec<String>,
     pub source: String,
-    /// Whether any path is under `.paja/high-risk`, as main has it.
+    /// Whether any path is under `.paja/high-risk`, as main had it when the plan was made; a pool
+    /// judges it again by the list main has now.
     pub high_risk: bool,
     /// What the plan was made from: [`text_basis`] of the item's title and text as the plan read
     /// them, so a pool can tell a plan of the item as it is now from one of older text. Absent

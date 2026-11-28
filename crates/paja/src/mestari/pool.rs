@@ -44,6 +44,10 @@ pub const EV_POOL_ADMITTED: &str = "pool.admitted";
 /// A lane's change touched files outside the ones it was admitted for:
 /// `{repo, number, lane, outside, admitted}`.
 pub const EV_POOL_DRIFT: &str = "pool.drift";
+/// The pool read main's `.paja/high-risk` and it differs from the list it recorded last (or it
+/// is the first read): `{repo, base, paths}`, `base` the commit read. The pool judges plans by
+/// it, and `paja pool status` does the same from the log.
+pub const EV_POOL_HIGH_RISK: &str = "pool.high_risk";
 
 /// The most lanes one pool runs.
 pub const MAX_LANES: u32 = 32;
@@ -113,7 +117,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         bail!("--workers takes 1 to {MAX_LANES} lanes");
     }
     let repo = std::path::absolute(opts.repo)?;
-    let (name, branch) = super::sync_queue_on(home, &repo)?;
+    let (name, base) = super::sync_queue_on(home, &repo)?;
     // The key the tamper lock uses for this checkout, read once: the pool looks for a tamper
     // stop on every tick without running git.
     let key = crate::ahjo::repo_key(&repo)?;
@@ -162,7 +166,7 @@ pub fn run(home: &Home, opts: PoolOptions<'_>) -> Result<()> {
         stopped: Vec::new(),
         since,
         high_risk: None,
-        branch,
+        base,
         held_back: BTreeSet::new(),
         retry_failed_to: 0,
         retried: BTreeSet::new(),
@@ -207,9 +211,9 @@ struct Pool<'a> {
     /// Main's `.paja/high-risk`, read at the start and at each sync, by which a plan made against
     /// an older one is judged again; `None` while it can't be read (a plan's own judgement holds).
     high_risk: Option<Vec<String>>,
-    /// The default branch, as the latest sync found it: `.paja/high-risk` is read from
-    /// `refs/remotes/origin/<branch>` as that sync fetched it.
-    branch: String,
+    /// The commit of the default branch's tip the latest sync fetched: `.paja/high-risk` is read
+    /// from it, as the sync read the labels and queue rules, never from a ref that can move.
+    base: String,
     /// Items whose lane ended on an error: not handed out again until the next timed sync, as
     /// `paja run --every` waits after a failed pass.
     held_back: BTreeSet<u64>,
@@ -305,8 +309,8 @@ impl Pool<'_> {
                             self.retry_failed_to = events.last().map_or(0, |e| e.seq);
                         }
                         match super::sync_queue_on(self.home, self.repo) {
-                            Ok((_, branch)) => {
-                                self.branch = branch;
+                            Ok((_, base)) => {
+                                self.base = base;
                                 self.read_high_risk();
                             }
                             // The next tick tells the lanes and stops, after the usual sleep.
@@ -464,17 +468,23 @@ impl Pool<'_> {
     }
 
     /// Read main's `.paja/high-risk` again, as the lanes' runs and planners do, at the start and
-    /// after each sync, from `refs/remotes/origin/<branch>` as that sync fetched it: no more
-    /// network. One that can't be read is said, and the list read last holds (the plans' own
-    /// judgement, before any read has worked) until a later sync reads it.
+    /// after each sync, from the commit that sync fetched: no more network. One that can't be
+    /// read is said, and the list read last holds (the plans' own judgement, before any read has
+    /// worked) until a later sync reads it.
     fn read_high_risk(&mut self) {
-        let read = high_risk_on(self.repo, &self.branch);
+        let before = self.high_risk.clone();
+        let read = high_risk_at(self.repo, &self.base);
         if let Some(said) = take_list(&mut self.high_risk, read) {
             progress(&format!(
-                "{said}; run `git fetch origin {}` in {} if it stays so",
-                self.branch,
-                self.repo.display()
+                "{said}; check that {} on the default branch is a plain text file",
+                super::HIGH_RISK_FILE
             ));
+        } else if self.high_risk != before {
+            // Recorded, so `paja pool status` judges plans by the same list.
+            let data = json!({ "repo": self.name, "base": self.base, "paths": self.high_risk });
+            if let Err(err) = record(self.home, EV_POOL_HIGH_RISK, data) {
+                self.say_error(&err);
+            }
         }
     }
 
@@ -985,7 +995,10 @@ fn plans_at(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, (u64, Pla
             e.data["title"].as_str().unwrap_or_default(),
             e.data["body"].as_str().unwrap_or_default(),
         );
-        if text.get(&number).is_none_or(|(t, b, _)| (*t, *b) != now) {
+        // A change of an item never imported is nothing, as in Jono's replay.
+        let applies = kind == jono::EV_IMPORTED || text.contains_key(&number);
+        let differs = text.get(&number).is_none_or(|(t, b, _)| (*t, *b) != now);
+        if applies && differs {
             text.insert(number, (now.0, now.1, e.seq));
         }
     }
@@ -1003,15 +1016,19 @@ fn plans_at(events: &[Event], repo: &str, since: u64) -> BTreeMap<u64, (u64, Pla
     latest
 }
 
-/// Main's `.paja/high-risk` as `refs/remotes/origin/<branch>` has it, by its full name, so
-/// a tag or a local branch named `origin/<branch>` (which an agent's local git could make)
-/// can't stand in for it. No file is an empty list.
-fn high_risk_on(repo: &Path, branch: &str) -> Result<Vec<String>> {
-    let text = super::read_from_base(
-        repo,
-        &format!("refs/remotes/origin/{branch}"),
-        super::HIGH_RISK_FILE,
-    )?;
+/// The `.paja/high-risk` list a pool of `repo` read last ([`EV_POOL_HIGH_RISK`]), if any.
+fn high_risk_read(events: &[Event], repo: &str) -> Option<Vec<String>> {
+    events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EV_POOL_HIGH_RISK && e.data["repo"] == repo)
+        .and_then(|e| serde_json::from_value(e.data["paths"].clone()).ok())
+}
+
+/// `.paja/high-risk` as commit `base` (a sync's fetched tip of main) has it. No file is an
+/// empty list.
+fn high_risk_at(repo: &Path, base: &str) -> Result<Vec<String>> {
+    let text = super::read_from_base(repo, base, super::HIGH_RISK_FILE)?;
     Ok(super::lines(&text.unwrap_or_default()))
 }
 
@@ -1738,10 +1755,15 @@ pub fn from_events(events: &[Event], repo: &str, running: bool, items: &[WorkIte
         })
         .unzip();
     let (lanes, lane_plans): (Vec<LaneStatus>, Vec<Option<Plan>>) = lanes.into_iter().unzip();
-    let lane_plans: Vec<&Plan> = lane_plans.iter().flatten().collect();
     let since = started.map_or(u64::MAX, |start| events[start].seq);
-    // As a pool would admit them, though with each plan's high-risk judgement as it was made.
-    let plans = current_plans(events, repo, since);
+    // As a pool admits them: judged by main's `.paja/high-risk` as the pool last read it.
+    let high_risk = high_risk_read(events, repo);
+    let lane_plans = judged_lanes(lane_plans.iter().flatten(), high_risk.as_deref());
+    let lane_plans: Vec<&Plan> = lane_plans.values().collect();
+    let mut plans = current_plans(events, repo, since);
+    if let Some(high_risk) = &high_risk {
+        judge_again(&mut plans, high_risk);
+    }
     let planning = |number: u64| {
         events
             .iter()
@@ -2253,13 +2275,19 @@ mod tests {
     }
 
     #[test]
-    fn main_s_high_risk_list_is_read_from_origin_by_its_full_name() {
+    fn main_s_high_risk_list_is_read_from_the_commit_a_sync_fetched() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         let git = |args: &[&str]| {
+            // No user or system configuration (commit signing, say) and no outer repository.
             let out = Command::new("git")
                 .args(args)
                 .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
                 .output()
                 .unwrap();
             assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -2283,18 +2311,17 @@ mod tests {
         git(&["init", "-q"]);
         let main = commit("src/hook.rs\n# a comment\n");
         let other = commit("");
-        git(&["update-ref", "refs/remotes/origin/main", &main]);
-        // An agent's local git could make a tag or a branch of the same short name.
-        git(&["tag", "origin/main", &other]);
-        git(&["branch", "origin/main", &other]);
-        assert_eq!(high_risk_on(repo, "main").unwrap(), ["src/hook.rs"]);
-        assert!(high_risk_on(repo, "trunk").is_err());
+        // The commit is read, whatever refs say: here the checkout has moved on to `other`.
+        assert_eq!(high_risk_at(repo, &main).unwrap(), ["src/hook.rs"]);
+        assert!(high_risk_at(repo, &other).unwrap().is_empty());
+        let gone = "0".repeat(40);
+        assert!(high_risk_at(repo, &gone).is_err());
 
         // A read that fails keeps the list read last, and says which list holds.
         let mut list = None;
-        let said = take_list(&mut list, high_risk_on(repo, "trunk")).unwrap();
+        let said = take_list(&mut list, high_risk_at(repo, &gone)).unwrap();
         assert!(said.contains("the list they were made with"), "{said}");
-        assert!(take_list(&mut list, high_risk_on(repo, "main")).is_none());
+        assert!(take_list(&mut list, high_risk_at(repo, &main)).is_none());
         let said = take_list(&mut list, Err(anyhow::anyhow!("gone"))).unwrap();
         assert!(said.contains("the list read last"), "{said}");
         assert_eq!(list.as_deref(), Some(&["src/hook.rs".to_string()][..]));
