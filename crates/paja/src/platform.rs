@@ -670,19 +670,38 @@ fn output_until(
         })),
         _ => None,
     };
-    // Drain both pipes while waiting, so a chatty child can't fill one and stall. Each sends
-    // what it read once its pipe closes, so a step ended at its deadline can still be read
-    // from without waiting on a process it started that outlived it.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        let (sent, read) = std::sync::mpsc::channel();
+    // Drain both pipes while waiting, so a chatty child can't fill one and stall. What each
+    // reads is kept as it comes, and a message says its pipe closed: a step ended at its
+    // deadline is read from as far as it got, without waiting on a process it started that
+    // outlived it and holds the pipe open.
+    type Drained = (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (closed, done) = std::sync::mpsc::channel();
+        let kept = std::sync::Arc::clone(&bytes);
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
+                let mut chunk = [0u8; 8192];
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    if let Ok(mut kept) = kept.lock() {
+                        kept.extend_from_slice(&chunk[..n]);
+                    }
+                }
             }
-            let _ = sent.send(bytes);
+            let _ = closed.send(());
         });
-        read
+        (bytes, done)
+    };
+    // What a drain has read, once its pipe closed or `wait` passed.
+    let read = |(bytes, done): Drained, wait: Option<std::time::Duration>| {
+        let _ = match wait {
+            Some(wait) => done.recv_timeout(wait).map_err(|_| ()),
+            None => done.recv().map_err(|_| ()),
+        };
+        bytes.lock().map(|b| b.clone()).unwrap_or_default()
     };
     let stdout = drain(
         child
@@ -707,15 +726,16 @@ fn output_until(
         }
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             kill_tree(&mut child);
-            let status = child.wait()?;
+            // Timed out either way: a wait that fails after the kill doesn't change that.
+            let status = child.wait().unwrap_or_default();
             // A moment for the pipes to close; one held open by a process that outlived the
-            // kill gives what was read so far as nothing, rather than holding Paja up.
-            let late = std::time::Duration::from_secs(2);
+            // kill gives what was read so far, rather than holding Paja up.
+            let late = Some(std::time::Duration::from_secs(2));
             return Ok(Bounded {
                 output: std::process::Output {
                     status,
-                    stdout: stdout.recv_timeout(late).unwrap_or_default(),
-                    stderr: stderr.recv_timeout(late).unwrap_or_default(),
+                    stdout: read(stdout, late),
+                    stderr: read(stderr, late),
                 },
                 timed_out: true,
             });
@@ -728,8 +748,8 @@ fn output_until(
     Ok(Bounded {
         output: std::process::Output {
             status,
-            stdout: stdout.recv().unwrap_or_default(),
-            stderr: stderr.recv().unwrap_or_default(),
+            stdout: read(stdout, None),
+            stderr: read(stderr, None),
         },
         timed_out: false,
     })

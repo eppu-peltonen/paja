@@ -549,12 +549,29 @@ fn still_going(pr: &str, limit: std::time::Duration, minutes: u64, checks: &str)
         long(limit),
         long(std::time::Duration::from_secs(minutes * 60))
     );
+    let checks = last_table(checks);
     if !checks.is_empty() {
+        // A fence longer than any run of backticks in the table, so none can end it.
+        let mut fence = "```".to_string();
+        while checks.contains(fence.as_str()) {
+            fence.push('`');
+        }
         text.push_str(&format!(
-            "\n\nThe checks when Paja stopped waiting:\n\n```\n{checks}\n```"
+            "\n\nThe checks when Paja stopped waiting:\n\n{fence}\n{checks}\n{fence}"
         ));
     }
     CiTimedOut(text)
+}
+
+/// The last table in `gh pr checks --watch`'s output: without a terminal it prints the whole
+/// table again at each refresh, with a blank line between them.
+fn last_table(output: &str) -> &str {
+    output
+        .trim()
+        .rsplit("\n\n")
+        .map(str::trim)
+        .find(|table| !table.is_empty())
+        .unwrap_or_default()
 }
 
 /// `limit` as a person reads it: whole minutes, or seconds below one.
@@ -622,6 +639,37 @@ mod tests {
         // Another method being off says nothing about this one.
         let v = json!({"viewerPermission": "ADMIN", "rebaseMergeAllowed": false});
         assert_eq!(why(v, super::SQUASH), None);
+    }
+
+    #[test]
+    fn the_timeout_question_shows_only_the_last_table_in_a_fence_it_cannot_end() {
+        let watched = "Refreshing checks status every 10 seconds.\n\ncheck\tpending\t0\n\n\
+                       check\tpending\t10s\nlint\tpass\t5s\n";
+        assert_eq!(
+            super::last_table(watched),
+            "check\tpending\t10s\nlint\tpass\t5s"
+        );
+        assert_eq!(super::last_table("  \n"), "");
+        let question = super::still_going(
+            "https://example.com/pull/1",
+            std::time::Duration::from_secs(60),
+            1,
+            "odd ``` name\tpending\t0",
+        )
+        .to_string();
+        assert!(question.contains("after 1 minute,") && question.contains("(it is now 1 minute)"));
+        assert!(
+            question.ends_with("\n````\nodd ``` name\tpending\t0\n````"),
+            "{question}"
+        );
+        let quiet = super::still_going(
+            "https://example.com/pull/1",
+            std::time::Duration::from_secs(1),
+            1,
+            "",
+        );
+        assert!(!quiet.to_string().contains("The checks when"), "{quiet}");
+        assert!(quiet.to_string().contains("after 1 second,"), "{quiet}");
     }
 
     #[test]
