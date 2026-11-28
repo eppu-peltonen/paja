@@ -9673,7 +9673,9 @@ fn a_sandboxed_agent_whose_whole_command_line_is_too_long_is_refused_before_it_s
         ],
     );
     assert_eq!(report["outcome"], "landed", "{report}");
-    // Wrapped for the sandbox, it doesn't.
+    // Wrapped for the sandbox, it doesn't: the excess, about 1,800 characters, is mostly the
+    // sandbox's own shell wrapping (`Sbx::command`'s git shim), so this needs a new size if that
+    // shrinks.
     let f = with_harness();
     let sbx = fake_sbx_that_hangs_on_unread_stdin(f.tmp.path());
     let (_, report) = paja_with(

@@ -410,7 +410,8 @@ pub(super) fn claude_with(
         }
     };
     // Measured on the whole command, with the sandbox's wrapping when there is one, as Windows
-    // quotes it: each argument in quotes and a space, and a `\` before every `"` or `\`.
+    // quotes it for an `.exe`: at most each argument in quotes and a space, and a `\` before
+    // every `"` or `\`. A `.cmd` or `.bat` goes through `cmd.exe`, which escapes differently.
     let line: usize = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
         .map(|arg| {
