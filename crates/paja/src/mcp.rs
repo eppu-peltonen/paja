@@ -244,7 +244,7 @@ impl PajaMcp {
     }
 
     #[tool(
-        description = "Jono: import open GitHub issues with the repository's work label (.paja/labels on the default branch, factory when missing) into the work queue (uses gh)."
+        description = "Jono: import open GitHub issues with the repository's work label (.paja/labels on the default branch, factory when missing) into the work queue (uses gh). Removes the clean environment (worktree, not branch) of a parked item whose issue was closed, listed under freed; one it keeps is listed under kept with the reason."
     )]
     async fn work_sync(&self, Parameters(args): Parameters<RepoArgs>) -> Result<String, String> {
         let home = self.home.clone();
