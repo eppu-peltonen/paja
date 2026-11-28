@@ -279,9 +279,11 @@ A pool admits an item to a lane only when the files it will touch don't overlap 
 its own, so its ticks go on meanwhile, recorded as `pool.planning`. With a lane free, it starts at most one plan per
 free lane. With every lane busy, it looks every 5 seconds and plans ahead, in queue order, until the first items a
 freed lane could take, as many as the pool has lanes, have a plan ready or on its way, so the next lane to free has
-its plan waiting; an item whose plan failed or overlaps a running lane's isn't one of them, no more plans run at once
-than the pool has lanes, and none are planned ahead while `pool lanes` shrinks the pool. Planning ahead reads the
-queue as last synced, since a busy pool doesn't sync, and a failed plan is retried only after a timed sync. In a plan,
+its plan waiting. An item whose plan would still wait after any one lane ends (it overlaps two running lanes' plans,
+or failed while another lane runs) isn't one of them; a look scans at most twice as many items as the pool has lanes,
+no more plans run at once than the pool has lanes, and none are planned ahead while `pool lanes` shrinks the pool.
+Planning ahead reads the queue as last synced, since a busy pool doesn't sync, and a failed plan is retried only after
+a timed sync, which waits for a free lane. In a plan,
 the item's `Touches:` line names the paths when it has one (`source: spec`; the words `and`, `or`, `none` and
 `nothing` and a sentence's punctuation are skipped, though a bracket pair inside a path such as `src/app/(auth)/` stays, and `.` or a path with a `..` part is the whole repository, `./`), else a short read-only agent on the
 `plan` role, in an environment of the default branch under the deny-list hook, lists them (`source: plan`). That

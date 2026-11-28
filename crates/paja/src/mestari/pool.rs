@@ -305,6 +305,7 @@ impl Pool<'_> {
                 // With every lane busy, the next items are planned ahead now and then: only when
                 // the next lane to end frees one (not while `pool lanes` shrinks the pool), and
                 // not while as many plans are on their way as the pool has lanes.
+                // (`pool lanes 0` leaves no lane busy, and nothing to plan ahead for.)
                 let ahead = !self.lanes.is_empty()
                     && self.lanes.len() == target as usize
                     && self.planners.len() + self.elsewhere.len() < target as usize
@@ -824,9 +825,10 @@ fn follow_lane(home: &Home, repo: &str, n: u32, lane: &mut Lane, events: &[Event
 
 /// With every lane busy, the items of the runnable `queue` to start planning, so that the
 /// first `target` items a lane that frees could take, in queue order, have a plan ready or on
-/// its way. One whose plan failed, or overlaps a `running` lane's, isn't counted among them,
-/// since a freed lane can't count on taking it. At most `target` plans run at once, counting the
-/// `in_flight` ones.
+/// its way. One whose plan would still be blocked after any one lane ends (it overlaps two
+/// `running` lanes, or failed while another lane runs) isn't counted among them. A look scans
+/// at most twice `target` items, so items that wait on each other never get the whole queue
+/// planned, and at most `target` plans run at once, counting the `in_flight` ones.
 fn plan_ahead(
     queue: &[u64],
     plans: &BTreeMap<u64, Plan>,
@@ -837,7 +839,7 @@ fn plan_ahead(
 ) -> Vec<u64> {
     let mut covered = 0;
     let mut to_plan = Vec::new();
-    for number in queue {
+    for number in queue.iter().take(2 * target) {
         if covered >= target || in_flight + to_plan.len() >= target {
             break;
         }
@@ -850,8 +852,15 @@ fn plan_ahead(
                 to_plan.push(*number);
                 covered += 1;
             }
-            Some(plan) if plan.source == "failed" || blocked_by(plan, running).is_some() => {}
-            Some(_) => covered += 1,
+            Some(plan) => {
+                let blocking = running
+                    .iter()
+                    .filter(|lane| blocked_by(plan, &[lane]).is_some())
+                    .count();
+                if blocking < 2 {
+                    covered += 1;
+                }
+            }
         }
     }
     to_plan
@@ -1811,27 +1820,50 @@ mod tests {
             error: None,
         };
         let none = BTreeSet::new();
+        // Two busy lanes that no queued item overlaps.
+        let (x, y) = (plan(3, "x.rs", "plan"), plan(4, "y.rs", "plan"));
+        let busy = [&x, &y];
         // An unplanned item ahead of planned ones is planned: a freed lane takes it first.
         let plans = BTreeMap::from([(8, plan(8, "b.rs", "plan")), (9, plan(9, "c.rs", "plan"))]);
-        assert_eq!(plan_ahead(&[7, 8, 9], &plans, &[], &none, 0, 2), [7]);
+        assert_eq!(plan_ahead(&[7, 8, 9], &plans, &busy, &none, 0, 2), [7]);
         // The first `target` items have plans: nothing more is planned.
-        assert!(plan_ahead(&[8, 9, 10], &plans, &[], &none, 0, 2).is_empty());
+        assert!(plan_ahead(&[8, 9, 10], &plans, &busy, &none, 0, 2).is_empty());
         // One being planned (again, after a failed plan) counts once.
         let mut again = plans.clone();
         again.insert(7, plan(7, "", "failed"));
         let seven = BTreeSet::from([7]);
-        assert!(plan_ahead(&[7, 8, 10], &again, &[], &seven, 1, 2).is_empty());
-        // A failed plan, or one overlapping a running lane, isn't one a freed lane takes next.
-        let running = plan(5, "c.rs", "plan");
+        assert!(plan_ahead(&[7, 8, 10], &again, &busy, &seven, 1, 2).is_empty());
+        // One lane: the lane that ends is the one an overlapping or failed plan waits on, so the
+        // next item is taken next whatever its plan, and nothing more is planned.
+        let one = plan(5, "c.rs", "plan");
         let mut failed = plans.clone();
         failed.insert(7, plan(7, "", "failed"));
+        assert!(plan_ahead(&[9, 10], &plans, &[&one], &none, 0, 1).is_empty());
+        assert!(plan_ahead(&[7, 10], &failed, &[&one], &none, 0, 1).is_empty());
+        let lost = plan(5, "", "failed");
+        assert!(plan_ahead(&[8, 10], &plans, &[&lost], &none, 0, 1).is_empty());
+        // Two lanes: a plan still blocked after either ends (it overlaps both, or failed) isn't
+        // one a freed lane takes next; one overlapping just one lane is.
+        let two = plan(4, "b.rs", "plan");
+        let mut waits = failed.clone();
+        let mut on_both = plan(6, "b.rs", "plan");
+        on_both.paths.push("c.rs".into());
+        waits.insert(6, on_both);
+        let lanes = [&one, &two];
         assert_eq!(
-            plan_ahead(&[7, 9, 8, 10], &failed, &[&running], &none, 0, 2),
+            plan_ahead(&[6, 7, 9, 10], &waits, &lanes, &none, 0, 2),
             [10]
         );
+        // A look scans at most twice the lanes: a queue of items that all wait is left alone.
+        let mut stuck = BTreeMap::new();
+        for n in 20..30 {
+            stuck.insert(n, plan(n, "", "failed"));
+        }
+        let queue: Vec<u64> = (20..30).chain([40]).collect();
+        assert!(plan_ahead(&queue, &stuck, &[&one, &two], &none, 0, 2).is_empty());
         // No more plans at once than the pool has lanes.
-        assert_eq!(plan_ahead(&[10, 11, 12], &plans, &[], &none, 1, 2), [10]);
-        assert!(plan_ahead(&[10, 11], &plans, &[], &none, 2, 2).is_empty());
+        assert_eq!(plan_ahead(&[10, 11, 12], &plans, &busy, &none, 1, 2), [10]);
+        assert!(plan_ahead(&[10, 11], &plans, &busy, &none, 2, 2).is_empty());
     }
 
     #[test]
