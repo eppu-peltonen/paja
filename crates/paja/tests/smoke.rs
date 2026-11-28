@@ -5198,7 +5198,10 @@ fn an_approval_does_not_carry_to_a_worktree_changed_since() {
         .unwrap()
         .unwrap()
         .path();
+    // Committed, so Paja has nothing left over to commit (CI has no git identity).
     std::fs::write(env.join("stray.txt"), "changed").unwrap();
+    git(&env, &["add", "stray.txt"]);
+    git(&env, &["commit", "-q", "-m", "stray"]);
     let (report, stderr) = f.run_with_stderr();
     assert_eq!(report["outcome"], "landed", "{report}\n{stderr}");
     assert!(!stderr.contains("the review approved"), "{stderr}");
@@ -5224,7 +5227,10 @@ fn an_approval_does_not_carry_to_a_rebuild_stopped_in_its_review() {
         .unwrap()
         .unwrap()
         .path();
+    // Committed, so Paja has nothing left over to commit (CI has no git identity).
     std::fs::write(env.join("stray.txt"), "changed").unwrap();
+    git(&env, &["add", "stray.txt"]);
+    git(&env, &["commit", "-q", "-m", "stray"]);
     std::fs::write(dir.join("review-hang"), "").unwrap();
     interrupt_run(&f, "review-hanging");
     std::fs::remove_file(dir.join("review-hang")).unwrap();
