@@ -190,7 +190,8 @@ earlier run kept). An item started before environments carried the repository's 
 environment when that was made in this checkout, or, once that environment is gone, its `paja/work-<issue>` branch,
 which is renamed to the item's own so it is carried over once. The branch is the item's only when the log shows it: the
 latest run in an environment named `work-<issue>` is the item's, and no run of the item landed after it. Otherwise, or
-when a `work-<issue>` environment still holds it or a worktree has it checked out, the run says so and starts fresh. A
+when a `work-<issue>` environment still holds it or a worktree has it checked out, the run says so and starts fresh,
+keeping the branch. A carried-over branch starts a new builder session, since the old one worked in the old worktree. A
 run that stops on an error removes the environment it used, but a `work-<issue>` only when it has no uncommitted
 changes, since an older release's park may have kept the builder's edits there; one that belongs to another repository
 is never taken, and a hashed name found to belong to another repository stops the run with the `paja env remove <name>`

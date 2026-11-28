@@ -672,6 +672,27 @@ pub fn item_events<'a>(
         .filter(move |e| e.data["number"] == number && event_repo(e, legacy) == repo)
 }
 
+/// Whether the log shows that the `work-<n>` environment an older release made last held this
+/// item's run: the latest `run.started` in an environment named `work-<n>` is one of the item's
+/// (an item from a log that names no repository counts as `repo`'s, as everywhere else), and no
+/// run of the item landed after it. Another repository's item of the same number that ran in a
+/// `work-<n>` later makes it not the item's; so does a landing, after which the branch holds
+/// work that is already on the base.
+pub(crate) fn ran_in_work_n(events: &[Event], repo: &str, number: u64) -> bool {
+    let plain = format!("work-{number}");
+    let mine: std::collections::BTreeSet<u64> =
+        item_events(events, repo, number).map(|e| e.seq).collect();
+    let mut ours = false;
+    for e in events {
+        if e.kind == crate::mestari::EV_STARTED && e.data["env"].as_str() == Some(plain.as_str()) {
+            ours = mine.contains(&e.seq);
+        } else if e.kind == crate::mestari::EV_LANDED && mine.contains(&e.seq) {
+            ours = false;
+        }
+    }
+    ours
+}
+
 /// Before the first event of a repository is written to a log that holds older, unkeyed ones,
 /// record which repository those belong to (see [`legacy_repo`]), so a later write from another
 /// checkout can't move them. Every writer calls this under the home lock. Returns the log as it
@@ -2030,7 +2051,7 @@ pub fn sync_with(
 /// is closed on GitHub instead of answered, nothing else frees the worktree and port block. The
 /// branch stays, so a reopened item resumes from it, also from the `paja/work-<n>` of the
 /// `work-<n>` environment an older release made, which is freed the same way when the log shows
-/// the item last ran there (see [`crate::mestari::ran_in_work_n`]). An environment
+/// the item last ran there (see [`ran_in_work_n`]). An environment
 /// is kept, with the reason, when:
 ///
 /// - its issue is still open on GitHub (the item left the queue because its label changed, or
@@ -2064,8 +2085,7 @@ fn free_closed(home: &Home, ok: &Untampered, repo: &str, top: &Path) -> (Vec<Str
             // A `work-<n>` carries no repository: it is the item's only when the log shows the
             // item last ran there.
             .filter(|(number, name)| {
-                *name != format!("work-{number}")
-                    || crate::mestari::ran_in_work_n(&events, repo, *number)
+                *name != format!("work-{number}") || ran_in_work_n(&events, repo, *number)
             })
             .collect())
     })();

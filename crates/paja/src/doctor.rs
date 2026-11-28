@@ -338,7 +338,7 @@ fn left_over_environments(home: &Home, repo: &Path) -> Check {
         let here = |env: &ahjo::Env| jono::same_dir(&env.repo, &checkout);
         // A `work-<n>` is the item's only when the log shows the item last ran there.
         let ours = |item: &jono::WorkItem| {
-            item.repo.is_empty() || crate::mestari::ran_in_work_n(&events, &item.repo, item.number)
+            item.repo.is_empty() || jono::ran_in_work_n(&events, &item.repo, item.number)
         };
         let mut left = Vec::new();
         for item in jono::replay(&events, "")?.values() {
