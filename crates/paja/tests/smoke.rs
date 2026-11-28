@@ -12550,14 +12550,18 @@ fn lanes_waiting_to_land_take_the_turn_in_the_order_they_began_to_wait() {
         "lane of #{}: {first:?}",
         order[0]
     );
+    // Whether the lane got the signal; only the last resume may ignore it.
     let signal = |sig: &str| {
-        let _ = Command::new("kill").args([sig, first.as_str()]).status();
+        Command::new("kill")
+            .args([sig, first.as_str()])
+            .status()
+            .is_ok_and(|status| status.success())
     };
     // However the test ends from here, the paused lane is let go again.
-    struct Resume<'a>(&'a dyn Fn(&str));
+    struct Resume<'a>(&'a dyn Fn(&str) -> bool);
     impl Drop for Resume<'_> {
         fn drop(&mut self) {
-            (self.0)("-CONT");
+            let _ = (self.0)("-CONT");
         }
     }
     let resume = Resume(&signal);
@@ -12568,14 +12572,14 @@ fn lanes_waiting_to_land_take_the_turn_in_the_order_they_began_to_wait() {
         .open(f.home.join("lock"))
         .unwrap();
     loop {
-        signal("-STOP");
+        assert!(signal("-STOP"), "pausing the lane of #{}", order[0]);
         match home_lock.try_lock() {
             Ok(()) => {
                 home_lock.unlock().unwrap();
                 break;
             }
             Err(_) => {
-                signal("-CONT");
+                assert!(signal("-CONT"), "resuming the lane of #{}", order[0]);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }

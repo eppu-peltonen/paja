@@ -62,6 +62,15 @@ pub(super) fn land_turn(home: &Home, item: &WorkItem, round: u32) -> Result<crat
             }
             if waiting.is_none() {
                 let merging = home.try_merging_lock(&item.repo, item.number)?;
+                // The run lock makes the item this run's alone, so another holder means a run
+                // that outlived its run lock; this run still waits, but others can't see it.
+                if merging.is_none() {
+                    progress(&format!(
+                        "another process holds #{}'s merging lock, so runs waiting after this \
+                         one may land first",
+                        item.number
+                    ));
+                }
                 let event = home.events().append(&lock, EV_MERGING, data.clone())?;
                 waiting = Some((event.seq, merging));
             }
