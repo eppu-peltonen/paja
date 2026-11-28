@@ -2439,6 +2439,7 @@ impl Factory {
         std::fs::write(dir.join("verdict.txt"), verdict).unwrap();
         let script = |name: &str, body: String| program(dir, name, &body);
         let d = slash(dir);
+        let token = fake_token();
         let gh = script(
             "gh",
             format!(
@@ -2450,15 +2451,18 @@ impl Factory {
                  if [ ! -f {d}/no-workflows ]; then echo 'CI	active	1'; fi ;;\n\
                  \"pr view\") if [ -f {d}/pr-open ]; then echo https://example.com/pull/1; else exit 1; fi ;;\n\
                  \"pr edit\") if [ -f {d}/edit-down ]; then echo 'HTTP 502' >&2; exit 1; fi ;;\n\
-                 \"pr merge\") if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi\n\
+                 \"pr merge\") if [ -f {d}/merge-conflicts ]; then echo 'Pull request is not mergeable: the merge commit cannot be cleanly created' >&2; exit 1; fi\n\
+                 if [ -f {d}/merge-refused ]; then echo 'GraphQL: Squash merges are not allowed on this repository' >&2; exit 1; fi\n\
                  if [ -f {d}/checks-required ]; then echo 'GraphQL: Required status check \"CI\" is expected.' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then n=${{3##*/}}; b=$(cat {d}/prs/$n); rm -rf {d}/merging; git clone -q {d}/origin.git {d}/merging && cd {d}/merging \
                  && git merge -q --squash origin/$b >/dev/null && git -c user.name=t -c user.email=t@example.com commit -qm \"pull $n\" && git push -q origin HEAD:main 2>/dev/null || exit 1; fi ;;\n\
                  \"pr checks\") if [ -f {d}/ci-none ]; then : > {d}/ci-waiting; echo \"no checks reported on the 'work-5' branch\" >&2; exit 1; fi\n\
                  if [ -f {d}/ci-hold ]; then echo $$ > {d}/ci-pid; printf 'check (ubuntu-latest)\\tpending\\t0\\n'; : > {d}/ci-waiting; fi; while [ -f {d}/ci-hold ]; do sleep 0.1; done\n\
                  if [ -f {d}/ci-silent ]; then echo 'HTTP 502: Bad Gateway' >&2; exit 1; fi\n\
-                 if [ -f {d}/ci-red-once ]; then rm {d}/ci-red-once; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
-                 \"run view\") echo 'test init_works ... FAILED: Author identity unknown' ;;\n\
+                 case \"$*\" in *--json*) if [ -f {d}/ci-red-seen ] || [ -f {d}/ci-red-always ]; then rm -f {d}/ci-red-seen; echo '[{{\"name\": \"check (ubuntu-latest)\", \"bucket\": \"fail\", \"link\": \"https://example.com/acme/app/actions/runs/7/job/8\"}}]'; else echo '[]'; fi; exit 0 ;; esac\n\
+                 if [ -f {d}/ci-red-always ]; then echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi\n\
+                 if [ -f {d}/ci-red-once ]; then mv {d}/ci-red-once {d}/ci-red-seen; echo 'check (ubuntu-latest)	fail	1m	https://example.com/acme/app/actions/runs/7/job/8'; exit 1; fi ;;\n\
+                 \"run view\") echo 'test init_works ... FAILED: Author identity unknown'; if [ -f {d}/log-token ]; then echo \"token {token}\"; fi ;;\n\
                  \"pr create\") if [ -f {d}/gh-down ]; then echo 'HTTP 502' >&2; exit 1; fi\n\
                  if [ -f {d}/real-merge ]; then mkdir -p {d}/prs; n=$(( $(ls {d}/prs | wc -l) + 1 )); prev=; for a in \"$@\"; do [ \"$prev\" = --head ] && echo \"$a\" > {d}/prs/$n; prev=$a; done; echo https://example.com/pull/$n; exit 0; fi\n\
                  if [ -f {d}/reuse-prs ]; then touch {d}/pr-open; fi\n\
@@ -11326,6 +11330,22 @@ fn a_merge_the_builder_leaves_unfinished_stays_in_progress_for_the_next_round() 
         .find(|c| c.contains("isn't finished: these files still have conflicts: feature.txt"))
         .unwrap_or_else(|| panic!("{calls:#?}"));
     assert!(fix.contains("finish the merge"), "{fix}");
+    // Paja started the merge again, so the files hold markers for the builder.
+    assert!(fix.contains("started the merge again"), "{fix}");
+}
+
+#[test]
+fn a_gh_failure_after_main_moved_escalates_instead_of_costing_a_round() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-silent"), "").unwrap();
+    f.main_moves("other.txt", "elsewhere");
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 1, "{report}");
+    assert!(
+        !stderr.contains("CI failed; sending the failure back to the builder"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -11425,6 +11445,33 @@ fn red_ci_goes_back_to_the_builder_with_the_failed_log() {
         "{}",
         f.gh_log()
     );
+}
+
+#[test]
+fn red_ci_on_the_last_round_escalates_redacted_and_names_the_reason() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("ci-red-always"), "").unwrap();
+    std::fs::write(f.tmp.path().join("log-token"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    assert_eq!(report["rounds"], 5, "{report}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("CI still failed"), "{question}");
+    assert!(!question.contains(&fake_token()), "{question}");
+    let log = f.gh_log();
+    assert!(log.contains("CI still failed"), "{log}");
+    assert!(!log.contains(&fake_token()), "{log}");
+}
+
+#[test]
+fn a_merge_that_conflicts_at_landing_escalates() {
+    let f = Factory::new("test -f feature.txt\n", "land");
+    std::fs::write(f.tmp.path().join("merge-conflicts"), "").unwrap();
+    let (report, stderr) = f.run_with_stderr();
+    assert_eq!(report["outcome"], "escalated", "{report}\n{stderr}");
+    let question = report["question"].as_str().unwrap();
+    assert!(question.contains("no longer merges"), "{question}");
+    assert!(f.gh_log().contains("issue comment 5"), "{}", f.gh_log());
 }
 
 #[test]

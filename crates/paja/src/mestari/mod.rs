@@ -1195,6 +1195,8 @@ fn run_item(
     let mut builder: Option<StepUsage> = None;
     // How often each kind of step hit its turn limit in this run: a second hit escalates.
     let (mut builder_limits, mut review_limits) = (0u32, 0u32);
+    // Whether the last round ended on a red CI, whose feedback holds a CI log.
+    let mut ci_red = false;
     progress(&format!("working in {}", env.path.display()));
     for round in start..=MAX_ROUNDS {
         run.round = round;
@@ -1211,6 +1213,7 @@ fn run_item(
         }
         let steps = &mut run.steps;
         steps.clear();
+        ci_red = false;
         // Only the round that was cut off may reuse what it had: the build, and the checks if
         // nothing has changed since they passed.
         let reused = if round == start { reuse.take() } else { None };
@@ -1371,8 +1374,27 @@ fn run_item(
         }
         // A merge Paja handed over must be finished, not committed with its conflicts. It stays
         // in progress, so the next round sees the files that still conflict.
-        if let Some(merge) = unfinished_merge(&env, &target.branch)? {
-            feedback = merge;
+        if unfinished_merge(&env, &target.branch)?.is_some() {
+            // The next round starts from the conflicts again: restart the merge, so the files
+            // hold markers for the builder to resolve.
+            git(&env.path, &["merge", "--abort"])?;
+            feedback = match catch_up(repo, &env, &target.branch)? {
+                CatchUp::Conflict(files) => format!(
+                    "The merge of {} isn't finished: these files still have conflicts: {}. \
+                     Paja started the merge again, so they hold conflict markers. Resolve each \
+                     one, keeping what both sides meant, then `git add` the files and `git \
+                     commit -m '<message>'` to finish the merge.",
+                    target.branch,
+                    files.join(", ")
+                ),
+                // The default branch moved so the merge is clean now, or the branch already
+                // holds it: nothing is left to resolve.
+                _ => format!(
+                    "The merge of {} wasn't finished and Paja has started it again. Make the \
+                     change and commit it.",
+                    target.branch
+                ),
+            };
             if let Some(p) = &prior {
                 feedback.push_str(&format!(
                     "\n\nThe review's blockers still need fixing too:\n\n{}",
@@ -1856,6 +1878,7 @@ fn run_item(
             let report = match landed {
                 Ok(Landing::Retry(why)) => {
                     progress("CI failed; sending the failure back to the builder");
+                    ci_red = true;
                     feedback = why.clone();
                     // Every finding in the change was fixed before landing, so only those outside
                     // it are left for the re-reviewer to keep or drop.
@@ -1995,8 +2018,17 @@ fn run_item(
             Some(next),
         )?;
     }
+    // A CI log can hold anything the build printed, and the question goes to a public issue.
+    let (reason, feedback) = if ci_red {
+        (
+            "CI still failed",
+            follow_ups::redact_for_comment(&feedback, repo, home.root(), follow_ups::QUOTED_CHARS),
+        )
+    } else {
+        ("the change still isn't ready", feedback)
+    };
     let question = format!(
-        "Paja tried {MAX_ROUNDS} rounds and the change still isn't ready. Last feedback:\n\n{feedback}\n\n\
+        "Paja tried {MAX_ROUNDS} rounds and {reason}. Last feedback:\n\n{feedback}\n\n\
          Answer with what should change, or what is out of scope."
     );
     let scene = Scene {

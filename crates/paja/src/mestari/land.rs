@@ -266,16 +266,24 @@ pub(super) fn land(
                 let question = late.to_string();
                 return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
             }
-            let err = format!("{err:#}");
             // Only a failed check, or checks that never start because the default branch moved
             // on (GitHub runs none on a conflicting pull request), is the builder's to fix. A
             // `gh` or network error, or a repository whose workflows never run, is not.
-            let failed_check = err.contains("\tfail\t");
-            if !failed_check && !default_branch_moved(repo, &target.branch, judged) {
-                let question =
-                    format!("CI did not report on {pr}, so Paja did not land it:\n\n{err}");
-                return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
-            }
+            let err = match err.downcast_ref::<CiFailed>() {
+                Some(failed) => failed.0.clone(),
+                None => {
+                    let text = format!("{err:#}");
+                    let never_started = text.contains("no CI checks appeared");
+                    if !(never_started && default_branch_moved(repo, &target.branch, judged)) {
+                        let question = format!(
+                            "CI did not report on {pr}, so Paja did not land it:\n\n{text}"
+                        );
+                        return escalated(home, repo, env, item, &question, rounds)
+                            .map(Landing::Done);
+                    }
+                    text
+                }
+            };
             let mut why = format!(
                 "CI failed on {pr}, so Paja did not land it. CI runs on GitHub's machines, which \
                  differ from this one (no git identity, a fresh checkout, other temp folders), so \
@@ -296,6 +304,16 @@ pub(super) fn land(
         if let Some(why) = merge_refused(repo, &item.repo, merge_flag) {
             let question =
                 format!("GitHub refused to merge {pr} with `{merge_flag}`:\n\n{err:#}\n\n{why}");
+            return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
+        }
+        // The default branch moved again after the catch-up. The branch is kept; the person
+        // can queue the item again and Paja merges the new tip in.
+        if text.contains("conflict") || text.contains("not mergeable") {
+            let question = format!(
+                "{pr} no longer merges: the default branch moved while the review and CI ran, so \
+                 Paja did not land it:\n\n{err:#}\n\nAnswer that it should try again and Paja \
+                 will merge the new tip into the branch and check it again."
+            );
             return escalated(home, repo, env, item, &question, rounds).map(Landing::Done);
         }
         // Only a hint on top of the error, for a repository with no CI: the wording is enough.
@@ -573,6 +591,11 @@ impl std::error::Error for CiTimedOut {}
 /// going at the limit, which is a [`CiTimedOut`]: the run holds the repository's turn to land
 /// while it waits, so a CI that hangs would otherwise hold up every landing there. `stop now`
 /// ends the wait at once.
+///
+/// Checks that failed are a [`CiFailed`], read from `gh pr checks --json` rather than from the
+/// watch's text, which is clipped to its last 4000 bytes and can lose the failed row. Only the
+/// `fail` bucket counts: a cancelled check (`cancel` bucket) is not the code's fault, so it is
+/// an ordinary error and escalates.
 pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
     const APPEAR: std::time::Duration = std::time::Duration::from_secs(300);
     const AGAIN: std::time::Duration = std::time::Duration::from_secs(10);
@@ -608,6 +631,13 @@ pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
         }
         let err = format!("`{gh} {}` failed: {}", args.join(" "), tail(&ended.output));
         if !err.contains("no checks reported") {
+            let failed = run_gh(repo, &["pr", "checks", pr, "--json", "name,bucket,link"])
+                .ok()
+                .map(|json| failed_checks(&json))
+                .unwrap_or_default();
+            if !failed.is_empty() {
+                return Err(CiFailed(failed).into());
+            }
             bail!(err);
         }
         // No checks yet: that is the workflows' to fix, not a hung CI, so it keeps its own
@@ -628,6 +658,39 @@ pub(super) fn wait_for_ci(repo: &Path, pr: &str, minutes: u64) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
+}
+
+/// At least one check failed: one row per failed check, with its job link. The builder's to fix.
+#[derive(Debug)]
+struct CiFailed(String);
+
+impl std::fmt::Display for CiFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CiFailed {}
+
+/// One row (`name`, `fail`, `link`) per check in `json` (the output of `gh pr checks --json
+/// name,bucket,link`) whose bucket is `fail`.
+fn failed_checks(json: &str) -> String {
+    let Ok(serde_json::Value::Array(checks)) = serde_json::from_str::<serde_json::Value>(json)
+    else {
+        return String::new();
+    };
+    checks
+        .iter()
+        .filter(|c| c["bucket"] == "fail")
+        .map(|c| {
+            format!(
+                "{}\tfail\t{}",
+                c["name"].as_str().unwrap_or("check"),
+                c["link"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The question for CI on `pr` still going after `limit`, with the checks as `gh` last showed
